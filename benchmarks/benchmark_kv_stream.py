@@ -20,6 +20,7 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SERVER_BIN = "Release/llama-server.exe" if os.name == "nt" else "llama-server"
 CONTEXT_STEP = 8192
 UVM_ENV_NAMES = (
     "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
@@ -86,7 +87,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--server",
         type=Path,
-        default=ROOT / "build/bin/llama-server",
+        default=ROOT / "build/bin" / SERVER_BIN,
         help="adaptive KV streaming llama-server binary",
     )
     parser.add_argument(
@@ -143,6 +144,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.model = args.model.resolve()
     args.server = args.server.resolve()
+    if not args.server.is_file():
+        exe_server = args.server.with_suffix(".exe").resolve()
+        if exe_server.is_file():
+            args.server = exe_server
     return args
 
 
@@ -337,7 +342,10 @@ class Server:
 
     def stop(self) -> None:
         if self.process is not None and self.process.poll() is None:
-            self.process.send_signal(signal.SIGINT)
+            terminate_signal = (
+                signal.CTRL_C_EVENT if os.name == "nt" else signal.SIGINT
+            )
+            self.process.send_signal(terminate_signal)
             try:
                 self.process.wait(timeout=8)
             except subprocess.TimeoutExpired:
@@ -792,7 +800,10 @@ def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
 def validate_args(args: argparse.Namespace) -> None:
     if not args.model.is_file():
         raise SystemExit(f"model not found: {args.model}")
-    if not args.server.is_file() or not os.access(args.server, os.X_OK):
+    server_ok = args.server.is_file() and (
+        os.name == "nt" or os.access(args.server, os.X_OK)
+    )
+    if not server_ok:
         raise SystemExit(f"server is not executable: {args.server}")
     numeric_positive = (
         args.decode_tokens,
