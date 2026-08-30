@@ -345,12 +345,22 @@ class Server:
             terminate_signal = (
                 signal.CTRL_C_EVENT if os.name == "nt" else signal.SIGINT
             )
-            self.process.send_signal(terminate_signal)
+            # On Windows, CTRL_C_EVENT reaches the shared console and would
+            # interrupt this benchmark process itself; mask SIGINT while we
+            # send it so the child stops but we keep running.
+            previous_handler = None
+            if os.name == "nt":
+                previous_handler = signal.signal(signal.SIGINT, lambda *_: None)
             try:
-                self.process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=10)
+                self.process.send_signal(terminate_signal)
+                try:
+                    self.process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=10)
+            finally:
+                if previous_handler is not None:
+                    signal.signal(signal.SIGINT, previous_handler)
         if not self.log_file.closed:
             self.log_file.close()
 
