@@ -109,6 +109,7 @@ struct llama_context {
     void detach_threadpool();
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
+    void set_decode_phase(enum llama_decode_phase phase);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
@@ -422,6 +423,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    enum llama_decode_phase decode_phase =
+        LLAMA_DECODE_PHASE_AUTOMATIC;
 
     // perf
     mutable int64_t t_start_us  = 0;

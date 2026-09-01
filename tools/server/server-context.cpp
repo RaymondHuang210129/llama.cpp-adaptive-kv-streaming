@@ -3655,14 +3655,23 @@ private:
         }
 
         bool has_output = false;
+        bool is_prompt = batch.tokens[off].is_prompt;
+        bool homogeneous_phase = true;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            homogeneous_phase &=
+                batch.tokens[i].is_prompt == is_prompt;
         }
+        const enum llama_decode_phase decode_phase =
+            !homogeneous_phase ? LLAMA_DECODE_PHASE_AUTOMATIC :
+            is_prompt ? LLAMA_DECODE_PHASE_PROMPT :
+                        LLAMA_DECODE_PHASE_GENERATION;
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            llama_set_decode_phase(ctx_tgt, decode_phase);
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);

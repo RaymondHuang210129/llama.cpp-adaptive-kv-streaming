@@ -202,5 +202,23 @@ int main() {
         t.assert_true("ring byte overflow", !plan.valid);
     });
 
+    t.test("explicit decode phase overrides ambiguous batch shape", [](testing & t) {
+        t.assert_true("automatic one-token batch is generation",
+            llama_kv_stream_phase_is_generation(
+                LLAMA_KV_STREAM_PHASE_AUTOMATIC, 1));
+        t.assert_true("automatic multi-token batch is prompt",
+            !llama_kv_stream_phase_is_generation(
+                LLAMA_KV_STREAM_PHASE_AUTOMATIC, 2));
+        t.assert_true("one-token prompt tail remains prompt",
+            !llama_kv_stream_phase_is_generation(
+                LLAMA_KV_STREAM_PHASE_PROMPT, 1));
+        t.assert_true("explicit prompt chunk remains prompt",
+            !llama_kv_stream_phase_is_generation(
+                LLAMA_KV_STREAM_PHASE_PROMPT, 256));
+        t.assert_true("explicit generation ignores token count",
+            llama_kv_stream_phase_is_generation(
+                LLAMA_KV_STREAM_PHASE_GENERATION, 4));
+    });
+
     return t.summary();
 }

@@ -137,3 +137,16 @@ llama_kv_stream_phase_plan llama_kv_stream_phase_plan_make(
     result.valid = true;
     return result;
 }
+
+bool llama_kv_stream_phase_is_generation(
+        llama_kv_stream_phase phase, uint32_t batch_tokens) {
+    switch (phase) {
+        case LLAMA_KV_STREAM_PHASE_AUTOMATIC:
+            return batch_tokens == 1;
+        case LLAMA_KV_STREAM_PHASE_PROMPT:
+            return false;
+        case LLAMA_KV_STREAM_PHASE_GENERATION:
+            return true;
+    }
+    return batch_tokens == 1;
+}

@@ -1568,6 +1568,17 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
     cparams.n_threads_batch = n_threads_batch;
 }
 
+void llama_context::set_decode_phase(enum llama_decode_phase phase) {
+    switch (phase) {
+        case LLAMA_DECODE_PHASE_AUTOMATIC:
+        case LLAMA_DECODE_PHASE_PROMPT:
+        case LLAMA_DECODE_PHASE_GENERATION:
+            decode_phase = phase;
+            return;
+    }
+    decode_phase = LLAMA_DECODE_PHASE_AUTOMATIC;
+}
+
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
     LLAMA_LOG_DEBUG("%s: call\n", __func__);
 
@@ -1771,8 +1782,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (auto * hybrid_context = dynamic_cast<llama_memory_hybrid_context *>(mctx)) {
             const llama_kv_cache_context * attn_context = hybrid_context->get_attn();
             if (attn_context != nullptr) {
+                llama_kv_stream_phase phase =
+                    LLAMA_KV_STREAM_PHASE_AUTOMATIC;
+                if (decode_phase == LLAMA_DECODE_PHASE_PROMPT) {
+                    phase = LLAMA_KV_STREAM_PHASE_PROMPT;
+                } else if (decode_phase == LLAMA_DECODE_PHASE_GENERATION) {
+                    phase = LLAMA_KV_STREAM_PHASE_GENERATION;
+                }
+                const bool generation =
+                    llama_kv_stream_phase_is_generation(
+                        phase, ubatch.n_tokens);
+                if (kv_stream_phase_arena.configured && generation &&
+                        ubatch.n_tokens != cparams.n_seq_max) {
+                    LLAMA_LOG_ERROR(
+                        "%s: phase arena currently supports TG1 without speculative batches\n",
+                        __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
                 if (!kv_stream_switch_phase(
-                        ubatch.n_tokens == 1, attn_context->get_n_kv())) {
+                        generation, attn_context->get_n_kv())) {
                     LLAMA_LOG_ERROR(
                         "%s: failed to switch shared CUDA arena phase\n",
                         __func__);
@@ -4265,6 +4294,11 @@ void llama_detach_threadpool(llama_context * ctx) {
 
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
+}
+
+void llama_set_decode_phase(
+        llama_context * ctx, enum llama_decode_phase phase) {
+    ctx->set_decode_phase(phase);
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

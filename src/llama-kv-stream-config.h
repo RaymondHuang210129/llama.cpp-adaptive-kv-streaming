@@ -72,3 +72,12 @@ struct llama_kv_stream_phase_plan {
 
 llama_kv_stream_phase_plan llama_kv_stream_phase_plan_make(
     const llama_kv_stream_phase_plan_params & params);
+
+enum llama_kv_stream_phase {
+    LLAMA_KV_STREAM_PHASE_AUTOMATIC,
+    LLAMA_KV_STREAM_PHASE_PROMPT,
+    LLAMA_KV_STREAM_PHASE_GENERATION,
+};
+
+bool llama_kv_stream_phase_is_generation(
+    llama_kv_stream_phase phase, uint32_t batch_tokens);
