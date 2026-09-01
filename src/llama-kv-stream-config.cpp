@@ -70,3 +70,59 @@ llama_kv_stream_pool_layout llama_kv_stream_pool_layout_make(
     result.valid = true;
     return result;
 }
+
+llama_kv_stream_phase_plan llama_kv_stream_phase_plan_make(
+        const llama_kv_stream_phase_plan_params & params) {
+    llama_kv_stream_phase_plan result;
+
+    auto invalid = [&](const char * error) {
+        result.error = error;
+        return result;
+    };
+
+    if (params.arena_bytes == 0 || params.compute_bytes == 0 ||
+            params.compute_alignment == 0 || params.page_bytes == 0 ||
+            params.layer_count == 0 || params.minimum_ring_pages == 0) {
+        return invalid("arena, compute, alignment, page, layer, and ring counts must be nonzero");
+    }
+    if (params.compute_bytes >= params.arena_bytes) {
+        return invalid("arena has no KV capacity after reserving compute space");
+    }
+
+    const uint64_t unaligned_compute_offset = params.arena_bytes - params.compute_bytes;
+    result.compute_offset =
+        (unaligned_compute_offset/params.compute_alignment)*params.compute_alignment;
+    result.compute_bytes = params.arena_bytes - result.compute_offset;
+    result.kv_offset = 0;
+    result.kv_bytes = result.compute_offset;
+
+    if (params.page_bytes > std::numeric_limits<uint64_t>::max()/params.minimum_ring_pages) {
+        return invalid("ring byte count overflow");
+    }
+    result.ring_bytes = params.page_bytes*params.minimum_ring_pages;
+    result.conversion_bytes = params.conversion_bytes;
+
+    if (result.conversion_bytes > result.kv_bytes ||
+            result.ring_bytes > result.kv_bytes - result.conversion_bytes) {
+        return invalid("KV space cannot hold conversion and ring reservations");
+    }
+    if (params.page_bytes > std::numeric_limits<uint64_t>::max()/params.layer_count) {
+        return invalid("per-layer partition byte count overflow");
+    }
+
+    const uint64_t bytes_per_round = params.page_bytes*params.layer_count;
+    const uint64_t resident_budget =
+        result.kv_bytes - result.conversion_bytes - result.ring_bytes;
+    const uint64_t resident_pages_per_layer = resident_budget/bytes_per_round;
+    if (resident_pages_per_layer == 0 ||
+            resident_pages_per_layer > std::numeric_limits<uint32_t>::max()) {
+        return invalid("KV space cannot hold one resident page per layer");
+    }
+
+    result.resident_pages_per_layer = resident_pages_per_layer;
+    result.resident_bytes = resident_pages_per_layer*bytes_per_round;
+    result.unused_bytes =
+        result.kv_bytes - result.conversion_bytes - result.ring_bytes - result.resident_bytes;
+    result.valid = true;
+    return result;
+}

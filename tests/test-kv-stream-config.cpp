@@ -88,5 +88,114 @@ int main() {
         t.assert_true("zero page", !layout.valid);
     });
 
+    t.test("phase arena partitions KV below compute without overlap", [](testing & t) {
+        const auto plan = llama_kv_stream_phase_plan_make({
+            /*.arena_bytes        =*/ 4096ULL*1024ULL*1024ULL,
+            /*.compute_bytes      =*/ 1192ULL*1024ULL*1024ULL,
+            /*.compute_alignment  =*/ 256,
+            /*.page_bytes         =*/ 1664ULL*256ULL,
+            /*.conversion_bytes   =*/ 32ULL*1024ULL*1024ULL,
+            /*.layer_count        =*/ 16,
+            /*.minimum_ring_pages =*/ 8,
+        });
+
+        t.assert_true("plan is valid", plan.valid);
+        t.assert_equal(uint64_t(0), plan.kv_offset);
+        t.assert_equal(plan.kv_bytes, plan.compute_offset);
+        t.assert_equal(4096ULL*1024ULL*1024ULL, plan.compute_offset + plan.compute_bytes);
+        t.assert_equal(uint64_t(0), plan.compute_offset % 256);
+        t.assert_equal(
+            plan.kv_bytes,
+            plan.resident_bytes + plan.ring_bytes + plan.conversion_bytes + plan.unused_bytes);
+    });
+
+    t.test("decode reclaims the exact aligned prefill compute reduction", [](testing & t) {
+        constexpr uint64_t MiB = 1024ULL*1024ULL;
+        const auto prefill = llama_kv_stream_phase_plan_make({
+            4096*MiB, 1192*MiB, MiB, 1664ULL*256ULL, 32*MiB, 16, 8,
+        });
+        const auto decode = llama_kv_stream_phase_plan_make({
+            4096*MiB, 7*MiB, MiB, 1664ULL*256ULL, 32*MiB, 16, 8,
+        });
+
+        t.assert_true("prefill plan is valid", prefill.valid);
+        t.assert_true("decode plan is valid", decode.valid);
+        t.assert_equal(1185*MiB, decode.kv_bytes - prefill.kv_bytes);
+        t.assert_equal(1185*MiB, prefill.compute_bytes - decode.compute_bytes);
+    });
+
+    t.test("prefill reserves a nonzero ring and one resident page per layer", [](testing & t) {
+        constexpr uint64_t page_bytes = 1664ULL*256ULL;
+        const auto plan = llama_kv_stream_phase_plan_make({
+            256ULL*1024ULL*1024ULL,
+            64ULL*1024ULL*1024ULL,
+            256,
+            page_bytes,
+            8ULL*1024ULL*1024ULL,
+            16,
+            3,
+        });
+
+        t.assert_true("plan is valid", plan.valid);
+        t.assert_equal(3*page_bytes, plan.ring_bytes);
+        t.assert_true("resident round retained", plan.resident_pages_per_layer >= 1);
+        t.assert_equal(8ULL*1024ULL*1024ULL, plan.conversion_bytes);
+    });
+
+    t.test("phase arena supports page geometry from other KV quantizations", [](testing & t) {
+        constexpr uint64_t page_bytes = 320ULL*1024ULL;
+        const auto plan = llama_kv_stream_phase_plan_make({
+            768ULL*1024ULL*1024ULL,
+            128ULL*1024ULL*1024ULL,
+            512,
+            page_bytes,
+            24ULL*1024ULL*1024ULL,
+            24,
+            11,
+        });
+
+        t.assert_true("plan is valid", plan.valid);
+        t.assert_equal(11*page_bytes, plan.ring_bytes);
+        t.assert_equal(
+            uint64_t(plan.resident_pages_per_layer)*page_bytes*24,
+            plan.resident_bytes);
+    });
+
+    t.test("phase arena rejects insufficient and overflowing layouts", [](testing & t) {
+        constexpr uint64_t page_bytes = 1664ULL*256ULL;
+        auto plan = llama_kv_stream_phase_plan_make({
+            64ULL*1024ULL*1024ULL,
+            48ULL*1024ULL*1024ULL,
+            256,
+            page_bytes,
+            8ULL*1024ULL*1024ULL,
+            16,
+            8,
+        });
+        t.assert_true("insufficient resident space", !plan.valid);
+
+        plan = llama_kv_stream_phase_plan_make({
+            UINT64_MAX,
+            1,
+            UINT64_MAX,
+            page_bytes,
+            0,
+            16,
+            1,
+        });
+        t.assert_true("alignment leaves no KV slice", !plan.valid);
+
+        plan = llama_kv_stream_phase_plan_make({
+            UINT64_MAX,
+            1,
+            1,
+            UINT64_MAX,
+            0,
+            16,
+            2,
+        });
+        t.assert_true("ring byte overflow", !plan.valid);
+    });
+
     return t.summary();
 }
