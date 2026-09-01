@@ -281,6 +281,51 @@ private:
 
     llama_cparams cparams;
 
+    struct kv_stream_phase_arena_owner {
+        struct layout {
+            size_t kv_bytes = 0;
+            size_t compute_offset = 0;
+            size_t compute_bytes = 0;
+            uint32_t ring_slots = 0;
+            uint32_t resident_pages_per_layer = 0;
+            std::vector<size_t> backend_sizes;
+        };
+
+        void * arena = nullptr;
+        void (*free_fn)(void *) = nullptr;
+        bool (*set_compute_fn)(void *, size_t, size_t) = nullptr;
+        ggml_backend_buffer_type_t (*buffer_type_fn)(void *) = nullptr;
+        bool (*graph_reset_fn)(ggml_backend_t) = nullptr;
+        ggml_backend_dev_t device = nullptr;
+        ggml_backend_buffer_type_t buffer_type = nullptr;
+        size_t arena_bytes = 0;
+        size_t page_bytes = 0;
+        size_t conversion_bytes = 0;
+        uint32_t layer_count = 0;
+        uint32_t minimum_ring_slots = 8;
+        size_t backend_index = SIZE_MAX;
+        size_t max_nodes = 0;
+        size_t current_kv_bytes = 0;
+        size_t current_compute_offset = 0;
+        size_t current_compute_bytes = 0;
+        uint32_t current_ring_slots = 0;
+        bool decode = false;
+        bool configured = false;
+        layout prefill;
+        layout token_generation;
+
+        ~kv_stream_phase_arena_owner() {
+            if (arena != nullptr) {
+                free_fn(arena);
+            }
+        }
+    };
+
+    bool kv_stream_switch_phase(bool decode, uint32_t active_tokens);
+
+    // Declared before memory and scheduler so their arena leases are released first.
+    kv_stream_phase_arena_owner kv_stream_phase_arena;
+
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 

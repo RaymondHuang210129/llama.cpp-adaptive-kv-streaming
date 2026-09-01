@@ -99,11 +99,12 @@ llama_kv_stream_phase_plan llama_kv_stream_phase_plan_make(
     if (params.page_bytes > std::numeric_limits<uint64_t>::max()/params.minimum_ring_pages) {
         return invalid("ring byte count overflow");
     }
-    result.ring_bytes = params.page_bytes*params.minimum_ring_pages;
     result.conversion_bytes = params.conversion_bytes;
 
+    const uint64_t minimum_ring_bytes =
+        params.page_bytes*params.minimum_ring_pages;
     if (result.conversion_bytes > result.kv_bytes ||
-            result.ring_bytes > result.kv_bytes - result.conversion_bytes) {
+            minimum_ring_bytes > result.kv_bytes - result.conversion_bytes) {
         return invalid("KV space cannot hold conversion and ring reservations");
     }
     if (params.page_bytes > std::numeric_limits<uint64_t>::max()/params.layer_count) {
@@ -111,16 +112,26 @@ llama_kv_stream_phase_plan llama_kv_stream_phase_plan_make(
     }
 
     const uint64_t bytes_per_round = params.page_bytes*params.layer_count;
-    const uint64_t resident_budget =
-        result.kv_bytes - result.conversion_bytes - result.ring_bytes;
-    const uint64_t resident_pages_per_layer = resident_budget/bytes_per_round;
+    const uint64_t page_budget = result.kv_bytes - result.conversion_bytes;
+    const uint64_t total_pages = page_budget/params.page_bytes;
+    const uint64_t resident_pages_per_layer =
+        (total_pages - params.minimum_ring_pages)/params.layer_count;
     if (resident_pages_per_layer == 0 ||
             resident_pages_per_layer > std::numeric_limits<uint32_t>::max()) {
         return invalid("KV space cannot hold one resident page per layer");
     }
 
+    const uint64_t ring_pages =
+        total_pages - resident_pages_per_layer*params.layer_count;
+    if (ring_pages < params.minimum_ring_pages ||
+            ring_pages > std::numeric_limits<uint32_t>::max()) {
+        return invalid("runtime ring page count exceeds supported range");
+    }
+
     result.resident_pages_per_layer = resident_pages_per_layer;
+    result.ring_pages = ring_pages;
     result.resident_bytes = resident_pages_per_layer*bytes_per_round;
+    result.ring_bytes = ring_pages*params.page_bytes;
     result.unused_bytes =
         result.kv_bytes - result.conversion_bytes - result.ring_bytes - result.resident_bytes;
     result.valid = true;

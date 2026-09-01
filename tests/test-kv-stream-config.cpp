@@ -107,6 +107,9 @@ int main() {
         t.assert_equal(
             plan.kv_bytes,
             plan.resident_bytes + plan.ring_bytes + plan.conversion_bytes + plan.unused_bytes);
+        t.assert_equal(
+            uint64_t(plan.ring_pages)*1664ULL*256ULL,
+            plan.ring_bytes);
     });
 
     t.test("decode reclaims the exact aligned prefill compute reduction", [](testing & t) {
@@ -137,7 +140,8 @@ int main() {
         });
 
         t.assert_true("plan is valid", plan.valid);
-        t.assert_equal(3*page_bytes, plan.ring_bytes);
+        t.assert_equal(uint32_t(4), plan.ring_pages);
+        t.assert_equal(4*page_bytes, plan.ring_bytes);
         t.assert_true("resident round retained", plan.resident_pages_per_layer >= 1);
         t.assert_equal(8ULL*1024ULL*1024ULL, plan.conversion_bytes);
     });
@@ -155,7 +159,8 @@ int main() {
         });
 
         t.assert_true("plan is valid", plan.valid);
-        t.assert_equal(11*page_bytes, plan.ring_bytes);
+        t.assert_equal(uint32_t(27), plan.ring_pages);
+        t.assert_equal(27*page_bytes, plan.ring_bytes);
         t.assert_equal(
             uint64_t(plan.resident_pages_per_layer)*page_bytes*24,
             plan.resident_bytes);

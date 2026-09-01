@@ -1932,6 +1932,13 @@ bool ggml_backend_cuda_kv_stream_resize_pool(
             pool_bytes > runtime->maximum_pool_bytes ||
             stage_slots == 0 ||
             runtime->stage_bytes > std::numeric_limits<size_t>::max()/stage_slots) {
+        GGML_LOG_ERROR(
+            "%s: invalid resize request: pool=%zu, maximum=%zu, conversion=%zu, page=%zu, ring=%u\n",
+            __func__, pool_bytes,
+            runtime == nullptr ? size_t(0) : runtime->maximum_pool_bytes,
+            runtime == nullptr ? size_t(0) : runtime->conversion_bytes,
+            runtime == nullptr ? size_t(0) : runtime->stage_bytes,
+            stage_slots);
         return false;
     }
     if (runtime->phase_arena == nullptr) {
@@ -1942,9 +1949,17 @@ bool ggml_backend_cuda_kv_stream_resize_pool(
 
     const size_t staging_pool_bytes = pool_bytes - runtime->conversion_bytes;
     const size_t scratch_bytes = runtime->stage_bytes*stage_slots;
-    if (scratch_bytes >= staging_pool_bytes ||
-            !ggml_backend_cuda_phase_arena_can_resize_kv(
-                runtime->phase_arena, pool_bytes)) {
+    if (scratch_bytes >= staging_pool_bytes) {
+        GGML_LOG_ERROR(
+            "%s: ring consumes resized staging pool: scratch=%zu, staging=%zu\n",
+            __func__, scratch_bytes, staging_pool_bytes);
+        return false;
+    }
+    if (!ggml_backend_cuda_phase_arena_can_resize_kv(
+            runtime->phase_arena, pool_bytes)) {
+        GGML_LOG_ERROR(
+            "%s: resized KV overlaps compute slice: pool=%zu, compute_offset=%zu\n",
+            __func__, pool_bytes, runtime->phase_arena->compute_offset);
         return false;
     }
 
@@ -1962,6 +1977,10 @@ bool ggml_backend_cuda_kv_stream_resize_pool(
     if (!ggml_cuda_kv_stream_resident_cache_resize(
             runtime->resident_cache, staging_pool_bytes,
             scratch_bytes, active_pages_per_layer)) {
+        GGML_LOG_ERROR(
+            "%s: resident layout rejected resize: staging=%zu, scratch=%zu, active_pages=%u\n",
+            __func__, staging_pool_bytes, scratch_bytes,
+            active_pages_per_layer);
         return false;
     }
     GGML_ASSERT(ggml_cuda_kv_stream_transfer_ring_set_active_slots(
@@ -3441,7 +3460,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
+        static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
+        "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3450,7 +3471,9 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
+        static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
+        "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -3460,7 +3483,9 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
+        static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
+        "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -3471,7 +3496,9 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
+        static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
+        "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
@@ -3542,6 +3569,27 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
+}
+
+bool ggml_backend_cuda_graph_reset(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+    ggml_cuda_lock_cv.wait(lock, [] {
+        return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0;
+    });
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+#ifdef USE_CUDA_GRAPH
+    cuda_ctx->cuda_graphs.clear();
+    cuda_ctx->last_graph_eviction_sweep = 0;
+#endif
+    cuda_ctx->stream_context().reset();
+    return true;
 }
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
@@ -5398,13 +5446,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
-                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                assert(ggml_backend_buft_is_cuda(node->buffer->buft) ||
                        ggml_backend_buft_is_cuda_kv_stream(node->buffer->buft) ||
                        (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
-                        assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                        assert(ggml_backend_buft_is_cuda(node->src[j]->buffer->buft) ||
                                ggml_backend_buft_is_cuda_kv_stream(node->src[j]->buffer->buft) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
@@ -6868,6 +6916,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
             return ggml_backend_cuda_phase_arena_buffer_type(
                 static_cast<ggml_backend_cuda_phase_arena_t>(arena));
         };
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_reset") == 0) {
+        return (void *) ggml_backend_cuda_graph_reset;
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_type_pair_supported") == 0) {
         return (void *) +[](ggml_type type_k, ggml_type type_v) {

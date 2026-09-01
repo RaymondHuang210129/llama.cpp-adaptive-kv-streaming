@@ -82,7 +82,9 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                     size_t kv_stream_stage_bytes) :
+                     size_t kv_stream_stage_bytes,
+                      void * kv_stream_phase_arena,
+                     size_t kv_stream_maximum_pool_bytes) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -245,6 +247,9 @@ llama_kv_cache::llama_kv_cache(
                         ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
                     using runtime_new_fn_t = void * (*)(
                         ggml_backend_dev_t, size_t, size_t, size_t, uint32_t);
+                    using arena_runtime_new_fn_t = void * (*)(
+                        ggml_backend_dev_t, void *, size_t, size_t,
+                        size_t, size_t, uint32_t);
                     using runtime_free_fn_t = void (*)(void *);
                     using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
                     using feedback_fn_t = kv_stream_runtime_owner::feedback_fn_t;
@@ -262,6 +267,8 @@ llama_kv_cache::llama_kv_cache(
                         reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
                     auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device");
+                    auto * arena_runtime_new_fn = (arena_runtime_new_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device_in_phase_arena");
                     auto * runtime_free_fn = (runtime_free_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_runtime_free");
                     auto * buffer_type_fn = (buffer_type_fn_t) ggml_backend_reg_get_proc_address(
@@ -278,15 +285,20 @@ llama_kv_cache::llama_kv_cache(
                         reg, "ggml_backend_cuda_kv_stream_set_decode_layout");
                     auto * mark_dirty_rows_fn = (mark_dirty_rows_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
+                    auto * resize_pool_fn = (kv_stream_runtime_owner::resize_pool_fn_t)
+                        ggml_backend_reg_get_proc_address(
+                            reg, "ggml_backend_cuda_kv_stream_resize_pool");
 
                     if (type_pair_supported_fn == nullptr || page_bytes_fn == nullptr ||
                             workspace_bytes_fn == nullptr || runtime_new_fn == nullptr ||
+                            (kv_stream_phase_arena != nullptr && arena_runtime_new_fn == nullptr) ||
                             runtime_free_fn == nullptr ||
                             buffer_type_fn == nullptr || feedback_fn == nullptr ||
                             span_feedback_fn == nullptr ||
                             repartition_fn == nullptr || decode_layout_fn == nullptr ||
                             reconfigure_fn == nullptr ||
-                            mark_dirty_rows_fn == nullptr) {
+                            mark_dirty_rows_fn == nullptr ||
+                            resize_pool_fn == nullptr) {
                         throw std::runtime_error("block KV streaming requires the CUDA backend");
                     }
 
@@ -310,8 +322,14 @@ llama_kv_cache::llama_kv_cache(
                             256, &conversion_bytes)) {
                         throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
                     }
-                    kv_stream_runtime.runtime = runtime_new_fn(
-                        dev, kv_stream_stage_bytes, page_bytes, conversion_bytes, kv_stream_layer_count);
+                    kv_stream_runtime.runtime = kv_stream_phase_arena == nullptr ?
+                        runtime_new_fn(
+                            dev, kv_stream_stage_bytes, page_bytes,
+                            conversion_bytes, kv_stream_layer_count) :
+                        arena_runtime_new_fn(
+                            dev, kv_stream_phase_arena,
+                            kv_stream_stage_bytes, kv_stream_maximum_pool_bytes,
+                            page_bytes, conversion_bytes, kv_stream_layer_count);
                     kv_stream_runtime.free_fn = runtime_free_fn;
                     kv_stream_runtime.feedback_fn = feedback_fn;
                     kv_stream_runtime.span_feedback_fn = span_feedback_fn;
@@ -319,6 +337,7 @@ llama_kv_cache::llama_kv_cache(
                     kv_stream_runtime.reconfigure_fn = reconfigure_fn;
                     kv_stream_runtime.decode_layout_fn = decode_layout_fn;
                     kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
+                    kv_stream_runtime.resize_pool_fn = resize_pool_fn;
                     kv_stream_runtime.layer_count = kv_stream_layer_count;
                     if (kv_stream_runtime.runtime == nullptr) {
                         throw std::runtime_error("failed to create CUDA block KV streaming runtime");
@@ -1333,6 +1352,26 @@ uint32_t llama_kv_cache::get_size() const {
 
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
+}
+
+bool llama_kv_cache::kv_stream_resize_pool(
+        size_t pool_bytes, uint32_t active_tokens, uint32_t ring_slots) {
+    auto & owner = kv_stream_runtime;
+    if (owner.runtime == nullptr || owner.resize_pool_fn == nullptr ||
+            ring_slots == 0) {
+        return false;
+    }
+    const uint32_t active_pages =
+        active_tokens/256U + (active_tokens%256U != 0);
+    if (!owner.resize_pool_fn(
+            owner.runtime, pool_bytes, active_pages, ring_slots)) {
+        return false;
+    }
+    owner.minimum_ring_slots = ring_slots;
+    owner.decode_layout_pages = active_pages;
+    owner.previous_query_tokens = UINT32_MAX;
+    owner.evaluations_since_repartition = UINT32_MAX;
+    return true;
 }
 
 bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens) {

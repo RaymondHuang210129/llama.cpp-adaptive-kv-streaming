@@ -115,7 +115,9 @@ public:
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
-                         size_t kv_stream_stage_bytes = 0);
+                         size_t kv_stream_stage_bytes = 0,
+                          void * kv_stream_phase_arena = nullptr,
+                         size_t kv_stream_maximum_pool_bytes = 0);
 
     ~llama_kv_cache() = default;
 
@@ -160,6 +162,8 @@ public:
     uint32_t get_n_stream() const;
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
+    bool kv_stream_resize_pool(
+        size_t pool_bytes, uint32_t active_tokens, uint32_t ring_slots);
 
     bool get_has_shift() const;
 
@@ -301,6 +305,7 @@ private:
         using repartition_fn_t = bool (*)(void *, uint32_t);
         using decode_layout_fn_t = bool (*)(void *, uint32_t);
         using mark_dirty_rows_fn_t = bool (*)(void *, const int64_t *, size_t);
+        using resize_pool_fn_t = bool (*)(void *, size_t, uint32_t, uint32_t);
 
         void * runtime = nullptr;
         void (*free_fn)(void *) = nullptr;
@@ -310,6 +315,7 @@ private:
         repartition_fn_t repartition_fn = nullptr;
         decode_layout_fn_t decode_layout_fn = nullptr;
         mark_dirty_rows_fn_t mark_dirty_rows_fn = nullptr;
+        resize_pool_fn_t resize_pool_fn = nullptr;
         uint32_t layer_count = 0;
         uint32_t minimum_ring_slots = 0;
         uint32_t decode_layout_pages = 0;

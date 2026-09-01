@@ -67,6 +67,7 @@ struct llama_kv_stream_phase_plan {
     uint64_t unused_bytes     = 0;
 
     uint32_t resident_pages_per_layer = 0;
+    uint32_t ring_pages = 0;
 };
 
 llama_kv_stream_phase_plan llama_kv_stream_phase_plan_make(

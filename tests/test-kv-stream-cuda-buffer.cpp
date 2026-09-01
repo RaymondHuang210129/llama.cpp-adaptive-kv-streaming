@@ -305,6 +305,61 @@ int main() {
         ggml_backend_buffer_free(buffer);
     });
 
+    t.test("CUDA backend async copies accept borrowed compute buffers", [](testing & t) {
+        constexpr size_t MiB = 1024*1024;
+        auto backend = ggml_backend_cuda_init(0);
+        auto arena = ggml_backend_cuda_phase_arena_new(0, 2*MiB);
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr) ||
+                !t.assert_true("arena allocation succeeds", arena != nullptr)) {
+            ggml_backend_free(backend);
+            ggml_backend_cuda_phase_arena_free(arena);
+            return;
+        }
+        t.assert_true("compute slice is accepted",
+            ggml_backend_cuda_phase_arena_set_compute(arena, MiB, MiB));
+        auto buffer = ggml_backend_buft_alloc_buffer(
+            ggml_backend_cuda_phase_arena_buffer_type(arena), MiB);
+        if (!t.assert_true("compute lease succeeds", buffer != nullptr)) {
+            ggml_backend_cuda_phase_arena_free(arena);
+            ggml_backend_free(backend);
+            return;
+        }
+
+        ggml_tensor tensor{};
+        tensor.type   = GGML_TYPE_I8;
+        tensor.buffer = buffer;
+        tensor.data   = ggml_backend_buffer_get_base(buffer);
+        tensor.ne[0]  = 4096;
+        tensor.ne[1]  = tensor.ne[2] = tensor.ne[3] = 1;
+        tensor.nb[0]  = 1;
+        tensor.nb[1]  = tensor.nb[2] = tensor.nb[3] = 4096;
+
+        std::vector<uint8_t> source(4096, 0x5a);
+        std::vector<uint8_t> destination(source.size(), 0);
+        ggml_backend_tensor_set_async(
+            backend, &tensor, source.data(), 0, source.size());
+        ggml_backend_tensor_get_async(
+            backend, &tensor, destination.data(), 0, destination.size());
+        ggml_backend_synchronize(backend);
+        t.assert_true("async round trip succeeds", source == destination);
+
+        ggml_backend_buffer_free(buffer);
+        ggml_backend_cuda_phase_arena_free(arena);
+        ggml_backend_free(backend);
+    });
+
+    t.test("CUDA graph state can be invalidated before arena reuse", [](testing & t) {
+        auto backend = ggml_backend_cuda_init(0);
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        t.assert_true("empty graph state resets",
+            ggml_backend_cuda_graph_reset(backend));
+        t.assert_true("null backend is rejected",
+            !ggml_backend_cuda_graph_reset(nullptr));
+        ggml_backend_free(backend);
+    });
+
     t.test("phase arena can move its compute lease after release", [](testing & t) {
         constexpr size_t MiB = 1024*1024;
         auto arena = ggml_backend_cuda_phase_arena_new(0, 4*MiB);
@@ -365,6 +420,7 @@ int main() {
             "ggml_backend_cuda_phase_arena_size",
             "ggml_backend_cuda_phase_arena_set_compute",
             "ggml_backend_cuda_phase_arena_buffer_type",
+            "ggml_backend_cuda_graph_reset",
             "ggml_backend_cuda_kv_stream_runtime_new_for_device_in_phase_arena",
             "ggml_backend_cuda_kv_stream_pool_bytes",
             "ggml_backend_cuda_kv_stream_resize_pool",
