@@ -3,7 +3,7 @@
 #include <limits>
 
 llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_stream_config & config) {
-    if (config.stage_bytes == 0) {
+    if (config.arena_bytes == 0) {
         return { true, false, {} };
     }
 
@@ -26,8 +26,8 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
     if (!config.kv_offload) {
         return invalid("block KV streaming requires GPU KV offload");
     }
-    if (config.minimum_stage_bytes == 0 || config.stage_bytes < config.minimum_stage_bytes) {
-        return invalid("block KV streaming stage is too small for one 256-token cache page");
+    if (config.minimum_arena_bytes == 0 || config.arena_bytes < config.minimum_arena_bytes) {
+        return invalid("block KV streaming arena is too small");
     }
 
     return { true, true, {} };

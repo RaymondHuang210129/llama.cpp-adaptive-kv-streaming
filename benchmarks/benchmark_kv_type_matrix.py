@@ -53,9 +53,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--context-step", type=parse_token_count, default=8 * 1024)
     parser.add_argument("--decode-tokens", type=int, default=256)
     parser.add_argument(
-        "--pool-mib",
+        "--arena-mib", "--pool-mib",
+        dest="arena_mib",
         type=int,
-        help="fixed pool size; omit to probe the maximum usable pool at every point",
+        help="fixed shared arena; omit to probe the maximum usable arena at every point",
     )
     parser.add_argument(
         "--types",
@@ -126,8 +127,8 @@ def runner_command(
         "--output-dir",
         str(output_dir),
     ]
-    if args.pool_mib is not None:
-        command.extend(("--fixed-pool-mib", str(args.pool_mib)))
+    if args.arena_mib is not None:
+        command.extend(("--fixed-arena-mib", str(args.arena_mib)))
     return command
 
 
@@ -149,6 +150,8 @@ def collect_rows(output_dir: Path, types: list[str]) -> list[dict]:
                     row["cache_type_k"] = type_k
                     row["cache_type_v"] = type_v
                     row["pair"] = f"K={type_k.upper()}, V={type_v.upper()}"
+                    if not row.get("arena_mib") and row.get("pool_mib"):
+                        row["arena_mib"] = row["pool_mib"]
                     row["streaming_active"] = parse_bool(row.get("streaming_active"))
                     rows.append(row)
     return rows
@@ -162,7 +165,7 @@ def write_combined_csv(path: Path, rows: list[dict]) -> None:
         "context_capacity",
         "prompt_tokens",
         "decode_tokens",
-        "pool_mib",
+        "arena_mib",
         "prefill_tps",
         "decode_tps",
         "prompt_ms",
@@ -342,8 +345,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("minimum context must not exceed maximum context")
     if min(args.context_step, args.decode_tokens) <= 0:
         raise SystemExit("step and decode tokens must be positive")
-    if args.pool_mib is not None and args.pool_mib <= 0:
-        raise SystemExit("fixed pool must be positive")
+    if args.arena_mib is not None and args.arena_mib <= 0:
+        raise SystemExit("fixed arena must be positive")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -22,16 +22,22 @@ python3 -m pip install matplotlib
 For every configured context capacity from 8K through `--max-context`, in 8K
 steps, the script:
 
-1. Starts a fresh adaptive KV streaming server with a small probe pool.
-2. Measures free VRAM after model initialization and a warm-up request.
-3. Assigns all measured free VRAM to the pool, rounded down to 32 MiB.
-4. Runs a full prompt and 256-token decode to validate that pool.
-5. If the candidate fails, reduces it by 64 MiB and retries.
-6. Records prefill speed, decode speed, selected pool size, and VRAM telemetry.
-7. Updates the CSV and Matplotlib graph after every successful point.
+1. Starts a fresh adaptive KV streaming server with a 1536 MiB total arena.
+2. If that arena cannot fit the prefill graph plus minimum KV layout, increases it in 256 MiB steps and retries.
+3. Measures free VRAM after model initialization and a warm-up request.
+4. Adds all measured free VRAM to the successful probe arena, rounded down to 32 MiB.
+5. Runs a full prompt and 256-token decode to validate that arena.
+6. If the candidate fails, reduces it by 64 MiB and retries.
+7. Records prefill speed, decode speed, selected arena size, and VRAM telemetry.
+8. Updates the CSV and Matplotlib graph after every successful point.
 
 There is no fixed VRAM safety reserve. Actual server execution is the
-validation: allocation failures are handled by automatic pool backoff.
+validation: allocation failures are handled by automatic arena backoff.
+
+The arena is one physical CUDA allocation shared between resident/ring KV and
+the active phase's compute workspace. The configured MiB value therefore
+includes both. Prompt processing reserves its measured scheduler workspace;
+TG1 decode releases that large slice and gives the reclaimed bytes to KV.
 
 The prompt length at each point is the configured context capacity minus the
 256 decode tokens. For example, the 192K point starts the server with
@@ -65,9 +71,9 @@ python3 benchmarks/benchmark_kv_stream.py \
 By default, a timestamped directory is created under
 `benchmarks/results/adaptive-kv-sweep-*`. It contains:
 
-- `results.jsonl`: metadata, pool probes, retries, and measurements
+- `results.jsonl`: metadata, arena probes, retries, and measurements
 - `results.csv`: one successful measurement per context capacity
-- `kv-stream-sweep.png` and `kv-stream-sweep.svg`: decode, prefill, and pool
+- `kv-stream-sweep.png` and `kv-stream-sweep.svg`: decode, prefill, and arena
   size plots
 - `logs/`: one server log per probe and benchmark attempt
 
@@ -85,7 +91,8 @@ The script rejects a resume if the model or benchmark settings differ, avoiding
 mixed data in one result set.
 
 Run `python3 benchmarks/benchmark_kv_stream.py --help` for optional GPU,
-timeout, pool-step, output, and server arguments.
+timeout, arena probing/backoff, output, and server arguments. Old `--*-pool-*`
+driver spellings remain accepted as compatibility aliases.
 
 Do not run another GPU workload during the sweep. Its allocations would change
-the automatically selected pool and invalidate comparisons between points.
+the automatically selected arena and invalidate comparisons between points.

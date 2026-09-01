@@ -4,8 +4,8 @@
 #include <string>
 
 struct llama_kv_stream_config {
-    uint64_t stage_bytes         = 0;
-    uint64_t minimum_stage_bytes = 0;
+    uint64_t arena_bytes         = 0;
+    uint64_t minimum_arena_bytes = 0;
 
     bool arch_qwen35     = false;
     bool context_default = false;

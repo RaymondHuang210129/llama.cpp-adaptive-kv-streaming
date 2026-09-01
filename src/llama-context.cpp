@@ -120,7 +120,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
-    cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
+    cparams.kv_stream_arena_mib     = params.kv_stream_arena_mib;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -387,13 +387,13 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
-        const uint64_t kv_stream_arena_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
+        const uint64_t kv_stream_arena_bytes = uint64_t(cparams.kv_stream_arena_mib)*1024ULL*1024ULL;
         uint64_t kv_stream_stage_bytes = kv_stream_arena_bytes;
         uint64_t kv_stream_minimum_stage_bytes = 0;
 
         const llama_kv_stream_config stream_config = {
-            /*.stage_bytes         =*/ kv_stream_arena_bytes,
-            /*.minimum_stage_bytes =*/ kv_stream_arena_bytes == 0 ? uint64_t(0) : uint64_t(1),
+            /*.arena_bytes         =*/ kv_stream_arena_bytes,
+            /*.minimum_arena_bytes =*/ kv_stream_arena_bytes == 0 ? uint64_t(0) : uint64_t(1),
             /*.arch_qwen35         =*/ model.arch == LLM_ARCH_QWEN35,
             /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
             /*.single_sequence     =*/ cparams.n_seq_max == 1,
@@ -4117,7 +4117,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
-        /*.kv_stream_stage_mib         =*/ 0,
+        /*.kv_stream_arena_mib         =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

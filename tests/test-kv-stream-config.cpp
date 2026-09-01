@@ -13,8 +13,8 @@ int main() {
 
     t.test("supported target configuration is accepted", [](testing & t) {
         llama_kv_stream_config config;
-        config.stage_bytes        = 64ULL*1024ULL*1024ULL;
-        config.minimum_stage_bytes = 1664ULL*256ULL;
+        config.arena_bytes         = 64ULL*1024ULL*1024ULL;
+        config.minimum_arena_bytes = 1664ULL*256ULL;
         config.arch_qwen35        = true;
         config.context_default    = true;
         config.single_sequence    = true;
@@ -28,8 +28,8 @@ int main() {
 
     t.test("each unsupported condition fails loudly", [](testing & t) {
         llama_kv_stream_config base;
-        base.stage_bytes         = 64ULL*1024ULL*1024ULL;
-        base.minimum_stage_bytes = 1664ULL*256ULL;
+        base.arena_bytes         = 64ULL*1024ULL*1024ULL;
+        base.minimum_arena_bytes = 1664ULL*256ULL;
         base.arch_qwen35         = true;
         base.context_default     = true;
         base.single_sequence     = true;
@@ -56,8 +56,8 @@ int main() {
         config = base;
         config.kv_offload = false;
         expect_invalid("KV offload disabled", config);
-        config.stage_bytes = config.minimum_stage_bytes - 1;
-        expect_invalid("stage smaller than one page", config);
+        config.arena_bytes = config.minimum_arena_bytes - 1;
+        expect_invalid("arena below its minimum", config);
     });
 
     t.test("pool is partitioned evenly across layers with one scratch page", [](testing & t) {

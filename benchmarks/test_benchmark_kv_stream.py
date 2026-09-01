@@ -44,6 +44,7 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         self.assertEqual(args.server, server.resolve())
         self.assertEqual(args.batch_size, 768)
         self.assertEqual(args.ubatch_size, 512)
+        self.assertEqual(args.probe_arena_mib, 1536)
 
     def test_validate_args_rejects_ubatch_larger_than_batch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -77,10 +78,10 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         )
 
 
-    def test_pool_estimate_uses_all_free_memory_and_rounds_down(self) -> None:
-        self.assertEqual(BENCHMARK.estimate_pool_mib(64, 3500, 32), 3552)
+    def test_arena_estimate_uses_all_free_memory_and_rounds_down(self) -> None:
+        self.assertEqual(BENCHMARK.estimate_arena_mib(1536, 2028, 32), 3552)
         self.assertEqual(
-            BENCHMARK.estimate_pool_mib(64, 3500, 32, max_pool_mib=2048),
+            BENCHMARK.estimate_arena_mib(1536, 2028, 32, max_arena_mib=2048),
             2048,
         )
 
@@ -121,7 +122,32 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         self.assertEqual(command[command.index("-b") + 1], "768")
         self.assertEqual(command[command.index("-ub") + 1], "512")
         self.assertEqual(command[command.index("-np") + 1], "1")
+        self.assertEqual(
+            command[command.index("--kv-stream-arena-mib") + 1], "2304"
+        )
+        self.assertEqual(command[command.index("--fit") + 1], "off")
+        self.assertNotIn("--kv-stream-stage-mib", command)
         self.assertEqual(command[-2:], ["--verbosity", "3"])
+
+    def test_prepare_server_warms_a_full_physical_batch(self) -> None:
+        args = argparse.Namespace(
+            prompt_suffix="suffix",
+            fill_token_id=None,
+            ubatch_size=512,
+            request_timeout=30,
+        )
+        server = mock.Mock()
+        server.url.side_effect = lambda path: f"http://test{path}"
+        with mock.patch.object(
+            BENCHMARK,
+            "http_json",
+            side_effect=({"tokens": [42, 43]}, {"timings": {}}),
+        ) as http_json:
+            suffix, fill_token_id = BENCHMARK.prepare_server(args, server)
+        self.assertEqual(suffix, [42, 43])
+        self.assertEqual(fill_token_id, 42)
+        warmup_payload = http_json.call_args_list[1].args[1]
+        self.assertEqual(len(warmup_payload["prompt"]), 512)
 
     def test_trace_parser_marks_only_pages_beyond_resident_partition(self) -> None:
         log = (
@@ -160,7 +186,7 @@ class BenchmarkKvStreamTest(unittest.TestCase):
                 "context_capacity": 8192,
                 "prompt_tokens": 7936,
                 "decode_tokens": 256,
-                "pool_mib": 3552,
+                "arena_mib": 3552,
                 "prefill_tps": 1400.0,
                 "decode_tps": 50.0,
             },
@@ -168,7 +194,7 @@ class BenchmarkKvStreamTest(unittest.TestCase):
                 "context_capacity": 16384,
                 "prompt_tokens": 16128,
                 "decode_tokens": 256,
-                "pool_mib": 3520,
+                "arena_mib": 3520,
                 "prefill_tps": 1300.0,
                 "decode_tps": 45.0,
             },

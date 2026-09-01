@@ -95,12 +95,12 @@ static void test(void) {
         common_params base;
         base.n_parallel = 4;
         base.n_outputs_max_per_seq = 8;
-        base.kv_stream_stage_mib = 64;
+        base.kv_stream_arena_mib = 64;
 
         const auto draft = common_base_params_to_speculative(base);
         assert(draft.n_outputs_max == 4);
         assert(draft.n_outputs_max_per_seq == 1);
-        assert(draft.kv_stream_stage_mib == 0);
+        assert(draft.kv_stream_arena_mib == 0);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -190,13 +190,19 @@ static void test(void) {
 
     {
         common_params stream_params;
-        assert(stream_params.kv_stream_stage_mib == 0);
+        assert(stream_params.kv_stream_arena_mib == 0);
+        assert(common_params_should_fit_device_memory(stream_params));
 
-        argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-stage-mib", "64"};
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-arena-mib", "2048"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), stream_params, LLAMA_EXAMPLE_COMMON));
-        assert(stream_params.kv_stream_stage_mib == 64);
+        assert(stream_params.kv_stream_arena_mib == 2048);
+        assert(!common_params_should_fit_device_memory(stream_params));
 
-        argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-stage-mib", "-1"};
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-stage-mib", "1536"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), stream_params, LLAMA_EXAMPLE_COMMON));
+        assert(stream_params.kv_stream_arena_mib == 1536);
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-arena-mib", "-1"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), stream_params, LLAMA_EXAMPLE_COMMON));
     }
 

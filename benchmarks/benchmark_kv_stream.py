@@ -106,15 +106,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--cache-type-k", default="q8_0")
     parser.add_argument("--cache-type-v", default="q4_0")
-    parser.add_argument("--probe-pool-mib", type=int, default=64)
-    parser.add_argument("--pool-step-mib", type=int, default=32)
-    parser.add_argument("--pool-backoff-mib", type=int, default=64)
-    parser.add_argument("--pool-retries", type=int, default=8)
-    parser.add_argument("--max-pool-mib", type=int)
     parser.add_argument(
-        "--fixed-pool-mib",
+        "--probe-arena-mib", "--probe-pool-mib",
+        dest="probe_arena_mib", type=int, default=1536,
+        help="initial total-arena size used to measure remaining VRAM",
+    )
+    parser.add_argument(
+        "--probe-arena-step-mib", type=int, default=256,
+        help="increase applied when the initial arena cannot fit prefill",
+    )
+    parser.add_argument(
+        "--arena-step-mib", "--pool-step-mib",
+        dest="arena_step_mib", type=int, default=32,
+    )
+    parser.add_argument(
+        "--arena-backoff-mib", "--pool-backoff-mib",
+        dest="arena_backoff_mib", type=int, default=64,
+    )
+    parser.add_argument(
+        "--arena-retries", "--pool-retries",
+        dest="arena_retries", type=int, default=8,
+    )
+    parser.add_argument(
+        "--max-arena-mib", "--max-pool-mib",
+        dest="max_arena_mib", type=int,
+    )
+    parser.add_argument(
+        "--fixed-arena-mib", "--fixed-pool-mib",
+        dest="fixed_arena_mib",
         type=int,
-        help="use exactly this KV pool size and skip per-context probing",
+        help="use exactly this shared arena size and skip per-context probing",
     )
     parser.add_argument(
         "--trace-kv-stream",
@@ -197,17 +218,17 @@ def query_gpu_memory(nvidia_smi: str, gpu_index: int) -> GpuMemory:
     return GpuMemory(total, used, free)
 
 
-def estimate_pool_mib(
-    probe_pool_mib: int,
+def estimate_arena_mib(
+    probe_arena_mib: int,
     free_mib: int,
     step_mib: int,
-    max_pool_mib: int | None = None,
+    max_arena_mib: int | None = None,
 ) -> int:
-    candidate = probe_pool_mib + free_mib
+    candidate = probe_arena_mib + free_mib
     candidate = candidate // step_mib * step_mib
-    if max_pool_mib is not None:
-        candidate = min(candidate, max_pool_mib // step_mib * step_mib)
-    if candidate < probe_pool_mib:
+    if max_arena_mib is not None:
+        candidate = min(candidate, max_arena_mib // step_mib * step_mib)
+    if candidate < probe_arena_mib:
         raise RuntimeError(f"only {free_mib} MiB is free after the probe")
     return candidate
 
@@ -245,7 +266,7 @@ def clean_server_env(
 def server_command(
     args: argparse.Namespace,
     context_capacity: int,
-    pool_mib: int,
+    arena_mib: int,
 ) -> list[str]:
     return [
         str(args.server),
@@ -275,10 +296,12 @@ def server_command(
         "1",
         "--no-mmproj",
         "--no-warmup",
+        "--fit",
+        "off",
         "--reasoning-format",
         "none",
-        "--kv-stream-stage-mib",
-        str(pool_mib),
+        "--kv-stream-arena-mib",
+        str(arena_mib),
         *args.extra_server_arg,
     ]
 
@@ -288,7 +311,7 @@ class Server:
         self,
         args: argparse.Namespace,
         context_capacity: int,
-        pool_mib: int,
+        arena_mib: int,
         log_path: Path,
     ) -> None:
         self.port = args.port
@@ -297,7 +320,7 @@ class Server:
         self.process: subprocess.Popen | None = None
         try:
             self.process = subprocess.Popen(
-                server_command(args, context_capacity, pool_mib),
+                server_command(args, context_capacity, arena_mib),
                 cwd=args.server.parent,
                 env=clean_server_env(
                     args.cuda_visible_devices,
@@ -400,7 +423,7 @@ def prepare_server(
     http_json(
         server.url("/completion"),
         {
-            "prompt": [fill_token_id] * 16,
+            "prompt": [fill_token_id] * args.ubatch_size,
             "n_predict": 4,
             "ignore_eos": True,
             "cache_prompt": False,
@@ -451,17 +474,18 @@ def resume_signature(args: argparse.Namespace, capacities: list[int]) -> dict:
         "context_step": args.context_step,
         "cache_type_k": args.cache_type_k,
         "cache_type_v": args.cache_type_v,
-        "fixed_pool_mib": args.fixed_pool_mib,
+        "fixed_arena_mib": args.fixed_arena_mib,
         "trace_kv_stream": args.trace_kv_stream,
         "capacities": capacities,
         "decode_tokens": args.decode_tokens,
         "batch_size": args.batch_size,
         "ubatch_size": args.ubatch_size,
-        "probe_pool_mib": args.probe_pool_mib,
-        "pool_step_mib": args.pool_step_mib,
-        "pool_backoff_mib": args.pool_backoff_mib,
-        "pool_retries": args.pool_retries,
-        "max_pool_mib": args.max_pool_mib,
+        "probe_arena_mib": args.probe_arena_mib,
+        "probe_arena_step_mib": args.probe_arena_step_mib,
+        "arena_step_mib": args.arena_step_mib,
+        "arena_backoff_mib": args.arena_backoff_mib,
+        "arena_retries": args.arena_retries,
+        "max_arena_mib": args.max_arena_mib,
         "gpu_index": args.gpu_index,
         "cuda_visible_devices": args.cuda_visible_devices,
         "fill_token_id": args.fill_token_id,
@@ -498,51 +522,80 @@ def git_revision() -> str:
     return result.stdout.strip() or "unknown"
 
 
-def probe_pool(
+def probe_arena(
     args: argparse.Namespace,
     context_capacity: int,
     baseline_used_mib: int,
     logs_dir: Path,
     results_path: Path,
 ) -> int:
-    print(
-        f"[{context_capacity}] probing VRAM with "
-        f"{args.probe_pool_mib} MiB pool",
-        flush=True,
+    arena_mib = args.probe_arena_mib
+    last_error = "arena probe did not run"
+    for attempt in range(args.arena_retries + 1):
+        print(
+            f"[{context_capacity}] VRAM probe attempt {attempt + 1}: "
+            f"arena={arena_mib} MiB",
+            flush=True,
+        )
+        server: Server | None = None
+        try:
+            server = Server(
+                args,
+                context_capacity,
+                arena_mib,
+                logs_dir / (
+                    f"context-{context_capacity}-probe-arena-{arena_mib}.log"
+                ),
+            )
+            prepare_server(args, server)
+            memory = query_gpu_memory(args.nvidia_smi, args.gpu_index)
+            selected_arena = estimate_arena_mib(
+                arena_mib,
+                memory.free_mib,
+                args.arena_step_mib,
+                args.max_arena_mib,
+            )
+            append_jsonl(
+                results_path,
+                {
+                    "type": "arena_probe",
+                    "context_capacity": context_capacity,
+                    "probe_arena_mib": arena_mib,
+                    "selected_arena_mib": selected_arena,
+                    "vram_total_mib": memory.total_mib,
+                    "vram_used_mib": memory.used_mib,
+                    "vram_free_mib": memory.free_mib,
+                },
+            )
+            return selected_arena
+        except Exception as exc:
+            last_error = str(exc)
+            append_jsonl(
+                results_path,
+                {
+                    "type": "arena_probe_attempt",
+                    "status": "failed",
+                    "context_capacity": context_capacity,
+                    "arena_mib": arena_mib,
+                    "attempt": attempt + 1,
+                    "error": last_error[-4000:],
+                },
+            )
+        finally:
+            if server is not None:
+                server.stop()
+            wait_for_release(args, baseline_used_mib)
+
+        next_arena = arena_mib + args.probe_arena_step_mib
+        if args.max_arena_mib is not None and next_arena > args.max_arena_mib:
+            break
+        arena_mib = next_arena
+
+    raise RuntimeError(
+        f"context {context_capacity} could not start an arena probe: {last_error}"
     )
-    server: Server | None = None
-    try:
-        server = Server(
-            args,
-            context_capacity,
-            args.probe_pool_mib,
-            logs_dir / f"context-{context_capacity}-probe.log",
-        )
-        prepare_server(args, server)
-        memory = query_gpu_memory(args.nvidia_smi, args.gpu_index)
-        selected_pool = estimate_pool_mib(
-            args.probe_pool_mib,
-            memory.free_mib,
-            args.pool_step_mib,
-            args.max_pool_mib,
-        )
-        append_jsonl(
-            results_path,
-            {
-                "type": "pool_probe",
-                "context_capacity": context_capacity,
-                "probe_pool_mib": args.probe_pool_mib,
-                "selected_pool_mib": selected_pool,
-                "vram_total_mib": memory.total_mib,
-                "vram_used_mib": memory.used_mib,
-                "vram_free_mib": memory.free_mib,
-            },
-        )
-        return selected_pool
-    finally:
-        if server is not None:
-            server.stop()
-        wait_for_release(args, baseline_used_mib)
+
+
 def parse_kv_stream_trace(log_path: Path) -> dict:
     text = log_path.read_text(errors="replace")
     samples = []
@@ -588,7 +641,7 @@ def parse_kv_stream_trace(log_path: Path) -> dict:
 def run_measurement(
     args: argparse.Namespace,
     context_capacity: int,
-    pool_mib: int,
+    arena_mib: int,
     baseline_used_mib: int,
     logs_dir: Path,
 ) -> dict:
@@ -598,8 +651,8 @@ def run_measurement(
         server = Server(
             args,
             context_capacity,
-            pool_mib,
-            logs_dir / f"context-{context_capacity}-pool-{pool_mib}.log",
+            arena_mib,
+            logs_dir / f"context-{context_capacity}-arena-{arena_mib}.log",
         )
         suffix, fill_token_id = prepare_server(args, server)
         prefix_count = prompt_tokens - len(suffix)
@@ -635,7 +688,7 @@ def run_measurement(
             "context_capacity": context_capacity,
             "prompt_tokens": prompt_tokens,
             "decode_tokens": args.decode_tokens,
-            "pool_mib": pool_mib,
+            "arena_mib": arena_mib,
             "fill_token_id": fill_token_id,
             "prompt_ms": timings.get("prompt_ms"),
             "prefill_tps": timings.get("prompt_per_second"),
@@ -658,24 +711,24 @@ def run_measurement(
 def benchmark_with_backoff(
     args: argparse.Namespace,
     context_capacity: int,
-    selected_pool_mib: int,
+    selected_arena_mib: int,
     baseline_used_mib: int,
     logs_dir: Path,
     results_path: Path,
 ) -> dict:
-    pool_mib = selected_pool_mib
+    arena_mib = selected_arena_mib
     last_error = "benchmark did not run"
-    for attempt in range(args.pool_retries + 1):
+    for attempt in range(args.arena_retries + 1):
         print(
             f"[{context_capacity}] benchmark attempt {attempt + 1}: "
-            f"pool={pool_mib} MiB",
+            f"arena={arena_mib} MiB",
             flush=True,
         )
         try:
             return run_measurement(
                 args,
                 context_capacity,
-                pool_mib,
+                arena_mib,
                 baseline_used_mib,
                 logs_dir,
             )
@@ -687,21 +740,21 @@ def benchmark_with_backoff(
                     "type": "measurement_attempt",
                     "status": "failed",
                     "context_capacity": context_capacity,
-                    "pool_mib": pool_mib,
+                    "arena_mib": arena_mib,
                     "attempt": attempt + 1,
                     "error": last_error[-4000:],
                 },
             )
-            next_pool = (
-                (pool_mib - args.pool_backoff_mib)
-                // args.pool_step_mib
-                * args.pool_step_mib
+            next_arena = (
+                (arena_mib - args.arena_backoff_mib)
+                // args.arena_step_mib
+                * args.arena_step_mib
             )
-            if next_pool < args.probe_pool_mib:
+            if next_arena < args.probe_arena_mib:
                 break
-            pool_mib = next_pool
+            arena_mib = next_arena
     raise RuntimeError(
-        f"context {context_capacity} failed after pool backoff: {last_error}"
+        f"context {context_capacity} failed after arena backoff: {last_error}"
     )
 
 
@@ -710,7 +763,7 @@ def write_csv(path: Path, rows: dict[int, dict]) -> None:
         "context_capacity",
         "prompt_tokens",
         "decode_tokens",
-        "pool_mib",
+        "arena_mib",
         "prefill_tps",
         "decode_tps",
         "prompt_ms",
@@ -751,7 +804,7 @@ def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
     contexts = sorted(rows)
     x = [context / 1024 for context in contexts]
 
-    fig, (decode_ax, pool_ax) = plt.subplots(
+    fig, (decode_ax, arena_ax) = plt.subplots(
         2,
         1,
         figsize=(12.5, 9),
@@ -777,29 +830,29 @@ def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
         linewidth=2.2,
         label="Prefill speed",
     )
-    pool_ax.plot(
+    arena_ax.plot(
         x,
-        [rows[context]["pool_mib"] for context in contexts],
+        [rows[context]["arena_mib"] for context in contexts],
         color="#666666",
         marker="o",
         linewidth=1.8,
-        label="Selected KV pool",
+        label="Selected shared arena",
     )
 
     decode_ax.set_title("Adaptive KV streaming context sweep")
     decode_ax.set_ylabel("Decode speed (tokens/s)")
     prefill_ax.set_ylabel("Prefill speed (tokens/s)")
-    pool_ax.set_xlabel("Configured context capacity (Ki tokens)")
-    pool_ax.set_ylabel("Pool (MiB)")
+    arena_ax.set_xlabel("Configured context capacity (Ki tokens)")
+    arena_ax.set_ylabel("Arena (MiB)")
     decode_ax.set_ylim(bottom=0)
     prefill_ax.set_ylim(bottom=0)
-    pool_ax.set_ylim(bottom=0)
+    arena_ax.set_ylim(bottom=0)
     decode_ax.grid(True, alpha=0.25)
-    pool_ax.grid(True, alpha=0.25)
+    arena_ax.grid(True, alpha=0.25)
     handles_a, labels_a = decode_ax.get_legend_handles_labels()
     handles_b, labels_b = prefill_ax.get_legend_handles_labels()
     decode_ax.legend(handles_a + handles_b, labels_a + labels_b, loc="best")
-    pool_ax.legend(loc="best")
+    arena_ax.legend(loc="best")
 
     png_path = output_dir / "kv-stream-sweep.png"
     fig.savefig(png_path, dpi=180)
@@ -819,30 +872,31 @@ def validate_args(args: argparse.Namespace) -> None:
         args.decode_tokens,
         args.batch_size,
         args.ubatch_size,
-        args.probe_pool_mib,
-        args.pool_step_mib,
-        args.pool_backoff_mib,
+        args.probe_arena_mib,
+        args.probe_arena_step_mib,
+        args.arena_step_mib,
+        args.arena_backoff_mib,
         args.startup_timeout,
         args.request_timeout,
         args.release_timeout,
     )
     if any(value <= 0 for value in numeric_positive):
-        raise SystemExit("decode, batch, pool, and timeout settings must be positive")
+        raise SystemExit("decode, batch, arena, and timeout settings must be positive")
     if args.min_context <= 0 or args.context_step <= 0:
         raise SystemExit("minimum context and context step must be positive")
     if args.min_context > args.max_context:
         raise SystemExit("minimum context must not exceed maximum context")
     if args.ubatch_size > args.batch_size:
         raise SystemExit("ubatch size must not exceed batch size")
-    if args.fixed_pool_mib is not None and args.fixed_pool_mib <= 0:
-        raise SystemExit("fixed pool must be positive")
+    if args.fixed_arena_mib is not None and args.fixed_arena_mib <= 0:
+        raise SystemExit("fixed arena must be positive")
     if (
-        args.pool_retries < 0
+        args.arena_retries < 0
         or args.release_slack_mib < 0
     ):
         raise SystemExit("retry count and release slack must not be negative")
-    if args.max_pool_mib is not None and args.max_pool_mib < args.probe_pool_mib:
-        raise SystemExit("maximum pool must be at least the probe pool")
+    if args.max_arena_mib is not None and args.max_arena_mib < args.probe_arena_mib:
+        raise SystemExit("maximum arena must be at least the probe arena")
     if args.gpu_index < 0 or not 1 <= args.port <= 65535:
         raise SystemExit("GPU index or port is invalid")
     if args.max_context < CONTEXT_STEP:
@@ -927,19 +981,19 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
             try:
-                if args.fixed_pool_mib is None:
-                    selected_pool = probe_pool(
+                if args.fixed_arena_mib is None:
+                    selected_arena = probe_arena(
                         args, context_capacity, baseline.used_mib,
                         logs_dir, results_path,
                     )
                     measurement = benchmark_with_backoff(
-                        args, context_capacity, selected_pool,
+                        args, context_capacity, selected_arena,
                         baseline.used_mib, logs_dir, results_path,
                     )
                 else:
-                    selected_pool = args.fixed_pool_mib
+                    selected_arena = args.fixed_arena_mib
                     measurement = run_measurement(
-                        args, context_capacity, selected_pool,
+                        args, context_capacity, selected_arena,
                         baseline.used_mib, logs_dir,
                     )
                 append_jsonl(results_path, measurement)

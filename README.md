@@ -2,7 +2,7 @@
 
 This branch adds an experimental, block-granular KV cache streaming path to the CUDA `llama-server`. It is intended for running long contexts when model weights leave too little VRAM for the complete KV cache.
 
-With `--kv-stream-stage-mib N`, the authoritative KV tensors are stored in pinned host memory while a bounded CUDA pool is shared by resident KV pages and a transfer ring. The runtime adapts that split as the context grows: it keeps as many pages resident as the budget allows, reclaims resident space for staging when more streaming is required, and prefetches later layers while the current layer computes. This avoids relying on uncontrolled Unified Memory page thrashing and preserves exact attention over the full context.
+With `--kv-stream-arena-mib N`, the authoritative KV tensors are stored in pinned host memory while one bounded physical CUDA arena is shared by phase-specific compute buffers, resident KV pages, and the transfer ring. During prompt processing, the scheduler borrows the compute workspace it needs and KV keeps a small nonzero ring. When ordinary TG1 decode begins, the large prefill workspace is released and the reclaimed bytes become additional resident/ring KV capacity. The runtime continues adapting the resident/ring split as context grows and prefetches later layers while the current layer computes. This avoids relying on uncontrolled Unified Memory page thrashing and preserves exact attention over the full context.
 
 Detailed project story, design, implementation, and benchmark results are in
 [Running Qwen 27B on 16G VRAM with Full Context Length: Building Adaptive KV Cache Streaming for llama.cpp](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9).
@@ -34,10 +34,12 @@ Example using the tested cache configuration:
   -b 512 \
   -ub 512 \
   -np 1 \
-  --kv-stream-stage-mib 2304
+  --kv-stream-arena-mib 2304
 ```
 
-The best value for `--kv-stream-stage-mib` depends on the model, context capacity, GPU, and other VRAM consumers. Start conservatively and increase it while checking startup and peak VRAM use.
+The arena value is the total shared allocation, not just KV capacity. It includes the phase's CUDA compute workspace. The best value depends on the model, context capacity, batch sizes, GPU, and other VRAM consumers. The benchmark driver below probes the maximum usable value automatically. `--kv-stream-stage-mib` remains a compatibility alias with the same total-arena semantics.
+
+llama.cpp's device-memory auto-fit dry run is bypassed when a nonzero arena is configured. The arena and supported single-GPU layer placement are already explicit, while the upstream no-allocation estimator cannot represent overlapping phase lifetimes. Real context initialization still measures both phase graphs and rejects an arena that cannot fit either layout.
 
 ### Batch and micro-batch sizes
 
@@ -63,14 +65,14 @@ GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
   -b 512 \
   -ub 512 \
   -np 1 \
-  --kv-stream-stage-mib 2304
+  --kv-stream-arena-mib 2304
 ```
 
-With this flag, CUDA-backed model buffers, including GPU-offloaded weights, are allocated with `cudaMallocManaged` and their pages can migrate between VRAM and host memory. The adaptive resident-page and transfer-ring pool is intentionally different: it is still allocated with `cudaMalloc`, so that fixed-size pool remains physically allocated in VRAM instead of becoming managed memory. UVM is therefore optional for this branch and does not change the KV streaming pool into pageable storage.
+With this flag, CUDA-backed model buffers, including GPU-offloaded weights, are allocated with `cudaMallocManaged` and their pages can migrate between VRAM and host memory. The shared phase arena is intentionally different: it is still allocated with `cudaMalloc`, so its compute, resident-page, and transfer-ring slices remain physically allocated in VRAM. UVM is therefore optional for this branch and does not change the shared arena into pageable storage.
 
 ## Recreate the benchmark graph
 
-The benchmark driver automatically selects the largest practical adaptive KV pool for each configured context capacity, sweeps from 8K through the requested maximum, and generates the CSV, PNG, and SVG results:
+The benchmark driver automatically selects the largest practical shared arena for each configured context capacity, sweeps from 8K through the requested maximum, and generates the CSV, PNG, and SVG results:
 
 ```bash
 python3 -m pip install matplotlib
@@ -82,7 +84,7 @@ python3 benchmarks/benchmark_kv_stream.py \
   --ubatch-size 512
 ```
 
-The only required arguments are the model GGUF and maximum context. See [benchmarks/README.md](benchmarks/README.md) for the pool-probing algorithm, generated files, optional settings, and resumable output directories.
+The only required arguments are the model GGUF and maximum context. See [benchmarks/README.md](benchmarks/README.md) for the arena-probing algorithm, generated files, optional settings, and resumable output directories.
 
 ---
 
