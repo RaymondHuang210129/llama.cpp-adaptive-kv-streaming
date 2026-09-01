@@ -40,6 +40,9 @@ void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache
 bool ggml_cuda_kv_stream_resident_cache_reconfigure(
     ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes,
     uint32_t active_pages_per_layer);
+bool ggml_cuda_kv_stream_resident_cache_resize(
+    ggml_cuda_kv_stream_resident_cache * cache, size_t pool_bytes,
+    size_t scratch_bytes, uint32_t active_pages_per_layer);
 bool ggml_cuda_kv_stream_resident_cache_repartition(
     ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes);
 bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
@@ -74,6 +77,8 @@ ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
 void ggml_cuda_kv_stream_transfer_ring_free(ggml_cuda_kv_stream_transfer_ring * ring);
 bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
     ggml_cuda_kv_stream_transfer_ring * ring, uint32_t stage_slots);
+void ggml_cuda_kv_stream_transfer_ring_set_conversion_data(
+    ggml_cuda_kv_stream_transfer_ring * ring, void * conversion_data);
 void ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(ggml_cuda_kv_stream_transfer_ring * ring);
 bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
     ggml_cuda_kv_stream_transfer_ring * ring, double elapsed_ms);

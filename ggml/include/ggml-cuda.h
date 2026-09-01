@@ -108,6 +108,11 @@ struct ggml_backend_cuda_kv_stream_stats {
 
 GGML_BACKEND_API ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
     struct ggml_backend_cuda_kv_stream_params params);
+GGML_BACKEND_API ggml_backend_cuda_kv_stream_runtime_t
+ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena(
+    ggml_backend_cuda_phase_arena_t arena,
+    size_t maximum_pool_bytes,
+    struct ggml_backend_cuda_kv_stream_params params);
 GGML_BACKEND_API void ggml_backend_cuda_kv_stream_runtime_free(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_kv_stream_buffer_type(
@@ -118,6 +123,13 @@ GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_stage_slots(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
+GGML_BACKEND_API size_t ggml_backend_cuda_kv_stream_pool_bytes(
+    ggml_backend_cuda_kv_stream_runtime_t runtime);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_resize_pool(
+    ggml_backend_cuda_kv_stream_runtime_t runtime,
+    size_t pool_bytes,
+    uint32_t active_pages_per_layer,
+    uint32_t stage_slots);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_reconfigure(
     ggml_backend_cuda_kv_stream_runtime_t runtime,
     uint32_t active_pages_per_layer,

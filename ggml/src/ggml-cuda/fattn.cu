@@ -361,6 +361,13 @@ bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
     return true;
 }
 
+void ggml_cuda_kv_stream_transfer_ring_set_conversion_data(
+        ggml_cuda_kv_stream_transfer_ring * ring, void * conversion_data) {
+    if (ring != nullptr) {
+        ring->conversion_data = static_cast<char *>(conversion_data);
+    }
+}
+
 void ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(
         ggml_cuda_kv_stream_transfer_ring * ring) {
     if (ring != nullptr) {
@@ -436,17 +443,18 @@ struct ggml_cuda_kv_stream_resident_cache {
 
 static bool kv_stream_resident_cache_layout(
         const ggml_cuda_kv_stream_resident_cache * cache,
+        size_t pool_bytes,
         size_t scratch_bytes,
         uint32_t decode_active_pages,
         uint32_t & resident_pages_per_layer,
         std::vector<uint32_t> & layer_pages,
         std::vector<size_t> & layer_offsets) {
-    if (cache == nullptr || scratch_bytes > cache->pool_bytes ||
+    if (cache == nullptr || scratch_bytes > pool_bytes ||
             scratch_bytes%cache->page_bytes != 0) {
         return false;
     }
     const size_t resident_pages_total =
-        (cache->pool_bytes - scratch_bytes)/cache->page_bytes;
+        (pool_bytes - scratch_bytes)/cache->page_bytes;
     const size_t pages_per_layer = resident_pages_total/cache->layer_count;
     if (pages_per_layer > UINT32_MAX ||
             pages_per_layer > std::numeric_limits<size_t>::max()/cache->layer_count) {
@@ -583,7 +591,7 @@ bool ggml_cuda_kv_stream_resident_cache_reconfigure(
     std::vector<uint32_t> layer_pages;
     std::vector<size_t> layer_offsets;
     if (!kv_stream_resident_cache_layout(
-            cache, scratch_bytes, active_pages_per_layer,
+            cache, cache->pool_bytes, scratch_bytes, active_pages_per_layer,
             pages_per_layer, layer_pages, layer_offsets)) {
         return false;
     }
@@ -619,6 +627,53 @@ bool ggml_cuda_kv_stream_resident_cache_reconfigure(
     return true;
 }
 
+bool ggml_cuda_kv_stream_resident_cache_resize(
+        ggml_cuda_kv_stream_resident_cache * cache,
+        size_t pool_bytes,
+        size_t scratch_bytes,
+        uint32_t active_pages_per_layer) {
+    if (cache == nullptr) {
+        return false;
+    }
+
+    uint32_t pages_per_layer = 0;
+    std::vector<uint32_t> layer_pages;
+    std::vector<size_t> layer_offsets;
+    if (!kv_stream_resident_cache_layout(
+            cache, pool_bytes, scratch_bytes, active_pages_per_layer,
+            pages_per_layer, layer_pages, layer_offsets)) {
+        return false;
+    }
+
+    const bool pool_changed = cache->pool_bytes != pool_bytes;
+    const bool scratch_changed = cache->scratch_bytes != scratch_bytes;
+    const bool layout_changed = cache->layer_pages != layer_pages;
+    cache->pool_bytes = pool_bytes;
+    cache->decode_active_pages = active_pages_per_layer;
+    cache->resident_pages_per_layer = pages_per_layer;
+    if (!scratch_changed && !layout_changed) {
+        return true;
+    }
+
+    cache->scratch_bytes = scratch_bytes;
+    cache->layer_pages = std::move(layer_pages);
+    cache->layer_offsets = std::move(layer_offsets);
+    cache->loaded.assign(cache->layer_offsets.back(), 0);
+    cache->dirty.assign(cache->layer_offsets.back(), 0);
+    cache->precise_dirty_tracking.assign(cache->layer_count, 0);
+    cache->dirty_rows.clear();
+    cache->mutable_pages.clear();
+    cache->all_pages_mutable = false;
+    cache->layer_by_k.clear();
+    cache->layer_by_data.clear();
+    cache->mirror_by_data.clear();
+    cache->next_layer = 0;
+    if (pool_changed || scratch_changed) {
+        cache->stats = {};
+    }
+    return true;
+}
+
 
 bool ggml_cuda_kv_stream_resident_cache_repartition(
         ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes) {
@@ -629,7 +684,7 @@ bool ggml_cuda_kv_stream_resident_cache_repartition(
     std::vector<uint32_t> layer_pages;
     std::vector<size_t> layer_offsets;
     if (!kv_stream_resident_cache_layout(
-            cache, scratch_bytes, cache->decode_active_pages,
+            cache, cache->pool_bytes, scratch_bytes, cache->decode_active_pages,
             pages_per_layer, layer_pages, layer_offsets)) {
         return false;
     }
@@ -662,7 +717,7 @@ bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
     std::vector<uint32_t> layer_pages;
     std::vector<size_t> layer_offsets;
     if (!kv_stream_resident_cache_layout(
-            cache, cache->scratch_bytes, active_pages_per_layer,
+            cache, cache->pool_bytes, cache->scratch_bytes, active_pages_per_layer,
             pages_per_layer, layer_pages, layer_offsets)) {
         return false;
     }

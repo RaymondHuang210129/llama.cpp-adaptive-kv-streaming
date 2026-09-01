@@ -1065,6 +1065,8 @@ struct ggml_backend_cuda_phase_arena {
     size_t compute_offset = 0;
     size_t compute_size = 0;
     bool compute_leased = false;
+    size_t kv_size = 0;
+    bool kv_leased = false;
     std::atomic<uint32_t> references{1};
     std::mutex mutex;
     std::string name;
@@ -1073,6 +1075,51 @@ struct ggml_backend_cuda_phase_arena {
 
 static void ggml_backend_cuda_phase_arena_acquire(ggml_backend_cuda_phase_arena_t arena) {
     arena->references.fetch_add(1, std::memory_order_relaxed);
+}
+
+static bool ggml_backend_cuda_phase_arena_bind_kv(
+        ggml_backend_cuda_phase_arena_t arena, size_t size) {
+    if (arena == nullptr || size == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(arena->mutex);
+    if (arena->kv_leased || arena->compute_size == 0 || size > arena->compute_offset) {
+        return false;
+    }
+    arena->kv_size = size;
+    arena->kv_leased = true;
+    ggml_backend_cuda_phase_arena_acquire(arena);
+    return true;
+}
+
+static bool ggml_backend_cuda_phase_arena_can_resize_kv(
+        ggml_backend_cuda_phase_arena_t arena, size_t size) {
+    if (arena == nullptr || size == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(arena->mutex);
+    return arena->kv_leased && size <= arena->compute_offset;
+}
+
+static void ggml_backend_cuda_phase_arena_resize_kv(
+        ggml_backend_cuda_phase_arena_t arena, size_t size) {
+    std::lock_guard<std::mutex> lock(arena->mutex);
+    GGML_ASSERT(arena->kv_leased && size != 0 && size <= arena->compute_offset);
+    arena->kv_size = size;
+}
+
+static void ggml_backend_cuda_phase_arena_unbind_kv(
+        ggml_backend_cuda_phase_arena_t arena) {
+    if (arena == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(arena->mutex);
+        GGML_ASSERT(arena->kv_leased);
+        arena->kv_size = 0;
+        arena->kv_leased = false;
+    }
+    ggml_backend_cuda_phase_arena_release(arena);
 }
 
 static void ggml_backend_cuda_phase_arena_release(ggml_backend_cuda_phase_arena_t arena) {
@@ -1185,7 +1232,7 @@ bool ggml_backend_cuda_phase_arena_set_compute(
     }
 
     std::lock_guard<std::mutex> lock(arena->mutex);
-    if (arena->compute_leased) {
+    if (arena->compute_leased || (arena->kv_leased && offset < arena->kv_size)) {
         return false;
     }
     arena->compute_offset = offset;
@@ -1567,10 +1614,12 @@ struct ggml_backend_cuda_kv_stream_runtime {
     size_t stage_bytes = 0;
     uint32_t stage_slots = 0;
     size_t pool_bytes = 0;
+    size_t maximum_pool_bytes = 0;
     size_t staging_pool_bytes = 0;
     size_t conversion_bytes = 0;
     uint32_t resident_layer_count = 0;
     void * stage_data = nullptr;
+    ggml_backend_cuda_phase_arena_t phase_arena = nullptr;
     ggml_cuda_kv_stream_transfer_ring * transfer_ring = nullptr;
     ggml_cuda_kv_stream_resident_cache * resident_cache = nullptr;
     std::vector<int64_t> dirty_rows;
@@ -1597,7 +1646,11 @@ static void ggml_backend_cuda_kv_stream_runtime_release(
     ggml_cuda_set_device(runtime->device);
     ggml_cuda_kv_stream_transfer_ring_free(runtime->transfer_ring);
     ggml_cuda_kv_stream_resident_cache_free(runtime->resident_cache);
-    CUDA_CHECK(cudaFree(runtime->stage_data));
+    if (runtime->phase_arena != nullptr) {
+        ggml_backend_cuda_phase_arena_unbind_kv(runtime->phase_arena);
+    } else {
+        CUDA_CHECK(cudaFree(runtime->stage_data));
+    }
     delete runtime;
 }
 
@@ -1717,8 +1770,10 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_kv_stream_buffer_type_
     /* .is_host          = */ ggml_backend_cuda_kv_stream_buffer_is_host,
 };
 
-ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
-        ggml_backend_cuda_kv_stream_params params) {
+static ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new_impl(
+        ggml_backend_cuda_kv_stream_params params,
+        ggml_backend_cuda_phase_arena_t phase_arena,
+        size_t maximum_pool_bytes) {
     if (params.device < 0 || params.device >= ggml_backend_cuda_get_device_count() ||
         params.stage_bytes == 0 || params.stage_slots == 0 ||
         params.stage_bytes > std::numeric_limits<size_t>::max()/params.stage_slots) {
@@ -1737,44 +1792,71 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
         return nullptr;
     }
 
+    const size_t pool_bytes = resident_enabled ? params.pool_bytes : minimum_pool_bytes;
+    if (phase_arena == nullptr) {
+        maximum_pool_bytes = pool_bytes;
+    } else if (phase_arena->device != params.device ||
+            maximum_pool_bytes < pool_bytes ||
+            maximum_pool_bytes > phase_arena->size ||
+            params.conversion_bytes >= maximum_pool_bytes ||
+            !ggml_backend_cuda_phase_arena_bind_kv(phase_arena, pool_bytes)) {
+        return nullptr;
+    }
+
     auto * runtime = new ggml_backend_cuda_kv_stream_runtime;
     runtime->device      = params.device;
     runtime->stage_bytes = params.stage_bytes;
     runtime->stage_slots = params.stage_slots;
-    runtime->pool_bytes  = resident_enabled ? params.pool_bytes : minimum_pool_bytes;
+    runtime->pool_bytes  = pool_bytes;
+    runtime->maximum_pool_bytes = maximum_pool_bytes;
     runtime->conversion_bytes = params.conversion_bytes;
     runtime->staging_pool_bytes = runtime->pool_bytes - runtime->conversion_bytes;
     GGML_ASSERT(runtime->staging_pool_bytes >= scratch_bytes);
     runtime->resident_layer_count = params.resident_layer_count;
+    runtime->phase_arena = phase_arena;
 
-    const size_t total_stage_bytes = runtime->pool_bytes;
     ggml_cuda_set_device(params.device);
-    const cudaError_t error = cudaMalloc(&runtime->stage_data, total_stage_bytes);
-    if (error != cudaSuccess) {
-        (void) cudaGetLastError();
-        GGML_LOG_ERROR("%s: allocating %.2f MiB KV staging on device %d failed: %s\n",
-            __func__, total_stage_bytes/1024.0/1024.0, params.device, cudaGetErrorString(error));
-        delete runtime;
-        return nullptr;
+    if (phase_arena != nullptr) {
+        runtime->stage_data = phase_arena->data;
+    } else {
+        const cudaError_t error = cudaMalloc(&runtime->stage_data, runtime->pool_bytes);
+        if (error != cudaSuccess) {
+            (void) cudaGetLastError();
+            GGML_LOG_ERROR("%s: allocating %.2f MiB KV staging on device %d failed: %s\n",
+                __func__, runtime->pool_bytes/1024.0/1024.0,
+                params.device, cudaGetErrorString(error));
+            delete runtime;
+            return nullptr;
+        }
     }
+
+    auto cleanup = [&]() {
+        ggml_cuda_kv_stream_transfer_ring_free(runtime->transfer_ring);
+        ggml_cuda_kv_stream_resident_cache_free(runtime->resident_cache);
+        if (runtime->phase_arena != nullptr) {
+            ggml_backend_cuda_phase_arena_unbind_kv(runtime->phase_arena);
+        } else if (runtime->stage_data != nullptr) {
+            CUDA_CHECK(cudaFree(runtime->stage_data));
+        }
+        delete runtime;
+    };
 
     if (resident_enabled) {
         runtime->resident_cache = ggml_cuda_kv_stream_resident_cache_new(
             runtime->stage_data, runtime->staging_pool_bytes, scratch_bytes, params.stage_bytes,
             params.resident_layer_count, params.page_tokens);
         if (runtime->resident_cache == nullptr) {
-            CUDA_CHECK(cudaFree(runtime->stage_data));
-            delete runtime;
+            cleanup();
             return nullptr;
         }
     }
 
+    const size_t maximum_staging_pool_bytes =
+        maximum_pool_bytes - runtime->conversion_bytes;
     const size_t ring_capacity = resident_enabled ?
-        runtime->staging_pool_bytes/runtime->stage_bytes : runtime->stage_slots;
+        maximum_staging_pool_bytes/runtime->stage_bytes : runtime->stage_slots;
     if (ring_capacity == 0 || ring_capacity > UINT32_MAX) {
-        ggml_cuda_kv_stream_resident_cache_free(runtime->resident_cache);
-        CUDA_CHECK(cudaFree(runtime->stage_data));
-        delete runtime;
+        cleanup();
         return nullptr;
     }
     runtime->transfer_ring = ggml_cuda_kv_stream_transfer_ring_new(
@@ -1784,9 +1866,7 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
         runtime->conversion_bytes,
         params.decode_span_pages);
     if (runtime->transfer_ring == nullptr) {
-        ggml_cuda_kv_stream_resident_cache_free(runtime->resident_cache);
-        CUDA_CHECK(cudaFree(runtime->stage_data));
-        delete runtime;
+        cleanup();
         return nullptr;
     }
     GGML_ASSERT(ggml_cuda_kv_stream_transfer_ring_set_active_slots(
@@ -1798,6 +1878,20 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
         /* .context = */ runtime,
     };
     return runtime;
+}
+
+ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
+        ggml_backend_cuda_kv_stream_params params) {
+    return ggml_backend_cuda_kv_stream_runtime_new_impl(params, nullptr, 0);
+}
+
+ggml_backend_cuda_kv_stream_runtime_t
+ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena(
+        ggml_backend_cuda_phase_arena_t arena,
+        size_t maximum_pool_bytes,
+        ggml_backend_cuda_kv_stream_params params) {
+    return ggml_backend_cuda_kv_stream_runtime_new_impl(
+        params, arena, maximum_pool_bytes);
 }
 
 void ggml_backend_cuda_kv_stream_runtime_free(ggml_backend_cuda_kv_stream_runtime_t runtime) {
@@ -1821,6 +1915,73 @@ uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(
         ggml_backend_cuda_kv_stream_runtime_t runtime) {
     return runtime == nullptr ? 0 :
         ggml_cuda_kv_stream_resident_cache_pages_per_layer(runtime->resident_cache);
+}
+
+size_t ggml_backend_cuda_kv_stream_pool_bytes(
+        ggml_backend_cuda_kv_stream_runtime_t runtime) {
+    return runtime == nullptr ? 0 : runtime->pool_bytes;
+}
+
+bool ggml_backend_cuda_kv_stream_resize_pool(
+        ggml_backend_cuda_kv_stream_runtime_t runtime,
+        size_t pool_bytes,
+        uint32_t active_pages_per_layer,
+        uint32_t stage_slots) {
+    if (runtime == nullptr || runtime->resident_cache == nullptr ||
+            pool_bytes <= runtime->conversion_bytes ||
+            pool_bytes > runtime->maximum_pool_bytes ||
+            stage_slots == 0 ||
+            runtime->stage_bytes > std::numeric_limits<size_t>::max()/stage_slots) {
+        return false;
+    }
+    if (runtime->phase_arena == nullptr) {
+        return pool_bytes == runtime->pool_bytes &&
+            ggml_backend_cuda_kv_stream_reconfigure(
+                runtime, active_pages_per_layer, stage_slots);
+    }
+
+    const size_t staging_pool_bytes = pool_bytes - runtime->conversion_bytes;
+    const size_t scratch_bytes = runtime->stage_bytes*stage_slots;
+    if (scratch_bytes >= staging_pool_bytes ||
+            !ggml_backend_cuda_phase_arena_can_resize_kv(
+                runtime->phase_arena, pool_bytes)) {
+        return false;
+    }
+
+    const bool pool_changed = runtime->pool_bytes != pool_bytes;
+    const bool ring_changed = runtime->stage_slots != stage_slots;
+    const bool layout_changed =
+        ggml_cuda_kv_stream_resident_cache_decode_active_pages(
+            runtime->resident_cache) != active_pages_per_layer;
+    if (!pool_changed && !ring_changed && !layout_changed) {
+        return true;
+    }
+
+    ggml_cuda_set_device(runtime->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (!ggml_cuda_kv_stream_resident_cache_resize(
+            runtime->resident_cache, staging_pool_bytes,
+            scratch_bytes, active_pages_per_layer)) {
+        return false;
+    }
+    GGML_ASSERT(ggml_cuda_kv_stream_transfer_ring_set_active_slots(
+        runtime->transfer_ring, stage_slots));
+    ggml_cuda_kv_stream_transfer_ring_set_conversion_data(
+        runtime->transfer_ring,
+        runtime->conversion_bytes == 0 ? nullptr :
+            static_cast<char *>(runtime->stage_data) + staging_pool_bytes);
+    ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(runtime->transfer_ring);
+    ggml_backend_cuda_phase_arena_resize_kv(runtime->phase_arena, pool_bytes);
+
+    runtime->pool_bytes = pool_bytes;
+    runtime->staging_pool_bytes = staging_pool_bytes;
+    runtime->stage_slots = stage_slots;
+    runtime->dirty_rows.clear();
+    runtime->dirty_rows_remaining = 0;
+    runtime->staged_set_rows = 0;
+    runtime->staged_set_rows_bytes = 0;
+    ++runtime->generation;
+    return true;
 }
 
 bool ggml_backend_cuda_kv_stream_reconfigure(
@@ -6596,6 +6757,62 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static void * ggml_backend_cuda_kv_stream_runtime_new_for_device_impl(
+        ggml_backend_dev_t dev,
+        ggml_backend_cuda_phase_arena_t phase_arena,
+        size_t pool_bytes,
+        size_t maximum_pool_bytes,
+        size_t page_bytes,
+        size_t conversion_bytes,
+        uint32_t resident_layer_count) {
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_cuda_device_get_name) {
+        return nullptr;
+    }
+    auto * dev_ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
+    if (page_bytes == 0 || conversion_bytes > pool_bytes) {
+        return nullptr;
+    }
+    const size_t staging_pool_bytes = pool_bytes - conversion_bytes;
+    if (staging_pool_bytes/page_bytes <= resident_layer_count) {
+        return nullptr;
+    }
+    const size_t pool_pages = staging_pool_bytes/page_bytes;
+    size_t minimum_slots = std::min<size_t>(
+        8, pool_pages - resident_layer_count);
+    // Diagnostic override for reproducible resident:ring sweeps. The
+    // llama-layer controller treats its presence as a fixed boundary.
+    if (const char * fixed_slots = getenv("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS")) {
+        char * end = nullptr;
+        const unsigned long requested = strtoul(fixed_slots, &end, 10);
+        if (end == fixed_slots || *end != 0 || requested == 0 || requested >= pool_pages) {
+            GGML_LOG_ERROR("%s: invalid GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS=%s for %zu pool pages\n",
+                    __func__, fixed_slots, pool_pages);
+            return nullptr;
+        }
+        minimum_slots = size_t(requested);
+    }
+    const size_t resident_pages_per_layer =
+        (pool_pages - minimum_slots)/resident_layer_count;
+    const size_t stage_slots_wide =
+        pool_pages - resident_pages_per_layer*resident_layer_count;
+    if (stage_slots_wide == 0 || stage_slots_wide > UINT32_MAX) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_kv_stream_params params{};
+    params.device               = dev_ctx->device;
+    params.stage_bytes          = page_bytes;
+    params.stage_slots          = uint32_t(stage_slots_wide);
+    params.pool_bytes           = pool_bytes;
+    params.resident_layer_count = resident_layer_count;
+    params.page_tokens          = 256;
+    params.conversion_bytes     = conversion_bytes;
+    return phase_arena == nullptr ?
+        ggml_backend_cuda_kv_stream_runtime_new(params) :
+        ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena(
+            phase_arena, maximum_pool_bytes, params);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6678,49 +6895,19 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) +[](ggml_backend_dev_t dev, size_t pool_bytes, size_t page_bytes,
                 size_t conversion_bytes,
                 uint32_t resident_layer_count) -> void * {
-            if (dev == nullptr || dev->iface.get_name != ggml_backend_cuda_device_get_name) {
-                return nullptr;
-            }
-            auto * dev_ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
-            if (page_bytes == 0 || conversion_bytes > pool_bytes) {
-                return nullptr;
-            }
-            const size_t staging_pool_bytes = pool_bytes - conversion_bytes;
-            if (staging_pool_bytes/page_bytes <= resident_layer_count) {
-                return nullptr;
-            }
-            const size_t pool_pages = staging_pool_bytes/page_bytes;
-            size_t minimum_slots = std::min<size_t>(
-                8, pool_pages - resident_layer_count);
-            // Diagnostic override for reproducible resident:ring sweeps. The
-            // llama-layer controller treats its presence as a fixed boundary.
-            if (const char * fixed_slots = getenv("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS")) {
-                char * end = nullptr;
-                const unsigned long requested = strtoul(fixed_slots, &end, 10);
-                if (end == fixed_slots || *end != '\0' || requested == 0 || requested >= pool_pages) {
-                    GGML_LOG_ERROR("%s: invalid GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS=%s for %zu pool pages\n",
-                            __func__, fixed_slots, pool_pages);
-                    return nullptr;
-                }
-                minimum_slots = size_t(requested);
-            }
-            const size_t resident_pages_per_layer =
-                (pool_pages - minimum_slots)/resident_layer_count;
-            const size_t stage_slots_wide =
-                pool_pages - resident_pages_per_layer*resident_layer_count;
-            if (stage_slots_wide == 0 || stage_slots_wide > UINT32_MAX) {
-                return nullptr;
-            }
-            const uint32_t stage_slots = uint32_t(stage_slots_wide);
-            ggml_backend_cuda_kv_stream_params params{};
-            params.device               = dev_ctx->device;
-            params.stage_bytes          = page_bytes;
-            params.stage_slots          = stage_slots;
-            params.pool_bytes           = pool_bytes;
-            params.resident_layer_count = resident_layer_count;
-            params.page_tokens          = 256;
-            params.conversion_bytes      = conversion_bytes;
-            return ggml_backend_cuda_kv_stream_runtime_new(params);
+            return ggml_backend_cuda_kv_stream_runtime_new_for_device_impl(
+                dev, nullptr, pool_bytes, pool_bytes, page_bytes,
+                conversion_bytes, resident_layer_count);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_runtime_new_for_device_in_phase_arena") == 0) {
+        return (void *) +[](ggml_backend_dev_t dev, void * arena,
+                size_t pool_bytes, size_t maximum_pool_bytes, size_t page_bytes,
+                size_t conversion_bytes, uint32_t resident_layer_count) -> void * {
+            return ggml_backend_cuda_kv_stream_runtime_new_for_device_impl(
+                dev, static_cast<ggml_backend_cuda_phase_arena_t>(arena),
+                pool_bytes, maximum_pool_bytes, page_bytes,
+                conversion_bytes, resident_layer_count);
         };
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_runtime_free") == 0) {
@@ -6733,6 +6920,20 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) +[](void * runtime) -> ggml_backend_buffer_type_t {
             return ggml_backend_cuda_kv_stream_buffer_type(
                 static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime));
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_pool_bytes") == 0) {
+        return (void *) +[](void * runtime) -> size_t {
+            return ggml_backend_cuda_kv_stream_pool_bytes(
+                static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime));
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_resize_pool") == 0) {
+        return (void *) +[](void * runtime, size_t pool_bytes,
+                uint32_t active_pages, uint32_t ring_slots) -> bool {
+            return ggml_backend_cuda_kv_stream_resize_pool(
+                static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime),
+                pool_bytes, active_pages, ring_slots);
         };
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_observe_decode_latency") == 0) {

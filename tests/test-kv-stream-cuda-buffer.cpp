@@ -365,11 +365,143 @@ int main() {
             "ggml_backend_cuda_phase_arena_size",
             "ggml_backend_cuda_phase_arena_set_compute",
             "ggml_backend_cuda_phase_arena_buffer_type",
+            "ggml_backend_cuda_kv_stream_runtime_new_for_device_in_phase_arena",
+            "ggml_backend_cuda_kv_stream_pool_bytes",
+            "ggml_backend_cuda_kv_stream_resize_pool",
         };
         for (const char * name : names) {
             t.assert_true(name, ggml_backend_reg_get_proc_address(registry, name) != nullptr);
         }
         ggml_backend_free(backend);
+    });
+
+    t.test("KV runtime expands inside the shared arena after compute releases", [](testing & t) {
+        constexpr size_t page_bytes = 64*1024;
+        constexpr size_t arena_pages = 20;
+        auto arena = ggml_backend_cuda_phase_arena_new(0, arena_pages*page_bytes);
+        if (!t.assert_true("arena allocation succeeds", arena != nullptr)) {
+            return;
+        }
+        t.assert_true("prefill compute range is accepted",
+            ggml_backend_cuda_phase_arena_set_compute(
+                arena, 12*page_bytes, 8*page_bytes));
+
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 12*page_bytes;
+        params.resident_layer_count = 2;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena(
+            arena, 18*page_bytes, params);
+        if (!t.assert_true("arena-backed KV runtime initializes", runtime != nullptr)) {
+            ggml_backend_cuda_phase_arena_free(arena);
+            return;
+        }
+        t.assert_equal(size_t(12*page_bytes),
+            ggml_backend_cuda_kv_stream_pool_bytes(runtime));
+        t.assert_equal(uint32_t(2), ggml_backend_cuda_kv_stream_stage_slots(runtime));
+        t.assert_equal(uint32_t(5),
+            ggml_backend_cuda_kv_stream_resident_pages_per_layer(runtime));
+
+        auto compute = ggml_backend_buft_alloc_buffer(
+            ggml_backend_cuda_phase_arena_buffer_type(arena), 8*page_bytes);
+        if (!t.assert_true("prefill compute lease succeeds", compute != nullptr)) {
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+            ggml_backend_cuda_phase_arena_free(arena);
+            return;
+        }
+        std::vector<uint8_t> source(4096, 0x5a);
+        std::vector<uint8_t> destination(source.size(), 0);
+        t.assert_true("prefill ring remains usable",
+            ggml_backend_cuda_kv_stream_stage_upload(
+                runtime, 1, 0, source.data(), source.size()));
+        t.assert_true("prefill ring round-trip succeeds",
+            ggml_backend_cuda_kv_stream_stage_download(
+                runtime, 1, 0, destination.data(), destination.size()));
+        t.assert_true("prefill ring bytes are exact", source == destination);
+
+        ggml_backend_buffer_free(compute);
+        t.assert_true("decode compute range is accepted",
+            ggml_backend_cuda_phase_arena_set_compute(
+                arena, 18*page_bytes, 2*page_bytes));
+        t.assert_true("KV pool expands and retains a nonzero ring",
+            ggml_backend_cuda_kv_stream_resize_pool(
+                runtime, 18*page_bytes, 0, 3));
+        t.assert_equal(size_t(18*page_bytes),
+            ggml_backend_cuda_kv_stream_pool_bytes(runtime));
+        t.assert_equal(uint32_t(3), ggml_backend_cuda_kv_stream_stage_slots(runtime));
+        t.assert_equal(uint32_t(7),
+            ggml_backend_cuda_kv_stream_resident_pages_per_layer(runtime));
+
+        auto decode_compute = ggml_backend_buft_alloc_buffer(
+            ggml_backend_cuda_phase_arena_buffer_type(arena), 2*page_bytes);
+        if (t.assert_true("decode compute lease succeeds", decode_compute != nullptr)) {
+            ggml_backend_buffer_free(decode_compute);
+        }
+        t.assert_true("KV pool shrinks before returning to prefill",
+            ggml_backend_cuda_kv_stream_resize_pool(
+                runtime, 12*page_bytes, 0, 2));
+        t.assert_true("prefill compute can move down after KV shrinks",
+            ggml_backend_cuda_phase_arena_set_compute(
+                arena, 12*page_bytes, 8*page_bytes));
+        t.assert_equal(uint32_t(2), ggml_backend_cuda_kv_stream_stage_slots(runtime));
+        t.assert_equal(uint32_t(5),
+            ggml_backend_cuda_kv_stream_resident_pages_per_layer(runtime));
+
+        ggml_backend_cuda_phase_arena_free(arena);
+        std::fill(destination.begin(), destination.end(), 0);
+        t.assert_true("KV runtime keeps the released arena alive",
+            ggml_backend_cuda_kv_stream_stage_download(
+                runtime, 1, 0, destination.data(), destination.size()));
+        t.assert_true("retained arena bytes remain exact", source == destination);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+    });
+
+    t.test("shared arena rejects overlap between KV and compute slices", [](testing & t) {
+        constexpr size_t page_bytes = 64*1024;
+        auto arena = ggml_backend_cuda_phase_arena_new(0, 20*page_bytes);
+        if (!t.assert_true("arena allocation succeeds", arena != nullptr)) {
+            return;
+        }
+        t.assert_true("compute range is accepted",
+            ggml_backend_cuda_phase_arena_set_compute(
+                arena, 10*page_bytes, 10*page_bytes));
+
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 11*page_bytes;
+        params.resident_layer_count = 2;
+        params.page_tokens          = 256;
+        t.assert_true("overlapping initial KV pool is rejected",
+            ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena(
+                arena, 18*page_bytes, params) == nullptr);
+
+        params.pool_bytes = 10*page_bytes;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena(
+            arena, 18*page_bytes, params);
+        if (!t.assert_true("non-overlapping KV runtime initializes", runtime != nullptr)) {
+            ggml_backend_cuda_phase_arena_free(arena);
+            return;
+        }
+        t.assert_true("compute cannot move into live KV",
+            !ggml_backend_cuda_phase_arena_set_compute(
+                arena, 9*page_bytes, 11*page_bytes));
+        t.assert_true("KV cannot grow into compute",
+            !ggml_backend_cuda_kv_stream_resize_pool(
+                runtime, 11*page_bytes, 0, 2));
+        t.assert_true("compute can move away from KV",
+            ggml_backend_cuda_phase_arena_set_compute(
+                arena, 12*page_bytes, 8*page_bytes));
+        t.assert_true("KV can then grow to the new boundary",
+            ggml_backend_cuda_kv_stream_resize_pool(
+                runtime, 12*page_bytes, 0, 2));
+
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+        ggml_backend_cuda_phase_arena_free(arena);
     });
 
     return t.summary();
