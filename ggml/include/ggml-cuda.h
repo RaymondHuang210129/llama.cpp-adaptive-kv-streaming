@@ -27,6 +27,20 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// Physical CUDA storage shared by phase-specific compute and KV slices.
+typedef struct ggml_backend_cuda_phase_arena * ggml_backend_cuda_phase_arena_t;
+
+GGML_BACKEND_API ggml_backend_cuda_phase_arena_t ggml_backend_cuda_phase_arena_new(
+    int device, size_t size);
+GGML_BACKEND_API void ggml_backend_cuda_phase_arena_free(
+    ggml_backend_cuda_phase_arena_t arena);
+GGML_BACKEND_API size_t ggml_backend_cuda_phase_arena_size(
+    ggml_backend_cuda_phase_arena_t arena);
+GGML_BACKEND_API bool ggml_backend_cuda_phase_arena_set_compute(
+    ggml_backend_cuda_phase_arena_t arena, size_t offset, size_t size);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_phase_arena_buffer_type(
+    ggml_backend_cuda_phase_arena_t arena);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 

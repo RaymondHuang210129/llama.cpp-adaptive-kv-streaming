@@ -727,9 +727,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+struct ggml_backend_cuda_phase_arena;
+static void ggml_backend_cuda_phase_arena_release(ggml_backend_cuda_phase_arena_t arena);
+static const char * ggml_backend_cuda_phase_arena_buffer_type_get_name(
+    ggml_backend_buffer_type_t buft);
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    ggml_backend_cuda_phase_arena_t arena = nullptr;
     std::string name;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -737,9 +743,13 @@ struct ggml_backend_cuda_buffer_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
-    ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+    ggml_backend_cuda_buffer_context(
+            int device, void * dev_ptr, ggml_backend_cuda_phase_arena_t arena) :
+        device(device), dev_ptr(dev_ptr), arena(arena),
+        name(GGML_CUDA_NAME + std::to_string(device)) {
     }
+
+    ~ggml_backend_cuda_buffer_context();
 };
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -960,7 +970,8 @@ static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_t
 }
 
 static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
+    return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name ||
+        buft->iface.get_name == ggml_backend_cuda_phase_arena_buffer_type_get_name;
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -988,11 +999,10 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
-static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
-
+static size_t ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
+        int device, const ggml_tensor * tensor) {
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
-        ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
+        ? ggml_cuda_flash_attn_ext_get_alloc_size(device, tensor)
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
@@ -1005,6 +1015,12 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     }
 
     return size;
+}
+
+static size_t ggml_backend_cuda_buffer_type_get_alloc_size(
+        ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    auto * buft_ctx = static_cast<ggml_backend_cuda_buffer_type_context *>(buft->context);
+    return ggml_backend_cuda_buffer_type_get_alloc_size_for_device(buft_ctx->device, tensor);
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
@@ -1040,6 +1056,146 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+struct ggml_backend_cuda_phase_arena {
+    int device = 0;
+    void * data = nullptr;
+    size_t size = 0;
+    size_t compute_offset = 0;
+    size_t compute_size = 0;
+    bool compute_leased = false;
+    std::atomic<uint32_t> references{1};
+    std::mutex mutex;
+    std::string name;
+    ggml_backend_buffer_type buffer_type{};
+};
+
+static void ggml_backend_cuda_phase_arena_acquire(ggml_backend_cuda_phase_arena_t arena) {
+    arena->references.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void ggml_backend_cuda_phase_arena_release(ggml_backend_cuda_phase_arena_t arena) {
+    if (arena == nullptr || arena->references.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return;
+    }
+
+    ggml_cuda_set_device(arena->device);
+    CUDA_CHECK(cudaFree(arena->data));
+    delete arena;
+}
+
+ggml_backend_cuda_buffer_context::~ggml_backend_cuda_buffer_context() {
+    if (arena == nullptr) {
+        CUDA_CHECK(cudaFree(dev_ptr));
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(arena->mutex);
+        GGML_ASSERT(arena->compute_leased);
+        arena->compute_leased = false;
+    }
+    ggml_backend_cuda_phase_arena_release(arena);
+}
+
+static const char * ggml_backend_cuda_phase_arena_buffer_type_get_name(
+        ggml_backend_buffer_type_t buft) {
+    auto * arena = static_cast<ggml_backend_cuda_phase_arena_t>(buft->context);
+    return arena->name.c_str();
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_phase_arena_buffer_type_alloc(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    auto * arena = static_cast<ggml_backend_cuda_phase_arena_t>(buft->context);
+    std::lock_guard<std::mutex> lock(arena->mutex);
+    if (size == 0 || size > arena->compute_size || arena->compute_leased) {
+        return nullptr;
+    }
+
+    arena->compute_leased = true;
+    ggml_backend_cuda_phase_arena_acquire(arena);
+    void * data = static_cast<char *>(arena->data) + arena->compute_offset;
+    auto * context = new ggml_backend_cuda_buffer_context(arena->device, data, arena);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, context, size);
+}
+
+static size_t ggml_backend_cuda_phase_arena_buffer_type_alignment(
+        ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return 128;
+}
+
+static size_t ggml_backend_cuda_phase_arena_buffer_type_alloc_size(
+        ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    auto * arena = static_cast<ggml_backend_cuda_phase_arena_t>(buft->context);
+    return ggml_backend_cuda_buffer_type_get_alloc_size_for_device(arena->device, tensor);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_phase_arena_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_cuda_phase_arena_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cuda_phase_arena_buffer_type_alloc,
+    /* .get_alignment    = */ ggml_backend_cuda_phase_arena_buffer_type_alignment,
+    /* .get_max_size     = */ nullptr,
+    /* .get_alloc_size   = */ ggml_backend_cuda_phase_arena_buffer_type_alloc_size,
+    /* .is_host          = */ nullptr,
+};
+
+ggml_backend_cuda_phase_arena_t ggml_backend_cuda_phase_arena_new(int device, size_t size) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || size == 0) {
+        return nullptr;
+    }
+
+    ggml_cuda_set_device(device);
+    void * data = nullptr;
+    const cudaError_t error = cudaMalloc(&data, size);
+    if (error != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: allocating %.2f MiB phase arena on device %d failed: %s\n",
+            __func__, size/1024.0/1024.0, device, cudaGetErrorString(error));
+        return nullptr;
+    }
+
+    auto * arena = new ggml_backend_cuda_phase_arena;
+    arena->device = device;
+    arena->data = data;
+    arena->size = size;
+    arena->name = GGML_CUDA_NAME "_Phase_Arena" + std::to_string(device);
+    arena->buffer_type = {
+        /* .iface   = */ ggml_backend_cuda_phase_arena_buffer_type_interface,
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+        /* .context = */ arena,
+    };
+    return arena;
+}
+
+void ggml_backend_cuda_phase_arena_free(ggml_backend_cuda_phase_arena_t arena) {
+    ggml_backend_cuda_phase_arena_release(arena);
+}
+
+size_t ggml_backend_cuda_phase_arena_size(ggml_backend_cuda_phase_arena_t arena) {
+    return arena == nullptr ? 0 : arena->size;
+}
+
+bool ggml_backend_cuda_phase_arena_set_compute(
+        ggml_backend_cuda_phase_arena_t arena, size_t offset, size_t size) {
+    if (arena == nullptr || size == 0 || offset % 128 != 0 ||
+            offset > arena->size || size > arena->size - offset) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(arena->mutex);
+    if (arena->compute_leased) {
+        return false;
+    }
+    arena->compute_offset = offset;
+    arena->compute_size = size;
+    return true;
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_phase_arena_buffer_type(
+        ggml_backend_cuda_phase_arena_t arena) {
+    return arena == nullptr ? nullptr : &arena->buffer_type;
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -6462,6 +6618,39 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_buffer_set_preferred_host") == 0) {
         return (void *) ggml_backend_cuda_buffer_set_preferred_host;
+    }
+    if (strcmp(name, "ggml_backend_cuda_phase_arena_new_for_device") == 0) {
+        return (void *) +[](ggml_backend_dev_t dev, size_t size) -> void * {
+            if (dev == nullptr || dev->iface.get_name != ggml_backend_cuda_device_get_name) {
+                return nullptr;
+            }
+            auto * dev_ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
+            return ggml_backend_cuda_phase_arena_new(dev_ctx->device, size);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_phase_arena_free") == 0) {
+        return (void *) +[](void * arena) {
+            ggml_backend_cuda_phase_arena_free(
+                static_cast<ggml_backend_cuda_phase_arena_t>(arena));
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_phase_arena_size") == 0) {
+        return (void *) +[](void * arena) -> size_t {
+            return ggml_backend_cuda_phase_arena_size(
+                static_cast<ggml_backend_cuda_phase_arena_t>(arena));
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_phase_arena_set_compute") == 0) {
+        return (void *) +[](void * arena, size_t offset, size_t size) -> bool {
+            return ggml_backend_cuda_phase_arena_set_compute(
+                static_cast<ggml_backend_cuda_phase_arena_t>(arena), offset, size);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_phase_arena_buffer_type") == 0) {
+        return (void *) +[](void * arena) -> ggml_backend_buffer_type_t {
+            return ggml_backend_cuda_phase_arena_buffer_type(
+                static_cast<ggml_backend_cuda_phase_arena_t>(arena));
+        };
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_type_pair_supported") == 0) {
         return (void *) +[](ggml_type type_k, ggml_type type_v) {

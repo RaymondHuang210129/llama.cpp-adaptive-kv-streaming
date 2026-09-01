@@ -233,5 +233,144 @@ int main() {
         ggml_backend_free(backend);
     });
 
+    t.test("phase arena lends an exact CUDA compute slice", [](testing & t) {
+        constexpr size_t MiB = 1024*1024;
+        auto arena = ggml_backend_cuda_phase_arena_new(0, 4*MiB);
+        if (!t.assert_true("arena allocation succeeds", arena != nullptr)) {
+            return;
+        }
+        t.assert_equal(size_t(4*MiB), ggml_backend_cuda_phase_arena_size(arena));
+        t.assert_true("compute slice is accepted",
+            ggml_backend_cuda_phase_arena_set_compute(arena, MiB, 2*MiB));
+
+        auto buft = ggml_backend_cuda_phase_arena_buffer_type(arena);
+        if (!t.assert_true("borrowed CUDA buffer type exists", buft != nullptr)) {
+            ggml_backend_cuda_phase_arena_free(arena);
+            return;
+        }
+        t.assert_true("CUDA device accepts borrowed buffer type",
+            ggml_backend_dev_supports_buft(ggml_backend_buft_get_device(buft), buft));
+        t.assert_true("oversized lease is rejected",
+            ggml_backend_buft_alloc_buffer(buft, 2*MiB + 1) == nullptr);
+
+        auto buffer = ggml_backend_buft_alloc_buffer(buft, 2*MiB);
+        if (!t.assert_true("exact compute lease succeeds", buffer != nullptr)) {
+            ggml_backend_cuda_phase_arena_free(arena);
+            return;
+        }
+        t.assert_equal(size_t(2*MiB), ggml_backend_buffer_get_size(buffer));
+        t.assert_true("borrowed base exists", ggml_backend_buffer_get_base(buffer) != nullptr);
+        t.assert_true("concurrent lease is rejected",
+            ggml_backend_buft_alloc_buffer(buft, MiB) == nullptr);
+
+        ggml_backend_buffer_free(buffer);
+        ggml_backend_cuda_phase_arena_free(arena);
+    });
+
+    t.test("borrowed compute buffer keeps its arena alive", [](testing & t) {
+        constexpr size_t MiB = 1024*1024;
+        auto arena = ggml_backend_cuda_phase_arena_new(0, 2*MiB);
+        if (!t.assert_true("arena allocation succeeds", arena != nullptr)) {
+            return;
+        }
+        t.assert_true("compute slice is accepted",
+            ggml_backend_cuda_phase_arena_set_compute(arena, MiB, MiB));
+        auto buffer = ggml_backend_buft_alloc_buffer(
+            ggml_backend_cuda_phase_arena_buffer_type(arena), MiB);
+        if (!t.assert_true("compute lease succeeds", buffer != nullptr)) {
+            ggml_backend_cuda_phase_arena_free(arena);
+            return;
+        }
+
+        ggml_tensor tensor{};
+        tensor.type   = GGML_TYPE_I8;
+        tensor.buffer = buffer;
+        tensor.data   = ggml_backend_buffer_get_base(buffer);
+        tensor.ne[0]  = 4096;
+        tensor.ne[1]  = tensor.ne[2] = tensor.ne[3] = 1;
+        tensor.nb[0]  = 1;
+        tensor.nb[1]  = 4096;
+        tensor.nb[2]  = tensor.nb[3] = 4096;
+
+        std::vector<uint8_t> source(4096);
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i] = uint8_t((i*29 + 7) & 0xff);
+        }
+        std::vector<uint8_t> destination(source.size(), 0);
+
+        ggml_backend_cuda_phase_arena_free(arena);
+        ggml_backend_tensor_set(&tensor, source.data(), 0, source.size());
+        ggml_backend_tensor_get(&tensor, destination.data(), 0, destination.size());
+        t.assert_true("borrowed storage remains valid", source == destination);
+        ggml_backend_buffer_free(buffer);
+    });
+
+    t.test("phase arena can move its compute lease after release", [](testing & t) {
+        constexpr size_t MiB = 1024*1024;
+        auto arena = ggml_backend_cuda_phase_arena_new(0, 4*MiB);
+        if (!t.assert_true("arena allocation succeeds", arena != nullptr)) {
+            return;
+        }
+        auto buft = ggml_backend_cuda_phase_arena_buffer_type(arena);
+        t.assert_true("first range is accepted",
+            ggml_backend_cuda_phase_arena_set_compute(arena, MiB, MiB));
+        auto first = ggml_backend_buft_alloc_buffer(buft, MiB);
+        if (!t.assert_true("first lease succeeds", first != nullptr)) {
+            ggml_backend_cuda_phase_arena_free(arena);
+            return;
+        }
+        void * first_base = ggml_backend_buffer_get_base(first);
+        t.assert_true("active lease cannot move",
+            !ggml_backend_cuda_phase_arena_set_compute(arena, 2*MiB, MiB));
+        ggml_backend_buffer_free(first);
+
+        t.assert_true("released lease can move",
+            ggml_backend_cuda_phase_arena_set_compute(arena, 2*MiB, MiB));
+        auto second = ggml_backend_buft_alloc_buffer(buft, MiB);
+        if (t.assert_true("second lease succeeds", second != nullptr)) {
+            t.assert_true("lease base moved", ggml_backend_buffer_get_base(second) != first_base);
+            ggml_backend_buffer_free(second);
+        }
+        ggml_backend_cuda_phase_arena_free(arena);
+    });
+
+    t.test("phase arena rejects invalid ranges", [](testing & t) {
+        constexpr size_t MiB = 1024*1024;
+        t.assert_true("zero arena is rejected",
+            ggml_backend_cuda_phase_arena_new(0, 0) == nullptr);
+
+        auto arena = ggml_backend_cuda_phase_arena_new(0, 2*MiB);
+        if (!t.assert_true("arena allocation succeeds", arena != nullptr)) {
+            return;
+        }
+        t.assert_true("zero compute size is rejected",
+            !ggml_backend_cuda_phase_arena_set_compute(arena, 0, 0));
+        t.assert_true("out of range offset is rejected",
+            !ggml_backend_cuda_phase_arena_set_compute(arena, 3*MiB, 1));
+        t.assert_true("overflowing range is rejected",
+            !ggml_backend_cuda_phase_arena_set_compute(arena, 2*MiB - 1, 2));
+        ggml_backend_cuda_phase_arena_free(arena);
+    });
+
+    t.test("phase arena operations are exported through the CUDA registry", [](testing & t) {
+        ggml_backend_t backend = ggml_backend_cuda_init(0);
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        auto device = ggml_backend_get_device(backend);
+        auto registry = ggml_backend_dev_backend_reg(device);
+        const char * names[] = {
+            "ggml_backend_cuda_phase_arena_new_for_device",
+            "ggml_backend_cuda_phase_arena_free",
+            "ggml_backend_cuda_phase_arena_size",
+            "ggml_backend_cuda_phase_arena_set_compute",
+            "ggml_backend_cuda_phase_arena_buffer_type",
+        };
+        for (const char * name : names) {
+            t.assert_true(name, ggml_backend_reg_get_proc_address(registry, name) != nullptr);
+        }
+        ggml_backend_free(backend);
+    });
+
     return t.summary();
 }
