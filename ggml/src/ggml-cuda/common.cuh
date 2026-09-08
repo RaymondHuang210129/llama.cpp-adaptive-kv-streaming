@@ -1432,6 +1432,12 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // Block KV streaming, forward-pass scoped. Set by
+    // ggml_backend_cuda_kv_stream_forward_begin/_end so graph_compute does not
+    // re-plan page streaming for every scheduler fragment of one forward pass.
+    bool kv_stream_forward_armed = false;
+    std::vector<ggml_backend_cuda_kv_stream_runtime_t> kv_stream_forward_runtimes;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

@@ -30,7 +30,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-                     size_t kv_stream_stage_bytes) :
+    const std::vector<uint64_t> & kv_stream_stage_bytes) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,

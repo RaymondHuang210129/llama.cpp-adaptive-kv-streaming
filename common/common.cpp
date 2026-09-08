@@ -1752,6 +1752,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
     cparams.kv_stream_stage_mib = params.kv_stream_stage_mib;
+    cparams.kv_stream_stage_mib_dev   = params.kv_stream_stage_mib_dev.empty() ? nullptr : params.kv_stream_stage_mib_dev.data();
+    cparams.n_kv_stream_stage_mib_dev = (uint32_t) params.kv_stream_stage_mib_dev.size();
 
     return cparams;
 }

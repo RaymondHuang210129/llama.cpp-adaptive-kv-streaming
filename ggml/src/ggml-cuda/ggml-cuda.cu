@@ -1425,6 +1425,9 @@ struct ggml_backend_cuda_kv_stream_runtime {
 
     std::atomic<uint32_t> references{1};
     ggml_backend_buffer_type buffer_type{};
+    // Per-device name: llama keys its KV contexts by buffer-type name, so two
+    // runtimes (one per GPU) must not share one.
+    std::string buffer_type_name;
 };
 
 struct ggml_backend_cuda_kv_stream_buffer_context {
@@ -1446,8 +1449,11 @@ static void ggml_backend_cuda_kv_stream_runtime_release(
 }
 
 static const char * ggml_backend_cuda_kv_stream_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(buft);
-    return GGML_CUDA_NAME "_KV_Stream_Host";
+    auto * runtime = static_cast<ggml_backend_cuda_kv_stream_runtime_t>(buft->context);
+    if (runtime == nullptr || runtime->buffer_type_name.empty()) {
+        return GGML_CUDA_NAME "_KV_Stream_Host";
+    }
+    return runtime->buffer_type_name.c_str();
 }
 
 static bool ggml_backend_buft_is_cuda_kv_stream(ggml_backend_buffer_type_t buft) {
@@ -1636,6 +1642,7 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
     GGML_ASSERT(ggml_cuda_kv_stream_transfer_ring_set_active_slots(
         runtime->transfer_ring, runtime->stage_slots));
 
+    runtime->buffer_type_name = std::string(GGML_CUDA_NAME) + std::to_string(params.device) + "_KV_Stream_Host";
     runtime->buffer_type = {
         /* .iface   = */ ggml_backend_cuda_kv_stream_buffer_type_interface,
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), params.device),
@@ -1892,8 +1899,11 @@ static void ggml_cuda_kv_stream_fattn(
         ctx, dst, runtime->transfer_ring, runtime->resident_cache);
 }
 
+// Plan page streaming for every streamed attention node of cgraph on the
+// runtimes owned by `device` (-1 = any device). Must see the whole forward
+// pass: the plan assigns per-forward deadlines and ring slots.
 static std::vector<ggml_backend_cuda_kv_stream_runtime_t> ggml_cuda_kv_stream_prepare_graph(
-        const ggml_cgraph * cgraph, cudaStream_t compute_stream) {
+        const ggml_cgraph * cgraph, cudaStream_t compute_stream, int device = -1) {
     std::vector<ggml_backend_cuda_kv_stream_runtime_t> runtimes;
     std::unordered_set<ggml_backend_cuda_kv_stream_runtime_t> seen;
 
@@ -1903,7 +1913,8 @@ static std::vector<ggml_backend_cuda_kv_stream_runtime_t> ggml_cuda_kv_stream_pr
             continue;
         }
         auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(node->src[1]);
-        if (runtime != nullptr && runtime == ggml_cuda_kv_stream_runtime_from_tensor(node->src[2]) &&
+        if (runtime != nullptr && (device < 0 || runtime->device == device) &&
+                runtime == ggml_cuda_kv_stream_runtime_from_tensor(node->src[2]) &&
                 seen.insert(runtime).second) {
             ggml_cuda_kv_stream_graph_begin(runtime->transfer_ring);
             runtimes.push_back(runtime);
@@ -1916,6 +1927,9 @@ static std::vector<ggml_backend_cuda_kv_stream_runtime_t> ggml_cuda_kv_stream_pr
             continue;
         }
         auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(node->src[1]);
+        if (seen.find(runtime) == seen.end()) {
+            continue;
+        }
         (void) ggml_cuda_kv_stream_graph_add_attention(
             runtime->transfer_ring, runtime->resident_cache, node);
     }
@@ -1924,6 +1938,50 @@ static std::vector<ggml_backend_cuda_kv_stream_runtime_t> ggml_cuda_kv_stream_pr
         ggml_cuda_kv_stream_graph_finalize(runtime->transfer_ring, compute_stream);
     }
     return runtimes;
+}
+
+// Forward-pass scoped planning. The scheduler hands the CUDA backend one
+// graph per split; when weights live on another backend a single forward
+// pass arrives as many fragments. The owner (llama-context) brackets the
+// whole pass with forward_begin/forward_end so planning and the end-of-pass
+// timing run once, while fragments only execute their nodes. Without a
+// bracket, graph_compute plans per graph as before.
+void ggml_backend_cuda_kv_stream_forward_begin(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+    if (backend == nullptr || cgraph == nullptr || !ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    GGML_ASSERT(!cuda_ctx->kv_stream_forward_armed && "kv stream forward_begin without matching forward_end");
+    ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->kv_stream_forward_runtimes = ggml_cuda_kv_stream_prepare_graph(cgraph, cuda_ctx->stream(), cuda_ctx->device);
+    cuda_ctx->kv_stream_forward_armed = true;
+}
+
+void ggml_backend_cuda_kv_stream_forward_end(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (!cuda_ctx->kv_stream_forward_armed) {
+        return;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    for (auto * runtime : cuda_ctx->kv_stream_forward_runtimes) {
+        ggml_cuda_kv_stream_graph_end(runtime->transfer_ring, cuda_ctx->stream());
+    }
+    cuda_ctx->kv_stream_forward_runtimes.clear();
+    cuda_ctx->kv_stream_forward_armed = false;
+}
+
+bool ggml_backend_cuda_kv_stream_register_layer(
+        ggml_backend_cuda_kv_stream_runtime_t runtime,
+        const void * k_data, size_t k_bytes,
+        const void * v_data, size_t v_bytes) {
+    if (runtime == nullptr || runtime->resident_cache == nullptr) {
+        return false;
+    }
+    return ggml_cuda_kv_stream_resident_cache_register_layer(
+        runtime->resident_cache, k_data, k_bytes, v_data, v_bytes);
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
@@ -5019,9 +5077,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             // The graph order is now final. Build one shared deadline queue
-            // per KV runtime before issuing any attention work.
-            const auto kv_stream_runtimes = ggml_cuda_kv_stream_prepare_graph(
-                cgraph, cuda_ctx->stream());
+            // per KV runtime before issuing any attention work, unless the
+            // owner already planned the whole forward pass (see
+            // ggml_backend_cuda_kv_stream_forward_begin), in which case this
+            // graph is one fragment of it and must not reset the plan.
+            const auto kv_stream_runtimes = cuda_ctx->kv_stream_forward_armed ?
+                std::vector<ggml_backend_cuda_kv_stream_runtime_t>{} :
+                ggml_cuda_kv_stream_prepare_graph(cgraph, cuda_ctx->stream(), cuda_ctx->device);
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -6630,6 +6692,20 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
             return ggml_backend_cuda_kv_stream_mark_dirty_rows(
                 static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime), rows, count);
         };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_register_layer") == 0) {
+        return (void *) +[](void * runtime, const void * k_data, size_t k_bytes,
+                const void * v_data, size_t v_bytes) -> bool {
+            return ggml_backend_cuda_kv_stream_register_layer(
+                static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime),
+                k_data, k_bytes, v_data, v_bytes);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_forward_begin") == 0) {
+        return (void *) ggml_backend_cuda_kv_stream_forward_begin;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_forward_end") == 0) {
+        return (void *) ggml_backend_cuda_kv_stream_forward_end;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

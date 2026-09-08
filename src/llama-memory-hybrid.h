@@ -40,7 +40,7 @@ public:
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
-                     size_t kv_stream_stage_bytes = 0);
+    const std::vector<uint64_t> & kv_stream_stage_bytes = {});
 
     ~llama_memory_hybrid() = default;
 

@@ -425,6 +425,17 @@ struct ggml_cuda_kv_stream_resident_cache {
     std::unordered_map<const void *, uint32_t> layer_by_k;
     std::unordered_map<const void *, uint32_t> layer_by_data;
     std::unordered_map<const void *, void *> mirror_by_data;
+    // Explicit layer identity registered by the owner at cache creation, in
+    // model order. When present, pointer-to-layer lookups are derived from it
+    // instead of being learned lazily from graph order, so the mapping survives
+    // scheduler graph splits and buffer resets.
+    struct registered_layer {
+        const char * k_data = nullptr;
+        size_t k_bytes = 0;
+        const char * v_data = nullptr;
+        size_t v_bytes = 0;
+    };
+    std::vector<registered_layer> registered;
     std::vector<uint8_t> loaded;
     std::vector<uint8_t> dirty;
     std::vector<uint8_t> precise_dirty_tracking;
@@ -554,6 +565,45 @@ void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache 
     delete cache;
 }
 
+// Drop derived pointer maps and, when explicit identity is registered,
+// rebuild the layer maps from it. Mirrors are re-derived at the next graph
+// plan because they depend on the current resident layout.
+static void kv_stream_resident_cache_rebind(ggml_cuda_kv_stream_resident_cache * cache) {
+    cache->layer_by_k.clear();
+    cache->layer_by_data.clear();
+    cache->mirror_by_data.clear();
+    for (uint32_t layer = 0; layer < cache->registered.size(); ++layer) {
+        const auto & entry = cache->registered[layer];
+        cache->layer_by_k[entry.k_data] = layer;
+        cache->layer_by_data[entry.k_data] = layer;
+        if (entry.v_data != nullptr) {
+            cache->layer_by_data[entry.v_data] = layer;
+        }
+    }
+    cache->next_layer = uint32_t(cache->registered.size());
+}
+
+bool ggml_cuda_kv_stream_resident_cache_register_layer(
+        ggml_cuda_kv_stream_resident_cache * cache,
+        const void * k_data, size_t k_bytes,
+        const void * v_data, size_t v_bytes) {
+    if (cache == nullptr || k_data == nullptr || k_bytes == 0 ||
+            cache->registered.size() >= cache->layer_count) {
+        return false;
+    }
+    for (const auto & entry : cache->registered) {
+        if (entry.k_data == k_data) {
+            return false;
+        }
+    }
+    cache->registered.push_back({
+        static_cast<const char *>(k_data), k_bytes,
+        static_cast<const char *>(v_data), v_bytes,
+    });
+    kv_stream_resident_cache_rebind(cache);
+    return true;
+}
+
 void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache * cache) {
     if (cache == nullptr) {
         return;
@@ -564,10 +614,7 @@ void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache
     cache->dirty_rows.clear();
     cache->mutable_pages.clear();
     cache->all_pages_mutable = false;
-    cache->layer_by_k.clear();
-    cache->layer_by_data.clear();
-    cache->mirror_by_data.clear();
-    cache->next_layer = 0;
+    kv_stream_resident_cache_rebind(cache);
     cache->stats = {};
 }
 
@@ -609,10 +656,7 @@ bool ggml_cuda_kv_stream_resident_cache_reconfigure(
     cache->dirty_rows.clear();
     cache->mutable_pages.clear();
     cache->all_pages_mutable = false;
-    cache->layer_by_k.clear();
-    cache->layer_by_data.clear();
-    cache->mirror_by_data.clear();
-    cache->next_layer = 0;
+    kv_stream_resident_cache_rebind(cache);
     if (scratch_changed) {
         cache->stats = {};
     }
@@ -644,10 +688,7 @@ bool ggml_cuda_kv_stream_resident_cache_repartition(
     cache->dirty.assign(cache->layer_offsets.back(), 0);
     cache->precise_dirty_tracking.assign(cache->layer_count, 0);
     cache->dirty_rows.clear();
-    cache->layer_by_k.clear();
-    cache->layer_by_data.clear();
-    cache->mirror_by_data.clear();
-    cache->next_layer = 0;
+    kv_stream_resident_cache_rebind(cache);
     cache->stats = {};
     return true;
 }
@@ -682,10 +723,7 @@ bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
     cache->dirty_rows.clear();
     cache->mutable_pages.clear();
     cache->all_pages_mutable = false;
-    cache->layer_by_k.clear();
-    cache->layer_by_data.clear();
-    cache->mirror_by_data.clear();
-    cache->next_layer = 0;
+    kv_stream_resident_cache_rebind(cache);
     cache->decode_active_pages = active_pages_per_layer;
     cache->resident_pages_per_layer = pages_per_layer;
     return true;
@@ -839,6 +877,23 @@ void ggml_cuda_kv_stream_resident_cache_mark_dirty(
 static uint32_t kv_stream_resident_layer(
         ggml_cuda_kv_stream_resident_cache * cache, const void * k_key) {
     GGML_ASSERT(cache != nullptr);
+    if (!cache->registered.empty()) {
+        const auto found = cache->layer_by_k.find(k_key);
+        if (found != cache->layer_by_k.end()) {
+            return found->second;
+        }
+        // A view into a registered layer's K storage (e.g. a non-zero stream
+        // offset) still belongs to that layer.
+        const char * key = static_cast<const char *>(k_key);
+        for (uint32_t layer = 0; layer < cache->registered.size(); ++layer) {
+            const auto & entry = cache->registered[layer];
+            if (key >= entry.k_data && key < entry.k_data + entry.k_bytes) {
+                cache->layer_by_k[k_key] = layer;
+                return layer;
+            }
+        }
+        GGML_ABORT("kv stream: K tensor %p does not belong to any registered layer", k_key);
+    }
     auto [it, inserted] = cache->layer_by_k.emplace(k_key, cache->next_layer);
     if (inserted) {
         GGML_ASSERT(cache->next_layer < cache->layer_count);
@@ -1606,10 +1661,14 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         // Graphs are rebuilt across warmup, prompt chunks, and slot reuse.
         // Relearn pointer-to-layer identity once per prefill graph while the
         // resident page contents are refreshed by the local multi-token path.
+        // Only in lazy mode: identity registered by the owner is fixed and must
+        // survive the per-fragment graphs produced by ggml_backend_sched.
         if (ring->graph_resident_cache == nullptr) {
-            resident_cache->layer_by_k.clear();
-            resident_cache->layer_by_data.clear();
-            resident_cache->next_layer = 0;
+            if (resident_cache->registered.empty()) {
+                resident_cache->layer_by_k.clear();
+                resident_cache->layer_by_data.clear();
+                resident_cache->next_layer = 0;
+            }
             ring->graph_resident_cache = resident_cache;
         }
         const uint32_t resident_layer = kv_stream_resident_layer(resident_cache, K->data);

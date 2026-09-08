@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -18,7 +19,7 @@ struct llama_memory_params {
     // kv cache
     ggml_type type_k;
     ggml_type type_v;
-    uint64_t kv_stream_stage_bytes;
+    std::vector<uint64_t> kv_stream_stage_bytes; // block-streaming pool per model device (device order); empty = off
 
     // use full-size SWA cache
     bool swa_full;

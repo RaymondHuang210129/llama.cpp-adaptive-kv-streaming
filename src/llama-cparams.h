@@ -54,7 +54,8 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
-    uint32_t kv_stream_stage_mib;
+    uint32_t kv_stream_stage_mib;                  // largest per-device pool, 0 = streaming off
+    std::vector<uint32_t> kv_stream_stage_mib_dev; // per model device (device order); empty = kv_stream_stage_mib everywhere
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

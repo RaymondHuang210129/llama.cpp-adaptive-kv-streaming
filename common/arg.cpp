@@ -2421,13 +2421,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
-        {"--kv-stream-stage-mib"}, "N",
-        string_format("block-streaming KV resident + staging pool in MiB; 0 disables it (default: %u)", params.kv_stream_stage_mib),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("KV stream stage size must be non-negative");
+        {"--kv-stream-stage-mib"}, "N[,N...]",
+        string_format("block-streaming KV resident + staging pool in MiB; 0 disables it (default: %u). "
+            "A comma-separated list gives one pool per GPU in device order; a 0 entry keeps that GPU's "
+            "attention layers in an ordinary VRAM cache", params.kv_stream_stage_mib),
+        [](common_params & params, const std::string & value) {
+            params.kv_stream_stage_mib_dev.clear();
+            for (const auto & item : string_split<std::string>(value, ',')) {
+                if (item.empty()) {
+                    throw std::invalid_argument("KV stream stage list has an empty entry");
+                }
+                const long long parsed = std::stoll(item);
+                if (parsed < 0 || parsed > UINT32_MAX) {
+                    throw std::invalid_argument("KV stream stage size must be non-negative");
+                }
+                params.kv_stream_stage_mib_dev.push_back((uint32_t) parsed);
             }
-            params.kv_stream_stage_mib = value;
+            if (params.kv_stream_stage_mib_dev.empty()) {
+                throw std::invalid_argument("KV stream stage list is empty");
+            }
+            params.kv_stream_stage_mib = 0;
+            for (const uint32_t mib : params.kv_stream_stage_mib_dev) {
+                params.kv_stream_stage_mib = std::max(params.kv_stream_stage_mib, mib);
+            }
+            if (params.kv_stream_stage_mib_dev.size() == 1) {
+                params.kv_stream_stage_mib_dev.clear();
+            }
         }
     ).set_env("LLAMA_ARG_KV_STREAM_STAGE_MIB"));
     add_opt(common_arg(
