@@ -423,6 +423,39 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    // Give the streaming runtime a fixed layer identity (model order) for
+    // each attention layer's K/V storage, so it no longer has to infer it
+    // from the order attention nodes appear in a graph.
+    if (kv_stream_runtime.runtime != nullptr && !hparams.no_alloc) {
+        using register_layer_fn_t = bool (*)(void *, const void *, size_t, const void *, size_t);
+        auto * register_layer_fn = (register_layer_fn_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(kv_stream_dev), "ggml_backend_cuda_kv_stream_register_layer");
+        if (register_layer_fn == nullptr) {
+            throw std::runtime_error("block KV streaming requires ggml_backend_cuda_kv_stream_register_layer");
+        }
+        uint32_t registered = 0;
+        for (const auto & layer : layers) {
+            if (layer.k == nullptr || layer.k->buffer == nullptr || ggml_backend_buffer_get_type(layer.k->buffer) != kv_stream_buft) {
+                continue;
+            }
+            const bool ok = register_layer_fn(
+                kv_stream_runtime.runtime,
+                layer.k->data, ggml_nbytes(layer.k),
+                layer.v != nullptr ? layer.v->data : nullptr,
+                layer.v != nullptr ? ggml_nbytes(layer.v) : 0);
+            if (!ok) {
+                // shared layers reuse another layer's tensors: not an error
+                continue;
+            }
+            ++registered;
+        }
+        LLAMA_LOG_INFO("%s: block KV streaming: registered %u/%u attention layers on %s\n",
+                __func__, registered, kv_stream_layer_count, ggml_backend_dev_name(kv_stream_dev));
+        if (registered == 0) {
+            throw std::runtime_error("block KV streaming registered no attention layers");
+        }
+    }
+
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();

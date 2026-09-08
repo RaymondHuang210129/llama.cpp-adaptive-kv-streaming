@@ -118,6 +118,22 @@ GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_mark_dirty_rows(
     ggml_backend_cuda_kv_stream_runtime_t runtime,
     const int64_t * rows,
     size_t count);
+// Pin a streamed attention layer's K/V storage to a fixed layer index. Call
+// once per layer, in model order, after the KV buffers are allocated; the
+// runtime then no longer infers layer identity from graph node order.
+GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_register_layer(
+    ggml_backend_cuda_kv_stream_runtime_t runtime,
+    const void * k_data, size_t k_bytes,
+    const void * v_data, size_t v_bytes);
+// Bracket one forward pass. begin plans page streaming for every streamed
+// attention node of the full graph on this backend's device; end records the
+// end-of-pass timing. Between the two, graph_compute treats each graph it
+// receives as a fragment of that pass (ggml_backend_sched splits) and does
+// not re-plan. Without a bracket, graph_compute plans per graph as before.
+GGML_BACKEND_API void ggml_backend_cuda_kv_stream_forward_begin(
+    ggml_backend_t backend,
+    const struct ggml_cgraph * cgraph);
+GGML_BACKEND_API void ggml_backend_cuda_kv_stream_forward_end(ggml_backend_t backend);
 GGML_BACKEND_API struct ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_stage_upload(

@@ -368,6 +368,17 @@ llama_context::llama_context(
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
+                if (cparams.kv_stream_stage_mib != 0) {
+                    kv_stream_forward_hook hook;
+                    hook.backend = backend.get();
+                    hook.begin_fn = (decltype(hook.begin_fn)) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_forward_begin");
+                    hook.end_fn = (decltype(hook.end_fn)) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_forward_end");
+                    if (hook.begin_fn != nullptr && hook.end_fn != nullptr) {
+                        kv_stream_forward_hooks.push_back(hook);
+                    }
+                }
             }
         }
 
@@ -2556,9 +2567,17 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    for (const auto & hook : kv_stream_forward_hooks) {
+        hook.begin_fn(hook.backend, gf);
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    for (const auto & hook : kv_stream_forward_hooks) {
+        hook.end_fn(hook.backend);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

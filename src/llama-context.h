@@ -359,6 +359,16 @@ private:
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 
+    // Block KV streaming: bracket each forward pass so the CUDA backend plans
+    // page streaming once for the whole graph instead of once per scheduler
+    // split (which breaks when weights are placed on another backend).
+    struct kv_stream_forward_hook {
+        ggml_backend_t backend = nullptr;
+        void (*begin_fn)(ggml_backend_t, const ggml_cgraph *) = nullptr;
+        void (*end_fn)(ggml_backend_t) = nullptr;
+    };
+    std::vector<kv_stream_forward_hook> kv_stream_forward_hooks;
+
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
