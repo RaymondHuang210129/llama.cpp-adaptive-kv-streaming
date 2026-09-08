@@ -15,6 +15,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -121,6 +122,15 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
+    cparams.kv_stream_stage_mib_dev.clear();
+    if (params.kv_stream_stage_mib_dev != nullptr && params.n_kv_stream_stage_mib_dev > 0) {
+        cparams.kv_stream_stage_mib_dev.assign(
+            params.kv_stream_stage_mib_dev, params.kv_stream_stage_mib_dev + params.n_kv_stream_stage_mib_dev);
+        cparams.kv_stream_stage_mib = 0;
+        for (const uint32_t mib : cparams.kv_stream_stage_mib_dev) {
+            cparams.kv_stream_stage_mib = std::max(cparams.kv_stream_stage_mib, mib);
+        }
+    }
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -398,7 +408,22 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
-        const uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
+        // one pool budget per model device (device order); a single value applies everywhere
+        std::vector<uint64_t> kv_stream_stage_bytes_dev(model.devices.size(), 0);
+        uint64_t kv_stream_stage_bytes = 0;
+        for (size_t i = 0; i < model.devices.size(); ++i) {
+            const uint32_t mib = cparams.kv_stream_stage_mib_dev.empty() ? cparams.kv_stream_stage_mib :
+                (i < cparams.kv_stream_stage_mib_dev.size() ? cparams.kv_stream_stage_mib_dev[i] : 0);
+            kv_stream_stage_bytes_dev[i] = uint64_t(mib)*1024ULL*1024ULL;
+            kv_stream_stage_bytes = std::max(kv_stream_stage_bytes, kv_stream_stage_bytes_dev[i]);
+        }
+        if (cparams.kv_stream_stage_mib_dev.size() > model.devices.size()) {
+            LLAMA_LOG_WARN("%s: --kv-stream-stage-mib lists %zu pools but the model uses %zu devices; extra entries ignored\n",
+                    __func__, cparams.kv_stream_stage_mib_dev.size(), model.devices.size());
+        }
+        if (cparams.kv_stream_stage_mib != 0 && kv_stream_stage_bytes == 0) {
+            throw std::runtime_error("block KV streaming requires at least one GPU device");
+        }
         uint64_t kv_stream_minimum_stage_bytes = 0;
         if (kv_stream_stage_bytes != 0 && model.arch == LLM_ARCH_QWEN35) {
             for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
@@ -425,14 +450,27 @@ llama_context::llama_context(
             throw std::runtime_error(stream_validation.error);
         }
         if (stream_validation.enabled) {
-            LLAMA_LOG_INFO("%s: experimental block KV streaming enabled, pool = %.2f MiB\n",
-                    __func__, kv_stream_stage_bytes/1024.0/1024.0);
+            for (size_t i = 0; i < model.devices.size(); ++i) {
+                if (kv_stream_stage_bytes_dev[i] == 0) {
+                    continue;
+                }
+                llama_kv_stream_config dev_config = stream_config;
+                dev_config.stage_bytes = kv_stream_stage_bytes_dev[i];
+                const auto dev_validation = llama_kv_stream_config_validate(dev_config);
+                if (!dev_validation.valid) {
+                    throw std::runtime_error(std::string(ggml_backend_dev_name(model.devices[i].dev)) + ": " + dev_validation.error);
+                }
+                LLAMA_LOG_INFO("%s: experimental block KV streaming enabled on %s, pool = %.2f MiB\n",
+                        __func__, ggml_backend_dev_name(model.devices[i].dev), kv_stream_stage_bytes_dev[i]/1024.0/1024.0);
+            }
+        } else {
+            kv_stream_stage_bytes_dev.clear();
         }
 
         llama_memory_params params_mem = {
             /*.type_k                =*/ params.type_k,
             /*.type_v                =*/ params.type_v,
-            /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes,
+            /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes_dev,
             /*.swa_full              =*/ params.swa_full,
             /*.ctx_type              =*/ cparams.ctx_type,
             /*.mem_other             =*/ llama_get_memory(cparams.ctx_other),
@@ -3709,6 +3747,8 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_stream_stage_mib         =*/ 0,
+        /*.kv_stream_stage_mib_dev     =*/ nullptr,
+        /*.n_kv_stream_stage_mib_dev   =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

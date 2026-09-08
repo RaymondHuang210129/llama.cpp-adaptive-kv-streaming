@@ -1425,6 +1425,9 @@ struct ggml_backend_cuda_kv_stream_runtime {
 
     std::atomic<uint32_t> references{1};
     ggml_backend_buffer_type buffer_type{};
+    // Per-device name: llama keys its KV contexts by buffer-type name, so two
+    // runtimes (one per GPU) must not share one.
+    std::string buffer_type_name;
 };
 
 struct ggml_backend_cuda_kv_stream_buffer_context {
@@ -1446,8 +1449,11 @@ static void ggml_backend_cuda_kv_stream_runtime_release(
 }
 
 static const char * ggml_backend_cuda_kv_stream_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(buft);
-    return GGML_CUDA_NAME "_KV_Stream_Host";
+    auto * runtime = static_cast<ggml_backend_cuda_kv_stream_runtime_t>(buft->context);
+    if (runtime == nullptr || runtime->buffer_type_name.empty()) {
+        return GGML_CUDA_NAME "_KV_Stream_Host";
+    }
+    return runtime->buffer_type_name.c_str();
 }
 
 static bool ggml_backend_buft_is_cuda_kv_stream(ggml_backend_buffer_type_t buft) {
@@ -1636,6 +1642,7 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
     GGML_ASSERT(ggml_cuda_kv_stream_transfer_ring_set_active_slots(
         runtime->transfer_ring, runtime->stage_slots));
 
+    runtime->buffer_type_name = std::string(GGML_CUDA_NAME) + std::to_string(params.device) + "_KV_Stream_Host";
     runtime->buffer_type = {
         /* .iface   = */ ggml_backend_cuda_kv_stream_buffer_type_interface,
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), params.device),

@@ -2483,6 +2483,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_stage_mib = 0;
+    result.kv_stream_stage_mib_dev.clear();
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

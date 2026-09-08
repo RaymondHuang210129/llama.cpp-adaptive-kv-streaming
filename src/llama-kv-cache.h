@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -115,7 +116,7 @@ public:
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
-                         size_t kv_stream_stage_bytes = 0);
+    const std::vector<uint64_t> & kv_stream_stage_bytes = {});
 
     ~llama_kv_cache() = default;
 
@@ -302,6 +303,10 @@ private:
         using decode_layout_fn_t = bool (*)(void *, uint32_t);
         using mark_dirty_rows_fn_t = bool (*)(void *, const int64_t *, size_t);
 
+        // the CUDA device this runtime streams for, and its pinned-host buffer type
+        ggml_backend_dev_t dev = nullptr;
+        ggml_backend_buffer_type_t buft = nullptr;
+
         void * runtime = nullptr;
         void (*free_fn)(void *) = nullptr;
         feedback_fn_t feedback_fn = nullptr;
@@ -328,9 +333,13 @@ private:
         }
     };
 
+    // One runtime per CUDA device that hosts streamed attention layers (a
+    // layer split gives each card its own page pool and host storage).
     // Declared before ctxs_bufs so the custom buffers release their runtime
-    // references before this owner releases the initial reference.
-    kv_stream_runtime_owner kv_stream_runtime;
+    // references before these owners release the initial reference.
+    std::vector<std::unique_ptr<kv_stream_runtime_owner>> kv_stream_runtimes;
+
+    bool kv_stream_adapt_owner(kv_stream_runtime_owner & owner, uint32_t active_tokens, uint32_t query_tokens);
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
