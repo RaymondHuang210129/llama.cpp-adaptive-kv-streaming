@@ -1,11 +1,31 @@
 # Adaptive KV Streaming for llama.cpp
 
-This branch adds an experimental, block-granular KV cache streaming path to the CUDA `llama-server`. It is intended for running long contexts when model weights leave too little VRAM for the complete KV cache.
+This branch adds experimental, block-granular adaptive KV cache streaming to the CUDA `llama-server`. It is intended for running long contexts when model weights leave too little VRAM for the complete KV cache, without relying on uncontrolled Unified Memory page migration.
 
-With `--kv-stream-arena-mib N`, the authoritative KV tensors are stored in pinned host memory while one bounded physical CUDA arena is shared by phase-specific compute buffers, resident KV pages, and the transfer ring. During prompt processing, the scheduler borrows the compute workspace it needs and KV keeps a small nonzero ring. When ordinary TG1 decode begins, the large prefill workspace is released and the reclaimed bytes become additional resident/ring KV capacity. The runtime continues adapting the resident/ring split as context grows and prefetches later layers while the current layer computes. This avoids relying on uncontrolled Unified Memory page thrashing and preserves exact attention over the full context.
+## Adaptive KV streaming
+
+The authoritative KV tensors remain in pinned host memory while a bounded CUDA pool is divided between resident KV pages and one transfer ring shared by all streamed attention layers. As the active context grows, the runtime keeps as many pages resident as the budget allows and gradually reclaims resident space for a larger ring. Nonresident pages are prefetched for later layers while the current layer computes, and consumed ring slots are recycled immediately. Every attention layer still processes its complete KV history; only physical residency and transfer scheduling change.
+
+## Phase arena
+
+`--kv-stream-arena-mib N` extends that adaptive pool into one fixed physical CUDA allocation shared by KV storage, the transfer ring, and phase-specific compute buffers. Prompt processing and token generation do not need their peak compute workspaces simultaneously. During prefill, the scheduler borrows the larger prompt-processing workspace while KV retains a small nonzero ring. When ordinary TG1 decode begins, the prefill CUDA graph and scheduler workspace are released, and those bytes become additional resident/ring KV capacity.
+
+This phase multiplexing prevents context-specific compute reservations from permanently reducing the memory available to decode. As a result, the usable decode KV pool remains nearly constant across different `--ctx-size` settings. Inside that stable total budget, adaptive KV streaming still changes the resident/ring partition in real time according to active context length and measured prefetch behavior.
 
 Detailed project story, design, implementation, and benchmark results are in
 [Running Qwen 27B on 16G VRAM with Full Context Length: Building Adaptive KV Cache Streaming for llama.cpp](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9).
+
+## Performance
+
+The first comparison uses Qwen3.8 27B `UD-Q3_K_XL` with a Q8_0 K cache and Q4_0 V cache on an RTX 5070 Ti 16 GB. Adaptive KV streaming keeps explicit control of residency and transfer scheduling, while the phase arena preserves its decode KV budget as the configured context grows. The implementation continues through the model's 256K native context; the stock Unified Memory run was measured through 192K.
+
+![Qwen3.8 27B Q3 XL phase arena compared with stock Unified Memory](media/phase-arena-q3-vs-stock-uvm.png)
+
+The second comparison isolates the phase-arena implementation and shows how target-model quantization changes the available KV budget. `UD-Q3_K_XL` leaves more VRAM for resident KV and begins streaming later than the larger `UD-IQ4_XS` model. All three panels share the same context-capacity axis. The subtitle reports the decode KV pool: 3737 MiB for Q3 XL and 2681 MiB for IQ4 XS. PCIe utilization estimates effective decode KV H2D traffic against the measured 50 GB/s transfer ceiling, and diamonds mark the first decode-streaming point.
+
+![Qwen3.8 27B phase-arena Q3 XL and IQ4 XS comparison](media/phase-arena-q3-vs-iq4.png)
+
+Both phase-arena sweeps use 256-token batch and micro-batch sizes, a 256-token decode, Q8_0 K/Q4_0 V, one server slot, and no Unified Memory. The benchmark driver selected the largest validated arena for each configured context capacity.
 
 > [!WARNING]
 > This is research code optimized and production-validated primarily for an RTX 5070 Ti with 16 GB VRAM, `unsloth/Qwen3.8-27B-GGUF` `UD-Q3_K_XL`, a 262144-token context, Flash Attention, a Q8_0 K cache, a Q4_0 V cache, and one server slot.
@@ -37,7 +57,7 @@ Example using the tested cache configuration:
   --kv-stream-arena-mib 2304
 ```
 
-The arena value is the total shared allocation, not just KV capacity. It includes the phase's CUDA compute workspace. The best value depends on the model, context capacity, batch sizes, GPU, and other VRAM consumers. The benchmark driver below probes the maximum usable value automatically. `--kv-stream-stage-mib` remains a compatibility alias with the same total-arena semantics.
+The arena value is the fixed total shared allocation, not just KV capacity. Its bytes are reassigned between the active phase's CUDA compute workspace and the adaptive resident/ring KV pool. The best value depends on the model, batch sizes, GPU, and other VRAM consumers. Once selected, the same arena can preserve nearly the same decode KV capacity across different context settings. The benchmark driver below probes the maximum usable value automatically. `--kv-stream-stage-mib` remains a compatibility alias with the same total-arena semantics.
 
 llama.cpp's device-memory auto-fit dry run is bypassed when a nonzero arena is configured. The arena and supported single-GPU layer placement are already explicit, while the upstream no-allocation estimator cannot represent overlapping phase lifetimes. Real context initialization still measures both phase graphs and rejects an arena that cannot fit either layout.
 
