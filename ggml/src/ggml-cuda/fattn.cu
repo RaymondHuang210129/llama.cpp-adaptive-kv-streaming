@@ -1932,7 +1932,12 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
     }
 
-    const bool use_mma_prefill = !convert_to_f16 &&
+    // the MMA tile <256,256,8,8> trips the WMMA DKQ > 128 guard on RDNA3/4
+    // the MMA kernel reads f16 rows, so a DIRECT quantized cache must not take it
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const bool mma_prefill_ok = !(GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
+    const bool use_mma_prefill = mma_prefill_ok && !convert_to_f16 &&
+        K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
