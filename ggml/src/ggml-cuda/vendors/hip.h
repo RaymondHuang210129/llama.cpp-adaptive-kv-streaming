@@ -66,6 +66,17 @@
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
+
+// KV streaming: pinned host memory and timing events
+#define cudaHostAlloc hipHostAlloc
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostAllocWriteCombined hipHostMallocWriteCombined
+#define cudaHostGetFlags hipHostGetFlags
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaEventCreate hipEventCreate
+#define cudaEventQuery hipEventQuery
+#define cudaEventElapsedTime hipEventElapsedTime
+#define cudaErrorNotReady hipErrorNotReady
 #define cudaFree hipFree
 #define cudaFreeHost hipHostFree
 #define cudaGetDevice hipGetDevice
