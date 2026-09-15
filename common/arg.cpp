@@ -2422,7 +2422,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
         {"--kv-stream-arena-mib", "--kv-stream-stage-mib"}, "N",
-        string_format("shared CUDA arena for block-streaming KV and phase compute buffers in MiB; 0 disables it (default: %u)", params.kv_stream_arena_mib),
+        string_format("shared CUDA arena for block-streaming KV and phase compute buffers in MiB; 0 = no arena (default: %u); "
+                     "takes precedence over --kv-stream-arena-fit", params.kv_stream_arena_mib),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("KV stream arena size must be non-negative");
@@ -2430,6 +2431,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_stream_arena_mib = value;
         }
     ).set_env("LLAMA_ARG_KV_STREAM_ARENA_MIB"));
+    add_opt(common_arg(
+        {"--kv-stream-arena-fit"},
+        {},
+        "auto mode: size the KV stream arena from the free VRAM left after fitting the model, "
+        "using the --fit-target margin (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_stream_arena_fit = value;
+        }
+    ).set_env("LLAMA_ARG_KV_STREAM_ARENA_FIT"));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
