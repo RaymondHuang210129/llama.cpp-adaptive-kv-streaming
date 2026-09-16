@@ -1292,8 +1292,82 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    if (params.kv_stream_arena_fit && params.kv_stream_arena_mib > 0) {
+        COM_WRN("%s: --kv-stream-arena-fit is ignored, --kv-stream-arena-mib %u is set\n",
+                __func__, params.kv_stream_arena_mib);
+        params.kv_stream_arena_fit = false;
+    }
+    if (params.kv_stream_arena_fit && !params.speculative.types.empty()) {
+        COM_WRN("%s: --kv-stream-arena-fit is ignored, speculative decoding is not supported\n",
+                __func__);
+        params.kv_stream_arena_fit = false;
+    }
+    if (params.kv_stream_arena_fit) {
+        // decide before fitting: the arena is what keeps the requested model and context on the
+        // device, so fitting must not resolve a shortfall by moving layers to the CPU
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
+        const auto data = common_get_device_memory_data(
+                params.model.path.c_str(), &mparams, &cparams,
+                devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        size_t arena_dev = 0;
+        size_t n_model_devs = 0;
+        bool fits = true;
+        for (size_t i = 0; i < data.size(); ++i) {
+            if (data[i].model == 0) {
+                continue;
+            }
+            if (i + 1 < data.size()) { // the last entry is the host
+                ++n_model_devs;
+            }
+            if (data[i].model > data[arena_dev].model) {
+                arena_dev = i;
+            }
+            const size_t target = i < params.fit_params_target.size() ? params.fit_params_target[i] : 0;
+            if (uint64_t(data[i].model) + data[i].context + data[i].compute + target > uint64_t(data[i].free)) {
+                fits = false;
+            }
+        }
+        if (n_model_devs == 0) {
+            COM_WRN("%s: --kv-stream-arena-fit is ignored, no model layers are on a device\n", __func__);
+        } else if (n_model_devs > 1) {
+            COM_WRN("%s: --kv-stream-arena-fit is ignored, the model spans %zu devices, "
+                    "the arena is single-device\n",
+                    __func__, n_model_devs);
+        } else if (fits) {
+            COM_INF("%s: model + context fit in device memory, no KV stream arena\n", __func__);
+        } else {
+            const size_t target = arena_dev < params.fit_params_target.size() ? params.fit_params_target[arena_dev] : 0;
+            const uint64_t free_bytes = uint64_t(data[arena_dev].free);
+            // the arena also holds the phase compute slice, so reserve only the model and the margin
+            const uint64_t reserved = uint64_t(data[arena_dev].model) + target;
+            const uint64_t arena_bytes = free_bytes > reserved ? free_bytes - reserved : 0;
+            const uint64_t ctx_kv = data[arena_dev].context;
+            const uint64_t min_kv = ctx_kv/4; // below a quarter of the context the streaming traffic costs more than offloading layers
+            const uint64_t kv_capacity = arena_bytes > data[arena_dev].compute ?
+                arena_bytes - data[arena_dev].compute : 0;
+            if (arena_bytes == 0) {
+                COM_WRN("%s: --kv-stream-arena-fit is ignored, the model plus the --fit-target margin "
+                        "does not fit in free device memory\n", __func__);
+            } else if (kv_capacity < min_kv) {
+                COM_WRN("%s: --kv-stream-arena-fit is ignored, the arena would hold %zu MiB of the "
+                        "%zu MiB context KV, under a quarter\n",
+                        __func__, kv_capacity/(1024*1024), ctx_kv/(1024*1024));
+            } else {
+                params.kv_stream_arena_mib = arena_bytes/(1024*1024);
+                cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
+                COM_INF("%s: KV stream arena fit: %u MiB from %lld MiB free, %zu MiB model, "
+                        "%zu MiB margin\n",
+                        __func__, params.kv_stream_arena_mib,
+                        (long long)(data[arena_dev].free/(1024*1024)),
+                        data[arena_dev].model/(1024*1024), target/(1024*1024));
+            }
+        }
+    }
+
     if (params.fit_params && !common_params_should_fit_device_memory(params)) {
-        COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
+        COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is configured\n");
     }
     if (common_params_should_fit_device_memory(params)) {
         COM_TRC("%s", "fitting params to device memory ...\n");

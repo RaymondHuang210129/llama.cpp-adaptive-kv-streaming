@@ -3842,6 +3842,10 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (kv_stream_phase_arena.buffer_type != nullptr) {
+        // the phase arena pool is not a buffer, report its KV slice as context memory
+        ret[kv_stream_phase_arena.buffer_type].context += kv_stream_phase_arena.current_kv_bytes;
+    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
