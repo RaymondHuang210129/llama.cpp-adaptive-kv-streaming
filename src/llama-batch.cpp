@@ -28,10 +28,11 @@ bool llama_batch_allocr::init(
         const llama_memory_i * memory,
         uint32_t n_embd,
         uint32_t n_seq_max,
-        bool output_all) {
+        bool output_all, const float * embd_h) {
     clear();
 
     batch = batch_inp;
+    this->embd_h = embd_h;
 
     this->vocab = &vocab;
 
@@ -724,6 +725,7 @@ void llama_batch_allocr::clear() {
     n_outputs = 0;
 
     batch = {};
+    embd_h = nullptr;
 
     pos       .clear();
     n_seq_id  .clear();
@@ -758,6 +760,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     udata->token     .resize(n_tokens);
     udata->embd      .resize(n_embd_all);
+    if (embd_h) udata->embd_h.resize(size_t(n_tokens)*n_embd);
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
@@ -777,6 +780,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         if (batch.embd) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
+        if (embd_h) memcpy(udata->embd_h.data()+i*n_embd,embd_h+size_t(idxs[i])*n_embd,n_embd*sizeof(float));
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
             // if we are using M-RoPE
@@ -834,6 +838,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.data         =*/ std::move(udata),
     };
 
+    if (embd_h) res.embd_h = res.data->embd_h.data();
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
 

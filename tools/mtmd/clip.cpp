@@ -2,6 +2,7 @@
 #include "clip-impl.h"
 #include "clip-model.h"
 #include "clip-graph.h"
+#include "mtmd-projector-storage.h"
 #include "models/models.h"
 
 #include "ggml.h"
@@ -147,8 +148,11 @@ static void clip_image_convert_f32_to_u8(const clip_image_f32& src, clip_image_u
 struct clip_ctx {
     clip_model model;
 
-    gguf_context_ptr ctx_gguf;
-    ggml_context_ptr ctx_data;
+    std::shared_ptr<mtmd_projector_metadata> weight_metadata;
+    std::shared_ptr<mtmd_projector_weights> weights;
+    std::unique_ptr<mtmd_projector_residency> weight_residency;
+    bool weight_busy = false;
+    bool defer_weights = false;
 
     std::vector<uint8_t> buf_compute_meta;
 
@@ -157,11 +161,13 @@ struct clip_ctx {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
-    ggml_backend_buffer_ptr buf;
 
 
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
+    std::unique_ptr<mtmd_compute_workspace> workspace;
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
@@ -179,8 +185,11 @@ struct clip_ctx {
     uint32_t rng_seed = UINT32_MAX;
 
     clip_ctx(clip_context_params & ctx_params) {
+        cb_eval = ctx_params.cb_eval;
+        cb_eval_user_data = ctx_params.cb_eval_user_data;
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
+        defer_weights = ctx_params.defer_weights;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -230,6 +239,12 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
+        weight_busy = true;
+        weight_residency.reset();
+        workspace.reset();
+        sched.reset();
+        weights.reset();
+        weight_metadata.reset();
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -239,6 +254,41 @@ struct clip_ctx {
     // this function is added so that we don't change too much of the existing code
     projector_type proj_type() const {
         return model.proj_type;
+    }
+
+    mtmd_projector_residency_hooks weight_hooks() {
+        return {
+            [this] { ggml_backend_sched_synchronize(sched.get()); return true; },
+            [this] {
+                if (!workspace) {
+                    auto retired = std::make_unique<mtmd_compute_workspace>(sched.get(),backend_ptrs,size_t(max_nodes));
+                    if (!retired->supported()) return false;
+                    workspace = std::move(retired);
+                }
+                if (!workspace->release()) return false;
+                workspace.reset();
+                ggml_backend_sched_reset(sched.get());
+                is_allocated = false;
+                return true;
+            }};
+    }
+};
+
+// One host submission owns the projector until its graph/output work returns; retirement drains its pin.
+struct clip_weight_operation {
+    clip_ctx * ctx;
+    bool entered = false;
+    explicit clip_weight_operation(clip_ctx * ctx) : ctx(ctx) {
+        if (!ctx || ctx->weight_busy) return;
+        if (ctx->weight_residency) {
+            if (!ctx->weight_residency->begin(ctx->weight_residency->generation())) return;
+        } else if (!ctx->weights) return;
+        ctx->weight_busy = entered = true;
+    }
+    ~clip_weight_operation() {
+        if (!entered) return;
+        if (ctx->weight_residency) ctx->weight_residency->end();
+        ctx->weight_busy = false;
     }
 };
 
@@ -1124,6 +1174,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
 struct clip_model_loader {
     ggml_context_ptr ctx_meta;
     gguf_context_ptr ctx_gguf;
+    std::shared_ptr<const mtmd_projector_source> weight_source;
 
     std::string fname;
 
@@ -2021,11 +2072,8 @@ struct clip_model_loader {
     void load_tensors(clip_ctx & ctx_clip) {
         auto & model = ctx_clip.model;
         auto & hparams = model.hparams;
-        std::map<std::string, size_t> tensor_offset;
-        std::vector<ggml_tensor *> tensors_to_load;
-
-        auto fin = open_ifstream_binary(fname);
-        if (!fin) {
+        if (!weight_source) weight_source = mtmd_projector_source::open(fname.c_str(),ctx_gguf.get());
+        if (!weight_source) {
             throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
         }
 
@@ -2034,20 +2082,14 @@ struct clip_model_loader {
                              : model.modality == CLIP_MODALITY_GEN_AUDIO ? "a.gen.code"
                              : "v";
 
-        // get offsets
-        for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
-            const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
-            tensor_offset[name] = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), i);
-        }
-
         // create data context
         struct ggml_init_params params = {
             /*.mem_size =*/ static_cast<size_t>(gguf_get_n_tensors(ctx_gguf.get()) + 1) * ggml_tensor_overhead(),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc =*/ true,
         };
-        ctx_clip.ctx_data.reset(ggml_init(params));
-        if (!ctx_clip.ctx_data) {
+        ggml_context_ptr data_context(ggml_init(params));
+        if (!data_context) {
             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
         }
 
@@ -2063,8 +2105,7 @@ struct clip_model_loader {
                 throw std::runtime_error(string_format("%s: unable to find tensor %s\n", __func__, name.c_str()));
             }
             if (cur) {
-                tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                ggml_tensor * data_tensor = ggml_dup_tensor(data_context.get(), cur);
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
@@ -2101,8 +2142,8 @@ struct clip_model_loader {
 
         auto get_vector = [&](const std::string & name) {
             std::vector<float> result;
-            auto it = tensor_offset.find(name);
-            if (it == tensor_offset.end()) {
+            const auto * entry = weight_source->find(name.c_str());
+            if (!entry) {
                 return result;
             }
 
@@ -2123,8 +2164,9 @@ struct clip_model_loader {
 
             const size_t n_elems = n_bytes / sizeof(float);
             result.resize(n_elems);
-            fin.seekg(it->second, std::ios::beg);
-            fin.read(reinterpret_cast<char*>(result.data()), n_bytes);
+            if (!weight_source->read(name.c_str(),result.data(),n_bytes)) {
+                throw std::runtime_error(string_format("%s: failed to read tensor %s\n",__func__,name.c_str()));
+            }
             return result;
         };
 
@@ -2509,7 +2551,8 @@ struct clip_model_loader {
                     model.std_bias  = get_tensor(TN_STD_BIAS,  false);
                     model.std_scale = get_tensor(TN_STD_SCALE, false);
                     // load scalar for Gemma4ClippableLinear
-                    for (auto * tensor : tensors_to_load) {
+                    for (auto * tensor = ggml_get_first_tensor(data_context.get()); tensor;
+                            tensor = ggml_get_next_tensor(data_context.get(),tensor)) {
                         std::string name = tensor->name;
                         if (string_ends_with(name, ".weight")) {
                             std::string name_inp_max = name;
@@ -3193,7 +3236,8 @@ struct clip_model_loader {
                     }
 
                     // Load clamp info for ClippableLinear AFTER all tensors are loaded
-                    for (auto * tensor : tensors_to_load) {
+                    for (auto * tensor = ggml_get_first_tensor(data_context.get()); tensor;
+                            tensor = ggml_get_next_tensor(data_context.get(),tensor)) {
                         std::string name = tensor->name;
                         if (string_ends_with(name, ".weight")) {
                             std::string name_inp_max = name;
@@ -3465,62 +3509,25 @@ struct clip_model_loader {
                 GGML_ASSERT(false && "unknown projector type");
         }
 
-        // load data
-        {
-            std::vector<uint8_t> read_buf;
-
-            // start loading event
-            if (progress_callback){
-                progress_callback(0.0, progress_callback_user_data);
-            }
-
-            // compute total tensor data size for progress reporting
-            size_t total_data_size = 0;
-            for (auto & t : tensors_to_load) {
-                total_data_size += ggml_nbytes(t);
-            }
-
-            // alloc memory and offload data
-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            // read the weight from file
-            if (!ctx_clip.no_alloc) {
-                size_t data_loaded = 0;
-                for (auto & t : tensors_to_load) {
-                    ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
-                    GGML_ASSERT(cur && "tensor not found in ctx_data");
-                    auto it_off = tensor_offset.find(t->name);
-                    GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
-                    const size_t offset = it_off->second;
-                    fin.seekg(offset, std::ios::beg);
-                    if (!fin) {
-                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
-                    }
-                    size_t num_bytes = ggml_nbytes(cur);
-                    if (ggml_backend_buft_is_host(buft)) {
-                        // for the CPU and Metal backend, we can read directly into the tensor
-                        fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
-                    } else {
-                        // read into a temporary buffer first, then copy to device memory
-                        read_buf.resize(num_bytes);
-                        fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
-                        ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
-                    }
-                    data_loaded += num_bytes;
-                    if (progress_callback && total_data_size > 0) {
-                        const float progress = (float)data_loaded / (float)total_data_size;
-                        if (!progress_callback(progress, progress_callback_user_data)) {
-                            throw std::runtime_error(string_format("%s: model loading cancelled by progress_callback\n", __func__));
-                        }
-                    }
-                }
-                LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
-            } else {
-                LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
-            }
-            fin.close();
+        ctx_clip.weight_metadata = mtmd_projector_metadata::create(std::move(data_context),weight_source);
+        if (!ctx_clip.weight_metadata) {
+            throw std::runtime_error(string_format("%s: invalid projector tensor metadata\n",__func__));
         }
+        if (ctx_clip.defer_weights) {
+            auto verified = std::make_unique<mtmd_compute_workspace>(ctx_clip.sched.get(),ctx_clip.backend_ptrs,size_t(ctx_clip.max_nodes));
+            if (!verified->supported()) throw std::runtime_error("deferred projector storage needs verified native retirement");
+            ctx_clip.weight_residency = mtmd_projector_residency::create_unloaded(ctx_clip.weight_metadata,
+                ggml_backend_get_default_buffer_type(ctx_clip.backend),ctx_clip.weight_hooks());
+            if (!ctx_clip.weight_residency) throw std::runtime_error("failed to create deferred projector storage");
+            return;
+        }
+        ctx_clip.weights = mtmd_projector_weights::allocate(ctx_clip.weight_metadata,
+            ggml_backend_get_default_buffer_type(ctx_clip.backend),ctx_clip.no_alloc,progress_callback,progress_callback_user_data);
+        if (!ctx_clip.weights) {
+            throw std::runtime_error(string_format("%s: failed to allocate or load projector weights\n",__func__));
+        }
+        LOG_DBG("%s: %s %zu tensors from %s\n",__func__,ctx_clip.no_alloc ? "allocated without uploading" : "loaded",
+            loaded_tensor_names.size(),fname.c_str());
 
     }
 
@@ -3646,7 +3653,9 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
+            throw std::runtime_error("failed to reserve vision/audio compute workspace");
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
@@ -3855,7 +3864,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
-            if (ctx_params.warmup) {
+            if (ctx_params.warmup && !ctx_params.defer_weights) {
                 loader.warmup(*ctx_vision);
             }
 
@@ -3869,7 +3878,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
             loader.load_tensors(*ctx_audio);
             loader.init_ctx(*ctx_audio);
-            if (ctx_params.warmup) {
+            if (ctx_params.warmup && !ctx_params.defer_weights) {
                 loader.warmup(*ctx_audio);
             }
         }
@@ -3908,6 +3917,60 @@ void clip_free(clip_ctx * ctx) {
         return;
     }
     delete ctx;
+}
+
+// Retained bindings outlive the scheduler; shared owners also retain tensor descriptors and the file source.
+std::shared_ptr<const mtmd_projector_weights> clip_acquire_projector_weights(const clip_ctx * ctx) noexcept {
+    if (!ctx || ctx->weight_busy) return {};
+    return ctx->weight_residency ? ctx->weight_residency->acquire() : ctx->weights;
+}
+
+// Native cache support is verified before changing eager residency; unsupported backends keep that path.
+bool clip_unload_projector_weights(clip_ctx * ctx) noexcept {
+    if (!ctx || ctx->weight_busy || ctx->no_alloc) return false;
+    try {
+        if (!ctx->weight_residency && (!ctx->weights || ctx->weights.use_count() != 1)) return false;
+        struct gate {
+            clip_ctx & ctx;
+            explicit gate(clip_ctx & ctx) : ctx(ctx) { ctx.weight_busy = true; }
+            ~gate() { ctx.weight_busy = false; }
+        } closed(*ctx);
+        if (!ctx->weight_residency) {
+            if (!ctx->workspace) {
+                auto verified = std::make_unique<mtmd_compute_workspace>(ctx->sched.get(),ctx->backend_ptrs,size_t(ctx->max_nodes));
+                if (!verified->supported()) return false;
+                ctx->workspace = std::move(verified);
+            }
+            if (!ctx->workspace->supported()) return false;
+            auto owner = mtmd_projector_residency::create(ctx->weights,ggml_backend_get_default_buffer_type(ctx->backend),ctx->weight_hooks());
+            if (!owner) return false;
+            ctx->weight_residency = std::move(owner);
+            ctx->weights.reset();
+        }
+        return ctx->weight_residency->unload();
+    } catch (...) { return false; }
+}
+
+// Reload is explicit and leaves failed candidates unbound; graph addresses are rebuilt on the next encode.
+bool clip_reload_projector_weights(clip_ctx * ctx,mtmd_progress_callback progress,void * user_data) noexcept {
+    if (!ctx || ctx->weight_busy || ctx->no_alloc) return false;
+    if (!ctx->weight_residency) return bool(ctx->weights);
+    struct gate {
+        clip_ctx & ctx;
+        explicit gate(clip_ctx & ctx) : ctx(ctx) { ctx.weight_busy = true; }
+        ~gate() { ctx.weight_busy = false; }
+    } closed(*ctx);
+    return ctx->weight_residency->reload(progress,user_data);
+}
+
+bool clip_reload_projector_weights_in(clip_ctx * ctx,ggml_backend_memory_lease_t lease,mtmd_progress_callback progress,void * user_data) noexcept {
+    if (!ctx || ctx->weight_busy || ctx->no_alloc || !ctx->weight_residency) return false;
+    struct gate {
+        clip_ctx & ctx;
+        explicit gate(clip_ctx & ctx) : ctx(ctx) { ctx.weight_busy = true; }
+        ~gate() { ctx.weight_busy = false; }
+    } closed(*ctx);
+    return ctx->weight_residency->reload_in(lease,progress,user_data);
 }
 
 const char * clip_patch_merge_type(const struct clip_ctx * ctx) {
@@ -4275,6 +4338,119 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     return clip_encode(ctx, &params);
 }
 
+// Measure the current image shape after retiring all addresses from the previous graph.
+static bool clip_measure_compute_workspace_impl(clip_ctx * ctx,const clip_image_f32_batch & batch,
+        std::vector<ggml_backend_memory_workspace_group> & output,
+        ggml_backend_buffer_type_t compute_type) {
+    if (!ctx || batch.entries.empty() || (!ctx->support_batch &&
+            batch.entries.size() > size_t(clip_model_n_temporal_merge(ctx)))) return false;
+    if (compute_type && compute_type != ctx->backend_buft.front()) {
+        if (!ggml_backend_supports_buft(ctx->backend,compute_type)) return false;
+        auto types=ctx->backend_buft;
+        types.front()=compute_type;
+        ggml_backend_sched_ptr next(ggml_backend_sched_new(ctx->backend_ptrs.data(),types.data(),
+            int(types.size()),size_t(ctx->max_nodes),false,true));
+        if (!next) return false;
+        auto owner=std::make_unique<mtmd_compute_workspace>(next.get(),ctx->backend_ptrs,size_t(ctx->max_nodes));
+        if (!owner->supported()) return false;
+        if (ctx->workspace && !ctx->workspace->release()) return false;
+        ggml_backend_sched_synchronize(ctx->sched.get());
+        if (!owner->retire_graph()) return false;
+        ctx->workspace.reset();
+        ctx->sched=std::move(next);
+        ctx->backend_buft=std::move(types);
+        ggml_backend_sched_set_eval_callback(ctx->sched.get(),ctx->cb_eval,ctx->cb_eval_user_data);
+        ctx->workspace=std::move(owner);
+    }
+    if (!ctx->workspace) {
+        auto owner=std::make_unique<mtmd_compute_workspace>(ctx->sched.get(),ctx->backend_ptrs,size_t(ctx->max_nodes));
+        if (!owner->supported()) return false;
+        ctx->workspace=std::move(owner);
+    }
+    if (!ctx->workspace->release()) return false;
+    if (ctx->flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
+        ctx->flash_attn_type=CLIP_FLASH_ATTN_TYPE_ENABLED;
+        auto * probe=clip_get_graph_builder(ctx,batch)->build();
+        for (int i=0;i<ggml_graph_n_nodes(probe);++i) {
+            auto * node=ggml_graph_node(probe,i);
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && !ggml_backend_supports_op(ctx->backend,node)) {
+                ctx->flash_attn_type=CLIP_FLASH_ATTN_TYPE_DISABLED;
+                break;
+            }
+        }
+    }
+    auto * graph=clip_get_graph_builder(ctx,batch)->build();
+    return ctx->workspace->measure(graph,output);
+}
+
+bool clip_measure_compute_workspace(clip_ctx * ctx,const clip_image_f32_batch & batch,
+        std::vector<ggml_backend_memory_workspace_group> & output,ggml_backend_buffer_type_t compute_type) {
+    clip_weight_operation weights(ctx);
+    return weights.entered && clip_measure_compute_workspace_impl(ctx,batch,output,compute_type);
+}
+
+// Describe resident leaves for graph-size planning only; no weight upload or backend tensor initialization occurs.
+bool clip_measure_vision_phase(clip_ctx * ctx,const clip_image_f32_batch & batch,ggml_backend_buffer_t parent,
+        size_t & weight_bytes,std::vector<ggml_backend_memory_workspace_group> & groups) {
+    if (!ctx || !parent || ctx->weight_busy || !ctx->weight_metadata || ctx->weights ||
+            !ctx->weight_residency || ctx->weight_residency->ready()) return false;
+    struct description {
+        clip_ctx & ctx;
+        ggml_backend_buffer_ptr view;
+        std::vector<std::pair<ggml_tensor *,ggml_tensor>> saved;
+        explicit description(clip_ctx & ctx) : ctx(ctx) { ctx.weight_busy = true; }
+        ~description() { for (const auto & entry : saved) *entry.first = entry.second; ctx.weight_busy = false; }
+    } scoped(*ctx);
+    auto * type = ggml_backend_buffer_get_type(parent);
+    const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx->weight_metadata->context(),type);
+    if (!bytes || bytes > ggml_backend_buffer_get_size(parent)) return false;
+    scoped.view.reset(ggml_backend_buffer_view(parent,0,bytes));
+    if (!scoped.view) return false;
+    ggml_backend_buffer_set_usage(scoped.view.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const auto base = uintptr_t(ggml_backend_buffer_get_base(scoped.view.get()));
+    const size_t alignment = ggml_backend_buft_get_alignment(type);
+    if (!base || !alignment) return false;
+    size_t cursor = 0;
+    for (auto * tensor = ggml_get_first_tensor(ctx->weight_metadata->context()); tensor;
+            tensor = ggml_get_next_tensor(ctx->weight_metadata->context(),tensor)) {
+        if (tensor->data || tensor->buffer || tensor->extra) return false;
+        const size_t padding = (alignment-(base+cursor)%alignment)%alignment;
+        const size_t needed = ggml_backend_buft_get_alloc_size(type,tensor);
+        if (padding > bytes-cursor || needed > bytes-cursor-padding) return false;
+        cursor += padding;
+        scoped.saved.emplace_back(tensor,*tensor);
+        tensor->buffer = scoped.view.get(); tensor->data = reinterpret_cast<void *>(base+cursor);
+        cursor += needed;
+    }
+    std::vector<ggml_backend_memory_workspace_group> measured;
+    if (!clip_measure_compute_workspace_impl(ctx,batch,measured,type)) return false;
+    groups = std::move(measured); weight_bytes = bytes;
+    return true;
+}
+
+// Validate grants before attachment; encoding after measurement requires a successful binding.
+bool clip_attach_compute_workspace(clip_ctx * ctx,const std::vector<ggml_backend_memory_lease_t> & leases) {
+    clip_weight_operation weights(ctx);
+    return weights.entered && ctx->workspace && ctx->workspace->attach(leases);
+}
+
+bool clip_borrow_compute_workspace(clip_ctx * ctx,llama_context_memory & parent) {
+    clip_weight_operation weights(ctx);
+    return weights.entered && ctx->workspace && ctx->workspace->borrow(parent);
+}
+
+// Retain model metadata and host embeddings while returning the borrowed compute storage.
+bool clip_release_compute_workspace(clip_ctx * ctx) {
+    if (!ctx || ctx->weight_busy) return false;
+    if (!ctx->workspace) return true;
+    struct gate {
+        clip_ctx & ctx;
+        explicit gate(clip_ctx & ctx) : ctx(ctx) { ctx.weight_busy = true; }
+        ~gate() { ctx.weight_busy = false; }
+    } closed(*ctx);
+    return ctx->workspace->release();
+}
+
 // persisted state slots of the gen-audio decoder, per pipeline
 static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hparams, const clip_model & model) {
     switch (model.proj_type) {
@@ -4285,6 +4461,9 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
 }
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    if (!ctx || !params || !params->imgs || params->imgs->entries.empty()) return false;
+    clip_weight_operation weights(ctx);
+    if (!weights.entered) return false;
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -4295,7 +4474,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
-    if (!ctx->is_allocated) {
+    if (ctx->workspace && (!ctx->workspace->ready() || !ctx->workspace->retire_graph())) {
+        LOG_ERR("%s: borrowed vision workspace is not ready\n",__func__);
+        return false;
+    }
+    if (!ctx->is_allocated && !ctx->workspace) {
         clip_model_loader::warmup(*ctx, *params->imgs);
     }
 
@@ -4307,7 +4490,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!(ctx->workspace ? ctx->workspace->alloc_graph(gf) : ggml_backend_sched_alloc_graph(ctx->sched.get(),gf))) {
+        LOG_ERR("%s: failed to allocate vision/audio graph within its workspace\n",__func__);
+        return false;
+    }
 
     // set inputs
     const auto & model   = ctx->model;
@@ -5554,7 +5740,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
 
-    auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    auto status = ctx->workspace ? ctx->workspace->compute_async(gf) : ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    if (status == GGML_STATUS_SUCCESS && ctx->workspace && !ctx->workspace->drain()) status=GGML_STATUS_FAILED;
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;

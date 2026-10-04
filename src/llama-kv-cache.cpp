@@ -6,6 +6,7 @@
 #include "llama-context.h"
 #include "llama-kv-stream-logical-cache.h"
 #include "llama-kv-stream-model.h"
+#include "llama-kv-stream-positions.h"
 #include "llama-kv-stream-mtp-proxy.h"
 #include "../ggml/src/ggml-kv-stream-device.h"
 
@@ -470,16 +471,33 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
-bool llama_kv_cache::kv_stream_can_remove(llama_seq_id seq_id,llama_pos p0,llama_pos p1) const {
+bool llama_kv_cache::kv_stream_can_remove(llama_seq_id seq_id,llama_pos p0,llama_pos p1,size_t * retained) const {
     if (!kv_stream) return true;
     if (seq_id != 0 && seq_id != -1) return false;
-    p0 = std::max(llama_pos(0),p0);
-    if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
-    return p1 <= p0 || p0 >= int64_t(kv_stream->tokens()) || p1 >= int64_t(kv_stream->tokens());
+    size_t keep;
+    if (!llama_kv_stream_suffix(v_cells[0], kv_stream->tokens(), p0, p1, keep)) return false;
+    if (retained) *retained = keep;
+    return true;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (!kv_stream_can_remove(seq_id,p0,p1)) return false;
+    if (kv_stream) {
+        if (p1 >= 0 && p1 <= std::max(llama_pos(0), p0)) return true;
+        size_t keep;
+        if (!kv_stream_can_remove(seq_id,p0,p1,&keep)) return false;
+        auto & cells = v_cells[0];
+        const bool full = p0 <= 0 && (p1 < 0 || p1 > cells.seq_pos_max(0));
+        if (keep == kv_stream->tokens() && !full) return true;
+        if (!(keep ? kv_stream->truncate(keep) : kv_stream->reset(false))) return false;
+        if (!keep) cells.reset();
+        else {
+            const uint32_t end = cells.used_max_p1();
+            for (uint32_t i = uint32_t(keep); i < end; ++i) if (!cells.is_empty(i)) cells.rm(i);
+        }
+        v_heads[0] = uint32_t(keep);
+        return true;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -496,16 +514,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
     if (mtp_proxy && p1 > p0) {
         if (seq_id != 0 && seq_id != -1) return false;
-        if (!mtp_proxy->remove_suffix(size_t(p0), size_t(p1))) return false;
-    }
-
-    if (kv_stream) {
-        if (seq_id != 0 && seq_id != -1) return false;
-        if (p0 == 0 && p1 >= int64_t(kv_stream->tokens())) {
-            if (!kv_stream->reset(false)) return false;
-        } else if (p0 < int64_t(kv_stream->tokens()) && p1 > p0) {
-            if (p1 < int64_t(kv_stream->tokens()) || !kv_stream->truncate(size_t(p0))) return false;
-        }
+        size_t retained;
+        if (!llama_kv_stream_suffix(v_cells[0],attached_mtp_cache->tokens(),p0,p1,retained) ||
+                !mtp_proxy->remove_suffix(retained,std::numeric_limits<size_t>::max())) return false;
     }
 
     if (seq_id >= 0) {
@@ -2241,10 +2252,9 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
                 io.flush_tensor_reads();
                 const auto & cells = v_cells[strm];
                 res = strm == 0 && sinfo.is_contiguous() && sinfo.head() == 0 && cell_count <= kv_stream->host()->config().context_tokens;
-                for (uint32_t i = 0; res && i < cell_count; ++i) {
-                    res = cells.pos_get(sinfo.idxs[0][i]) == llama_pos(i) && cells.seq_has(sinfo.idxs[0][i],0);
-                }
+                res = res && llama_kv_stream_validate_cells(cells, cell_count, false);
                 res = res && kv_stream->restore(cell_count);
+                if (res) v_heads[strm] = cell_count;
             }
             if (res && mtp_proxy) {
                 io.flush_tensor_reads();
@@ -2262,7 +2272,8 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
                     key->nb[1] == layout.k_token_bytes &&
                     value->nb[1] == layout.v_token_bytes;
                 for (uint32_t i = 0; res && i < cell_count; ++i)
-                    res = cells.pos_get(sinfo.idxs[0][i]) == llama_pos(i) &&
+                    res = cells.pos_get(sinfo.idxs[0][i]) >= 0 &&
+                        (i == 0 || cells.pos_get(sinfo.idxs[0][i]) >= cells.pos_get(sinfo.idxs[0][i-1])) &&
                         cells.seq_has(sinfo.idxs[0][i], 0);
                 if (res) res = mtp_proxy->remove_suffix(0, std::numeric_limits<size_t>::max());
                 const auto gather = [&](ggml_tensor * source, size_t stride,
@@ -2455,6 +2466,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
+    if (kv_stream && cell_count > cells.size()) return false;
 
     if (dest_seq_id != -1) {
         // single sequence
@@ -2473,7 +2485,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
 
-            if (n_seq_id != 1) {
+            if (n_seq_id != 1 || (kv_stream && pos < 0)) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
                 return false;
             }
@@ -2503,8 +2515,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
-        //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+        // Restore spatial metadata through the same path as live M-RoPE input.
         apply_ubatch(sinfo, ubatch);
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
@@ -2534,6 +2545,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
 
+            if (kv_stream && (pos < 0 || n_seq_id != 1)) return false;
             cells.pos_set(i, pos);
 
             if (hparams.n_pos_per_embd() > 1) {
@@ -2823,7 +2835,7 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 bool llama_kv_cache_context::kv_stream_begin(const llama_ubatch & ubatch, bool decode) const {
     auto * stream = kv->get_kv_stream();
     if (!stream || i_cur >= sinfos.size() || !ubatch.n_tokens || ubatch.n_seqs_unq != 1 ||
-            !ubatch.seq_id_unq || ubatch.seq_id_unq[0] != 0 || !ubatch.pos || ubatch.embd) {
+            !ubatch.seq_id_unq || ubatch.seq_id_unq[0] != 0 || !ubatch.pos) {
         LLAMA_LOG_WARN("%s: invalid batch: stream=%d slot=%zu/%zu tokens=%u seqs=%u embd=%d\n",
             __func__, int(stream != nullptr), i_cur, sinfos.size(), ubatch.n_tokens,
             ubatch.n_seqs_unq, int(ubatch.embd != nullptr));
@@ -2838,11 +2850,10 @@ bool llama_kv_cache_context::kv_stream_begin(const llama_ubatch & ubatch, bool d
             info.size(), ubatch.n_tokens, int(info.is_contiguous()), info.s0, info.s1, info.strm.size());
         return false;
     }
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) if (ubatch.pos[i] != int64_t(stream->tokens()+i)) {
-        LLAMA_LOG_WARN("%s: position mismatch: row=%u pos=%lld expected=%zu\n",
-            __func__, i, (long long) ubatch.pos[i], stream->tokens()+i);
-        return false;
-    }
+    const llama_batch batch{int32_t(ubatch.n_tokens),ubatch.token,ubatch.embd,ubatch.pos,
+        ubatch.n_seq_id,ubatch.seq_id,ubatch.output};
+    if (!llama_kv_stream_validate_append(batch, {stream->tokens(), size_t(kv->get_size()), kv->seq_pos_max(0),
+            ubatch.n_pos, decode, false})) return false;
     const bool accepted = stream->begin(stream->tokens()+ubatch.n_tokens,ubatch.n_tokens,decode);
     if (!accepted) LLAMA_LOG_WARN("%s: session begin rejected: tokens=%zu rows=%u decode=%d revision=%llu\n",
         __func__, stream->tokens(), ubatch.n_tokens, int(decode), (unsigned long long) stream->binding_view().revision);
@@ -2857,9 +2868,11 @@ bool llama_kv_cache_context::mtp_span_append(const llama_ubatch & ubatch) const 
     if (info.empty() || !info.is_contiguous() || info.s0 != 0 || info.s1 != 0 ||
             info.strm.size() != 1 || info.strm[0] != 0 ||
             info.head() != cache->tokens() || info.size() != ubatch.n_tokens) return false;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i)
-        if (ubatch.pos[i] != llama_pos(cache->tokens() + i)) return false;
-    return true;
+    const llama_batch batch{int32_t(ubatch.n_tokens),ubatch.token,ubatch.token ? nullptr : ubatch.embd,
+        ubatch.pos,ubatch.n_seq_id,ubatch.seq_id,ubatch.output};
+    const auto previous = cache->tokens() ? kv->get_cells(0).pos_get(uint32_t(cache->tokens()-1)) : -1;
+    return llama_kv_stream_validate_append(batch,{cache->tokens(),kv->get_size(),previous,ubatch.n_pos,
+        ubatch.token != nullptr,false});
 }
 
 

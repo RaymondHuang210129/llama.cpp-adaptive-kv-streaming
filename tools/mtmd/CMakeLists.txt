@@ -16,6 +16,14 @@ add_library(mtmd
             mtmd.cpp
             mtmd-audio.cpp
             mtmd-image.cpp
+            mtmd-embeddings.cpp
+            mtmd-embeddings.h
+            mtmd-session.cpp
+            mtmd-session.h
+            mtmd-workspace.cpp
+            mtmd-workspace.h
+            mtmd-projector-storage.cpp
+            mtmd-projector-storage.h
             mtmd.h
             mtmd-helper.cpp
             mtmd-helper-gen.cpp

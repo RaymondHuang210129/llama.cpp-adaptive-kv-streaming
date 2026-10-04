@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "mtmd.h"
+#include "mtmd-workspace.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -57,6 +58,7 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    bool defer_weights = false;
 };
 
 struct clip_init_result {
@@ -85,6 +87,15 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx);
 // TODO: remove clip_image_encode() and always use batched version
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);
+
+bool clip_measure_compute_workspace(clip_ctx * ctx,const clip_image_f32_batch & batch,
+    std::vector<ggml_backend_memory_workspace_group> & output,
+    ggml_backend_buffer_type_t compute_type);
+bool clip_attach_compute_workspace(clip_ctx * ctx,const std::vector<ggml_backend_memory_lease_t> & leases);
+bool clip_release_compute_workspace(clip_ctx * ctx);
+bool clip_borrow_compute_workspace(clip_ctx * ctx, llama_context_memory & parent);
+bool clip_measure_vision_phase(clip_ctx * ctx,const clip_image_f32_batch & batch,ggml_backend_buffer_t parent,
+    size_t & weight_bytes,std::vector<ggml_backend_memory_workspace_group> & groups);
 
 enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,

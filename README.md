@@ -3,7 +3,7 @@
 V2 runs full-context Qwen3.8-27B on a bounded GPU KV working set. The complete KV history stays in pinned system RAM; resident GPU pages and one shared ring supply attention without dropping old tokens. V1 (`feature/kv-stream-phase-arena`) already had streaming, cross-layer prefetch, and a CUDA phase arena. V2 rebuilds those ideas on explicit memory ownership, stays closer to stock attention arithmetic, and adds long-context MTP without a second full GPU KV allocation.
 
 > [!WARNING]
-> This is experimental. The end-to-end path is currently qualified for one serial Qwen3.8-27B-style target with its embedded MTP head on one CUDA GPU, Flash Attention, Q8_0 K / Q4_0 V, and no mmproj. The memory APIs support more backends, but their streamed-attention execution paths are not implemented here.
+> This is experimental. The end-to-end path is qualified for one serial Qwen3.8-27B-style target on one CUDA GPU, Flash Attention and Q8_0 K / Q4_0 V. Text-only execution supports the embedded MTP head; image requests support a matching M-RoPE projector with speculation disabled. Vision plus MTP, audio/video arena execution and other accelerator streaming paths remain unqualified.
 
 ## Results and quick start
 
@@ -49,6 +49,37 @@ python3 benchmarks/run-fixed-span-sweep.py \
 ```
 
 The script writes CSV, JSONL, logs, and a plot when Matplotlib is installed. `--auto-max-arena` instead probes the maximum for each context **and MTP mode**; those variable-budget results are not directly comparable to this fixed-budget figure.
+
+## Image requests, with optional MTP
+
+The server can now share its arena with the matching Qwen3.8 F16 vision projector. Projector weights start unloaded. For an image batch, authoritative host KV is retained while device mirrors are suspended. The projector and its compute workspace borrow separate arena regions, and host embeddings are retained. The projector then unloads and text regains the arena before image-embedding prefill and generation. Compatible media batching and prompt-prefix caching keep their existing server behavior.
+
+```sh
+./build-v2/bin/llama-server \
+  --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --mmproj /path/to/mmproj-Qwen3.8-27B-F16.gguf \
+  --ctx-size 262144 --parallel 1 \
+  --batch-size 256 --ubatch-size 256 --n-gpu-layers 999 \
+  --flash-attn on --cache-type-k q8_0 --cache-type-v q4_0 \
+  --shared-device-memory-mib 2240 --spec-type none --fit off
+```
+
+This requires a shared arena, not the legacy fixed KV-pool flag. To enable the single embedded Qwen MTP head, replace `--spec-type none` with:
+
+```sh
+--spec-type draft-mtp --spec-draft-n-max 3 \
+--spec-draft-type-k q8_0 --spec-draft-type-v q4_0
+```
+
+Draft lengths 1-3 are qualified. MTP consumes the raw image embeddings and shifted target hidden rows as separate inputs; its cache tracks physical rows independently of image M-RoPE positions. Vision suspends both text schedulers and retires the MTP ring lease before borrowing the parent. Pending hidden rows also survive checkpoint and RAM prompt-cache restoration.
+
+Parallel slots, separate draft models, other speculation modes, CPU projector offload, LoRA, embeddings and unqualified KV pairs are rejected. The draft must fit the target's borrowable scratch; a separate-workspace fallback is not admitted for vision. A batch that exceeds the arena returns an error; reduce image size/token limits or choose a suitable arena. The example budget was tested on the RTX 5070 Ti, not guaranteed for other models/cards. Target/MTP weights, persistent recurrent state and CUDA housekeeping remain outside the arena.
+
+An offline [server qualification harness](tools/server/tests/test_adaptive_vision.py) compares the ordinary eager server with the arena server using deterministic local PNGs. It checks token IDs, cached/changed/follow-up and multiple images, RAM prompt-cache restoration, socket cancellation, oversized-batch recovery and optional rejected startup configurations. See [test instructions](tools/server/tests/README.md#adaptive-kv-vision-qualification). It does not stop production containers or download models.
+
+Repeated no-MTP image requests at native context capacity with a 2,240 MiB parent were also memory-qualified at 64/64 and 256/256: sampled device usage settled at 15,466 MiB on the 16,303 MiB RTX 5070 Ti, with every vision grant returned before text resumed. These used 6K-token backgrounds, not full-262K histories. See the [memory/latency measurement companion](tools/server/tests/README.md#vision-memory-and-handoff-measurements) for reproduction and the distinction between projector reload, text restoration and lazy KV refill. Sampling does not guarantee an instantaneous peak bound; image dimensions and batch limits still matter.
+
+With MTP=3, native context capacity, 256/256 batches and the same parent budget, repeated short image requests settled at 15,836 MiB. A separate 39K-token streaming test matched the eager control's 128 generated token IDs across image/cache scenarios. These are bounded qualification cases, not a guarantee of identical output for every prompt or an instantaneous memory-peak bound.
 
 ## KV data movement and attention
 
@@ -270,7 +301,7 @@ bool adopt_truncated_prefix(llama_kv_stream_complete_layer_lease_t previous,
 
 Memory views exist for CPU, CUDA/HIP, OpenCL, SYCL, and Vulkan, but the current pinned-host registration and complete streamed-attention adapter are CUDA-specific. A backend port must advertise only real K/V pair support, preserve its own stock attention order, and pass view/lease, cancellation, graph-lifetime, numerical, and long-context tests. The [CUDA copy](ggml/src/ggml-cuda/kv-stream-copy.cu) and [attention](ggml/src/ggml-cuda/fattn.cu) code are examples, not portable kernels. The broader [consumer roadmap](DEVICE_MEMORY_CONSUMERS_ROADMAP.md) explains how phase grants and these hooks fit together.
 
-Current limits: one serial target/MTP pair on one CUDA GPU; Qwen3.8-style 256-token page geometry; Flash Attention and KV offload enabled; no parallel slots, multi-GPU split, mmproj, or automatic VRAM-pressure eviction. The example's Q8_0/Q4_0 and 256/256 settings are qualified; general layout code handling more types is not a promise that every model or quant combination is ready.
+Current limits: one serial target/MTP pair on one CUDA GPU; Qwen3.8-style 256-token page geometry; Flash Attention and KV offload enabled; no parallel slots, multi-GPU split or automatic VRAM-pressure eviction. The matching F16 image projector is qualified only through the shared-arena path above. The example's Q8_0/Q4_0 and 256/256 settings are qualified; general layout code handling more types is not a promise that every model or quant combination is ready.
 
 ---
 

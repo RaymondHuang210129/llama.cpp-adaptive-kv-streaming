@@ -54,6 +54,7 @@ struct llama_ubatch {
     struct data_t {
         std::vector<llama_token>    token;
         std::vector<float>          embd;
+        std::vector<float>          embd_h;
         std::vector<llama_pos>      pos;
         std::vector<int32_t>        n_seq_id;
         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
@@ -66,6 +67,8 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+    // Optional separate previous hidden rows for MTP visual inputs; owned by data when split.
+    const float * embd_h = nullptr;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
@@ -81,7 +84,7 @@ public:
             const llama_memory_i * memory,
             uint32_t n_embd,
             uint32_t n_seq_max,
-            bool output_all);
+            bool output_all, const float * embd_h = nullptr);
 
     const llama_batch & get_batch() const;
 
@@ -125,6 +128,7 @@ private:
     void ubatch_print(const llama_ubatch & ubatch, int debug);
 
     llama_batch batch;
+    const float * embd_h = nullptr;
 
     // only for debugging purposes
     const llama_vocab * vocab;

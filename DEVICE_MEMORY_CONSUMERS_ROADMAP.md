@@ -432,7 +432,21 @@ Record substage completion here only after the required validation succeeds. Exp
 | 6.5a | Ready for review (combined) | - | Exact shared-device parent API/CLI, phase-arena compatibility alias, legacy fixed-pool preservation, and order-independent conflict rejection. |
 | 6.5b | Ready for review (combined) | - | Exact minimum KV bootstrap, all-phase startup validation, next-granule rejection, and phase-safe maximum-budget execution probing. |
 | 6.5c | Ready for review (combined) | - | Parseable grant/transition/residency/copy diagnostics plus full-model numerical, memory, and representative phase-arena performance qualification. |
-| 7.1a-7.5c | Planned | - | See substage dependencies and milestone acceptance gate; no vision integration stage is complete. |
+| 7.1a | Committed | dfed912b5 | Actual-batch mtmd workspace measurement, bounded borrowed execution, native-capture retirement and lease release. Its numerical fixture is corrected and requalified in 7.1b. |
+| 7.1b | Committed | 09f566915 | Retained host embedding views, checked token slices, atomic result publication, cancellation cleanup and compatible/incompatible batch controls. CPU ownership and real CUDA lifetime/equivalence tests pass. |
+| 7.2a | Committed | 9295ce06c | Backend-neutral ordered text/image session plan and ordinary mtmd baseline adapter. Initial/follow-up IQ4_XS logits and 16 continuation tokens match the legacy helper; failed images stop later prefill. |
+| 7.2b prerequisite | Committed | a9c1f74cb | Pre-existing short-prefill dispatch bug isolated and fixed at the 7.2a checkpoint before restoring the ongoing embedding/position work. |
+| 7.2b | Committed | 02d9f199c | Adaptive embedding admission separates dense physical KV rows from repeated/gapped M-RoPE positions; resident/ring image controls, checkpoint/suffix handling and numerical/memory regressions pass. |
+| 7.2c | Committed | f47e08d3b | Multiple serial scheduler children, exclusive submission/reentry gates, bounded vision borrowing, and capture/copy retirement; CPU/CUDA three-consumer and live shared-image controls pass. |
+| 7.3a | Committed | 74fc83338 | Zero-grant KV/graph suspension preserves the session, host frontiers and recurrent state while rejecting paused execution; resident/ring and auxiliary-cache qualifications pass. |
+| 7.3b | Committed | 2b3432c74 | Fresh phase grants, reconstructed mirrors, gated graph reservation and unchanged host/recurrent state; resumed prefill/decode comparisons, warm-capture retirement and memory checks pass. |
+| 7.3c | Committed | cace79b9b | Full-parent suspended-KV vision borrowing, exclusive restoration admission, interruption/retry and terminal recovery; real image equivalence and CPU/CUDA memory checks pass. |
+| 7.4a | Committed | 0092cef1e | Separate file source, stable tensor metadata and shared eager weight bindings; original CPU/CUDA embedding equivalence, shared-owner teardown and memory checks pass. |
+| 7.4b | Committed | d2d996604 | Explicit pinned weight unload/reload, native retirement, generation-safe rebinding and retry; CPU/CUDA equivalence, borrowed-workspace return and memory checks pass. |
+| 7.4c | Committed | `b6b9b38e0` | Deferred projector startup, bounded weight/compute loans, phase cleanup/recovery and outside-budget accounting; combined image/text and lifetime qualifications pass. |
+| 7.5a | Committed | `1c7d40879` | Serial no-MTP server admission, deferred projector startup, bounded image encoding, media/prompt-cache reuse and request cleanup qualified. |
+| 7.5b | Committed | `b17fabc1a` | Repeated image-request memory sampling, phase/reload diagnostics, variable workspace accounting and no-MTP documentation qualified. |
+| 7.5c | Complete, pending user commit | - | Image-aware embedded MTP, physical/M-RoPE cache addressing, native short-prefill allocation contract, serial suspension and full M7 acceptance qualified on CUDA. |
 | 8.1a-8.5 | Planned | - | Real adapter 8.2b conditional; otherwise explicitly deferred. |
 
 ## Substage 4.1a implementation and validation
@@ -3561,3 +3575,577 @@ Matched Release IQ4_XS measurement used context 139,264, prompt 138,752, 512 dec
 Relative to the stage-6.5 baseline at 23.734 tok/s, stages 6.6 and 6.7a together improve this point by **2.90%**. Benchmark artifacts are under `/tmp/cross-token-current-139k` and `/tmp/sparse-feedback-current-139k`. Sparse feedback targets optional marker overhead only; the remaining intra-token exposed H2D time belongs to the forthcoming per-layer deadline-aware residency/lookahead work.
 
 Task files and this roadmap are staged for user review. Unrelated README, infrastructure documentation, and benchmark-tree changes remain untouched. No assistant commit or push was made.
+
+### Stage 7.1a: borrowed vision compute workspace
+
+Committed as `dfed912b5` on `feature/mmproj-v2` after rebasing onto V2 `e5a7b37d9`. This is the vision consumer seam, not a production multimodal streaming configuration. The server's streaming/mmproj rejection remains in place until the later integration stages.
+
+The private `mtmd-workspace.h` interface measures the actual preprocessed media batch, attaches one committed lease per canonical buffer-type group, executes inside those bounds, and drains and retires native graph captures before returning storage. It reuses `llama_memory_workspace` and `llama_memory_executor`, rather than adding another allocator or ownership model. The scheduler and backends outlive the consumer. Image embeddings retain their existing host-vector ownership; projector weights remain eagerly loaded outside the workspace.
+
+Measurement uses a detached size-only scheduler. It saves and restores tensor metadata and graph node lists because scheduler splitting can replace cross-backend inputs and backend optimization can rewrite nodes. Without restoration, the execution graph can differ from the measured graph. A too-small grant is rejected without a hidden scheduler-owned allocation; a larger subsequent batch fails cleanly and the original smaller batch can run again. New measurement explicitly retires the previous grants. The caller can request a compatible primary compute buffer type, allowing CUDA vision to borrow the text arena's physical `CUDA0_Device` storage even when the projector weights use UVM. Scheduler reconstruction preserves the evaluation callback.
+
+Two prerequisite infrastructure edge cases are included with regression tests: a failed second attachment now clears the already-attached first lease, and an exactly exhausted borrowed allocator tail keeps its zero-size end marker so best-fit placement agrees with unbounded measurement. The existing unbounded allocator path is unchanged. The cross-library workspace/executor methods used by mtmd have explicit export annotations; these remain internal C++ interfaces, not newly installed public APIs.
+
+Qualification:
+
+- TDD red cases covered missing owner behavior, partial-attachment rollback, exact-tail placement, measurement mutation and the requested physical CUDA buffer type before the fixes passed.
+- The new CPU suite passes **10 cases / 88 assertions**, covering measurement without compute allocation, canonical aliases, invalid types/counts, exact and larger grants, oversized graphs, foreign attachments, graph retirement, retained asynchronous dependencies, release ordering and reentry rejection.
+- The original real-model suite passed **11 cases / 183 assertions**, exercising actual encoder execution, bounded allocation, oversized-image rejection and recovery. Stage 7.1b discovered that vocabulary-only loading reported zero embedding width, making the original embedding-value comparisons vacuous. Do not use that run as numerical equivalence evidence; the corrected full-value qualification is recorded under 7.1b below.
+- The four focused suites (`test-mtmd-workspace`, `test-memory-workspace`, `test-alloc`, `test-mtmd-c-api`) pass Release, ASan with leak checking and UBSan. Eighteen additional/focused Release suite selections cover the common planner, transitions, executor, activation/recovery, KV geometry/policy/binding and backend memory APIs; the complete Release allocator suite also passes on CUDA.
+- CUDA Compute Sanitizer memcheck passes the real-model suite with UVM enabled for weights and physical device-local workspace leases: **zero errors**. The complete server target rebuilds successfully. Production is restored with its original image and configuration after testing.
+
+| Synthetic input size | Measured total borrowed workspace |
+| --- | ---: |
+| 320 x 320 | 12.903 MiB |
+| 640 x 384 | 30.967 MiB |
+| 1024 x 768 | 99.094 MiB |
+| 1280 x 1024 | 165.156 MiB |
+
+These are allocation and numerical equivalence tests, not grounding-quality or end-to-end generation benchmarks. The fixtures allow smaller image-token counts to exercise variable workspace sizes. Native capture retirement is currently qualified for CPU and CUDA, matching the existing text consumer capability gate; other backends reject this opt-in path until a safe retirement hook is available. Their ordinary mtmd path remains unchanged. Windows export annotations are included, but no Windows build was available for validation. Audio borrowing, independent multi-image handoff, M-RoPE/physical KV-index separation, live text/vision/MTP coordination, projector unload/reload, and server admission belong to later stages.
+
+Run the CPU suite with `build-device-memory-infra-cuda-release/bin/test-mtmd-workspace`. Run the optional real-projector fixture with:
+
+```sh
+build-device-memory-infra-cuda-release/bin/test-mtmd-workspace \
+    --cuda --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf \
+    --mmproj /path/to/mmproj-F16.gguf
+```
+
+For CUDA memory checks, prefix that invocation with `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 compute-sanitizer --tool memcheck --error-exitcode 1`. Validation logs are under `/tmp/vision-7.1a-cuda-final.log` and `/tmp/vision-7.1a-cuda-memcheck-final.log`. Stage files and this roadmap are staged for user review; no assistant commit or push was made.
+
+### Stage 7.1b: retained host embedding handoff
+
+Committed as `09f566915`.
+
+The private `mtmd-embeddings.h` interface gives consumers a copyable, read-only `mtmd_embedding_view` of an encoded media chunk. A view owns only the host result snapshot; it does not retain a vision workspace lease, scheduler, projector, input pixels or chunk metadata. The caller must separately keep the input metadata needed for M-RoPE and other position rules while consuming that chunk. A view can outlive the original batch and projector, and checked `slice(first_token, token_count, output)` calls share the same allocation without copying rows or crossing chunk boundaries.
+
+```mermaid
+flowchart LR
+    W[Borrowed vision workspace] --> E[Encoder completes and copies results to host]
+    E --> H[Published host embedding snapshot]
+    E --> R[Drain and return vision workspace]
+    B[Media batch owner] --> H
+    A[Earlier image consumer] --> H
+    L[Later image consumer or token slice] --> H
+    H --> F[Free host storage after the final owner releases it]
+```
+
+Each successful batch encoding moves its existing output vector into a snapshot and freezes the chunk row offsets and embedding width. A failed encoding or invalid publication leaves the previous successful generation intact. Existing views remain valid across successful re-encoding, explicit batch-output clearing, cancellation, input-chunk destruction and context teardown. The legacy C getter remains a borrowed mutable pointer for ABI compatibility; callers using retained views must treat the shared data as read-only. Adding a chunk does not publish output for it, and lookup of an unencoded or unknown chunk returns null without traversing stale row bounds.
+
+There is no additional VRAM allocation, pinned-host allocation, H2D/D2H transfer or attention-kernel change. Publication and view acquisition do not copy embedding values. Retaining any slice keeps the whole batch's host output alive until its last consumer releases it. Re-encoding uses a separate host output vector while the previous result remains available; this can temporarily retain two generations of ordinary RAM. Their size is `output_tokens * embedding_width * sizeof(float)` per generation, not an arena grant.
+
+The existing media compatibility check is factored into a backend-neutral, non-mutating validator with checked token totals. It preserves model batching capability and the existing rule that the first independent image can exceed the combined-batch token limit. Positive compatible batches, incompatible image shapes, unsupported batching, text rejection and exact/insufficient limits are tested without forcing a backend to accept unsupported batches. The current Qwen projector still rejects batching independent images; this stage does not enable a model capability that its graph builder lacks.
+
+TDD and qualification:
+
+- Initial placeholder ownership behavior produced four failing cases. Subsequent red tests covered batching decisions and empty moved-from views before their implementations passed.
+- `test-mtmd-embeddings` passes **7 cases / 88 assertions** for zero-copy adoption, chunk row mapping, partial/nested slices, overflow and invalid-size rejection, prior-generation preservation, copied/moved views, final-consumer lifetime, cancellation and batch compatibility. Release, ASan with leak checking and UBSan pass for this suite and the existing mtmd workspace/C API suites.
+- The real CUDA projector suite passes **11 cases / 601 assertions**. It now loads full model metadata with `no_alloc=true`, `load_mode=NONE` and CPU layer placement, requires nonzero model input width, and compares **12,226,560 embedding values** across the four synthetic images. Width is 5,120 for this model. All four maximum absolute errors are **zero** against ordinary mtmd encoding.
+- Actual retained outputs survive workspace release, a failed retry, output clearing, batch/input destruction, another image's encoding, and projector/model destruction. After teardown, every output is consumed in ordered 13-token slices and compared with the stock result. Re-encoding the first batch keeps its prior view valid.
+- CUDA memcheck with UVM enabled for projector weights and physical borrowed workspace reports **zero errors**. Six focused Release suites include the memory transition, executor and workspace controls. The complete server target rebuilds successfully. Production is restored with its original image/configuration and health checked after testing.
+
+Logs: `/tmp/vision-7.1b-cuda-final.log` and `/tmp/vision-7.1b-cuda-memcheck.log`. The test fixture's earlier zero-width crash was a validation bug, not a retained-view lifetime failure. This corrected qualification supersedes the 7.1a numerical claim. Full main-model decoding, mixed text/image execution order, position admission and text/vision/MTP scheduler handoff remain in 7.2 and later stages. No production mmproj gate is lifted here, and no assistant commit or push is made.
+
+### Stage 7.2a: ordered text/image session execution
+
+Committed as `9295ce06c`.
+
+The private `mtmd-session.h` interface turns borrowed prompt chunks into explicit `text_prefill`, `vision_encode`, and `embedding_prefill` steps. It is a request-order owner, not a second memory allocator or replacement for the existing stage coordinator. Device allocations, target KV/recurrent state, positions, and input metadata remain caller-owned. The same prepared backend must execute the plan, and copying/moving an active plan is not allowed.
+
+Preparation validates every input and freezes the model's media-batching decisions before executing either model. It groups compatible images in media order even when text lies between them. An incompatible image or batch-size boundary starts a new group; the planner does not skip it to combine images farther ahead. Each group's encode step runs immediately before its first image prefill. Retained host views then allow later images from the same group to wait for their actual prompt positions without retaining the transient mtmd batch object.
+
+When the model supports a two-image batch, the logical order is:
+
+```mermaid
+flowchart LR
+    T0[Text prefix] --> E[Encode images A and B]
+    E --> A[Prefill image A]
+    A --> T1[Intervening text]
+    T1 --> B[Prefill image B]
+    B --> T2[Text suffix]
+    E -. retain host output .-> H[Image B embedding view]
+    H -. consume at its prompt position .-> B
+```
+
+The current Qwen projector does not batch independent images, so its corresponding flow has a separate encode step before each image. This stage preserves that native capability restriction; compatible batching is tested through the common backend contract rather than forcing an unsupported Qwen graph shape.
+
+The backend interface separates non-executing batch validation, image encoding with ordered retained outputs, and target prefill. Before any image prefill, the owner checks output count, non-null data, embedding width, and token-row count. It rejects speculative execution, invalid media/byte sizes, foreign backend submission and reentry. Encoding or prefill failure closes the request, releases pending host views, and prevents all later text/image operations. A failed owner cannot be restarted. Cancellation inside a callback defers view release until the callback returns; cancellation after successful completion is a no-op.
+
+`mtmd_session_eval_chunks()` is a live, serial baseline adapter using existing `mtmd_batch_*` encoding and the ordinary text/image decode helpers. It preserves their batching, M-RoPE, non-causal setup and position progression, and passes no draft/MTP callback. It does not reset a supplied conversation prefix, reclaim graph storage, suspend KV, unload projector weights or share arenas. Target work must finish using passed host views before a backend callback returns; native queue draining for shared device allocations remains in 7.2c. A completed prefix can remain after a later failure, and the caller is responsible for target-state recovery rather than replaying the failed request blindly.
+
+Qualification:
+
+- The initial placeholder implementation produced **7 failing cases**. Additional red tests exposed missing backend-affinity and size-overflow admission checks before those checks passed.
+- The common CPU suite passes **12 cases / 146 assertions**. It covers batched lookahead with ordered consumption, separate incompatible/unbatchable images, follow-up progress, encoder/prefill errors and exceptions, malformed outputs, cancellation at and within callbacks, preparation cancellation, reentry, backend affinity, pure text, empty requests and speculation rejection.
+- A real IQ4_XS Qwen3.8-27B target plus the matching F16 projector passes **13 cases / 168 assertions**. The fixture loads the target weights normally with all GPU layers, MTP disabled, context 1,024, batch/ubatch 64 and Q8_0/Q4_0 KV. Image/text helper calls use batch 32. The first prompt contains two images separated by text; a follow-up adds another image to the saved prefix state.
+- Planned versus ordinary mtmd helper execution has **zero maximum logit error** for the initial and follow-up prompts, matching final positions, and **16/16 matching greedy continuation token IDs**. A real missing-pixel image fails encoding, and both the reported position and target KV position stop at the completed text prefix; subsequent text is not decoded. Prefix save/restore is used only to control the A/B test, not by the session implementation.
+- Seven focused Release suites pass, including the memory transition/executor/workspace controls and four mtmd suites. The four mtmd suites also pass ASan with leak checking and UBSan. The complete server target rebuilds successfully.
+- CUDA memcheck with UVM enabled passes with **zero memory-access errors** using `--report-api-errors no`. The first default-reporting run passed all numerical assertions but reported six handled API errors: three `cudaGraphExecUpdate` failures plus their `cudaGetLastError` clearing calls. The existing CUDA backend explicitly handles error 910 by destroying and reinstantiating the graph executable. No CUDA graph code was changed or error silently ignored by the implementation; both the original report and the memory-only report are retained.
+
+Artifacts: `/tmp/vision-7.2a-cuda-final.log`, `/tmp/vision-7.2a-memcheck.log`, and `/tmp/vision-7.2a-memcheck-memory-only.log`. Production is restored with its existing image/configuration and health checked after qualification.
+
+Run the default CPU suite with `build-device-memory-infra-cuda-release/bin/test-mtmd-session`. Add `--cuda --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --mmproj /path/to/mmproj-F16.gguf` for the optional full-model fixture. CUDA memory-access qualification uses `compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 1` before that invocation.
+
+This checkpoint qualifies the internal session plan and a live ordinary-allocation adapter. Public helper/server routing remains unchanged, as does the streaming/mmproj server guard. Adaptive embedding admission and physical KV-index versus model-position separation are 7.2b; live coordinated ownership is 7.2c; production server admission is 7.5. Audio, speculative execution, long-context streaming vision, and other accelerator inference paths are not qualified here. Stage files and this roadmap are staged for user review, with no assistant commit or push.
+
+### Prerequisite before 7.2b: short-prefill phase dispatch
+
+The broader text-only regression exposed a bug already present at the committed 7.2a checkpoint: native span selection treated any one-to-four-query operation as decode-capable, ignoring explicit prefill intent. A three-token prefill after generation requested 4,659,328 bytes of span/MMA scratch from a 3,407,872-byte encoded-gather grant. The two-query prefill selector could also avoid the intended strict-gather route when resumed decoding was enabled.
+
+Following the user's prerequisite-fix policy, the uncommitted 7.2b implementation was parked in the task-scoped stash named `codex-7.2b-parked-before-prefill-intent-fix`. The user committed the narrow fix, its regression test and this ledger as `a9c1f74cb`. The 7.2b work is now reapplied onto that checkpoint for combined qualification. The stash is retained as a recovery copy; unrelated benchmark files remain untouched.
+
+The common resident-attention dispatcher now requires decode intent for the segmented span path. All short prefills use encoded gathering plus ordinary native attention, just like longer prefills. TG2 prefill is explicitly admitted to that same native path rather than the older split/fold route. Actual TG1-TG4 decode retains the existing resumable/vector/MMA decisions. No backend API, CUDA kernel, quantization arithmetic or arena budget is changed. Native attention's output-side scratch was already accounted for by the graph allocator; the new synthetic fixture reserves an actual attention output tensor so this requirement is exercised correctly.
+
+TDD and qualification:
+
+- With 7.2b parked, the focused regression reproduced the same three-query scratch rejection. This establishes the defect at the previous checkpoint rather than attributing it to the new position work.
+- `test-kv-stream-session --cuda-short-prefill` passes **1 case / 52 assertions**, using an exact gather-sized lease at a nonzero parent offset. Each query count 1, 2, 3 and 4 is exercised with streamed history, and both layer outputs match stock attention **bit-for-bit**.
+- The complete CUDA session suite passes **17 cases / 778 assertions**, including TG2 resumed decode, TG3/TG4 stock-MMA decode, ring guards and repartition/handoff controls.
+- The full IQ4_XS text-context suite passes **5 cases / 561 assertions**. The previously failing serial decode-to-prefill scenario has zero logit error and **14/14 matching boundaries**. Ubatch 256 and 512 retain zero logit error, zero recurrent relative L2 error, and **32/32 matching continuation tokens**.
+- The focused CUDA memcheck reports **zero memory-access errors**, with API-error reporting disabled as in the existing graph-update qualification. The CPU/common session control passes ASan with leak checking and UBSan. Production is restored with its original image/configuration and health checked after testing.
+
+Logs: `/tmp/kv-short-prefill-red.log`, `/tmp/kv-short-prefill-final.log`, `/tmp/kv-short-prefill-full-session.log`, `/tmp/kv-short-prefill-full-model.log`, and `/tmp/kv-short-prefill-memcheck.log`. No assistant commit or push was made.
+
+### Stage 7.2b: adaptive image-embedding prefill and position identity
+
+An image can contribute hundreds of KV rows while advancing its scalar M-RoPE position by a much smaller amount. Several image rows share a scalar position and use different spatial coordinates. The old text-only admission rule equated each position with its physical KV row. This stage removes that assumption without changing the model's RoPE, attention masks, recurrent computation or native attention kernels.
+
+#### Implementation boundary
+
+- `llama-kv-stream-positions.*` checks target appends before execution. Capacity is measured in physical rows. Model positions must be nonnegative and monotone; image prefill can repeat scalar positions, while later text advances past the previous attention position. Spatial coordinates are preserved rather than rewritten to physical row indices. Implicit text positions retain the existing batch allocator's signed-position overflow bound.
+- Raw context admission and per-ubatch admission use the same checks. SET_ROWS and the streaming host cache still address a dense physical prefix. The existing cache-cell metadata supplies scalar/spatial positions to RoPE, masks and checkpoint serialization.
+- The mtmd session adapter explicitly identifies both text and embedding work as prefill. A short embedding batch must not select a decode-only kernel merely because it has one to four rows. The prerequisite fix retains strict gathered/native prefill arithmetic.
+- Checkpoint restoration validates a dense, single-sequence physical prefix with nondecreasing model positions, including duplicate image positions and spatial metadata. Its append head resumes at the physical row count. Oversized metadata and negative positions are rejected. The existing checkpoint format is unchanged.
+- Suffix removal translates a model-position interval into physical row indices using binary search. Removing a shared image position removes all rows at that position. Interior deletion remains unsupported. This lookup is O(log n); the complete O(n) prefix validation runs during checkpoint loading, not on every decode or rejection replay.
+- The phase signal now identifies an ordinary target operation rather than a text-token-only operation. No new allocator, backend execution hook, kernel, public option or production routing is introduced.
+
+Stage 7.5c separates dense physical KV rows from image M-RoPE positions for the single embedded Qwen MTP head. Image embeddings remain a prefill operation, not an explicit decode batch. Embedding-output contexts, sequence copies, shifts, position rescaling and interior deletion are not newly supported.
+
+#### TDD and qualification
+
+The coordinate tests were first red against nonfunctional validation stubs. A later boundary test caught the batch allocator's extra implicit-position increment, and the broad model regression exposed the separately committed short-prefill defect. Tests and tolerances were not weakened to accept incorrect numerical output.
+
+- Coordinate and suffix tests pass **7 cases / 8,252 assertions**, including an exhaustive comparison of binary suffix lookup with interval deletion over duplicate/gapped position sequences. They pass in the release, ASan/leak-checking and UBSan builds.
+- Common mtmd session tests pass **12 cases / 146 assertions** under ASan and UBSan. Phase tracking, serial ownership and workspace tests pass **7/115**, **5/88** and **21/454** respectively.
+- The combined CUDA session suite passes **17 cases / 778 assertions**. The combined IQ4_XS text suite passes **5 cases / 561 assertions**: the short-prefill scenario has 14/14 matching boundaries, and ubatch 256/512 retain zero logit error, zero recurrent-state relative L2 error and 32/32 continuation-token matches.
+
+The real-image fixture compares ordinary mtmd with the session adapter using the downloaded matching F16 projector, IQ4_XS target, Q8_0 keys/Q4_0 values, MTP disabled and UVM disabled. It prefills approximately 6K text tokens, two 512x512 images, a later image-bearing follow-up and 16 greedy continuation tokens. It checks initial/follow-up logits, recurrent state, whole-context and sequence checkpoint restoration, malformed input without target mutation, physical row counts distinct from model positions, and failure before unsafe later text. A targeted attention-cache suffix test restores the complete target checkpoint before resuming model work; it does not claim arbitrary recurrent-state rewind is supported.
+
+The small fixed-pool controls do not mean that the final decode pool stays at their configured minimum: the existing phase owner reclaims prefill workspace for decode. Vision weights and vision compute remain separate allocations outside the text parent in this stage. Sharing or suspending those allocations is still future work.
+
+The expanded real-image controls each pass **13 cases / 194 assertions**, including image-position suffix removal and full checkpoint restoration before further target work. All three have zero initial/follow-up logit error, identical recurrent-state bytes and **16/16 matching continuation tokens**:
+
+| Text memory configuration | Decode KV pool | Active pages | Resident pages/layer | Ring slots | Streaming |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Private minimum 16 MiB | 80.6807 MiB | 27 | 11 | 22 | Yes |
+| Private minimum 128 MiB | 192.681 MiB | 0 | 29 | 10 | No |
+| Exact shared parent 96 MiB | 84.5244 MiB | 27 | 11 | 32 | Yes |
+
+The text-only embedded-MTP context regression passes **2 cases / 246 assertions**, retaining zero MTP logit error for TG1-TG4 catch-up and two sequential predictions. This does not qualify MTP with image inputs; the new admission checks still reject that unimplemented combination.
+
+GPU memory checking is split into two focused paths: the exact gather-grant streamed TG1-TG4 prefill regression, and the real-image/checkpoint fixture with a short text prefix and resident KV. The former passes **1 case / 52 assertions** with zero memory-access errors. The initial instrumented 6K-prefix full-model run was deliberately terminated because instrumenting its unchanged text prefill was too costly; its partial zero-error output is not counted as a passed test. Long-prefix resident/ring numerical and suffix controls remain unchanged and pass without instrumentation. The test-only `--prefix-repetitions` option bounds shortened fixtures to the same maximum 6,000 repeated words used by the default run.
+
+The shortened real-image memcheck also passes **13 cases / 194 assertions** with **zero memory-access errors**, zero initial/follow-up logit error, identical recurrent state and 16/16 continuation tokens. Both completed memcheck runs disable API-error reporting for the stock backend's handled CUDA graph-update fallback; actual memory-access checking remains enabled. These are separate completed qualifications, not the interrupted long-prefix run.
+
+Artifacts: `/tmp/vision-7.2b-final-session.log`, `/tmp/vision-7.2b-final-text.log`, `/tmp/vision-7.2b-suffix-stream.log`, `/tmp/vision-7.2b-suffix-resident.log`, `/tmp/vision-7.2b-suffix-arena.log`, `/tmp/vision-7.2b-mtp-regression.log`, `/tmp/vision-7.2b-prefill-memcheck.log`, and `/tmp/vision-7.2b-image-memcheck.log`.
+
+Stage 7.2b is ready for review. Production is restored with its existing image/configuration after qualification. The streaming/mmproj server guard remains in place, and shared vision ownership, suspension, projector reload and server admission remain in later stages. Implementation, tests and this roadmap are staged without unrelated benchmark files. No assistant commit or push is made.
+
+### Stage 7.2c: serial text, vision and optional MTP ownership
+
+The live `llama_context_memory` owner previously tracked one MTP child. It now registers multiple borrowed scheduler owners, rejects duplicate scheduler/backend handles and nested parents, and allows only one active participant to submit graph work. A shared owner-thread gate covers submission, drain, native retirement and phase changes; reentrant handoffs cannot overwrite scratch midway through a callback. This is not concurrent or thread-safe inference.
+
+#### Bounded borrowing and handoff
+
+- `borrow_workspace()` accepts the actual measured canonical buffer groups from a prefill-only consumer. Its device grant must fit before the target's reconstructible KV pool in the prefill layout. Host/fallback groups retain the existing separate allocation behavior. Non-streaming graph owners expose their conservative shared scratch too, which makes the same handoff protocol testable on CPU without inventing a fake CUDA allocator.
+- A vision consumer entering from decode drains the previous scheduler, returns any retained MTP ring guard, and activates the existing target prefill layout. The existing KV consumer preserves authoritative host data and rebinds its resident/ring mirror. Vision then uses only the bounded discardable prefix, not KV bytes. Oversized grants fail instead of silently falling back to an independent vision allocation.
+- Target and MTP preparation now coordinate all registered children. Returning to target decode shrinks inactive child grants before expanding the KV pool. The regular MTP child retains its existing prefill/decode path and unchanged-graph caching; prefill-only vision children cannot enter a decode phase and retire their native captures before the next participant reuses their scratch.
+- Parent destruction drains and invalidates surviving children before detaching their bindings. Child destruction drains and invalidates itself before unregistering from its parent. Children whose parent has disappeared reject further execution, even if their retained buffer owner has not yet been destroyed.
+- Preparation and retirement reuse the existing workspace, executor, lease and transition machinery. There is no new allocator or attention kernel. The private cross-library calls used by mtmd have explicit `LLAMA_API` visibility, including destruction, so the adapter does not rely on ELF's broader default symbol export behavior.
+
+The opt-in internal `mtmd_session_eval_chunks_shared()` adapter measures each actual media batch, borrows from the current target coordinator, encodes, retains the host embedding views, and returns vision scratch before embedding prefill. An early return or exception attempts the same workspace cleanup. A failed request remains closed rather than running later prompt chunks. The existing ordinary adapter stays available; no CLI/server switch or production vision guard is changed.
+
+The target coordinator may be rebuilt by scheduler reservation, so the adapter retrieves it for each batch rather than keeping a raw parent pointer across requests. Graph metadata is rebuilt after a workspace has been returned: measuring a graph containing tensor-buffer pointers from a released grant is outside the detached-graph contract.
+
+#### TDD and qualification
+
+The new three-scheduler test first failed against stubbed borrowing methods while all pre-existing owner controls passed. It then qualified CPU admission, shared physical addresses, repeated target/MTP/vision handoffs and parent-first/child-first teardown before the live vision bridge was wired.
+
+- Owner tests pass **7 cases / 657 assertions** on CPU and **8 cases / 685 assertions** on CUDA. A synchronization probe injects drain failure, rejects callback reentry into target/child/phase admission, and successfully retries. CUDA tests include pending output D2H completion before reuse and native-capture retirement before vision scratch changes ownership.
+- Vision workspace tests pass **11 cases / 113 assertions**. They verify an actual tensor address falls inside the target parent, reject a too-small parent without changing target readiness, return storage on release/cancellation cleanup, reborrow with fresh graph metadata, and close a child whose parent is destroyed first.
+- The owner, workspace and common session suites pass ASan with leak checking and UBSan; the common session controls remain **12 cases / 146 assertions**.
+- The full IQ4_XS text regression remains **5 cases / 561 assertions**, with zero logit/recurrent-state error and matching continuation tokens. The embedded-MTP regression remains **2 cases / 246 assertions**, with zero MTP logit error for TG1-TG4 catch-up and sequential predictions. These text-only MTP controls do not qualify MTP image processing.
+- CUDA memcheck of the complete owner suite passes **8 cases / 685 assertions** with **zero memory-access errors**. API-error reporting is disabled for the stock backend's handled CUDA graph-update fallback; memory-access checking is enabled.
+
+The live no-MTP image fixture uses the matching F16 projector, IQ4_XS target, Q8_0/Q4_0 KV and UVM disabled. Both the private 16 MiB minimum and the exact 96 MiB shared parent pass **13 cases / 208 assertions**. Initial images, a follow-up image, and another image after generation have **zero maximum logit error**, identical recurrent-state bytes, and matching 16-token continuation sequences before and after the last image. The final decode pools are 80.6807 MiB and 84.5244 MiB respectively, with 28 active pages, 11 resident pages per layer, and 22/32 ring slots.
+
+The fixture also borrows and executes vision directly from a populated decode layout before any follow-up text can trigger prefill. Returning that workspace leaves the complete serialized target state unchanged. It then prefills the later image/text request and generates the same continuation as ordinary mtmd. This explicitly qualifies external decode-to-vision-to-text reactivation rather than only the initial prefill-to-vision path.
+
+One integration-fixture failure was corrected without loosening numerical checks: its malformed-input setup attempted another ordinary image encoding after shared execution had returned the vision grant. That setup now measures and reacquires a grant, retains the host view, and returns scratch before testing target rejection. Another synthetic fixture reconstructed its graph after release rather than reusing tensor-buffer metadata from the previous grant.
+
+Artifacts: `/tmp/vision-7.2c-three-owner-red.log`, `/tmp/vision-7.2c-owner-final.log`, `/tmp/vision-7.2c-owner-final-memcheck.log`, `/tmp/vision-7.2c-cycle-stream.log`, `/tmp/vision-7.2c-cycle-arena.log`, `/tmp/vision-7.2c-text-regression.log`, and `/tmp/vision-7.2c-mtp-regression.log`.
+
+#### Deliberate limits
+
+This stage shares graph scratch but keeps a target KV pool and eager projector weights resident. Vision batches larger than the protected prefill prefix are rejected. Stage 7.3 adds full KV suspension/resume; 7.4 adds projector-weight unload/reload; 7.5 admits qualified production requests. Image-aware MTP remains rejected until 7.5c. The adapter is backend-neutral, but native-cache lifecycle qualification here remains CPU/CUDA, not a claim that real multimodal inference has been tested on other accelerators.
+
+Stage 7.2c is staged for user review without unrelated benchmark files. Production is restored using its original image/configuration; no assistant commit or push is made.
+
+### Stage 7.3a: zero-grant device suspension
+
+The shared context plan now has an explicit suspension stage with zero requirements for target graph scratch, KV pool, KV writer scratch and attention scratch. Serial children have a corresponding zero-workspace stage. Suspension uses the existing consumer transition lifecycle: close submission, drain affected work, retire native captures, release views, commit the empty arena layout, and publish the suspended state.
+
+#### Preserved ownership and protected state
+
+- The KV session, registered consumer pointer, proxy host buffer, cache IDs, host generation, publication frontiers and logical token count remain in place. A zero-grant transition does not delete and recreate the session. Its device-layout revision advances so an old capture cannot be mistaken for a valid binding.
+- Target and auxiliary MTP appends must be complete before suspension. An active append or an unacknowledged MTP publication is rejected instead of being implicitly accepted or cancelled. A completed retained MTP layer is released without changing the auxiliary host cache's identity, frontier or bytes.
+- Pending target compute, output D2H and cross-token prefetch retire before the KV views are released. All registered child schedulers surrender their scratch grants as well. Suspended target and child execution, target phase activation, new borrowing, KV append and unsupported reset/truncation are rejected; empty cleanup detach is allowed.
+- `llama_context_suspend_kv_device()` supplies a recurrent-completion participant to the common owner. Its callback runs under the same reentry gate and completes pending recurrent publication/restoration after target scheduler synchronization. Current recurrent tensors and rollback/staging storage remain separately owned, outside the returned KV/graph ranges. This stage neither unloads nor zeroes recurrent state.
+- The memory diagnostics explicitly report suspended KV with zero resident/ring/writer/attention bytes. Expected teardown sizes account for deliberately detached compute grants. Normal context construction and text/MTP execution do not automatically suspend.
+
+**Release of reservations is not release of the parent allocation.** The shared device-local parent stays allocated for later vision reuse; its arena has no KV/graph reservations or leases after successful suspension. Consequently, `nvidia-smi` need not show a VRAM decrease. Persistent weights, recurrent state and other independently owned allocations are also not counted as reclaimed KV space.
+
+No new allocator, backend interface pattern or attention kernel is introduced. The suspension completion uses the existing `llama_memory_executor_backend` drain contract. The private mtmd/context integration entry points retain explicit cross-library visibility.
+
+#### TDD and qualification
+
+The first suspension regression was red against stubbed owner methods while pre-existing allocation paths still built. The live hybrid case subsequently caught a cleanup assertion: context teardown needs to detach an already-empty workspace after suspension. The implementation now accepts that idempotent empty cleanup but rejects attaching a new workspace while suspended. Numerical and state checks were not relaxed.
+
+- The targeted CUDA owner/model case passes **1 case / 47 assertions**. It rejects active target append, incomplete auxiliary publication and an injected auxiliary-completion failure; retries safely; closes callback reentry; completes queued D2H; releases a retained MTP layer and a registered child; retains host bytes/identities; and reports zero pool/writer/attention/graph grants. Suspended reactivation is rejected, and repeated suspension/cleanup is safe.
+- The real IQ4_XS Q8_0/Q4_0 hybrid tests pass **3 cases / 133 assertions** with UVM disabled. One case suspends after 256 prefill rows and four decode rows, compares the complete serialized context and recurrent tensors, rejects another decode without mutation, repeats suspension and tears down normally. The other prefills 6,144 tokens with ubatch 64, decodes four rows into a streamed layout, confirms cross-token prefetch is primed, then verifies suspension retires it while preserving all host KV bytes and recurrent state at the 6,148-row frontier.
+- The new auxiliary-readiness controls and existing logical cache tests pass **9 cases / 180 assertions**. Host publication without its final acknowledgment is not suspension-ready; cancellation and completed publication restore readiness, while an unacknowledged external host replacement is rejected.
+- Logical-cache, common session, context-owner and workspace controls pass ASan with leak checking and UBSan. Their CPU counts are **9/180**, **1/2**, **7/658** and **21/454** respectively. The common-only session test is not a claim of GPU instrumentation by CPU sanitizers.
+- The text regression remains **5 cases / 561 assertions** with zero logit/recurrent-state error and matching continuations. The text-only MTP regression remains **2 cases / 246 assertions** with zero TG1-TG4 MTP logit error. The full CUDA session suite remains **17 cases / 778 assertions**.
+- The final full CUDA model/adapter suite passes **14 cases / 491 assertions**, and the CUDA context-owner suite passes **8 cases / 686 assertions**. Existing phase resizing, recovery, MTP population/cancellation, three-consumer handoffs and native retirement remain green.
+- The existing shared-vision regression remains **13 cases / 208 assertions**: initial, follow-up and post-decode image logits, recurrent state and continuation tokens still match ordinary mtmd. This is the 7.2c scratch-sharing path, not vision reuse of suspended KV space.
+- CUDA memcheck passes for both the targeted family suspension (**1/47**) and the real resident hybrid suspension (**2/22**) with **zero memory-access errors**. API-error reporting is disabled for the stock backend's handled CUDA graph-update fallback; actual memory checking stays enabled. The long ring test is qualified without full-model instrumentation.
+
+Artifacts: `/tmp/vision-7.3a-suspend-red.log`, `/tmp/vision-7.3a-family-suspend-final.log`, `/tmp/vision-7.3a-family-memcheck-final.log`, `/tmp/vision-7.3a-hybrid-qualification.log`, `/tmp/vision-7.3a-hybrid-memcheck.log`, `/tmp/vision-7.3a-model-suite-final.log`, `/tmp/vision-7.3a-owner-suite-final.log`, `/tmp/vision-7.3a-text-regression.log`, `/tmp/vision-7.3a-mtp-regression.log`, `/tmp/vision-7.3a-session-full.log`, and `/tmp/vision-7.3a-vision-regression.log`.
+
+#### Deliberate checkpoint boundary
+
+This checkpoint ends with the KV device binding suspended. Fresh-grant reactivation and pointer/graph reconstruction remain in 7.3b; the broader interruption/recovery matrix and using reclaimed KV capacity for vision remain in 7.3c. Projector weights remain eager, production vision is still guarded, and no suspension CLI/server option is added. Ownership logic is backend-neutral; real accelerator qualification here is CUDA only.
+
+Stage 7.3a is staged for user review without unrelated benchmark files. Production is restored with its original image/configuration after testing. No assistant commit or push is made.
+
+### Stage 7.3b: fresh-grant resume and executable reconstruction
+
+Resume is explicit: the suspended owner acquires fresh compute, pool, writer and attention leases for its measured prefill or decode layout. The same session, proxy host buffer, cache IDs, host generation, publication frontiers and logical prefix remain authoritative. The new binding revision and arena generation invalidate the old device lifetime, even if the allocator reuses the same physical address.
+
+#### Reconstruction and admission
+
+- `llama_kv_stream_policy_restore()` rebuilds placement for an equal, smaller or larger fresh grant at the current frontier. Existing grow/shrink APIs retain their strict direction checks. Reconstruction resets device-placement feedback rather than treating old timing observations as valid for a new mirror.
+- The session's existing pool-transition preparation now accepts a suspended starting point with no old device regions. It validates the complete candidate grant, builds new resident/ring views and writer scratch, and publishes them only after activation. Historical encoded host rows upload lazily before their first use; suspension/resume itself does not change their bytes or quantization.
+- Reverse preparation can restore the zero-grant state if reattachment fails after resources start changing. It does not invent a missing old device binding. The broader interruption and fault matrix remains in 7.3c.
+- `resume_kv()` holds the serial submission gate through an optional graph-rebuild callback. That callback may rebuild metadata and reserve graph storage, but must not execute graphs or change persistent state. Callback failure or exception attempts a zero-grant transition; if closing itself fails, execution is quiesced rather than silently reopened.
+- The real context adapter discards graph results referring to the old leases and performs the same phase-specific graph reservation used by ordinary text phase changes. Prefill reserves its ubatch-sized graph; decode reserves the qualified one-token or target-verification width. The callback completes before the owner reopens submission. A failed rebuild restores the previous logical decode flag.
+- Resume rejects invalid phases, an already-active target, unacknowledged host changes, and pending auxiliary/MTP publication. Suspended children remain unbound after the parent resumes and reacquire their own phase grant only when explicitly prepared.
+
+Fresh leases come from the retained shared parent. Selecting prefill versus decode changes the KV start address and capacity within that parent; same-phase cycles still obtain fresh leases/generations. This checkpoint does not replace the whole parent allocation or implicitly increase its capacity. It does not yet let vision claim suspended KV capacity.
+
+#### TDD and numerical qualification
+
+The first low-level resume test was red against a stubbed API. Metadata rebinding then passed, but the real resumed-prefill tests stayed red: clearing graph results alone yielded a first-batch logit difference of about 12.38 and divergent continuations. Checkpoint-only controls still matched, isolating this to resume rather than saved state. Repeating the ordinary phase graph reservation after reattachment eliminated the difference; no attention kernel or numerical tolerance was changed.
+
+- The policy suite passes **35 cases / 145,017 assertions**, including same/smaller/larger fresh budgets, invalid-budget output preservation and unchanged grow/shrink controls.
+- The low-level CUDA resume test passes **1 case / 72 assertions**: repeated prefill/decode and same-phase cycles, changed addresses/capacities, increasing arena/binding identities, unchanged host cache/session/frontier, callback reentry rejection, callback failure/exception closure and retry, pending auxiliary publication rejection, and explicit child reactivation.
+- The final full CUDA model/adapter suite passes **15 cases / 563 assertions**, retaining suspension, resize/recovery, MTP population/cancellation and ordinary graph-dispatch controls.
+- Real IQ4_XS Q8_0/Q4_0 tests with UVM disabled pass **5 cases / 317 assertions**. The four substantive cases cover resident/streamed KV and resume into decode/prefill. Resident history is 256 rows, streamed history is 6,144 rows with ubatch 64, and each prefix is warmed with four decode rows. A checkpoint-only control validates saved-state equivalence before the suspend/resume comparison.
+- For every substantive case, the first post-resume batch and final logits have **zero maximum absolute difference**, the **16 continuation token IDs match**, and recurrent metadata/tensor bytes match uninterrupted execution. The complete serialized state also matches before more model work runs. Resident controls confirm live native attention captures before suspension and no old captures after suspension/resume; they rebuild on subsequent execution.
+- The existing full text regression remains **5/561**, embedded-MTP TG1-TG4 regression **2/246**, and shared-vision regression **13/208**, with their previous zero-error/token-equivalence checks intact. The vision result is still the bounded 7.2c scratch path, not suspended-pool borrowing.
+- Policy, CPU owner and workspace suites pass ASan with leak checking and UBSan. This qualifies common ownership/metadata logic, not GPU checks through a CPU sanitizer.
+- The targeted CUDA resume test passes memcheck **1/72** and the resident real-model resume tests pass memcheck **3/67**, both with **zero memory-access errors**. API-error reporting is disabled for the stock backend's handled CUDA graph-update fallback; memory-access checking remains enabled. The long streamed comparison is not instrumented.
+
+Artifacts: `/tmp/vision-7.3b-resume-red.log`, `/tmp/vision-7.3b-prefill-control.log`, `/tmp/vision-7.3b-phase-reserve-trial.log`, `/tmp/vision-7.3b-model-suite.log`, `/tmp/vision-7.3b-warm-resume-final.log`, `/tmp/vision-7.3b-resume-memcheck.log`, `/tmp/vision-7.3b-hybrid-memcheck.log`, `/tmp/vision-7.3b-text-regression.log`, `/tmp/vision-7.3b-mtp-regression.log`, and `/tmp/vision-7.3b-vision-regression.log`.
+
+#### Remaining boundary
+
+Stage 7.3c still owns the expanded interruption/recovery matrix and integration of vision with the reclaimed suspended-KV capacity. Projector weights remain eager, image-aware MTP is not admitted, and production vision stays guarded. No resume CLI/server option is added. Ownership and reconstruction are backend-neutral; real accelerator qualification here remains CUDA.
+
+Stage 7.3b is staged for user review without unrelated benchmark files. Production is restored and health checked with its existing image/configuration. No assistant commit or push is made.
+
+### Stage 7.3c: interrupted handoff and reclaimed-KV vision borrowing
+
+The opt-in internal image-session adapter now uses the full retained device parent while target KV is suspended, instead of borrowing only the scratch prefix before live KV. The first lower-level test rejected this borrow on the old implementation; the real-model test then detected that vision was still running without target suspension. No attention kernel or numerical tolerance changes are part of this stage.
+
+#### Ownership and execution order
+
+```mermaid
+flowchart LR
+    A[Measure actual vision batch] --> B[Drain target and suspend KV grants]
+    B --> C[Borrow bounded parent storage for vision]
+    C --> D[Encode and retain host embeddings]
+    D --> E[Drain vision and return its grants]
+    E --> F[Resume target with fresh prefill grants and graphs]
+    F --> G[Prefill image embeddings in prompt order]
+```
+
+- Measurement and oversized-batch rejection happen before eviction. Borrowing reclaimed KV space requires an explicitly suspended, valid parent with zero target grants and no child grants. The shared parent allocation does not grow or get replaced.
+- The borrower is prefill-only. It can use the reclaimed KV bytes as discardable vision workspace, but cannot restore target KV or execute target attention. Constructor callbacks, computation, handoff and restoration share the existing owner-thread submission gate.
+- Target resume rejects any child still holding workspace leases, even if its native executable has already been retired. Returning vision grants drains its scheduler and retires captures before target addresses are rebuilt.
+- The adapter retains image embeddings on the host, releases vision storage, and calls the real context resume seam, including phase-specific graph reservation, before embedding prefill. Encoding errors and exceptions use the same scoped cleanup. Restoration failure stops the request; no later embedding or text step runs.
+- Cancellation still follows the session planner's existing rule: an active callback completes its cleanup before cancellation takes effect. Earlier committed text remains committed; cancelled future image outputs are discarded. This is not an asynchronous interruption of an in-flight GPU kernel.
+- A recoverable allocation/rebind failure leaves either the previous active layout or a safe zero-grant suspended layout. A failed reverse transition, or inability to close a failed reconstruction, permanently closes owner admission; `valid()` reports this condition and the caller must recreate that context. It is not reopened by another suspend, resume, phase signal or borrower.
+
+Projector weights and the explicitly accounted recurrent allocation remain outside these reclaimed KV/graph grants. Projector weight unload/reload is still stage 7.4, and production vision/image-aware MTP admission is still stage 7.5. No server guard is lifted or new CLI option added here. The handoff uses backend-neutral leases, transitions and scheduler lifetimes; real accelerator qualification remains CUDA.
+
+#### Validation
+
+- CUDA suspension/borrowing test: **1 case / 83 assertions**. It covers full-parent grants beyond the old scratch allowance, oversized rejection, injected borrower allocation failure, callback reentry, premature resume and decode rejection, return after cancellation/completion, retryable resume failure, repeated transitions, unchanged host bytes/frontier/cache identity, and terminal reverse-drain failure.
+- Full CUDA model suite: **16 cases / 646 assertions**. Existing auxiliary-cache, MTP lease/publication/cancellation and phase-resize controls remain passing.
+- Real IQ4_XS Q8_0/Q4_0 text regression: **5/561**; resume regression: **5/317**; embedded-MTP regression: **2/246**. Their previous numerical and recurrent-state checks remain passing.
+- The real shared-vision test passes **13/225** with a populated streaming cache and a 96 MiB shared parent. Initial images, follow-up images and images after decode have **zero maximum logit difference**, identical recurrent bytes and identical 16-token continuations versus the ordinary adapter. It also tests an interrupted encoder and a restoration allocation failure, followed by explicit resume and successful reuse.
+- Existing serial-owner CUDA and vision-workspace controls pass **8/686** and **11/113**. CPU owner, workspace and session tests pass ASan with leak checking and UBSan; the generic transition suite passes **21/454** under both sanitizers.
+- Focused CUDA borrowing/recovery memcheck passes **1/83**; the real-model vision memcheck passes **13/225**, both with **zero memory-access errors**. The latter uses a zero-background resident control and `--continuation-tokens 1` to bound instrumentation cost while exercising all handoffs and injected failures. The normal populated-ring equivalence test still uses 16-token continuations. An earlier full-continuation instrumented run was stopped for cost and is not counted as a pass. Handled stock CUDA graph-update API errors are excluded from API-error reporting; memory-access checking remains enabled.
+
+Artifacts use `/tmp/vision-7.3c-*`, including `model-full.log`, `session-final.log`, `text-regression.log`, `resume-regression.log`, `mtp-regression.log`, `owner-memcheck.log`, and `session-short-memcheck.log`. Stage 7.3c is staged for user review; production is restored with its existing image/configuration and unrelated benchmark artifacts remain untouched. No assistant commit or push is made.
+
+### Stage 7.4a: separate projector metadata and eager weight ownership
+
+Implemented in `tools/mtmd/mtmd-projector-storage.h/.cpp` and used by the existing CLIP loader. This is ownership preparation for 7.4b, not a runtime eviction feature. Successful loads still allocate the same eager backend tensor buffer and use the same tensor types, selection order and upload path.
+
+```mermaid
+flowchart TD
+    C[Projector context and model fields] --> M[Stable GGML tensor metadata]
+    C --> W[Shared resident weight owner]
+    W --> M
+    W --> B[Backend weight buffer]
+    M --> S[Shared file handle and copied source manifest]
+    R[Another retained owner] --> W
+```
+
+#### Ownership and loading
+
+- `mtmd_projector_source` copies tensor names, types, shapes, byte sizes and checked absolute file offsets from parsed GGUF metadata. It retains one binary file handle, independent of the loader and working directory. Modalities from the same loader share the source but keep their own selected tensors and backend buffers. File-cursor reads are serialized; unknown names, wrong payload sizes, unfinalized offsets and incomplete reads are rejected.
+- `mtmd_projector_metadata` owns the selected no-allocation GGML context and retains the source. Tensor objects stay at stable addresses while resident storage has a separate lifetime. The factory checks names, shapes, types, byte counts, contiguity and unbound descriptors. The model's hparams, preprocessing values and raw tensor references remain in the existing CLIP model.
+- `mtmd_projector_weights` owns the eager backend buffer and retains its metadata. Copying its shared owner does not duplicate weight storage. A second allocation against bound descriptors and callback reentry are rejected. Failed or cancelled candidates release their storage and clear bindings, including failures after partial loading; progress exceptions preserve the same cleanup.
+- CPU/host-visible buffers still receive direct file reads. Other backends use a temporary per-tensor upload buffer, discarded after loading. No permanent host copy of all projector weight bytes is introduced. The skipped-upload measurement mode still allocates the backend buffer as before; it does not execute an uninitialized model.
+- The projector drains/tears down its workspace and scheduler before returning its weight owner. If another owner remains, descriptors, the backend buffer and source remain alive. Returning the last resident owner releases the buffer before clearing descriptor `data`, `buffer` and `extra`; independently retained metadata remains valid and unbound. Callers must retire all execution/captures before returning that last owner.
+- `mtmd_acquire_projector_weights()` is an internal vision ownership seam, not a new public mtmd C API. Binding changes remain owner-thread-only; reference counting protects lifetime, not concurrent mutation.
+
+The loader's Gemma vision/audio clamp-scalar scans now iterate selected tensor descriptors in their original creation order. Host preprocessing vectors and scalars are read through the same checked source. Cancellation at the initial progress callback is now honored before allocating a candidate, and truncated uploads fail instead of publishing incomplete weight bytes.
+
+The retained source file must remain unchanged in place. Keeping its handle avoids reopening a potentially different pathname, but this stage does not hash or snapshot all weight bytes, nor promise recovery from external file modification. The source handle is closed when its last source/metadata owner is returned; platform file-sharing rules still apply.
+
+#### TDD and qualification
+
+- Initial source/metadata/resident tests were red against stub factories. The final focused suite passes **8 cases / 60 assertions** in Release, ASan with leak checking, UBSan and targeted TSan (`setarch x86_64 -R`). It covers loader/source independence, invalid descriptors, selected modality subsets, exact payload reads, shared buffer release exactly once, metadata surviving buffer release, allocation failure, truncated payloads, early/late cancellation, callback exceptions and reentry, temporary metadata lifetimes, skipped uploads, and concurrent reads sharing one cursor. This TSan result does not qualify parallel binding changes or GPU execution.
+- Before wiring the new owners into CLIP, the test saved image embeddings from the original eager loader on **CPU and CUDA**. The wired implementation matches each saved output **byte-for-byte** with the same Qwen3.8 F16 projector and a deterministic 256x256 image. Those real tests pass **9/76** on both backends and verify retained weights remain readable after projector scheduler/backend destruction, followed by unbound metadata and a still-readable source after the last weight owner is returned.
+- The real CUDA ownership/encoding test passes memcheck **9/76**, with **zero memory-access errors**. No target-model weight allocation is needed for this encoder-only test; the target model is loaded metadata-only. API-error reporting excludes handled stock CUDA graph-update fallback errors, not memory-access errors.
+- The existing populated-ring shared vision/text test remains **13/225**, with zero initial/follow-up/post-decode logit differences, identical recurrent bytes and matching 16-token continuations. Interrupted encoding and restoration/retry controls remain passing.
+- Existing CPU borrowed-workspace and session controls remain **11/113** and **12/146** under ASan/leak checking and UBSan. The new owner implementation also passes strict warning checks with conversion/sign-conversion warnings treated as errors. The complete CUDA server target is rebuilt.
+
+Artifacts are `/tmp/vision-7.4a-*`, including the original CPU/CUDA `.embd` snapshots, `real-cpu.log`, `real-cuda.log`, `real-cuda-memcheck.log`, `session-ring.log` and sanitizer storage logs. Production is restored and health checked using its existing image/configuration. Stage 7.4a is staged for user review without unrelated benchmark files; no assistant commit or push is made.
+
+#### Remaining boundary
+
+Stage 7.4b will add explicit live unload/reload, capture invalidation, drain/rebind ordering and stale-execution rejection. Stage 7.4c will coordinate those bindings with phase grants and recover failed reloads. Projector weights remain eagerly resident here; production vision and image-aware MTP remain guarded until their later qualifications.
+
+### Stage 7.4b: explicit projector unload/reload and generation-safe execution
+
+The internal `mtmd_unload_projector_weights()` and `mtmd_reload_projector_weights()` seams now provide an explicit vision-weight lifecycle. The existing eager path stays active until unload is requested; no automatic policy, server option or production admission guard is changed.
+
+#### Lifetime and execution ordering
+
+`mtmd_projector_residency` reuses `llama_memory_executor` and its execution pins. A captured dependency retains the current weight owner; a pending pin remains retained between serial submissions until retirement drains the queue. An owner-thread gate prevents callbacks from reopening execution while the binding is changing.
+
+```mermaid
+flowchart LR
+    R[Ready binding and generation] --> U[Reject retained readers and close admission]
+    U --> D[Drain scheduler work]
+    D --> I[Retire native captures and workspace grants]
+    I --> F[Release weights and clear tensor bindings]
+    F --> L[Explicit upload into a fresh candidate]
+    L --> P[Publish new generation]
+    P --> G[Rebuild graphs on next encode]
+    G --> R
+```
+
+- Unload first rejects active host submissions and external retained weight readers. The queued execution pin is not released merely because an encode call returned. Drain and native invalidation finish before the last internal weight reference is returned.
+- Reader count is checked again after retirement. A reader obtained through a previously retained weak reference during a callback must not turn a successful retirement into a false claim that weight bytes were freed. That case leaves weights bound and admission closed until the reader returns and unload is retried.
+- The CLIP adapter uses the existing verified workspace/native-cache lifetime protocol. Ordinary CUDA captures and borrowed compute captures are retired before weight addresses disappear; borrowed leases are detached. The scheduler graph is reset and `is_allocated` is cleared, so the next encode must rebuild/reserve graph addresses. Stable tensor objects, hparams, host preprocessing values, the source manifest/file and retained host embeddings remain alive.
+- Binding generations advance on successful unload/reload. `begin()` rejects an old generation even if a backend allocator recycles the physical address. A failed drain/invalidation keeps execution closed and storage retained; retry is explicit. Failed or cancelled reloads remain unbound, without publishing a partial candidate.
+- Encode, measurement, attachment and borrowing use the same projector admission gate. Reload callbacks cannot execute with partially uploaded weights. Measurement-only buffers made with skipped uploads are explicitly rejected by the live lifecycle; buffer existence alone is not proof that payload bytes are ready.
+- The live adapter admits this lifecycle only when native-cache retirement is verified (CPU/CUDA here). Unsupported backends preserve eager allocation and reject the explicit unload request before changing residency. The storage owner, pins, generations and drain/invalidate hook contract are backend-neutral; other adapters can implement that contract without CUDA allocation logic in the owner.
+
+The explicit lifecycle does not promise that every ordinary scheduler allocation is freed: scheduler-owned compute buffers may remain allocated after a graph reset. Borrowed workspace grants are returned, and the projector weight buffer is released after its readers retire. Shared-arena placement and complete phase-budget coordination belong to 7.4c. The retained source must still remain unchanged in place, as documented in 7.4a.
+
+#### TDD and qualification
+
+- Lifecycle tests were initially red against stubbed methods. The final focused suite passes **13 cases / 117 assertions** in ASan/leak checking, UBSan and targeted TSan with process-local ASLR disabled. It covers ordered drain/invalidate/unbind, host/reload callback reentry, retained and late-retained readers, stale generations, failed retirement closure/retry, allocation/cancellation/exception cleanup, and rejection of measurement-only weights.
+- A fake allocator supplies four different backing addresses across repeated reloads. Tensor object identity stays unchanged, exact payload bytes are restored, and every previous generation remains rejected. These forced-address tests do not assume the production CUDA allocator will always return a different address.
+- Real CPU and CUDA projector tests pass **14/174** each. They match saved pre-7.4a eager-loader embeddings byte-for-byte, repeat three unload/reload cycles with warmed graph execution, reject unloaded encoding/measurement and callback reentry, preserve host embeddings, and retain the earlier projector-destruction/metadata-lifetime checks.
+- The real CUDA suite passes memcheck **14/174**, with **zero memory-access errors**. Handled stock CUDA graph-update API errors are excluded from API-error reporting; memory-access checking remains enabled.
+- The real borrowed-workspace suite passes **12/629**. Image sizes 320x320 through 1280x1024 have zero embedding differences. The largest point unloads weights while borrowed grants remain attached; all grants return before reload, and fresh encoding still matches the ordinary result.
+- The populated-ring text/image session regression remains **13/225**, with zero initial/follow-up/post-decode logit differences, identical recurrent bytes and matching 16-token continuations. Its encoding/restoration failure checks remain passing.
+- Existing CPU workspace/session controls remain **11/113** and **12/146** under ASan/leak checking and UBSan. The residency implementation passes strict conversion/sign-conversion warning checks, and the complete CUDA server target is rebuilt. TSan coverage is host ownership/source/lifecycle logic, not GPU race qualification.
+
+Artifacts are `/tmp/vision-7.4b-*`, including `red.log`, `measure-red.log`, sanitizer storage logs, `real-cpu.log`, `real-cuda.log`, `real-borrowed.log`, `session-ring.log` and `real-memcheck.log`. Production is restored and health checked using its unchanged image/configuration. Stage 7.4b is staged for user review without unrelated benchmark files; no assistant commit or push is made.
+
+#### Remaining boundary
+
+Stage 7.4c must place/reload projector storage through coordinated phase grants, account for allocations outside those grants, and qualify failed phase handoffs. Automatic image-session weight swapping and production vision admission remain pending; this checkpoint only adds and qualifies the explicit lifecycle.
+
+### Stage 7.4c: coordinated weight and compute grants for vision
+
+The opt-in internal arena adapter now executes the entire vision phase inside the suspended target's shared parent. It does not merely leave projector weights separately resident while borrowing graph scratch. The existing eager adapter and the graph-only shared adapter remain available unchanged; production/server admission is still guarded.
+
+#### Phase order and source ownership
+
+```mermaid
+flowchart LR
+    A[Projector metadata and file source only] --> B[Measure actual image batch and weight storage]
+    B --> C[Check combined weight plus compute quota]
+    C --> D[Drain text and suspend device KV]
+    D --> E[Loan separate weight and compute regions]
+    E --> F[Upload weights into their lease]
+    F --> G[Encode into borrowed compute]
+    G --> H[Retain host embeddings]
+    H --> I[Retire vision and unload its weights]
+    I --> J[Return all phase leases]
+    J --> K[Restore text grants and graphs]
+    K --> L[Prefill embeddings and continue text]
+```
+
+- `mtmd_init_from_file_deferred()` is a private C++ initialization seam. It retains hparams, tensor descriptors, host preprocessing values and the file source without allocating a projector weight buffer. Requested startup warmup is deferred too; it must not allocate a large ordinary graph before the actual batch and budget are known. Unsupported native-cache lifetimes reject this opt-in mode rather than changing the eager path.
+- `mtmd_batch_measure_vision_phase()` measures the actual preprocessed batch while weights are unbound. A scoped descriptor-only view identifies weights as already-resident leaves for the scheduler's size calculation; it neither uploads weights nor initializes backend tensors. All descriptor fields are restored on exit. The parent bytes and usage remain unchanged. This avoids incorrectly counting all unloaded weights as graph temporaries.
+- The plan reports backend-aligned weight bytes, compute bytes in the shared parent, and host compute bytes outside it. It rejects a parent too small for weights alone or for weights plus compute, and does not silently allocate a second device buffer to make the request work. Non-host compute on another buffer type/device is rejected by this adapter.
+- `llama_context_memory::lend_suspended()` commits disjoint temporary regions in the **actual target arena**, not an unrelated alias facade. It only lends while KV is suspended and ordinary target/child grants are gone. Outstanding lease references block new loans, scratch borrowing and target restoration. Leases retain the arena/buffer independently of their lender's scheduler lifetime.
+- `mtmd_projector_weights::allocate_in()` uses the existing bounded tensor allocator to bind and upload within the weight lease. It retains that lease and never substitutes another backend allocation. The residency executable includes the lease as a dependency; copied readers and execution pins keep restoration blocked until they return.
+- `mtmd_batch_encode_arena()` attaches compute leases, encodes, keeps batch-owned host embeddings, then drains/returns compute, unloads leased weights, returns caller lease references and explicitly resumes the target. `mtmd_session_eval_chunks_arena()` uses that operation within the existing ordered text/image plan. Projector weights stay unloaded between vision phases, including when the next image follows intervening text.
+- Known auxiliary/speculative consumers are explicitly rejected by this adapter; current image-aware MTP is not implicitly admitted by the new memory path. The checks and the lender/lifecycle are backend-neutral, while the live text-streaming adapter is qualified on CUDA here.
+
+#### Failure boundaries and accounting
+
+Insufficient quota is rejected before KV eviction. Failed region materialization returns temporary leases and leaves a safe suspended state that can be resumed; failure to restore a clean loan layout marks the owner invalid. Partial weight-upload cancellation, encoding exceptions and text-restoration allocation failures stop the request and use the same cleanup order. If a reader or incomplete retirement still retains a phase lease, text restoration remains blocked instead of aliasing live vision bytes. Preflight rejection before taking ownership does not clean up someone else's workspace. Request cancellation still takes effect after the active callback has cleaned up, not by interrupting a GPU kernel.
+
+`borrowed_phase_bytes` diagnostics now account for active borrowed phase reservations, including the existing graph-only borrowed path; those bytes are not reported as unused space while KV is paused. Host compute arenas, host image/preprocessing/embedding storage, per-tensor upload staging, persistent target weights and recurrent state are outside the shared parent. CUDA context/library/native graph housekeeping can also allocate outside it. The configured parent is therefore a bound for its ordinary weight/KV/compute buffers, **not a total device-VRAM limit**. No claim is made that unloading the parent reduces `nvidia-smi` usage: the parent is deliberately retained and reused.
+
+The retained file must remain unchanged in place, as in 7.4a. Cold deferred startup avoids requiring both an eager projector weight allocation and the entire shared parent at once. Existing eager contexts can explicitly switch to this adapter after unloading, but their earlier startup peak is not retroactively removed.
+
+#### TDD and qualification
+
+- The suspended-parent loan test was initially red against the stub API. Its final CUDA case passes **1/25**: active-context rejection, invalid/oversized requests, disjoint bounds, retained-reference restoration rejection, last-release retry, unchanged host KV, failed view materialization and leases outliving the lender. Focused memcheck reports **zero errors**. The full CUDA model suite remains **17/672**, with auxiliary, resume, MTP and graph-dispatch controls intact.
+- The bounded weight test proves loading succeeds while replacement backend allocation is faulted, rejects an undersized lease, checks tensor addresses within the grant, retains the grant through a reader and returns it on unload. The focused ownership suite passes **14/126** under ASan/leak checking, UBSan and targeted host TSan.
+- The deferred encoder component passes **1/22** on CPU and **1/23** on CUDA. It starts with no weight owner despite requested warmup, measures without changing parent bytes/usage, rejects both weight-only and smaller quotas, loads weight/compute into separate leases, matches saved original eager-loader embeddings byte-for-byte, and keeps a reader valid after projector and arena-owner destruction. CUDA memcheck passes **1/23 with zero errors**. The target model is metadata-only in this instrumented encoder test; this is not instrumentation of full target decoding.
+- The full IQ4_XS Q8_0/Q4_0 image/text arena fixture passes **13/231** with a 6K-word background, initial images, follow-up images and another image after decoding. Initial/follow-up/post-decode logits have **zero maximum difference**, recurrent bytes match, and 16-token continuations match the ordinary adapter. It also qualifies partial-upload cancellation/retry, encoding interruption and target-restoration failure/retry with unchanged persistent state.
+- In that fixture, a **1,024 MiB** parent holds **884.618 MiB weights + 30.016 MiB device compute = 914.634 MiB** during vision. **3.016 MiB host compute** is reported outside the parent. Text decode regains approximately **1,012.52 MiB KV pool** after the phase. The simultaneous sum would exceed the parent budget, so these results demonstrate phase reuse, not a second projector allocation hidden outside the quota. Active contexts remain resident at this short history; streaming behavior is separately retained in the legacy ring regression.
+- The existing graph-only shared image test remains **13/225** with active ring streaming; the populated-cache resume comparison remains **5/317**, and the CUDA context-owner controls remain **8/686**. The existing eager projector regression remains **15/183**. CPU owner/session controls remain **7/658** and **12/146** under ASan/leak checking and UBSan; host session TSan also passes **12/146** with process-local ASLR disabled.
+- Strict conversion/sign-conversion checks pass for the storage and session implementations, and the full CUDA server target is rebuilt. This does not claim Windows execution, other accelerator qualification or image-aware MTP support.
+
+Artifacts use `/tmp/vision-7.4c-*`, including `loan-red.log`, `loan-memcheck.log`, `model-full.log`, `phase-final.log`, `deferred-cpu.log`, `deferred-cuda.log`, `deferred-memcheck.log`, `legacy-ring.log`, `resume-regression.log` and sanitizer logs. Production is restored with its unchanged image/configuration and health checked; stage 7.4c is staged for user review without unrelated benchmark files. No assistant commit or push is made.
+
+#### Remaining boundary
+
+Stage 7.5a must wire deferred initialization and the arena adapter into the server's qualified no-MTP image request path, handle image/prompt-cache reuse and lift the production guard only for supported configurations. Stage 7.5b measures full-device peaks and transition costs; 7.5c separately qualifies image-aware MTP. The private test/adapter seams here do not themselves enable production multimodal requests.
+
+### Stage 7.5a: serial image requests through the server arena
+
+The server now admits the qualified no-MTP vision configuration and initializes its projector with metadata/file ownership only. Actual image batches call the bounded phase adapter from 7.4c. Text-only streaming, text MTP and ordinary eager multimodal execution retain their existing paths; this stage does not enable image-aware MTP.
+
+#### Admission and execution
+
+- Pure configuration checks reject unsupported combinations before allocating the target or projector: fixed KV pools instead of a shared arena, parallel requests, fitting, CPU projector execution, embedding-only operation, disabled KV offload, LoRA, auxiliary/speculative consumers, and settings other than enabled flash attention with Q8_0 K/Q4_0 V. After model initialization, capability checks require a valid shared target owner, image support and MROPE, without audio or speculative consumers. Existing target/backend geometry restrictions still apply; buffer-view support alone does not qualify another backend.
+- The server retains its existing compatible-image lookahead batching and batch-owned host embeddings. Only image encoding is redirected to `mtmd_batch_encode_arena()`: suspend target KV, loan weight/compute regions, encode, unload/return projector grants, and resume text prefill. Subsequent embedding batches do not re-encode already-owned batch outputs.
+- Whole media chunks, image identities, model positions, prompt checkpoints and RAM prompt-cache serialization continue through the existing server token implementation. Images with changed pixels cannot reuse an unchanged-image prefix solely because their dimensions match. Audio/video are not advertised by the arena path. Request overrides cannot enable speculation or LoRA after startup admission.
+- Failed image processing explicitly recovers a valid suspended owner where possible, clears the partial sequence and cached slot prompt, then releases the slot. If restoration or sequence clearing fails, the existing inference queue is terminated rather than accepting another decode against an unsafe owner. Lower-layer injected retirement/restoration failures are qualified in earlier stages; no new HTTP fault-injection claim is made here.
+- Cancellation follows the existing queue/yield contract: a disconnected request is cancelled after active work has returned its phase grants. It does not interrupt a running GPU kernel. Projector destruction now precedes destruction of the text lender.
+
+```mermaid
+sequenceDiagram
+    participant HTTP as Image request
+    participant Server as Serial slot
+    participant Vision as Deferred projector
+    participant Arena as Shared target arena
+    HTTP->>Server: Tokenize text and whole image chunks
+    Server->>Arena: Suspend text KV after its final use
+    Server->>Vision: Encode compatible image batch
+    Vision->>Arena: Borrow weight and compute grants
+    Vision-->>Server: Batch-owned host embeddings
+    Vision->>Arena: Retire execution, unload weights, return grants
+    Server->>Arena: Restore text prefill grants
+    Server->>Server: Prefill image embeddings and remaining text
+    Server-->>HTTP: Decode response
+```
+
+#### TDD and HTTP qualification
+
+- Admission tests were red against the initial stub; the pre-change live server rejected the arena/mmproj combination. The final server-policy/media-token suite passes **5 cases / 30 assertions** in Release, ASan with leak checking, UBSan and targeted host TSan with process-local ASLR disabled. TSan here covers host policy/token logic, not GPU race detection.
+- The new offline standard-library harness generates images locally and exercises nine native completion cases: text, initial image, uncached repeat, cached image, cached follow-up, changed image, separated images, adjacent images and RAM-cache restoration after another prompt. It also checks an OpenAI-compatible image chat request, socket-disconnect cancellation, a clean next request, and oversized-image rejection/recovery for the smaller arena.
+- With IQ4_XS, the matching F16 projector, Q8_0/Q4_0 KV and UVM disabled, **all nine 16-token native continuations match the same binary's ordinary eager/non-streaming path**, both with a 128-token background and a 6K-token background. This is a matched server-path comparison, not a separate upstream-build comparison. The repeated cached image processes four prompt tokens and its follow-up eleven; changed-image processing and RAM-cache restoration are exercised independently.
+- Six live startup rejection checks pass: parallel execution, MTP, CPU projector, unsupported K quantization, fitting and embeddings. The 1,024 MiB parent rejects an oversized image and successfully serves the known text continuation afterward.
+- Native capacity **262,144** with **256/256** batching and a **2,240 MiB** parent passes the image/cache/cancellation flows using short requests. This is capacity/configuration admission, not a full-262K-history or performance qualification. A 1,024 MiB parent correctly rejects that larger startup workspace. The oversized-image negative assertion is separately skipped for the larger parent because that image legitimately fits.
+- A **40K-token background**, context capacity 49,152, 64/64 batching and a 1,024 MiB parent passes the complete arena HTTP suite. Decode diagnostics explicitly show **157 active pages, 155 resident pages and 12 ring slots, `streaming=1`**. This tests media/cache/cancellation recovery with actual streaming; it does not claim a stock numerical comparison at that longer history.
+
+The executable harness is `tools/server/tests/test_adaptive_vision.py`; its usage and limits are documented beside the existing server tests. Artifacts are under `/tmp/vision-7.5a-*`, including policy/sanitizer logs, `final-comparison`, `long-comparison`, `native-final` and `streamed-http`. Temporary servers do not download models or alter production checkpoint/cache settings. The production container is restored using its unchanged image/configuration. Only this stage's source, tests and documentation are staged; no assistant commit or push is made.
+
+#### Remaining boundary
+
+Stage 7.5b must measure full-device peaks, transition/reload latency and post-request baselines, including batch-dependent workspace. Stage 7.5c must separately qualify image-aware MTP. Native context capacity, short matching continuations and host sanitizer coverage do not establish arbitrary full-context image equivalence, accelerator portability or GPU race freedom.
+
+### Stage 7.5b: measured no-MTP vision memory and handoff costs
+
+This stage adds qualification and low-frequency diagnostics, not a new allocation policy. The CUDA/CPU ownership, bounded grants, image batching, numerical execution and no-MTP admission rules remain unchanged. The reproducible measurement companion is `tools/server/tests/measure_adaptive_vision.py`; its report tests are registered with CTest when Python and server tests are available.
+
+#### Distinct timings and accounting
+
+`vision_phase` reports actual weight/device-compute/host-compute bytes, peak borrowed grants, the target KV grant before and after restoration, returned-grant status, and wall times for planning, suspension, loan creation, projector reload, encoding, retirement and text restoration. Records are emitted only after successful retirement/restoration, with explicit diagnostics validity. A successful inference is not turned into a failure merely because a diagnostic snapshot is unavailable; the measurement harness rejects such a record rather than inventing accounting.
+
+`text_resume_us` is not a measurement of uploading the entire KV cache. It rebuilds the target's grants and graph reservations. The existing resident mirror is populated lazily by its next consumer. A new `KV_reload` record measures the first refresh of each new mirror: actual copied bytes/calls, its existing backend-drain time, and the host wall time for planning and synchronous tensor copies. Timing is conditional on first use; no GPU events, new GPU synchronization or per-token logging are added. These records also cover ordinary startup and other binding replacements, so the report identifies the first refill **after each vision phase**, rather than treating every cold mirror as an image-related reload. Nonresident ring transfers and later attention computation are outside that first-refill measurement.
+
+The owner/refresh diagnostics remain backend-neutral. The external observer is explicitly NVIDIA/Linux-specific: it samples the selected physical device every 50 ms, selects that device for the temporary server, and correlates samples with the existing Linux monotonic clock. It records raw samples and request/vision/idle windows. Missing samples remain unknown, not zero. Device-wide memory includes any other activity on that GPU; sampling can miss short-lived allocations and is not an instantaneous peak guarantee.
+
+#### Observed memory and variable workspace
+
+The qualified configuration uses IQ4_XS, the matching F16 projector, Q8_0/Q4_0 KV, enabled FA, serial execution, speculation disabled and UVM disabled on the RTX 5070 Ti (16,303 MiB). Temporary image-token limits are 64-4096 to exercise variable encoder geometry; these are not a grounding-quality recommendation or a change to production defaults. Each point performs three uncached image requests with identical 16-token output IDs and a matching text continuation before/after them. The native-capacity points use a 6K-token background, not a full-262K history.
+
+| Context capacity / background | Parent MiB | Image requests | b/ub | Ready device MiB | Sampled request peak / warm idle MiB |
+| --- | --- | --- | --- | --- | --- |
+| 8,192 / 6K | 1,024 | One 512x512 image | 64/64 and 256/256 | 14,168 | 14,208 / 14,208 |
+| 262,144 / 6K | 2,240 | One 1024x1024 image | 64/64 and 256/256 | 15,396 | 15,466 / 15,466 |
+| 8,192 / 6K | 1,024 | Two 512x512 images | 64/64 | 14,168 | 14,208 / 14,208 |
+| 49,152 / 40K | 1,024 | One 512x512 image, streamed decode | 64/64 | 14,170 | 14,210 / 14,210 |
+
+- Projector weights occupy **884.618 MiB**. A 512x512 image needs **30.016 MiB device compute + 3.016 MiB host compute**; a 1024x1024 image needs **120.062 MiB device compute + 12.062 MiB host compute**. Therefore actual preprocessed image geometry, not startup warmup, determines vision scratch. Host compute is outside the parent.
+- At native capacity, the resumed **prefill** KV grant is **757.701 MiB** with 64/64 and **631.695 MiB** with 256/256. Both regain **2,228.040 MiB decode KV** inside the same 2,240 MiB parent. Larger text ubatches change prefill workspace, not the measured projector weight bytes; the vision allocation follows the actual encoder batch.
+- The native image phase uses **1,004.680 MiB** of bounded vision grants, then returns every borrowed byte and clears suspension before embedding prefill. Retaining the ready text allocation and adding those measured vision buffers separately would require an estimated **16,400.680 MiB**, above this card's total. The actual sampled peak is **15,466 MiB**. This is a counterfactual for retaining the configured text parent, not a measured stock server or a complete driver-memory prediction.
+- The first request establishes native graph/driver allocations outside the parent: device usage rises 40 MiB in the smaller configuration and 70 MiB at native capacity, then stays unchanged across the later repeats. Returning a lease does not free the retained parent to the driver; the expected baseline is the warmed allocation, not the pre-model or pre-capture value.
+- The two-image point uses two encoder batches per HTTP request with the current projector settings. All six phases across three requests are accounted for independently, including each projector reload and target refill. No one-image/one-phase assumption is made by the report.
+- The 40K point explicitly reaches `streaming=1` and returns to the same warmed baseline over all three requests. The first post-vision resident refill copies **728 MiB** in 32 calls; later decode rebindings and ring traffic are listed separately, not attributed to that initial refill.
+
+#### Handoff latency
+
+At the quiet native-capacity point, subsequent projector reloads take **150.5-152.2 ms**, image encoding **224.1-230.4 ms**, and text-grant restoration **1.40-1.47 ms**. The first post-vision resident refill copies **156 MiB** in 32 calls and takes **3.46-3.64 ms**, separately from restoration. A later prefill-to-decode replacement may refill another mirror; the raw report preserves those records too. Projector reload includes file access and upload preparation; mirror refill includes host planning and its existing synchronous copies. Neither number is a pure PCIe bandwidth measurement.
+
+The long-history point is used for streaming-memory stability, not a throughput claim: some qualification builds overlapped that run, and its host wall timings vary with CPU load. Native-capacity handoff timings above come from the separate quiet run. These are a few representative repetitions with already-cached source files, not statistical cold-I/O or steady-decode benchmarks.
+
+#### TDD and regression evidence
+
+- Host report tests started red for missing phase parsing, then for request grouping and lazy-refill parsing. A further red overlap/orphan case catches duplicated attribution that simple total-count checking would miss. The final **5 unittest cases** cover missing/malformed records, invalid returned grants, negative timing, timestamp ordering, absent samples, multiple batches per request and unambiguous attribution. Live reports additionally require a refill after every successful vision phase.
+- The complete registered Release selection passes **4 CTest targets**: report tests, server admission/media policy (**5/30**), session controls (**12/146**) and resident controls (**15/275**). Session/resident controls also pass ASan with leak checking and UBSan. Targeted host session TSan passes **12/146** with process-local ASLR disabled. The resident suite's ordinary TSan run reports a race in unchanged CPU OpenMP graph execution (`ggml-cpu.c:3385`), outside the new diagnostics; that broader run is not counted as passing. A separate `OMP_THREAD_LIMIT=1` control passes **15/275** and qualifies the host logic only, not multithreaded OpenMP or GPU race freedom.
+- The real no-MTP phase-arena fixture passes **13 cases / 231 assertions**. Initial, follow-up and post-decode image logits have **zero maximum difference**; recurrent state bytes and 16-token continuations match the ordinary adapter. Interrupted encoding, upload cancellation and target-restoration retry remain covered. The first invocation used the fixture's streaming expectation with an all-resident 1,024 MiB parent and failed that expectation; the corrected `--resident-control` invocation passes without a code change or weakened assertion.
+- The final repeated-image studies qualify returned grants, stable warmed device usage, unchanged token IDs, post-image text recovery and separate reload timings. A small-image run separately checks the diagnostic/report path at verbosity 3. No image-aware MTP, other accelerator execution or full-262K image history is claimed.
+
+Artifacts are `/tmp/vision-7.5b-*`, notably `native-reload-final`, `two-image-reload-final`, `streamed-reload-final`, `verbosity3-passed`, `real-session-final.log`, CTest and host sanitizer logs. The initial two-image report correctly stopped when its one-phase-per-request assumption was disproved; grouping now preserves all completed phases. The initial verbosity-3 check also exposed the generic backend callback's INFO-to-verbosity-4 mapping. Diagnostics now use the existing `memory_phase` warning-level visibility so they remain present at verbosity 3; this severity does not indicate an inference failure. The production container is restored using its original image/configuration. Only this stage's source, test and documentation files are staged; no assistant commit or push is made.
+
+#### Next boundary
+
+Stage 7.5c must qualify the existing embedded MTP path across vision/text transitions, including image-embedding catch-up, M-RoPE positions, target/draft/vision scheduler ownership, ring-guard retirement, rejection replay, cancellation and peak memory. The no-MTP path and its measured baselines remain the control. The current speculative vision guard stays closed until those qualifications pass.
+
+### Stage 7.5c: image-aware embedded MTP qualification
+
+Milestone 7's acceptance gate is met for the documented CUDA/Qwen configuration, pending the user's commit. Admission accepts only the single embedded Qwen MTP head with draft lengths 1-3, matching Q8_0/Q4_0 KV, a registered borrowed draft and the existing serial shared-arena vision configuration. No new claim is made for arbitrary models, accelerator backends, image dimensions or universally identical generations.
+
+- Raw visual embeddings and shifted target hidden rows use separate MTP input channels. Owning microbatch copies preserve both through splitting and caller lifetime changes. The original split regression was red before this input existed; host tests now cover both channel separation and lifetime.
+- Target and auxiliary caches use dense physical append/suffix indices while retaining monotone image M-RoPE metadata. Checkpoint/RAM prompt-cache restoration also saves the draft's pending hidden row. The suspension adapter accepts only its registered borrowed draft and host-backed auxiliary cache; unknown speculative consumers remain rejected. Other model families keep their existing visual catch-up behavior.
+- The initial non-finite output was an allocation-contract bug, not a recurrent rollback arithmetic bug. Short prefill used native CUDA MMA, but the managed TG1-TG4 allocation heuristic reserved only the output, omitting stock F16 K/V conversion scratch. A four-query node reserved 98,304 bytes rather than 2,195,456 bytes, allowing writes into other live tensors inside the same parent. Memcheck cannot detect that logical intra-allocation overlap. The full-checkpoint fallback changed allocator packing and masked the bug; disabling CUDA graphs/fusion/publication or skipping MTP image catch-up did not fix it.
+- Managed attention now explicitly declares external scratch only for bounded decode/span execution. Short prefill retains native allocation extras. Measurement and MTP handoff reservations carry the same phase intent; graph reuse includes that intent. The allocation regression went red before the fix, then passed for TG1-TG4, with arithmetic parameters unchanged and bounded decode allocations retained. Default host-spilled rollback stays enabled.
+- Eager/arena comparisons pass all nine text/image, uncached/cached, follow-up, changed-image, multiple/adjacent-image and restored-prompt cases. MTP=1 matches 16-token continuations; MTP=2/3 match 64-token continuations. Chat smoke, rejected drafts, disconnect cancellation, oversized-image rejection and subsequent text recovery pass. These controls use this binary's image-aware input plumbing and ordinary native kernels, not an unmodified upstream server.
+- At approximately 39K prompt tokens, 256/256 batches, a 1,024 MiB arena and MTP=3, streaming is confirmed in the logs and all nine 128-token continuations match the eager control. Its separate allocations require UVM to fit; only that control enables UVM. The arena remains non-UVM. The eager run retains accepted outputs despite its 2 GiB RAM-cache capacity failing the RAM-restore assertion; the arena uses 8 GiB and passes that assertion. Accepted output comparison uses the retained control JSON rather than repeating its completed requests.
+- Native-capacity memory qualification uses context 262,144, a 2,240 MiB parent, 256/256 batches, MTP=3, 512px images and short backgrounds. Three repeated uncached requests settle at 15,836 MiB on the 16,303 MiB card. Actual vision grants are 884.62 MiB of weights plus 30.02 MiB of compute, returned before text resumes. Retaining those as additional buffers beside the ready text allocation would estimate 16,672.6 MiB, above device capacity; that is a counterfactual, not a measured stock peak.
+- The real-model `--vision-mtp-handoff` test checks byte-identical target/draft state through suspension, an overwritten borrowed region, loan-blocked resume and final return. The parent address stays stable and a new MTP lease can be acquired. TG1-TG4 and sequential draft logits match the native control exactly in this case. A too-small native-context fixture correctly fell back to separate draft scratch and was rejected by vision capability admission; the final fixture uses an 8K context and a 640 MiB shared parent.
+- A 192,073-token prompt with native 262,144 context capacity, a 2,240 MiB arena, 256/256 batches, MTP=3 and UVM disabled completes 128-token generation. The cached repeat restores 192,069 rows and executes four-token native prefill, reproducing the same 128 token IDs. A changed image then restores the earlier text checkpoint, encodes the new image, generates successfully and leaves a fresh text request usable. This specifically tests the corrected short-prefill allocation at large history length; it is not a stock-throughput comparison or a full-262K prompt test.
+- Release host tests and focused ASan/UBSan checks pass. Focused TSan initially hit runtime `unexpected memory mapping` before test execution; rerunning with process-local ASLR disabled (`setarch x86_64 -R`) passes without changing boot/system settings. The instrumented HTTP suite completes its functional cases without reported illegal accesses; it reports expected, handled CUDA graph-update API failures. Its first rejection pass exposed an overly broad test diagnostic assertion, now covered by host tests. Instrumented subprocess cleanup now terminates the owned process group before GPU restoration.
+- Final acceptance: 37 focused Release CTests pass, the host harness/report suites pass, CUDA allocation tests pass 75 assertions, native short-prefill tests pass 52 assertions, the shared-parent real handoff passes 262 assertions, and the original small-pool target/MTP test passes 246 assertions with zero measured TG1-TG4 logit error. Native short-prefill memcheck exits normally with `ERROR SUMMARY: 0 errors` (handled API reports disabled, memory checking retained). The final no-MTP eager/arena comparison matches all nine requests and rejects all six unsupported startup configurations. Default rollback, graph capture and publication remain enabled during normal live tests.
+
+Artifacts are under `/tmp/vision-7.5c-*`: `fixed-mtp2`, `fixed-mtp3`, `stream-arena-mtp3`, `stream-mtp3-uvm-control`, `native-mtp3`, `large-history`, `real-handoff5.log`, `streamed-pair.log`, `session-memcheck.log`, `no-mtp-final`, allocation/session test logs and host sanitizer logs. Temporary NaN tracing and unsuccessful arithmetic/publication prototypes are removed. Only `llm-llmster` is stopped for GPU tests; face recognition and unrelated containers are not changed. Production is restored with its original image/configuration before handoff. Unrelated benchmark files remain untouched, and no assistant commit or push is made.

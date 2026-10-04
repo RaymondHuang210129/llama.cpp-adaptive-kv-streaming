@@ -284,8 +284,11 @@ struct llama_kv_stream_resident::implementation {
 
     // Refresh only the capacity assigned to each layer; concentrated layouts may assign zero rows.
     bool refresh(size_t padded, uint32_t only_layer = UINT32_MAX) {
+        const bool cold = !initialized;
+        const auto start_us = cold ? ggml_time_us() : 0;
         bytes = calls = 0;
         ggml_backend_synchronize(backend);
+        const auto drained_us = cold ? ggml_time_us() : 0;
         if (!initialized) {
             if (!content->reset_mirror()) return false;
             initialized = true;
@@ -295,6 +298,7 @@ struct llama_kv_stream_resident::implementation {
             if (only_layer != UINT32_MAX) range.layer = only_layer;
             range.count = std::min(padded, placement(range.layer).planes.tokens);
         }
+        const auto upload_start_us = cold ? ggml_time_us() : 0;
         if (!content->flush(selected, [&](const llama_kv_stream_copy_span & span) {
             const bool value = span.rows.operand == ggml_kv_stream_operand::v;
             const auto & planes = placement(span.rows.layer).planes;
@@ -304,6 +308,13 @@ struct llama_kv_stream_resident::implementation {
             bytes += span.bytes; ++calls;
             return true;
         })) return false;
+        // Measure first-use mirror refill without adding a wait to its existing synchronous copies.
+        if (cold) {
+            const auto end_us = ggml_time_us();
+            LLAMA_LOG_WARN("KV_reload: bytes=%zu calls=%zu padded_rows=%zu drain_us=%lld upload_us=%lld begin_us=%lld end_us=%lld\n",
+                bytes,calls,padded,static_cast<long long>(drained_us-start_us),static_cast<long long>(end_us-upload_start_us),
+                static_cast<long long>(start_us),static_cast<long long>(end_us));
+        }
         return true;
     }
 
@@ -1032,6 +1043,7 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
     ggml_kv_stream_block_layout work;
     ggml_kv_stream_layout gathered;
     ggml_kv_stream_resume_plan resume_plan;
+    const bool prefill = cross && !s.sequence->decode;
     const bool resumed = s.resumed_decode && cross && s.sequence->decode && q->ne[1] <= 2 && !s.fallback &&
         ops->version >= 5 && ops->resume_plan && ops->resume &&
         ops->resume_plan(s.backend,s.binding.config.shape.type_k,s.binding.config.shape.type_v,
@@ -1039,12 +1051,13 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
     const bool span_shape = q->ne[1] <= 2 ||
         (s.binding.config.shape.type_k == GGML_TYPE_Q8_0 && s.binding.config.shape.type_v == GGML_TYPE_Q4_0) ||
         (s.binding.config.shape.type_k == GGML_TYPE_F16 && s.binding.config.shape.type_v == GGML_TYPE_F16);
-    const bool segmented = span_shape && s.native_graph_attention && cross && !s.fallback &&
+    const bool segmented = span_shape && s.native_graph_attention && cross && !prefill && !s.fallback &&
         q->ne[1] <= 4 && blocks <= slots && ops->version >= 8 && ops->spans && ops->spans_workspace &&
         (q->ne[1] != 2 || resumed ||
          (s.binding.config.shape.type_k == GGML_TYPE_Q8_0 && s.binding.config.shape.type_v == GGML_TYPE_Q4_0)) &&
         (prefix == padded || !resumed);
-    const bool native = s.native_graph_attention && !resumed && (q->ne[1] != 2 || segmented || !s.resumed_decode);
+    // Short prefills use the same encoded gather and stock kernel as longer prefills.
+    const bool native = s.native_graph_attention && !resumed && (prefill || q->ne[1] != 2 || segmented || !s.resumed_decode);
     if (ggml_kv_stream_block_layout_make(size_t(q->ne[1])*size_t(q->ne[2]),size_t(output->ne[0]),work).status !=
             ggml_kv_stream_partial_status::success) return false;
     if (native && !segmented && ggml_kv_stream_layout_make(s.binding.config.shape,padded,gathered).status != ggml_kv_stream_status::success) return false;
