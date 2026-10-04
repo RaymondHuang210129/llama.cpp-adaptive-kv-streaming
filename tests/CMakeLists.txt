@@ -208,6 +208,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     if (LLAMA_BUILD_SERVER)
         llama_build_and_test(test-server-vision.cpp)
         target_link_libraries(test-server-vision PRIVATE server-context)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if (Python3_Interpreter_FOUND)
+            llama_test_cmd(${Python3_EXECUTABLE} NAME test-adaptive-vision-measurements
+                ARGS -B ${PROJECT_SOURCE_DIR}/tools/server/tests/test_adaptive_vision_measurements.py)
+        endif()
     endif()
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
