@@ -562,10 +562,12 @@ struct server_prompt {
     server_tokens tokens;
 
     std::list<common_prompt_checkpoint> checkpoints;
+    std::vector<uint8_t> speculative_state;
 
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        speculative_state.clear();
     }
 
     int n_tokens() const {
@@ -576,6 +578,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            speculative_state,
         };
     }
 };
@@ -594,7 +597,7 @@ struct server_prompt_cache_state {
     server_prompt_data data;
 
     size_t size() const {
-        size_t res = data.size();
+        size_t res = data.size() + prompt.speculative_state.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();

@@ -157,6 +157,8 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    // Decode visual MTP rows with distinct raw inputs and previous hidden states.
+    int decode_mtp_embeddings(const llama_batch & batch, const float * hidden, size_t elements);
 
     //
     // state save/load
@@ -300,6 +302,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    const float * mtp_visual_hidden = nullptr;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
