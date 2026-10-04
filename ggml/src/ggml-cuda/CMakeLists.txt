@@ -56,6 +56,8 @@ if (CUDAToolkit_FOUND)
         endif()
     endif()
 
+    include(${CMAKE_CURRENT_SOURCE_DIR}/architectures.cmake)
+    ggml_cuda_check_toolkit_architectures("${CUDAToolkit_VERSION}" "${CMAKE_CUDA_ARCHITECTURES}")
     enable_language(CUDA)
 
     # TODO: Remove once CCCL 3.2 has been released and bundled with CUDA Toolkit
