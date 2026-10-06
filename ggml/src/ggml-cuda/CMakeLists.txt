@@ -126,7 +126,7 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-bf16-bf16.cu)
     endif()
 
-    # Compile only the streamed head-256 / one-column kernels, without changing stock attention dispatch.
+    # Compile private head-256 streamed kernels without changing stock attention dispatch.
     foreach(KV_STREAM_KEY IN ITEMS F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0)
         set(KV_STREAM_DEFAULT_NATIVE 0)
         if (KV_STREAM_KEY MATCHES "^(F16|BF16|Q4_0|Q8_0)$")
@@ -135,6 +135,9 @@ if (CUDAToolkit_FOUND)
         set(KV_STREAM_INSTANCE "${CMAKE_CURRENT_BINARY_DIR}/kv-stream-instance-${KV_STREAM_KEY}.cu")
         configure_file(kv-stream-instance.cu.in "${KV_STREAM_INSTANCE}" @ONLY)
         list(APPEND GGML_SOURCES_CUDA "${KV_STREAM_INSTANCE}")
+        set(KV_STREAM_TILE_INSTANCE "${CMAKE_CURRENT_BINARY_DIR}/kv-stream-tile-instance-${KV_STREAM_KEY}.cu")
+        configure_file(kv-stream-tile-instance.cu.in "${KV_STREAM_TILE_INSTANCE}" @ONLY)
+        list(APPEND GGML_SOURCES_CUDA "${KV_STREAM_TILE_INSTANCE}")
     endforeach()
 
     ggml_add_backend_library(ggml-cuda
