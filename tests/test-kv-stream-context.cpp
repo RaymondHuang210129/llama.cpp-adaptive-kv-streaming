@@ -13,6 +13,14 @@
 #include <cstring>
 #include <fstream>
 
+#ifdef KV_STREAM_TILE_NATIVE_TEST
+bool kv_stream_test_is_sm61_only();
+bool kv_stream_test_is_arch_only(int cc);
+int kv_stream_test_compiled_cc(ggml_backend_t backend);
+int kv_stream_test_override_cc(ggml_backend_t backend, int cc);
+bool kv_stream_test_native_graphs_enabled();
+#endif
+
 using context_ptr = std::unique_ptr<llama_context,decltype(&llama_free)>;
 using model_ptr = std::unique_ptr<llama_model,decltype(&llama_model_free)>;
 static bool auxiliary_control = false, embedded_mtp_control = false, target_tg3_control = false, target_stream_tg4_control = false;
@@ -340,6 +348,19 @@ static serial_phase_result evaluate_serial_phases(testing & t, llama_model * mod
 }
 
 int main(int argc,char ** argv) {
+    int baseline=0;
+    for (int i=3;i<argc;++i) {
+        if (!std::strcmp(argv[i],"--pascal")) baseline=610;
+        if (!std::strcmp(argv[i],"--sm75")) baseline=750;
+        if (!std::strcmp(argv[i],"--sm86")) baseline=860;
+        if (!std::strcmp(argv[i],"--sm89")) baseline=890;
+        if (!std::strcmp(argv[i],"--sm120")) baseline=1200;
+    }
+#ifdef KV_STREAM_TILE_NATIVE_TEST
+    if (baseline && !kv_stream_test_is_arch_only(baseline)) return 77;
+#else
+    if (baseline) return 77;
+#endif
     testing t;
     t.test("streaming_is_disabled_by_default", [&](testing & t) {
         const auto defaults = llama_context_default_params();
@@ -377,6 +398,20 @@ int main(int argc,char ** argv) {
     }
     embedded_mtp_control |= vision_mtp_handoff;
     ggml_backend_load_all(); llama_backend_init();
+    ggml_backend_ptr baseline_backend;
+#ifdef KV_STREAM_TILE_NATIVE_TEST
+    if (baseline) {
+        auto * device=ggml_backend_dev_by_name("CUDA0");
+        if (!device) return 77;
+        baseline_backend.reset(ggml_backend_dev_init(device,nullptr));
+        if (!baseline_backend || kv_stream_test_compiled_cc(baseline_backend.get()) != baseline) return 77;
+    }
+    const int previous=baseline ? kv_stream_test_override_cc(baseline_backend.get(),baseline) : 0;
+    struct restore {
+        ggml_backend_t backend; int previous;
+        ~restore() {if (backend) kv_stream_test_override_cc(backend,previous);}
+    } restore_cc{baseline_backend.get(),previous};
+#endif
     auto mparams = llama_model_default_params(); mparams.n_gpu_layers = 999;
     mparams.load_mtp = embedded_mtp_control || mtp_memory_probe || mtp_sustained_control || target_drift_control || rollback_probe || serial_workspace_growth;
     model_ptr model(llama_model_load_from_file(argv[2],mparams),llama_model_free);
@@ -850,7 +885,12 @@ int main(int argc,char ** argv) {
                     for (size_t i = 0; i < 4; ++i)
                         if (!t.assert_equal(0,llama_decode(ctx.get(),llama_batch_get_one(&prompt[i],1)))) return;
                     t.assert_true(snapshot() == saved);
-                    if (!streamed) t.assert_true(stream->captured_layers() > 0);
+                    if (!streamed) {
+#ifdef KV_STREAM_TILE_NATIVE_TEST
+                        if (kv_stream_test_native_graphs_enabled()) t.assert_true(stream->captured_layers() > 0);
+                        else t.assert_equal(size_t(0),stream->captured_layers());
+#endif
+                    }
                     const auto revision = stream->binding_view().revision;
                     if (!t.assert_true(llama_context_suspend_kv_device(ctx.get()))) return;
                     t.assert_equal(size_t(0),stream->captured_layers());

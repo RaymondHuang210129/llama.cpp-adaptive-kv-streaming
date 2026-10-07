@@ -330,6 +330,14 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 
 namespace {
+// Sizing and launch must validate the same compiled span specialization.
+template<int ncols1, int ncols2>
+static auto mma_span_kernel(bool quantized) {
+    return quantized ?
+        flash_attn_ext_f16_spans<256,256,ncols1,ncols2,false,false,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0> :
+        flash_attn_ext_f16_spans<256,256,ncols1,ncols2,false,false,GGML_TYPE_F16,GGML_TYPE_F16>;
+}
+
 struct mma_span_launch {
     dim3 blocks;
     int ncols1 = 0;
@@ -349,7 +357,9 @@ struct mma_span_launch {
 // Reproduce stock Stream-K planning while accounting for descriptors in caller-owned scratch.
 static bool mma_span_launch_make(
         ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
-        size_t span_count, mma_span_launch & output) {
+        size_t span_count, mma_span_launch & output, ggml_cuda_kv_stream_plan_status * failure = nullptr) {
+    using status = ggml_cuda_kv_stream_plan_status;
+    if (failure) *failure = status::unsupported_geometry;
     if (!dst || dst->op != GGML_OP_FLASH_ATTN_EXT || !span_count || span_count > INT_MAX) return false;
     const auto * q = dst->src[0];
     const auto * k = dst->src[1];
@@ -371,6 +381,13 @@ static bool mma_span_launch_make(
     float params[3];
     memcpy(params,dst->op_params,sizeof(params));
     if (!std::isfinite(params[0]) || params[0] <= 0 || params[1] != 0 || params[2] != 0) return false;
+    if (k->ne[1]%FATTN_KQ_STRIDE) return false;
+    for (const auto * tensor : {q,k,v,mask}) if (!ggml_is_quantized(tensor->type))
+        for (int i=1;i<4;++i) if (tensor->nb[i]%16) return false;
+    if (ggml_cuda_flash_attn_ext_kernel_family(ctx.device,dst) != ggml_cuda_kv_stream_kernel_family::mma) {
+        if (failure) *failure=status::stock_unavailable;
+        return false;
+    }
 
     constexpr int DKQ = 256, DV = 256;
     const int gqa_ratio = int(q->ne[2]/k->ne[2]);
@@ -378,7 +395,10 @@ static bool mma_span_launch_make(
     const int ncols1 = ggml_cuda_kv_stream_mma_ncols1(uint32_t(q->ne[1]),gqa_ratio);
     const int ncols2 = gqa_ratio > 4 ? 8 : 2, ncols = ncols1*ncols2;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (!turing_mma_available(cc)) return false;
+    if (!turing_mma_available(cc)) {
+        if (failure) *failure = status::unsupported_device_features;
+        return false;
+    }
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ,DV,ncols,cc);
     const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ,DV,ncols,cc);
     const int nbatch_K2 = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ,DV,ncols,cc);
@@ -401,6 +421,7 @@ static bool mma_span_launch_make(
     next.ncols2 = ncols2;
     next.shared_bytes = std::max(shared_combine,q_in_reg ?
         std::max(shared_q,shared_kv+shared_mask) : shared_q+shared_kv+shared_mask);
+    const size_t native_shared_bytes=next.shared_bytes;
     if (span_count <= 3) {
         next.span_shared_offset = (next.shared_bytes+15)/16*16;
         next.shared_bytes = next.span_shared_offset+3*sizeof(ggml_cuda_kv_span);
@@ -416,12 +437,42 @@ static bool mma_span_launch_make(
         flash_attn_ext_f16<DKQ,DV,2,8,false,false> :
         ncols2 == 8 ? flash_attn_ext_f16<DKQ,DV,4,8,false,false> :
         flash_attn_ext_f16<DKQ,DV,4,2,false,false>;
-    CUDA_CHECK(cudaFuncSetAttribute(
-        ordinary,cudaFuncAttributeMaxDynamicSharedMemorySize,int(next.shared_bytes)));
+    auto spanned=ncols1 == 2 ? mma_span_kernel<2,8>(k->type == GGML_TYPE_Q8_0) :
+        ncols2 == 8 ? mma_span_kernel<4,8>(k->type == GGML_TYPE_Q8_0) : mma_span_kernel<4,2>(k->type == GGML_TYPE_Q8_0);
+    cudaFuncAttributes attributes{};
+    if (cudaFuncGetAttributes(&attributes,spanned) != cudaSuccess) {
+        if (failure) *failure=status::unsupported_launch_resources;
+        (void) cudaGetLastError(); return false;
+    }
+    const auto limit=ggml_cuda_info().devices[ctx.device].smpbo;
+    if (size_t(attributes.sharedSizeBytes) > limit || next.shared_bytes > limit-size_t(attributes.sharedSizeBytes) ||
+            nthreads > attributes.maxThreadsPerBlock) {
+        if (failure) *failure=status::unsupported_launch_resources;
+        return false;
+    }
+    if (cudaFuncSetAttribute(spanned,cudaFuncAttributeMaxDynamicSharedMemorySize,int(next.shared_bytes)) != cudaSuccess) {
+        if (failure) *failure=status::unsupported_launch_resources;
+        (void) cudaGetLastError(); return false;
+    }
+    int span_occupancy=0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&span_occupancy,spanned,nthreads,next.shared_bytes) != cudaSuccess || !span_occupancy) {
+        if (failure) *failure=status::unsupported_launch_resources;
+        (void) cudaGetLastError(); return false;
+    }
+    // Extra descriptor bytes may reduce streamed occupancy, but must not change stock Stream-K arithmetic.
+    if (cudaFuncSetAttribute(ordinary,cudaFuncAttributeMaxDynamicSharedMemorySize,int(native_shared_bytes)) != cudaSuccess) {
+        if (failure) *failure = status::unsupported_launch_resources;
+        (void) cudaGetLastError(); return false;
+    }
     int max_blocks_per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_blocks_per_sm,ordinary,nthreads,next.shared_bytes));
-    if (!max_blocks_per_sm) return false;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm,ordinary,nthreads,native_shared_bytes) != cudaSuccess) {
+        if (failure) *failure = status::unsupported_launch_resources;
+        (void) cudaGetLastError(); return false;
+    }
+    if (!max_blocks_per_sm) {
+        if (failure) *failure = status::unsupported_launch_resources;
+        return false;
+    }
     const int max_blocks = max_blocks_per_sm*ggml_cuda_info().devices[ctx.device].nsm;
     const int tiles_nwaves = (next.ntiles_dst+max_blocks-1)/max_blocks;
     const int tiles_efficiency = 100*next.ntiles_dst/(max_blocks*tiles_nwaves);
@@ -444,6 +495,7 @@ static bool mma_span_launch_make(
     }
     next.bytes = next.descriptor_bytes+next.fixup_bytes;
     output = next;
+    if (failure) *failure = status::success;
     return true;
 }
 } // namespace
@@ -454,18 +506,23 @@ size_t ggml_cuda_flash_attn_ext_mma_f16_spans_workspace(
     return mma_span_launch_make(ctx,dst,spans,plan) ? plan.bytes : 0;
 }
 
+// Report the same caller-owned layout and shared-memory usage used by the unchanged span launcher.
+bool ggml_cuda_flash_attn_ext_mma_f16_spans_requirements(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * dst, size_t spans,
+        ggml_cuda_kv_stream_workspace_requirements & output, ggml_cuda_kv_stream_plan_status * failure) {
+    mma_span_launch plan;
+    if (!mma_span_launch_make(ctx, dst, spans, plan, failure)) return false;
+    output = {true, 0, plan.bytes, 128, plan.shared_bytes, true, true};
+    return true;
+}
+
 template<int ncols1, int ncols2>
 static bool ggml_cuda_flash_attn_ext_mma_f16_spans_case(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_cuda_kv_span * spans, size_t count,
         void * workspace, const mma_span_launch & plan) {
     constexpr int DKQ = 256, DV = 256;
-    constexpr bool softcap = false, v_is_k = false;
-    auto kernel = dst->src[1]->type == GGML_TYPE_Q8_0 ?
-        flash_attn_ext_f16_spans<DKQ,DV,ncols1,ncols2,softcap,v_is_k,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0> :
-        flash_attn_ext_f16_spans<DKQ,DV,ncols1,ncols2,softcap,v_is_k,GGML_TYPE_F16,GGML_TYPE_F16>;
-    CUDA_CHECK(cudaFuncSetAttribute(
-        kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,int(plan.shared_bytes)));
+    auto kernel=mma_span_kernel<ncols1,ncols2>(dst->src[1]->type == GGML_TYPE_Q8_0);
     auto * device_spans = static_cast<ggml_cuda_kv_span *>(workspace);
     CUDA_CHECK(cudaMemcpyAsync(
         device_spans,spans,count*sizeof(*spans),cudaMemcpyHostToDevice,ctx.stream()));
@@ -776,7 +833,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+ggml_cuda_kv_stream_kernel_family ggml_cuda_flash_attn_ext_kernel_family(int device, const ggml_tensor * dst) {
+    using family = ggml_cuda_kv_stream_kernel_family;
+    switch (ggml_cuda_get_best_fattn_kernel(device, dst)) {
+        case BEST_FATTN_KERNEL_VEC: return family::vector;
+        case BEST_FATTN_KERNEL_TILE: return family::tile;
+        case BEST_FATTN_KERNEL_MMA_F16: return family::mma;
+        case BEST_FATTN_KERNEL_NONE: return family::none;
+    }
+    return family::none;
+}
+
+size_t ggml_cuda_flash_attn_ext_selected_alloc_size(ggml_cuda_kv_stream_kernel_family kernel, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * K = dst->src[1];
@@ -785,22 +853,20 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
-
     bool need_f16_K = false;
     bool need_f16_V = false;
 
     switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
+        case ggml_cuda_kv_stream_kernel_family::tile:
+        case ggml_cuda_kv_stream_kernel_family::mma:
             need_f16_K = true;
             need_f16_V = true;
             break;
-        case BEST_FATTN_KERNEL_VEC:
+        case ggml_cuda_kv_stream_kernel_family::vector:
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
-        case BEST_FATTN_KERNEL_NONE:
+        case ggml_cuda_kv_stream_kernel_family::none:
             break;
     }
 
@@ -810,21 +876,30 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+    return ggml_cuda_flash_attn_ext_selected_alloc_size(ggml_cuda_flash_attn_ext_kernel_family(device, dst), dst);
+}
+
+void ggml_cuda_flash_attn_ext_selected(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_kv_stream_kernel_family family) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
-        case BEST_FATTN_KERNEL_NONE:
+    switch (family) {
+        case ggml_cuda_kv_stream_kernel_family::none:
             GGML_ABORT("fatal error");
-        case BEST_FATTN_KERNEL_TILE:
+        case ggml_cuda_kv_stream_kernel_family::tile:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_VEC:
+        case ggml_cuda_kv_stream_kernel_family::vector:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_MMA_F16:
+        case ggml_cuda_kv_stream_kernel_family::mma:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }
+}
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+    ggml_cuda_flash_attn_ext_selected(ctx, dst, ggml_cuda_flash_attn_ext_kernel_family(ctx.device, dst));
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

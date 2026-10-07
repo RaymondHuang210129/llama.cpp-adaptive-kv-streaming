@@ -183,7 +183,7 @@ For a build covering all CUDA GPUs, disable `GGML_NATIVE`:
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=OFF
 ```
 
-The resulting binary should run on all CUDA GPUs with optimal performance, though some just-in-time compilation may be required.
+The resulting binary covers the GPU targets supported by the selected toolkit, though some just-in-time compilation may be required. CUDA 13 does not compile Maxwell, Pascal or Volta targets.
 
 ### Override Compute Capability Specifications
 
@@ -220,6 +220,180 @@ If you have multiple CUDA installations on your system and want to compile llama
 ```bash
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/opt/cuda-11.7/bin/nvcc -DCMAKE_INSTALL_RPATH="/opt/cuda-11.7/lib64;\$ORIGIN" -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
 ```
+
+#### Pascal / GTX 10-series build qualification
+
+SM61 requires CUDA 12.9 or earlier. Use a separate toolkit and build directory; do not downgrade the production driver or change the default CUDA installation. The following Linux profile is compile-qualified with CUDA 12.9.1, NVCC 12.9.86, GCC 13.3 and CMake 3.28.3 on Ubuntu 24.04:
+
+```bash
+cmake -S . -B build-sm61 -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=61 \
+  -DCMAKE_CUDA_COMPILER=/opt/cuda-12.9/bin/nvcc \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13 \
+  -DGGML_CUDA_FA_ALL_QUANTS=ON -DLLAMA_BUILD_TESTS=ON
+cmake --build build-sm61 --target llama-server test-cuda-compiled-features test-kv-stream-attention-plan -j
+ctest --test-dir build-sm61 --output-on-failure \
+  -R '^(test-cuda-architecture-config|test-cuda-compiled-features|test-kv-stream-attention-plan)$'
+```
+
+Replace the example compiler paths with those of your isolated toolkit and supported host compiler. A compile-only container also works without NVIDIA device access: use `nvidia/cuda:12.9.1-devel-ubuntu24.04`, install CMake/Ninja and normal build dependencies inside that container, mount the source read-only and a separate build directory writable, then use `-DCMAKE_CUDA_ARCHITECTURES=61`. Keep the container's default NVCC/GCC paths instead of the `/opt` paths above.
+
+In a container without a driver, final executable linking can fail because the SDK's `libcuda.so` stub has the SONAME `libcuda.so.1`, but no matching symlink. For compile-only qualification with `/source` and `/build` mounts:
+
+```bash
+mkdir -p /build/driver-stubs
+ln -s /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so /build/driver-stubs/libcuda.so.1
+cmake -S /source -B /build -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=61 \
+  -DGGML_CUDA_FA_ALL_QUANTS=ON -DLLAMA_BUILD_TESTS=ON \
+  -DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath-link=/build/driver-stubs
+cmake --build /build --target llama-server test-cuda-compiled-features test-kv-stream-attention-plan -j
+LD_LIBRARY_PATH=/build/driver-stubs ctest --test-dir /build --output-on-failure \
+  -R '^(test-cuda-architecture-config|test-cuda-compiled-features|test-kv-stream-attention-plan)$'
+```
+
+This stub is only for linking and GPU-independent tests. Do not install it as a driver, put it on an inference runtime's library path, or count these tests as GPU execution. Inference needs the real NVIDIA driver and device access.
+
+`test-cuda-compiled-features` uses the CUDA backend's actual architecture list and build definitions, but does not initialize a GPU. An SM61-only build reports compiled target `610`, slow FP16 and no Tensor Core / `cp.async` support, even when queried for a newer hypothetical GPU. The normal CUDA source guards keep newer instructions out of this target. For mixed Q8_0 K / Q4_0 V, keep `GGML_CUDA_FA_ALL_QUANTS=ON`; the default vector build compiles only matching F16/F16, BF16/BF16, Q4_0/Q4_0 and Q8_0/Q8_0 pairs. Other stock attention paths may use bounded conversion; a missing direct pair is not proof that the hardware is unsupported.
+
+This compile profile alone is not Pascal adaptive-streaming runtime qualification. The development branch has stock-selected quantized TG1/TG2 vector resume and head-256 tile-backed TG1-TG4 target/MTP integration. Actual Pascal acceptance remains pending. No Windows/MSVC build or GTX 10-series inference result is claimed by these Linux compile tests. Modern CUDA 13 builds retain their existing target selection and optimized kernels.
+
+#### Runtime prerequisites without optional acceleration
+
+Adaptive KV storage and DMA do not require VMM, Tensor Cores, PDL or native CUDA graph capture. Device-local arena parents use `cudaMalloc`; VMM is an optional stock temporary-pool implementation. If its capability or allocation-granularity query fails, the CUDA backend warns with the driver error and uses the existing `cudaMalloc` pool. HIP/MUSA probing is unchanged. This does not suppress an actual device-allocation failure or claim support for a missing attention kernel.
+
+For a separate reduced-feature validation build, use a new directory such as `build-sm61-eager`, add `-DGGML_CUDA_NO_VMM=ON -DGGML_CUDA_GRAPHS=OFF` to the appropriate toolkit/architecture configuration above, and run with `GGML_CUDA_PDL=0`. Do not change production defaults merely to qualify the fallback. Stock's below-Volta capture restriction remains unchanged. The common executor still drains queued work before invoking retirement hooks and releasing leased storage when there is no native graph to destroy. PDL is also gated by a loaded kernel's target; pre-Hopper code does not become PDL code merely because it was forward-JITed on a newer GPU.
+
+After building the corresponding test targets on a machine with a real driver and CUDA device:
+
+```bash
+cmake --build build-sm61-eager --target test-memory-executor-cuda test-kv-stream-copy -j
+GGML_CUDA_PDL=0 ./build-sm61-eager/bin/test-memory-executor-cuda --cuda --no-graphs
+GGML_CUDA_PDL=0 ./build-sm61-eager/bin/test-kv-stream-copy --cuda --queue-only
+```
+
+The `--queue-only` mode checks DMA boundaries, event ordering, final-consumer retirement, cancellation and retained backing without executing attention or requiring Tensor Cores. It does not qualify the attention kernels on that GPU. Tests also check the last live token, tail clearing and canaries outside an exact device/host view. The metadata-only `test-cuda-vmm-probe` runs without CUDA and simulates failed/absent optional queries before a pool is selected. `test-cuda-compiled-features` reports compiled VMM/graph/PDL options; compiled acceleration is not a promise that it is active on a particular device.
+
+Mutable KV backing still requires pinned, GPU-mapped host memory for publication and ordered DMA. Pinning/mapping failure, including `GGML_CUDA_NO_PINNED`, is a real storage-contract failure, not an absent optimization; strict KV allocation does not silently substitute pageable memory. These checks do not constitute complete startup arena-size verification. Linux SM61 code has been forward-JIT smoke-tested on an RTX 5070 Ti, but actual Pascal and Windows runtime qualification remain pending.
+
+#### Quantized TG1/TG2 development checks
+
+The legacy wrapper accepts quantized TG1/TG2 only when stock selects vector and the required pair and resume code are compiled. It does not force unquantized or tile-selected requests onto vector, or change modern TG2 vector/MMA choices. Legacy F16/BF16 values use the stock 8-byte copy grouping and 16 saved floats per thread; newer compiled targets use 32. Quantized values use 8. Scratch reporting and validation follow that compiled body even during forward-JIT on a newer GPU. TG2 saves independent state for both queries, so its scratch is twice TG1's for equal split counts; it is not implemented as two separate TG1 evaluations. The model and session still permit a TG1-only workspace plan when TG2 is unavailable.
+
+After building an SM61-only test binary with all FA quants, a focused forward-JIT check on a newer CUDA GPU is:
+
+```bash
+cmake --build build-sm61-eager --target test-kv-stream-vector-spans -j
+./build-sm61-eager/bin/test-kv-stream-vector-spans --cuda-pascal-tg1
+./build-sm61-eager/bin/test-kv-stream-vector-spans --cuda-pascal-tg2
+```
+
+These modes change only the test process's host CC metadata, restore it before teardown, and reject mixed-target binaries. They check all-resident and wrapped spans, one-slot refill waves, masks/tails, exact/short scratch, canaries and phase handoffs against the stock kernel in the same binary. TG2 also tests separate causal frontiers, stale TG1 plans, changed-tail visibility, suffix invalidation and catch-up/replay. Use `--cuda-tg2` for that same matrix on an ordinary, unmodified CUDA device. These are not actual Pascal performance results or full-model support guarantees. Actual Pascal validation remains follow-up work; do not advertise complete GTX 10-series support from these tests alone.
+
+#### Native tile-access development checks
+
+The tile-load seam shares stock lane distribution and half-to-float conversion with future encoded/span readers. Its compile-time contract is:
+
+```cpp
+template<int bytes>
+void load(half2 * destination, int row, int half2_column,
+          bool valid, const half2 * zero_source) const;
+```
+
+The default native tag retains the original affine pointer loads and restrict qualifiers. Custom readers use their own copy implementation and explicit zero initialization for invalid rows. This load seam alone is not span attention or accumulator resume; the following tests qualify those layers separately.
+
+`test-cuda-tile-access` validates exact intermediate bits, float conversion, read counts, zero fill and padding/canaries on a real CUDA device. `test-kv-stream-tile` records native stock-selected tile outputs and compares a later build against those same files:
+
+```bash
+cmake --build build-sm61-eager --target test-cuda-tile-access test-kv-stream-tile -j
+./build-sm61-eager/bin/test-cuda-tile-access
+mkdir -p /tmp/tile-native-reference
+./build-sm61-eager/bin/test-kv-stream-tile --record /tmp/tile-native-reference --pascal
+# Rebuild with the proposed change, keeping toolkit, architecture, GPU and options identical.
+./build-sm61-eager/bin/test-kv-stream-tile --compare /tmp/tile-native-reference --pascal
+```
+
+Omit `--pascal` for the ordinary-device native tile matrix. Recording a reference from an already modified build is not an upstream-equivalence check. The Pascal mode requires an SM61-only binary and changes only test-process CC metadata; forward-JIT checks on a newer card are not actual Pascal hardware or throughput qualification.
+
+`test-cuda-tile-spans` checks the complete-layer reader: bounded metadata, encoded tile conversion and stock/span attention outputs with one to three physical ranges. It reports table/split scratch without a context-sized F16 conversion plane. Build the target with the same CUDA options as the backend, then run it without arguments. Conversion, metadata and canaries remain byte-exact. Modern outputs are byte-exact; compiled SM61 FP32 outputs must satisfy both maximum absolute error <= 1e-8 and normalized L2 error <= eight FP32 epsilons. The summary reports every nonexact case and the maximum errors. `--policy-only` tests this comparator, including its negative cases, without initializing CUDA. Forward-JIT evidence is not actual Pascal hardware qualification or a full-model output guarantee. See `DEVICE_MEMORY_CONSUMERS_ROADMAP.md` for the separate live integration qualification.
+
+The C4c resume checks use `test-kv-stream-tile-resume` for metadata-only geometry, window and submission/publication contracts, plus `test-cuda-tile-spans` for the actual checkpoint/refill kernels. Build both targets with the backend's CUDA settings and run them without arguments. The device test compares one-wave versus multi-wave outputs/metadata byte-for-byte, reuses a bounded ring, poisons state before reset, and exercises pending read fences, cancellation, discarded work, publication failure and replay. Final stock comparisons retain the C4b SM61 bound; state bytes and refill equivalence do not receive a relaxed tolerance. The caller must reserve the reported resume scratch and retain every grant until the read fence completes.
+
+#### Live tile dispatch development checks
+
+C4d connects the head-256 tile path to the existing target/MTP/session hooks. It follows stock selection instead of forcing modern vector/MMA onto a baseline kernel. Decode scratch covers descriptor, raw native accumulators, split outputs and private final publication; it is leased and reused, not a context-sized F16 cache. Registry version 10 reports the largest admitted serial decode requirement before phase transitions, including vector tail staging. Tile-backed target attention can resume over multiple ring waves; retained MTP attention reads its complete prefix/suffix spans under the existing lease. Strict prefill gathering remains unchanged.
+
+For an SM61-only binary on a newer GPU:
+
+```bash
+cmake --build build-sm61-eager --target test-kv-stream-tile-dispatch test-kv-stream-context -j
+./build-sm61-eager/bin/test-kv-stream-tile-dispatch --pascal
+./build-sm61-eager/bin/test-kv-stream-context --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --target-stream-tg4 --pascal
+./build-sm61-eager/bin/test-kv-stream-context --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --embedded-mtp-pair --pascal
+./build-sm61-eager/bin/test-kv-stream-context --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --resume-only --pascal
+```
+
+The test-only `--pascal` option requires an SM61-only build and restores CC metadata before teardown. The real-model tests still need sufficient VRAM for the IQ4 weights; they do not simulate a smaller card's memory or throughput. Unit fixtures cover short grants, aliases, stale layouts, one-slot refills and unpadded MTP tails. Only the causal-mask-hidden, exact rounded tail can be absent from physical spans. Numerical bounds are unchanged; matching output in these test prompts is not a universal token-equivalence guarantee. Actual Pascal/Volta hardware and Windows/MSVC acceptance remain pending, as do generation-specific performance checks and complete startup arena-size verification.
+
+#### Turing/Ampere streamed-attention development checks
+
+The existing Q8_0/Q4_0 TG2 MMA wrapper is admitted from SM75 when stock selects it. Its planner checks the actual streamed specialization's shared-memory/thread/occupancy limits before launch. Stock's block/fixup calculation uses native shared-memory requirements; the streamed descriptor cache is accounted separately. An unavailable streamed launch does not implicitly permit a native fallback with different output extras or scratch.
+
+For a single-target code-path check, replace `75` by `86` for the Ampere profile:
+
+```bash
+cmake -S . -B build-sm75 -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA_NO_VMM=ON -DGGML_CUDA_GRAPHS=OFF -DLLAMA_BUILD_TESTS=ON
+cmake --build build-sm75 --target test-cuda-compiled-features test-kv-stream-vector-spans test-kv-stream-context -j
+./build-sm75/bin/test-cuda-compiled-features
+./build-sm75/bin/test-kv-stream-vector-spans --cuda-sm75
+./build-sm75/bin/test-kv-stream-context --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --embedded-mtp-pair --sm75
+./build-sm75/bin/test-kv-stream-context --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --target-stream-tg4 --sm75
+./build-sm75/bin/test-kv-stream-context --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --resume-only --sm75
+```
+
+The compiled checks preserve ordinary SM75 staging and stock's two-stage SM86 `cp.async` configuration. The runtime switches require the corresponding single-target binary and restore test-process CC metadata before teardown. On a newer GPU they exercise forward-JIT code, not an older card's actual resource limits, memory capacity or performance. Unit fixtures also inject a process-local shared-memory limit and require a clean rejection without modifying device/driver settings; `--cuda-resource-probe` runs that check alone on the normal CUDA build.
+
+The new consumer matrices require byte-exact TG2-TG4 MMA outputs. Optimized TG1's regional reduction can differ slightly from stock's global split distribution: the measured maximum is 7.45e-9 and the new regression guard is 1e-8. Real-model test prompts separately check matching logits/tokens; these finite test results are not universal prompt equivalence or actual Turing/Ampere hardware acceptance. See `DEVICE_MEMORY_CONSUMERS_ROADMAP.md` for the qualified pairs/geometries, evidence and pending hardware/performance checks.
+
+#### Adaptive KV CUDA qualification and startup errors
+
+The [README support matrix](../README.md#cuda-compatibility-and-qualification) distinguishes actual-device tests from older-target forward-JIT checks. The detailed numerical, lifecycle and representative performance evidence is in [C5/C6 of the roadmap](../DEVICE_MEMORY_CONSUMERS_ROADMAP.md#phase-c6-end-to-end-acceptance-and-handoff). Actual Pascal/Volta/Turing/Ampere/Ada hardware and Windows/MSVC qualification remain pending. CUDA 13 SM75/SM86/SM89/SM120 builds and the isolated CUDA 12.9 SM61 build do not certify other targets automatically.
+
+For community testing on a real device, start from the quick-start CUDA build and specify the card's architecture. For example, on an SM86 card:
+
+```sh
+cmake -S . -B build-v2 -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_TESTS=ON
+cmake --build build-v2 --target llama-server test-cuda-compiled-features \
+  test-kv-stream-model test-kv-stream-context -j
+./build-v2/bin/test-cuda-compiled-features
+./build-v2/bin/test-kv-stream-model --cuda-native-admission
+./build-v2/bin/test-kv-stream-context \
+  --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --embedded-mtp-pair
+./build-v2/bin/test-kv-stream-context \
+  --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --target-stream-tg4
+./build-v2/bin/test-kv-stream-context \
+  --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf --resume-only
+```
+
+Use the isolated-toolkit instructions above for SM61/SM70; CUDA 13 rejects pre-SM75 compilation. Use a separate build directory when changing toolkit or architecture. Rebuild the complete server and its libraries together after private API changes; do not mix a stale server implementation/DLL with newly built tests or CUDA libraries. The normal commands above use the real device's dispatch and do not override its compute capability. Scoped development switches such as `--pascal` or `--sm75` are only for the specifically described single-target experiments.
+
+The admission fixture needs no model, but does initialize CUDA and allocate small test buffers. Real-model fixtures need enough device and host memory for their allocations; an OOM is not a kernel-qualification pass. To qualify images/cache/cancellation, use the [HTTP vision harness](../tools/server/tests/README.md#adaptive-kv-vision-qualification). Free the GPU for testing; these commands do not stop production or download models. Report the commit, GPU, toolkit/compiler, architecture list, build options, test command and complete log, including skips and failures. Record numerical results separately from timings.
+
+Mixed Q8_0 K / Q4_0 V requires `GGML_CUDA_FA_ALL_QUANTS=ON`. The similarly named `GGML_CUDA_FA_QUANTS` setting is not a substitute in this fork. Context admission checks native Flash Attention support for **every reachable query width**, not only TG1-TG4: short cached prefills can reach intermediate widths even with 256/256 batching. A passing private span kernel alone cannot replace an absent native prefill kernel.
+
+| Failure category | Meaning and response |
+| --- | --- |
+| Native attention unavailable, with K/V types and query width | Check compiled kernels, all-quants option, backend and geometry. Increasing the arena does not add missing kernels. |
+| Shared arena quota insufficient | The graph minimum or combined graph/KV/writer/attention minima do not fit. Check the reported phase/resource; increase the quota only if device memory permits. Current logs are not yet a complete additional-byte calculation. |
+| Host KV allocation/registration or host metadata allocation | Check system/pinned-memory availability and registration errors. A larger device arena is not a host-memory fix. Disabling pinned memory is not a valid streaming fallback. |
+| Device grant allocation/binding or CUDA allocator/driver error | Check total VRAM, other processes and the lower-level CUDA diagnostic. Weights and driver/native-executable allocations can fail outside the arena. |
+| Unsupported configuration | Preserve the serial/single-GPU and qualified model/KV/projector/speculation scope; do not suppress admission to force an unvalidated execution path. |
+
+No-UVM runs qualify physical-budget behavior. Optional `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` enables supported managed model buffers, but the shared parent remains device-local; UVM neither enlarges the quota nor guarantees that driver allocations fit. The CUDA 12.9 reduced-feature profile proves that VMM/capture/PDL are optional, not that disabling them is generally faster. No driver downgrade, global toolkit replacement or numerical-tolerance change is needed for these checks.
 
 #### Fixing Compatibility Issues with Old CUDA and New glibc
 
