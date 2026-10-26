@@ -26,6 +26,8 @@ struct llama_kv_stream_writer::implementation {
     ggml_context_ptr context;
     ggml_tensor * roots[2] = {};
     ggml_tensor * indices = nullptr;
+    // Cached executions drain before this upload storage is released.
+    std::vector<int64_t> index_data;
     std::array<std::vector<std::unique_ptr<write_graph>>,2> plans;
     llama_kv_stream_write_stats last;
 
@@ -154,9 +156,8 @@ std::unique_ptr<llama_kv_stream_writer> llama_kv_stream_writer::create(ggml_back
         }
         s.indices = ggml_new_tensor_1d(s.context.get(), GGML_TYPE_I64, int64_t(s.capacity));
         if (ggml_backend_tensor_alloc(buffer, s.indices, base + index_offset) != GGML_STATUS_SUCCESS) return {};
-        std::vector<int64_t> indices(s.capacity);
-        for (size_t i = 0; i < s.capacity; ++i) indices[i] = int64_t(i);
-        ggml_backend_tensor_set(s.indices, indices.data(), 0, indices.size()*sizeof(int64_t));
+        s.index_data.resize(s.capacity);
+        for (size_t i = 0; i < s.capacity; ++i) s.index_data[i] = int64_t(i);
         return writer;
     } catch (const std::bad_alloc &) { return {}; }
 }
@@ -202,6 +203,8 @@ bool llama_kv_stream_writer::generate_async(const ggml_tensor * source, bool val
         return false;
     };
     try {
+        // Another execution phase may have overwritten the shared scratch.
+        ggml_backend_tensor_set_async(s.backend,s.indices,s.index_data.data(),0,std::min(rows,s.capacity)*sizeof(int64_t));
         size_t tile=0;
         for (size_t first=0; first < rows; first += std::min(s.capacity,rows-first)) {
             const size_t count=std::min(s.capacity,rows-first);

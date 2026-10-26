@@ -260,6 +260,24 @@ int main(int argc, char ** argv) {
         t.assert_true(!llama_kv_stream_writer::requirements(type,shape,256,bytes));
         t.assert_equal(size_t(17),bytes);
     });
+    t.test("writer_restores_indices_after_scratch_contents_are_reused", [&](testing & t) {
+        writer_fixture f(backend.get(), cuda);
+        encoder e(f, 17, GGML_TYPE_Q8_0);
+        e.run();
+        std::vector<uint8_t> expected(e.rows*e.row_bytes), actual(expected.size());
+        ggml_backend_tensor_get(e.output, expected.data(), 0, expected.size());
+        auto * type = ggml_backend_get_default_buffer_type(backend.get());
+        size_t bytes = 0;
+        if (!t.assert_true(llama_kv_stream_writer::requirements(type, f.host->config().shape, 256, bytes))) return;
+        ggml_backend_buffer_ptr scratch(ggml_backend_buft_alloc_buffer(type, bytes));
+        auto writer = llama_kv_stream_writer::create(backend.get(), scratch.get(), bytes, f.host->config().shape, 256);
+        if (!t.assert_true(bool(writer))) return;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            ggml_backend_buffer_clear(scratch.get(), 0);
+            if (!t.assert_true(writer->generate(e.source, false, actual.data(), {}))) return;
+            t.assert_true(actual == expected);
+        }
+    });
     t.test("ordinary_set_rows_baseline_populates_authoritative_cache", [&](testing & t) {
         writer_fixture f(backend.get(), cuda); encoder e(f, 33, GGML_TYPE_Q8_0);
         std::vector<uint8_t> bytes(e.rows*e.row_bytes);

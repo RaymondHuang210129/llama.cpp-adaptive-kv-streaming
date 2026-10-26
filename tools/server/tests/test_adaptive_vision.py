@@ -134,6 +134,21 @@ def run(args, mode):
     ]
     results = {}
     with server(args, mode) as port:
+        # Cross a user-message checkpoint before a multi-batch image prefill.
+        image_first = png(672, 512)
+        for count in (1, 2):
+            chat = {"messages": [{"role": "system", "content": " green" * 355},
+                {"role": "user", "content": [
+                    *[{"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_first}} for _ in range(count)],
+                    {"type": "text", "text": "Describe this pattern briefly."}]}],
+                "temperature": 0, "max_tokens": args.decode, "ignore_eos": True,
+                "chat_template_kwargs": {"enable_thinking": False}}
+            status, result = request(port, "/v1/chat/completions", chat)
+            assert status == 200 and result.get("choices"), (mode, "image_first", count, status, result)
+            assert result["usage"]["completion_tokens"] == args.decode, (mode, "image_first", count, result)
+            if args.mtp_length:
+                assert result["timings"]["draft_n"] > 0, (mode, "image_first", count, result)
+            print(mode, "image_first", count, flush=True)
         for name, body in cases:
             status, result = request(port, "/completion", body)
             assert status == 200, (mode, name, status, result)
