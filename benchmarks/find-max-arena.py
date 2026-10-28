@@ -33,7 +33,8 @@ REMOVED_ENV = ("GGML_CUDA_ENABLE_UNIFIED_MEMORY", "GGML_CUDA_PREFER_MODEL_WEIGHT
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", type=Path, default=ROOT/"build-v2/bin/llama-server")
+    executable = "llama-server.exe" if os.name == "nt" else "llama-server"
+    parser.add_argument("--server", type=Path, default=ROOT/"build-v2/bin"/executable)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--context-size", type=int, default=262144)
     parser.add_argument("--cache-type-k", choices=SWEEP.KV_TYPES, default="q8_0")
@@ -116,6 +117,16 @@ def environment():
     return env
 
 
+def shell_commands(command, removed):
+    launch = ["env"] + [item for name in removed for item in ("-u", name)] + ["LLAMA_MEDIA_MARKER="+MARKER] + command
+    def quote(value):
+        return "'"+value.replace("'", "''")+"'"
+    powershell = ["[Environment]::SetEnvironmentVariable("+quote(name)+", $null, 'Process')" for name in removed]
+    powershell.append("$env:LLAMA_MEDIA_MARKER = "+quote(MARKER))
+    powershell.append("& "+" ".join(quote(value) for value in command))
+    return {"posix":shlex.join(launch), "powershell":"\n".join(powershell)}
+
+
 def bounded_bytes(path, maximum=64*1048576):
     with path.open("rb") as source:
         data = source.read(maximum+1)
@@ -170,8 +181,9 @@ def probe(args, candidate):
     command = server_command(args, candidate)
     failure = None
     result = {}
-    with log_path.open("x") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment())
+    with log_path.open("x", encoding="utf-8") as log:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment(), creationflags=flags)
         try:
             url = f"http://127.0.0.1:{args.port}"
             SWEEP.wait_ready(url, process, log_path)
@@ -193,7 +205,7 @@ def probe(args, candidate):
             failure = error
         finally:
             SWEEP.stop_process(process)
-    text = log_path.read_text(errors="replace")
+    text = log_path.read_text(encoding="utf-8", errors="replace")
     if re.search(r"illegal memory access|misaligned address|device-side assert|unspecified launch failure", text, re.IGNORECASE):
         raise RuntimeError(f"probe reported a device fault, not an arena capacity boundary; see {log_path}")
     if failure is None:
@@ -201,7 +213,7 @@ def probe(args, candidate):
             SWEEP.validate_execution_log(text)
         except RuntimeError as error:
             failure = error
-    minimum = SWEEP.arena_minimum_mib(text)
+    minimum = SWEEP.arena_minimum_mib(text, include_mtp_fallback_hint=failure is None or SWEEP.is_arena_capacity_failure(text))
     if minimum is not None:
         raise SWEEP.ArenaTooSmallError(minimum)
     if failure and not SWEEP.is_arena_capacity_failure(text):
@@ -261,10 +273,15 @@ def fit(args):
     removed = sorted(set(REMOVED_ENV) | {name for name in os.environ if name.startswith("LLAMA_ARG_")})
     report["environment"] = {name:None for name in removed}
     report["environment"]["LLAMA_MEDIA_MARKER"] = MARKER
-    launch = ["env"] + [item for name in removed for item in ("-u",name)] + ["LLAMA_MEDIA_MARKER="+MARKER] + report["command"]
-    report["shell_command"] = shlex.join(launch)
-    (args.output/"result.json").write_text(json.dumps(report,indent=2)+"\n")
-    (args.output/"command.txt").write_text(report["shell_command"]+"\n")
+    commands = shell_commands(report["command"], removed)
+    report["shell"] = "powershell" if os.name == "nt" else "posix"
+    report["shell_command"] = commands[report["shell"]]
+    report["posix_shell_command"] = commands["posix"]
+    report["powershell_command"] = commands["powershell"]
+    report["windows_sysmem_fallback_verified"] = False if os.name == "nt" else None
+    (args.output/"result.json").write_text(json.dumps(report,indent=2)+"\n", encoding="utf-8")
+    (args.output/"command.txt").write_text(report["shell_command"]+"\n", encoding="utf-8")
+    (args.output/"command.ps1").write_text(commands["powershell"]+"\n", encoding="utf-8-sig")
     return report
 
 
@@ -283,8 +300,10 @@ def main(argv=None):
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     print("Free the GPU before fitting. This tool does not stop containers. UVM is disabled for every probe.", flush=True)
+    if os.name == "nt":
+        print("Windows: disabling UVM does not disable driver system-memory fallback. Configure this server's NVIDIA profile to Prefer No Sysmem Fallback before physical-VRAM fitting; allocation success alone does not verify residency.", flush=True)
     report = fit(args)
-    print("\nSelected command (POSIX shell):\n"+report["shell_command"], flush=True)
+    print("\nSelected command ("+report["shell"]+"):\n"+report["shell_command"], flush=True)
     return 0
 
 
