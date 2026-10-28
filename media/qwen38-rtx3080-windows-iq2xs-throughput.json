@@ -1,0 +1,148 @@
+{
+  "description": "Separate Windows RTX 3080 10 GiB Qwen IQ2_XS text cohort: 16 capacities, MTP off and embedded MTP3.",
+  "recorded_date_local": "2026-10-25",
+  "timezone": "America/Chicago",
+  "model": {
+    "repository": "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF",
+    "file": "Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf",
+    "revision": "d562806dbafae37109975e970aae91b43e73b440",
+    "sha256": "f3369f8d36968ab7dd12f5ff11452680aef9371aa19c9922d22ccd5e58c2d9c8",
+    "bytes": 8771311680
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 3080",
+    "vram_mib": 10240,
+    "cpu": "Intel Core i9-14900K",
+    "system_ram_gib": 64,
+    "platform": "Native Windows, MSVC, WDDM",
+    "driver": "610.88",
+    "cuda_toolkit": "12.9",
+    "cuda_architecture": "sm_86",
+    "msvc": "14.35.32215",
+    "nvcc": "12.9.86"
+  },
+  "source": {
+    "base_commit": "bcf1a81d641c478db5690d2f2c048c691801fcb2",
+    "working_tree_at_measurement": "fix/windows-arena-fit, uncommitted Windows arena changes",
+    "retained_patch": "../benchmarks/data/windows-rtx3080-qwen38-iq2xs/measurement-source.patch",
+    "retained_patch_sha256": "0a572c13696e038b481c461bc287b2089a7d98239d783100d85b38a99bb93fac",
+    "recorded_sweep_script_sha256": "ecda49722f72327e569c7664815ebdfc927cab50dd4930a8d03709160d26cf28",
+    "recorded_server_sha256": "a8e274c49ac738bb506e1112eff442cef920eaa652546ceac594d76056246671",
+    "note": "The measurements predate the later sweep-script bandwidth/Windows fixes. Curves use the recorded timings; exporting documentation is not a new measurement."
+  },
+  "protocol": {
+    "context_capacities": [
+      8192,
+      16384,
+      24576,
+      32768,
+      40960,
+      49152,
+      57344,
+      65536,
+      73728,
+      81920,
+      90112,
+      98304,
+      106496,
+      114688,
+      122880,
+      131072
+    ],
+    "modes": [
+      0,
+      3
+    ],
+    "points_per_mode": 16,
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q4_0",
+    "batch_size": 128,
+    "ubatch_size": 128,
+    "cpu_threads": 8,
+    "cpu_threads_batch": 8,
+    "decode_tokens": 256,
+    "prompt_headroom": 15,
+    "prompt_tokens": "context_capacity - 271",
+    "corpus": "benchmarks/data/online-articles-262144-words.txt",
+    "corpus_sha256_at_export": "5a15c6990bd1409260545699ab406a8eec5fed378b722ef8fee6320b6f2117d2",
+    "tokenization_add_special": false,
+    "seed": 123,
+    "temperature": 0,
+    "ignore_eos": true,
+    "cache_prompt": false,
+    "warmup_prompt_tokens": 256,
+    "warmup_decode_tokens": 4,
+    "fresh_server_per_point": true,
+    "uvm": false,
+    "mmproj": false,
+    "measurement_count": "One retained full-workload measurement per context/mode; no repeated-trial confidence interval.",
+    "off_128k_origin": "Reused the successful full-workload 128K maximum-arena probe, which uses the same 256-token/4-output warmup and full prompt/decode protocol as the ordinary sweep."
+  },
+  "arenas": {
+    "policy": "Fit at 128K separately for each mode, then hold fixed across its sweep; no arbitrary reserve.",
+    "off_mib": 1440,
+    "off_next_mib_rejected": 1441,
+    "mtp3_mib": 1078,
+    "mtp3_next_mib_rejected": 1079
+  },
+  "streaming_first_sampled_decode_context": {
+    "off_tokens": 57344,
+    "off_previous_nonstreaming_tokens": 49152,
+    "mtp3_tokens": 40960,
+    "mtp3_previous_nonstreaming_tokens": 32768,
+    "note": "Sampled in 8 Ki steps; these are not exact crossover thresholds or intrinsic model limits."
+  },
+  "driver_policy": {
+    "name": "Prefer No Sysmem Fallback",
+    "scope": "actual llama-server.exe",
+    "evidence": "User confirmed applying the per-executable setting; server restarted for probes.",
+    "programmatically_verified": false,
+    "host_kv_ram_allowed": true,
+    "note": "Shared GPU-memory counters include mapped host KV RAM and do not independently prove residency of every device allocation."
+  },
+  "scope": {
+    "tested": "Text-only target and embedded MTP3 through 131072 configured positions.",
+    "untested_by_this_cohort": [
+      "Gemma",
+      "DFlash2",
+      "image input",
+      "mmproj",
+      "contexts above 131072",
+      "other Windows drivers or GPUs"
+    ],
+    "comparison": "Mode-specific fixed arenas, not equal-arena isolation or a Windows-vs-Linux comparison.",
+    "identical_output_pairs": 1,
+    "total_output_pairs": 16,
+    "output_note": "Input prompts and output lengths match; generated continuations differed in 15 of 16 pairs. This is an observed throughput comparison, not an identical-output isolation experiment.",
+    "quality_note": "This throughput cohort does not establish numerical equivalence or model quality."
+  },
+  "artifacts": {
+    "csv": "qwen38-rtx3080-windows-iq2xs-throughput.csv",
+    "csv_sha256": "bf7f4476866be44c78f854825351da4cfb755c089bae0a7019e37b7b2dada257",
+    "records": "../benchmarks/data/windows-rtx3080-qwen38-iq2xs/results.jsonl",
+    "records_sha256": "f33679dce2d32dd7b48dadde3e31fb134c9b478cd5a96a49db89833577d8ddf6",
+    "evidence": "../benchmarks/data/windows-rtx3080-qwen38-iq2xs/evidence.json",
+    "evidence_sha256": "7568b8cd180ae5a4baa97b476ed0816937dc51cefc74c81ee74736dc3b8e421b",
+    "original_comparison_csv_sha256": "42da37c229b09af8e2aa8313848238ab3576b78e07f9ed9f1babf034c4a24d04",
+    "original_comparison_receipt_sha256": "c33862378ff34e6e670b5417ebf90d5f8e4fbd4b57f20f44133f0f7b804bd945",
+    "path_normalization": "Machine-local server/model/corpus paths replaced with placeholders or repository paths; timing values and token IDs retained.",
+    "pcie-summary.json": {
+      "path": "../benchmarks/data/windows-rtx3080-qwen38-iq2xs/pcie-summary.json",
+      "sha256": "6ffb79d77cd2a0123e37af5ed3c25efe044c25e4e3eb26f9181ec4054beb9afb"
+    },
+    "pcie-calibration.jsonl": {
+      "path": "../benchmarks/data/windows-rtx3080-qwen38-iq2xs/pcie-calibration.jsonl",
+      "sha256": "5dc70fd53c7490c77d7f881bbc59629660b024733787dd40ada112c1c4a6ec64"
+    },
+    "figure_png": {
+      "path": "qwen38-rtx3080-windows-iq2xs-throughput.png",
+      "sha256": "e108c46e0b242b64c8123200528cea90b9af4ecd9d7e79b36344e7ba9c5f1f31"
+    },
+    "figure_svg": {
+      "path": "qwen38-rtx3080-windows-iq2xs-throughput.svg",
+      "sha256": "bcfb27d645270622a901990f997f46aff63303cb7f7bca36c9217ae5ca4cb573"
+    },
+    "export_line_endings": "UTF-8 text with LF, pinned by repository .gitattributes; recorded producer/log hashes are retained separately."
+  },
+  "h2d_note": "Historical h2d_util_pct used an uncalibrated 50 GB/s reference. Raw records retain it for provenance; the published throughput chart and comparison CSV do not use it as measured PCIe utilization."
+}
