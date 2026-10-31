@@ -20,6 +20,8 @@ The chart shows the earlier target-only, MTP1 and MTP2 cohort through 120 Ki and
 
 The implementation supports **one serial Qwen3.8-27B or Gemma 4 31B request on one CUDA GPU**. Supported combinations and tested limits are listed below. Ordinary upstream modes remain available without adaptive execution. The Qwen figure above is its earlier recorded cohort, not a rerun with the newer prefill implementation.
 
+A separate [Windows RTX 3080 10 GB text sweep](#windows-rtx-3080-10-gb) uses ISTA-DASLab GSQ-RCO IQ2_XS weights and compares target-only with MTP=3 through 128 Ki.
+
 [Supported features](#supported-features) · [Quickstart](#quickstart) · [Performance](#performance-and-reproduction) · [How it works](#how-it-works) · [Developer guide](#developer-guide) · [Upstream README](#upstream-llamacpp-readme)
 
 ## Supported features
@@ -74,9 +76,9 @@ F32 describes storage, not fully FP32 attention: the CUDA reader follows stock a
 | Platform / backend | Implemented or tested here | What this does not establish |
 | --- | --- | --- |
 | Linux + CUDA, RTX 5070 Ti / SM120 | Qwen text/MTP/DFlash2/vision and Gemma text/shared-KV MTP/image phase arena, cache/recovery and scoped numerical/performance checks | Other cards, drivers and workloads can have different memory limits; other Gemma modalities/variants are not qualified |
-| CUDA SM61/SM70/SM75/SM86 | Gemma D512 affected-unit functional compilation: 19 logical units, 72 actual device images; changed prefill adapters rechecked | Not a full legacy server link or physical Pascal/Volta/Turing/Ampere runtime/performance test |
+| CUDA SM61/SM70/SM75/SM86 | Gemma D512 affected-unit functional compilation: 19 logical units, 72 actual device images; changed prefill adapters rechecked | These are Gemma compilation checks; Windows SM86 Qwen runtime evidence is scoped separately below |
 | Other CUDA targets, including SM89 | Earlier Qwen selected-target/forward-JIT evidence is recorded separately | Forward-JIT on the 5070 Ti does not reproduce older-card resource/performance limits |
-| Windows + CUDA | The CUDA path and DLL export fixes are in the source | The recorded Linux matrix is not Windows/MSVC qualification |
+| Windows + CUDA, RTX 3080 / SM86 | Native MSVC/CUDA build and Qwen3.8-27B GSQ-RCO IQ2_XS text sweeps, target-only and embedded MTP3, 8-128 Ki; [profile](#windows-rtx-3080-10-gb) | This model, driver and text configuration; Gemma, DFlash2, vision and contexts above 128 Ki are outside this Windows cohort |
 | CPU | Buffer views, leases, allocators, planning, transitions and host tests | Not a GPU streaming adapter |
 | OpenCL / SYCL | Current builds pass; this machine lacks a compatible GPU/runtime for the Gemma qualification | Compile-only evidence is not streamed inference qualification |
 | Vulkan / Meta composition | Actual common memory/view/completion/metadata tests | Not complete Gemma or Qwen streamed-attention inference |
@@ -189,7 +191,8 @@ Use `arena_mib` to launch the server. The tool also prints the complete selected
 | File | Contents |
 | --- | --- |
 | `result.json` | Selected size, tested configuration, validation scope and launch command |
-| `command.txt` | Complete POSIX-shell launch command, ready to copy |
+| `command.txt` | Complete launch command for PowerShell on Windows or a POSIX shell elsewhere |
+| `command.ps1` | PowerShell launch script, including process-local environment cleanup |
 | `probes.jsonl` | Results of the arena search probes |
 | `arena-<MiB>.log` | Server output for each attempted arena size |
 | `selected-validation/` | Full selected-workload record and log when requested |
@@ -198,9 +201,25 @@ Omit `--validate-selected` for short-probe sizing alone; then the report does no
 
 The finder removes inherited `LLAMA_ARG_*`, UVM and graph/rollback debug overrides. Unsupported kernels, incomplete responses, device faults and other non-OOM failures stop the search. Different images, prompt shapes, concurrent GPU users or driver allocations can change fit; there is no universal OOM guarantee. Even one full native-context validation can take several minutes.
 
+On Windows, disabling UVM does not disable the driver's system-memory fallback. Before fitting a dedicated-VRAM budget, set **CUDA - Sysmem Fallback Policy** to **Prefer No Sysmem Fallback** for the actual `llama-server.exe` in NVIDIA Control Panel's Program Settings, then start a new server process. Apply this to the server executable, not the Python finder. [NVIDIA's instructions](https://nvidia.custhelp.com/app/answers/detail/a_id/5490).
+
+The complete GPU footprint includes weights, native CUDA allocations and driver overhead outside the shared arena. Allocation success alone cannot certify residency on Windows; the finder records `windows_sysmem_fallback_verified=false` because it does not inspect the driver profile or Windows residency counters. The designed pinned host KV history can also appear as shared GPU memory, so zero shared-memory usage is not the criterion for avoiding device-allocation spillover.
+
+An MTP graph that exceeds the shared quota can try a separate workspace. The finder treats that diagnostic as an arena lower bound, even if the separate allocation runs out of memory: a larger shared arena may let MTP reuse the target workspace. This avoids mistaking an undersized shared arena for the physical VRAM ceiling. The quota diagnostic must be visible at the finder's log verbosity; use a server built with the corresponding warning enabled.
+
+The finder emits a ready-to-run `command.ps1`. Its JSON report retains both `powershell_command` and `posix_shell_command`; `shell_command` selects the platform's native shell.
+
+### Windows sweeps and H2D estimates
+
+`benchmarks/run-fixed-span-sweep.py` also supports native Windows execution: its default executable has the `.exe` suffix, logs and result files use UTF-8, and server probes do not open console windows. Automatic Podman production-container management defaults off on Windows. `--manage-production` opts in; `--no-manage-production` opts out on any platform. Both scripts require the per-server NVIDIA fallback policy described above for dedicated-VRAM fitting; neither verifies that policy automatically.
+
+Fit each speculation mode separately: enabling or disabling MTP changes the weights and workspace footprint. The sweep's `--auto-max-arena` refits at every context and MTP mode. For one fixed budget across a range, first run the sweep with `--contexts 131072 --auto-max-arena` and the intended MTP mode, batch sizes and KV types. Then use that result with `--arena-mib` for the full range. A fit is specific to its tested workload and available GPU memory.
+
+The sweep reports `estimated_h2d_gbps` for target-only runs using logged KV bytes per evaluation and measured output throughput. Missing transfer telemetry and MTP rates remain `null`. Add `--h2d-reference-gbps` with a measured pinned host-to-device rate in **decimal GB/s** to normalize that payload estimate. There is no default bandwidth reference. The legacy `h2d_util_pct` column is retained, but means KV-payload percentage of the supplied reference, **not total PCIe bus utilization**; without a reference it is `null`. Plots recalculate the percentage from payload data, so older recorded 50 GB/s percentages are not silently reused. Validate external bandwidth counters against known-byte timed copies before using them as a reference.
+
 ### Launch examples
 
-These examples use Bash. On Windows, adapt the argument grouping and executable path to your shell; the recorded qualification was on Linux. Substitute your own model paths and the arena found for **each** configuration.
+These Bash examples describe the Linux reference profiles. The [Windows Qwen text profile](#windows-rtx-3080-10-gb) has separate settings and [PowerShell reproduction commands](docs/development/adaptive-kv-performance.md#windows-rtx-3080-reproduction). Substitute your own model paths and the arena found for **each** configuration.
 
 ```bash
 KV_SERVER=./build-v2/bin/llama-server
@@ -328,9 +347,26 @@ The introduction shows the context-scaling charts. The [detailed performance rep
 
 ### Qwen measurements
 
+#### RTX 5070 Ti / Linux / IQ4_XS
+
 The IQ4_XS/Q8-Q4 reference sweep covers target-only, MTP3 and DFlash2 draft lengths 3 and 7 through 256 Ki, with 32 points per mode. A separate stock-UVM baseline ends at 128 Ki: target-only decode there is 26.15 tok/s streamed versus 2.48 tok/s stock+UVM. This earlier sweep is not a rerun with the newer prefill optimizations.
 
 [Four-mode data](media/adaptive-kv-four-mode-comparison.csv) · [Stock-UVM data](media/stock-uvm-iq4-throughput.csv) · [Three-format comparison](docs/development/adaptive-kv-performance.md#full-context-comparison-kv-formats-and-drafting-modes)
+
+#### Windows RTX 3080 10 GB
+
+This separate 32-measurement text cohort uses ISTA-DASLab `Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf`, Q8_0 K / Q4_0 V, batch/microbatch 128 and 256 outputs at every 8 Ki step from 8 to 128 Ki. UVM and mmproj are disabled. Each mode's arena was fitted at 128 Ki, then held fixed across its sweep under the manually configured **Prefer No Sysmem Fallback** driver policy.
+
+![Windows RTX 3080 IQ2_XS: target-only and MTP3 generation and prompt throughput, 8-128 Ki, with separately fitted fixed arenas](media/qwen38-rtx3080-windows-iq2xs-throughput.png)
+
+| Mode | Fixed arena | Decode at 128 Ki | First sampled decode-streaming point |
+| --- | ---: | ---: | ---: |
+| Target-only | 1,440 MiB | 8.53 tok/s | 56 Ki |
+| MTP=3 | 1,078 MiB | 17.06 tok/s | 40 Ki |
+
+MTP=3 increased generation throughput by 1.33-2.43x across these points, while prompt processing was slower. At 128 Ki, the full prompt plus 256 outputs took 307.93 s target-only and 321.54 s with MTP3. These are single-pass, mode-specific arena fits; generated continuations differed in 15 of 16 pairs. Streaming onset was sampled in 8 Ki steps and depends on the configuration.
+
+[All 16 paired points (CSV)](media/qwen38-rtx3080-windows-iq2xs-throughput.csv) · [Profile and provenance](media/qwen38-rtx3080-windows-iq2xs-throughput.json) · [Methods, memory and PCIe observations](docs/development/adaptive-kv-performance.md#windows-rtx-3080-text-measurements) · [Windows reproduction](docs/development/adaptive-kv-performance.md#windows-rtx-3080-reproduction)
 
 ### Gemma 4 measurements
 
