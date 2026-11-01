@@ -224,5 +224,205 @@ class Launch(unittest.TestCase):
         self.assertIn((987654, signal.SIGKILL), [call.args for call in kill.call_args_list])
 
 
+class FinderCapacity(unittest.TestCase):
+    def finder(self):
+        root=Path(__file__).resolve().parents[3]
+        spec=importlib.util.spec_from_file_location("capacity_finder",root/"benchmarks/find-max-arena.py")
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module
+
+    def plan(self):
+        module=self.finder()
+        plan={"schema":"vision-memory-v1","arena_bytes":1024*1048576,"family":"qwen3vl","alignment":32,
+              "min_image_tokens":64,"effective_image_max_tokens":256,"images_per_probe":1,"microbatch":256,"ratios":[]}
+        for ratio in ("1:1","4:3","3:4","16:9","9:16","2:1","1:2"):
+            p,q=map(int,ratio.split(":"))
+            plan["ratios"].append({"ratio":ratio,"shapes_measured":1,"candidates":[{"width":256,"height":256,
+                "input_width":p*256,"input_height":q*256,"image_tokens":64,"image_max_tokens":64,
+                "weight_bytes":100,"compute_bytes":200,"required_arena_bytes":400,"shape_id":1}],"budget_shape_ids":[1]*193})
+        return module,plan
+
+    def test_capacity_output_contains_landscape_portrait_and_actual_pixels(self):
+        module,plan=self.plan()
+        module.validate_vision_plan(plan,1024)
+        report={"ratios":[{"ratio":row["ratio"],"maximum":row["candidates"][0]} for row in plan["ratios"]]}
+        output=module.format_vision_capacity(report)
+        for ratio in ("1:1","4:3","3:4","16:9","9:16","2:1","1:2"):self.assertIn(ratio,output)
+        self.assertIn("256x256",output)
+        self.assertIn("--image-max-tokens 64",output)
+
+    def test_capacity_rejects_incomplete_or_impossible_server_plans(self):
+        import copy
+        module,valid=self.plan()
+        for change in range(7):
+            plan=copy.deepcopy(valid)
+            if change==0:plan["ratios"].pop()
+            elif change==1:plan["arena_bytes"]-=1
+            elif change==2:plan["ratios"][0]["candidates"][0]["width"]=255
+            elif change==3:plan["ratios"][0]["candidates"][0]["required_arena_bytes"]=1025*1048576
+            elif change==4:plan["ratios"][0]["candidates"][0]["image_tokens"]=65
+            elif change==5:plan["ratios"][0]["candidates"][0]["height"]=True
+            else:plan["schema"]="unknown"
+            with self.subTest(change=change),self.assertRaises(RuntimeError):module.validate_vision_plan(plan,1024)
+
+    def test_vision_boundary_cannot_pass_with_silently_smaller_encoded_shape(self):
+        module,plan=self.plan();shape=plan["ratios"][0]["candidates"][0]
+        line="vision_phase: parent=1073741824 image_width=256 image_height=256 image_tokens=64 weights=100 compute=200 borrowed_after=0 suspended_after=0 diagnostics=1"
+        self.assertEqual(module.check_vision_phase(line,shape,1024)["image_tokens"],64)
+        for bad in (line.replace("image_width=256","image_width=128"),line.replace("compute=200","compute=201"),line+"\n"+line):
+            with self.assertRaises(RuntimeError):module.check_vision_phase(bad,shape,1024)
+
+    def test_cli_requests_automatic_vision_capacity_without_an_image(self):
+        module=self.finder()
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ("server","model","projector","corpus"):(root/name).write_text("fixture")
+            report={"shell":"posix","shell_command":"server"}
+            options=["--server",str(root/"server"),"--model",str(root/"model"),"--mmproj",str(root/"projector"),
+                     "--prefill-text",str(root/"corpus"),"--output",str(root/"result")]
+            with patch.object(module,"fit",return_value=report) as fit,contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(module.main(options),0)
+            self.assertTrue(fit.call_args.kwargs["report_vision"])
+            self.assertEqual(fit.call_args.args[0].image,[])
+
+    def test_auto_probe_keeps_the_text_workload_and_adds_a_minimum_image(self):
+        module,plan=self.plan()
+        args=module.arguments(["--model","model","--mmproj","projector"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"vision_plan_probe",return_value=plan),patch.object(module,"_runtime_probe",return_value={"fits":True}) as probe:
+                result=module.probe_with_vision(args,1024)
+            config=probe.call_args.args[0]
+            self.assertEqual(config.image,[])
+            self.assertEqual(config.image_max_tokens,64)
+            self.assertEqual(len(config._vision_bootstrap),7)
+            self.assertEqual({row["ratio"] for row in config._vision_bootstrap},set(module.VISION_RATIOS))
+            self.assertTrue(all(Path(row["image"]).is_file() for row in config._vision_bootstrap))
+            self.assertIsNone(args.image_max_tokens)
+            self.assertEqual(result["vision_plan"],plan)
+
+    def test_ratio_search_does_not_downgrade_numerical_failures_into_capacity(self):
+        module,plan=self.plan()
+        args=module.arguments(["--model","model","--mmproj","projector"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"probe",side_effect=RuntimeError("numerical mismatch")) as probe:
+                with self.assertRaisesRegex(RuntimeError,"numerical mismatch"):module.vision_capacity(args,1024,plan)
+            self.assertEqual(probe.call_count,1)
+
+    def test_explicit_images_keep_existing_default_preprocessing_limits(self):
+        module=self.finder()
+        args=module.arguments(["--model","model","--mmproj","projector","--image","photo.png"])
+        self.assertEqual((args.image_min_tokens,args.image_max_tokens),(64,4096))
+        auto=module.arguments(["--model","model","--mmproj","projector"])
+        self.assertIsNone(auto.image_min_tokens);self.assertIsNone(auto.image_max_tokens)
+
+    def test_common_launch_budget_is_admitted_and_validated_for_every_ratio(self):
+        module,plan=self.plan();plan["effective_image_max_tokens"]=66
+        for index,row in enumerate(plan["ratios"]):
+            row["budget_shape_ids"]=[1,1,-1] if index==0 else [1,1,1]
+            row["candidates"][0]["image_max_tokens"]=65 if index==0 else 66
+        args=module.arguments(["--model","model","--mmproj","projector"])
+        observed=[]
+        def probe(config,arena):
+            observed.append(config.image_max_tokens)
+            return {"fits":True,"arena_mib":arena}
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"probe",side_effect=probe),patch.object(module,"vision_common_sequence",return_value={"fits":True}):result=module.vision_capacity(args,1024,plan)
+        self.assertEqual(result["common_image_max_tokens"],65)
+        self.assertTrue(result["common"]["validated"])
+        self.assertEqual(len(result["common"]["ratios"]),7)
+        self.assertTrue(all(row["maximum"]["image_max_tokens"]==65 for row in result["common"]["ratios"]))
+        self.assertIn(66,observed)
+        self.assertIn(65,observed)
+
+    def test_runtime_boundary_search_checks_fit_and_rejected_neighbor_with_bounded_restarts(self):
+        module=self.finder();observed=[]
+        def check(value):
+            observed.append(value)
+            return value<=37
+        self.assertEqual(module.vision_runtime_boundary(list(range(1000)),check),37)
+        self.assertIn(38,observed)
+        self.assertIn(999,observed)
+        self.assertLessEqual(len(observed),12)
+        self.assertIsNone(module.vision_runtime_boundary([1,2],lambda _:False))
+        self.assertEqual(module.vision_runtime_boundary([1,2],lambda _:True),2)
+
+    def test_failed_planner_keeps_upper_boundary_artifacts(self):
+        module=self.finder();args=module.arguments(["--model","model","--mmproj","projector"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            log=args.output/"arena-1000-vision-plan.log";log.write_text("CUDA out of memory")
+            (args.output/"arena-1000-vision-plan.json").write_bytes(b"")
+            with patch.object(module,"vision_plan_probe",return_value=None):result=module.probe_with_vision(args,1000)
+            self.assertEqual(result["log"],str(log))
+            self.assertEqual(result["log_sha256"],module.hashlib.sha256(log.read_bytes()).hexdigest())
+            self.assertIn("--vision-memory-report",result["command"])
+
+    def test_no_common_budget_cannot_publish_a_generic_vision_command(self):
+        module,plan=self.plan();args=module.arguments(["--model","model","--mmproj","projector"])
+        def search(start,check):
+            self.assertTrue(check(1024));return 1024
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module.SWEEP,"find_max_arena_mib",side_effect=search),patch.object(module,"probe_with_vision",return_value={"fits":True,"arena_mib":1024,"timings":{"predicted_n":256},"vision_plan":plan}),patch.object(module,"vision_capacity",return_value={"common_image_max_tokens":None,"common":None,"all_ratios_validated":True}):
+                with self.assertRaisesRegex(RuntimeError,"common"):module.fit(args,report_vision=True)
+            self.assertFalse((args.output/"command.txt").exists())
+
+    def test_supplied_image_cli_keeps_the_complete_request_mode(self):
+        module=self.finder()
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ("server","model","projector","photo.png","corpus"):(root/name).write_bytes(b"fixture")
+            options=["--server",str(root/"server"),"--model",str(root/"model"),"--mmproj",str(root/"projector"),
+                     "--image",str(root/"photo.png"),"--prefill-text",str(root/"corpus"),"--output",str(root/"out")]
+            with patch.object(module,"fit",return_value={"shell":"posix","shell_command":"server"}) as fit,contextlib.redirect_stdout(io.StringIO()):module.main(options)
+            self.assertFalse(fit.call_args.kwargs["report_vision"])
+
+    def test_common_budget_also_executes_all_ratios_serially_in_one_server(self):
+        module,plan=self.plan();args=module.arguments(["--model","model","--mmproj","projector"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"_runtime_probe",return_value={"fits":True}) as probe:
+                receipt=module.vision_common_sequence(args,1024,plan,64,args.output/"sequence")
+            config=probe.call_args.args[0]
+            self.assertEqual(config.image,[])
+            self.assertEqual(config.probe_mode,"preflight")
+            self.assertEqual(len(config._vision_bootstrap),7)
+            self.assertTrue(all(row["shape"]["image_max_tokens"]==64 for row in config._vision_bootstrap))
+            self.assertTrue(Path(receipt["record"]).is_file())
+            with patch.object(module,"_runtime_probe",side_effect=RuntimeError("numerical mismatch")):
+                with self.assertRaisesRegex(RuntimeError,"numerical mismatch"):
+                    module.vision_common_sequence(args,1024,plan,64,args.output/"failed")
+
+    def test_failed_serial_common_setting_lowers_the_published_budget(self):
+        module,plan=self.plan();plan["effective_image_max_tokens"]=66
+        for row in plan["ratios"]:
+            row["budget_shape_ids"]=[1,1,1];row["candidates"][0]["image_max_tokens"]=66
+        args=module.arguments(["--model","model","--mmproj","projector"])
+        def sequence(config,arena,report,budget,directory):return {"fits":budget<66}
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"probe",return_value={"fits":True}),patch.object(module,"vision_common_sequence",side_effect=sequence):
+                result=module.vision_capacity(args,1024,plan)
+            self.assertEqual(result["common_image_max_tokens"],65)
+            row=result["ratios"][0]["runtime_attempts"][0]
+            self.assertEqual(row["image_sha256"],module.hashlib.sha256((Path(row["record"]).parent/"input.png").read_bytes()).hexdigest())
+
+    def test_serial_vision_phase_validation_requires_every_completed_shape(self):
+        module,plan=self.plan();shape=plan["ratios"][0]["candidates"][0]
+        line="vision_phase: parent=1073741824 image_width=256 image_height=256 image_tokens=64 weights=100 compute=200 borrowed_after=0 suspended_after=0 diagnostics=1"
+        self.assertEqual(len(module.check_vision_phases(line+"\n"+line,[shape,shape],1024)),2)
+        with self.assertRaises(RuntimeError):module.check_vision_phases(line,[shape,shape],1024)
+        with self.assertRaises(RuntimeError):module.check_vision_phases(line+"\n"+line.replace("image_height=256","image_height=128"),[shape,shape],1024)
+
+    def test_capacity_png_is_bounded_without_image_dependencies(self):
+        module=self.finder()
+        self.assertTrue(module.vision_png(256,128).startswith(b"\x89PNG"))
+        for size in [(0,1),(65537,1),(65536,65536)]:
+            with self.assertRaises(ValueError):module.vision_png(*size)
+
+
 if __name__ == '__main__':
     unittest.main()

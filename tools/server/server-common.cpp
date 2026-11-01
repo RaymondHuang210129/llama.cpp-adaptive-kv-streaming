@@ -39,6 +39,8 @@ bool server_uses_vision_arena(const common_params & params) {
     return !params.mmproj.path.empty() && (params.kv_stream_pool_bytes || params.shared_device_memory_bytes);
 }
 const char * server_vision_arena_config_error(const common_params & params) {
+    if (params.vision_memory_report && (!server_uses_vision_arena(params) || !params.shared_device_memory_bytes))
+        return "vision memory reporting requires --mmproj and a shared device memory arena";
     if (!server_uses_vision_arena(params)) return nullptr;
     if (!params.shared_device_memory_bytes || params.kv_stream_pool_bytes)
         return "vision KV streaming requires a shared device memory arena, not a fixed KV pool";

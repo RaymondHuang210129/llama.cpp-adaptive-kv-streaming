@@ -6,6 +6,7 @@
 #include "../../ggml/src/ggml-backend-memory.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
 class llama_context_memory;
@@ -59,3 +60,20 @@ struct mtmd_vision_phase_requirements {
 MTMD_API bool mtmd_batch_measure_vision_phase(mtmd_batch * batch,ggml_backend_buffer_t parent,
     mtmd_vision_phase_requirements & output);
 MTMD_API mtmd_context * mtmd_batch_context(mtmd_batch * batch) noexcept;
+
+struct mtmd_vision_geometry {
+    std::string family;
+    int patch_size = 0, merge = 0, min_tokens = 0, max_tokens = 0;
+};
+struct mtmd_vision_shape {
+    int width = 0, height = 0, input_width = 0, input_height = 0, budget = 0;
+    size_t tokens = 0;
+};
+// Planning uses native preprocessing and shape-only graphs, without reading parent bytes.
+MTMD_API bool mtmd_get_vision_geometry(mtmd_context * ctx, mtmd_vision_geometry & output);
+MTMD_API bool mtmd_vision_shape_for_budget(const mtmd_vision_geometry & geometry, int budget,
+    int ratio_width, int ratio_height, mtmd_vision_shape & output);
+MTMD_API size_t mtmd_vision_weight_bytes(mtmd_context * ctx, ggml_backend_buffer_type_t type);
+MTMD_API bool mtmd_measure_vision_shape(mtmd_context * ctx, ggml_backend_buffer_t parent,
+    const mtmd_vision_shape & shape, mtmd_vision_phase_requirements & output);
+MTMD_API bool mtmd_batch_vision_shape(const mtmd_batch * batch, mtmd_vision_shape & output);

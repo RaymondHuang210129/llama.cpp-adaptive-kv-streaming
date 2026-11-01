@@ -15,6 +15,13 @@ static common_params qualified() {
 
 int main() {
     testing t;
+    t.test("vision_memory_report_requires_a_real_shared_projector_profile",[](testing & t) {
+        auto p=qualified();p.vision_memory_report=true;
+        t.assert_true(!server_vision_arena_config_error(p));
+        p.mmproj.path.clear();t.assert_true(server_vision_arena_config_error(p));
+        p=qualified();p.vision_memory_report=true;p.shared_device_memory_bytes=0;
+        t.assert_true(server_vision_arena_config_error(p));
+    });
     t.test("vision_cache_formats_are_validated_by_capabilities_not_one_pair", [](testing & t) {
         const ggml_type types[] = {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0,
             GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL};

@@ -100,6 +100,7 @@ bool clip_release_compute_workspace(clip_ctx * ctx);
 bool clip_borrow_compute_workspace(clip_ctx * ctx, llama_context_memory & parent);
 bool clip_measure_vision_phase(clip_ctx * ctx,const clip_image_f32_batch & batch,ggml_backend_buffer_t parent,
     size_t & weight_bytes,std::vector<ggml_backend_memory_workspace_group> & groups);
+size_t clip_vision_weight_bytes(clip_ctx * ctx, ggml_backend_buffer_type_t type);
 
 enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,

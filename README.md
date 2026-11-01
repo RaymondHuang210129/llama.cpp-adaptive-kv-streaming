@@ -115,11 +115,13 @@ Set `-DCMAKE_CUDA_ARCHITECTURES=...` for your GPU if needed. Increase build para
 
 ### Find a usable arena size
 
-Make sufficient GPU memory available, supply local model files, and choose an unused port.
+Make sufficient GPU memory available, supply local model files, and choose an unused port. No existing inference server is required; the finder starts and cleans up its own servers.
 
-These two examples use each GGUF's native 262,144-position capacity, MTP3, Q8_0 K / Q4_0 V and a configured matching projector. `--probe-mode preflight` searches with short runtime probes (2,048 prompt tokens plus 256 outputs here), not just startup admission. `--validate-selected` then checks the full requested text workload **once**, at the selected arena. A failed final check stops without publishing a successful fit.
+With `--mmproj` and no `--image`, the finder now reports maximum **validated processed resolutions** for **1:1, 4:3, 3:4, 16:9, 9:16, 2:1 and 1:2**. It uses native preprocessing and workspace admission, then executes generated image requests. Each ratio has its own boundary; the generated launch command uses a shared setting validated for all seven. Native alignment can slightly change the processed ratio, and larger uploads can be resized. See the [capacity guide and measured examples](docs/multimodal/vision-capacity.md) for scope and memory tradeoffs.
 
-**Gemma 4 31B:** The example uses the Q3_K_S vision profile, local Q8 projector and matching external Q8 assistant. Substitute your own paths:
+These examples use native 262,144-position context capacity, MTP3 and Q8_0 K / Q4_0 V. Image-budget limits come from projector metadata and the fixed microbatch. `--probe-mode preflight` searches with short text requests plus actual decoding and minimum images. `--validate-selected` additionally checks the full requested text workload **once**, at the selected arena; a failed final check stops without publishing a fit.
+
+**Gemma 4 31B:** use the Q3_K_S vision profile, local Q8 projector and matching external Q8 assistant. Substitute your paths:
 
 ```sh
 python3 benchmarks/find-max-arena.py \
@@ -128,31 +130,11 @@ python3 benchmarks/find-max-arena.py \
   --mmproj /path/to/mmproj-gemma4-31B-Q8_0-local.gguf \
   --context-size 262144 --cache-type-k q8_0 --cache-type-v q4_0 \
   --spec-mode mtp --draft-length 3 --batch-size 256 --ubatch-size 256 \
-  --image-min-tokens 70 --image-max-tokens 70 --decode-tokens 256 \
-  --probe-mode preflight --validate-selected \
+  --decode-tokens 256 --probe-mode preflight --validate-selected \
   --output benchmarks/results/fit-gemma-vision-mtp
 ```
 
-Selected fields from the real Gemma `result.json` on the RTX 5070 Ti:
-
-```json
-{
-  "arena_mib": 2472,
-  "next_mib_rejected": 2473,
-  "context_size": 262144,
-  "draft_length": 3,
-  "probe_mode": "preflight",
-  "prompt_tokens": 2048,
-  "requested_prompt_tokens": 261873,
-  "decode_tokens": 256,
-  "runtime_probe_validated": true,
-  "full_workload_validated": true,
-  "projector_configured": true,
-  "vision_execution_validated": false
-}
-```
-
-**Qwen3.8-27B:** The example uses IQ4_XS weights and the matching F16 projector. MTP is embedded in this model, so no separate assistant is supplied:
+**Qwen3.8-27B:** use IQ4_XS weights and the matching F16 projector. MTP is embedded in this model:
 
 ```sh
 python3 benchmarks/find-max-arena.py \
@@ -160,33 +142,13 @@ python3 benchmarks/find-max-arena.py \
   --mmproj /path/to/mmproj-Qwen3.8-27B-F16.gguf \
   --context-size 262144 --cache-type-k q8_0 --cache-type-v q4_0 \
   --spec-mode mtp --draft-length 3 --batch-size 256 --ubatch-size 256 \
-  --image-min-tokens 64 --image-max-tokens 4096 --decode-tokens 256 \
-  --probe-mode preflight --validate-selected \
+  --decode-tokens 256 --probe-mode preflight --validate-selected \
   --output benchmarks/results/fit-qwen-vision-mtp
 ```
 
-Selected fields from the real Qwen `result.json` on the same card:
+Adding `--image /path/to/photo.png` retains complete supplied-image workload validation instead of the automatic ratio report; repeat it for multiple images. A prompt file needs one `<__media__>` marker per image. See [image-aware fitting](docs/multimodal/vision-capacity.md#explicit-images-and-saved-evidence).
 
-```json
-{
-  "arena_mib": 2324,
-  "next_mib_rejected": 2325,
-  "context_size": 262144,
-  "draft_length": 3,
-  "probe_mode": "preflight",
-  "prompt_tokens": 2048,
-  "requested_prompt_tokens": 261873,
-  "decode_tokens": 256,
-  "runtime_probe_validated": true,
-  "full_workload_validated": true,
-  "projector_configured": true,
-  "vision_execution_validated": false
-}
-```
-
-Both selected arenas completed the final **261,873-token prefill and all 256 outputs**, with actual MTP drafts. Each 1 MiB-larger neighbor was rejected during the short-probe search. These are real, workload-specific fits with UVM disabled and no arbitrary reserve, not portable arena recommendations. [Recorded outputs, artifact hashes and validation receipt](benchmarks/data/native-context-finder-examples.json). The Gemma Q3_K_S fit does not replace the Q3_K_M performance cohort.
-
-With no `--image`, both runs configure the deferred projector but test text execution: `projector_configured=true`, `vision_execution_validated=false`. Image-dependent minimum grants are a separate check. Add `--image /path/to/photo.png` to execute that image workload; see the [image-aware fitting example](docs/multimodal/gemma4-vision.md#find-a-fit-for-your-images). A prompt file needs one `<__media__>` marker per image. Preflight never truncates a supplied image request.
+The [earlier native-context finder measurements](benchmarks/data/native-context-finder-examples.json) completed 261,873 text tokens and 256 outputs at 2472 MiB for Gemma MTP3 and 2324 MiB for Qwen MTP3. Those historical runs configured projectors but did not encode images. Their sizes are not results of the new image-aware commands above and are not image-fit recommendations.
 
 Use `arena_mib` to launch the server. The tool also prints the complete selected command and stores:
 
@@ -198,6 +160,8 @@ Use `arena_mib` to launch the server. The tool also prints the complete selected
 | `probes.jsonl` | Results of the arena search probes |
 | `arena-<MiB>.log` | Server output for each attempted arena size |
 | `selected-validation/` | Full selected-workload record and log when requested |
+| `arena-*-vision-plan.json` | Native image shape/workspace admission report |
+| `vision-capacity/` | Per-ratio images, completed request receipts and shared-setting checks |
 
 Omit `--validate-selected` for short-probe sizing alone; then the report does not claim full text-workload validation. The default `--probe-mode full` retains the older behavior of testing the full workload for every candidate. `--prompt-tokens N` and `--prefill-text FILE` select another text workload. `--initial-arena-mib` is optional (default starting guess 2240), not a required arena size or reserve. `next_mib_rejected` is `null` if no larger neighbor was tested.
 
@@ -313,7 +277,7 @@ For Gemma lengths 1 or 2, change `--spec-draft-n-max` and refit. For 120 Ki, use
 
 #### Vision launch examples
 
-Qwen and Gemma use the same launch mechanism and image-request API: add a matching `--mmproj` and a shared device arena. Choose **one** of the following model profiles, then use the common launch commands below. The example arena/budget values are reference settings, not universal fits; use the [image-aware finder](docs/multimodal/gemma4-vision.md#find-a-fit-for-your-images) with your actual inputs when sizing another workload.
+Qwen and Gemma use the same launch mechanism and image-request API: add a matching `--mmproj` and a shared device arena. Choose **one** of the following model profiles, then use the common launch commands below. The example arena/budget values are reference settings, not universal fits; use the [image-aware finder](docs/multimodal/vision-capacity.md) for automatic per-ratio capacity or your actual image workload.
 
 Qwen profile, with its embedded MTP weights:
 

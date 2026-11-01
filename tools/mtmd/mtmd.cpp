@@ -2203,6 +2203,97 @@ bool mtmd_batch_measure_vision_phase(mtmd_batch * batch,ggml_backend_buffer_t pa
 }
 mtmd_context * mtmd_batch_context(mtmd_batch * batch) noexcept { return batch ? batch->ctx : nullptr; }
 
+bool mtmd_get_vision_geometry(mtmd_context * ctx, mtmd_vision_geometry & output) {
+    if (!ctx || !ctx->ctx_v) return false;
+    const auto type=clip_get_projector_type(ctx->ctx_v);
+    mtmd_vision_geometry next;
+    if (type==PROJECTOR_TYPE_QWEN3VL) next.family="qwen3vl";
+    else if (type==PROJECTOR_TYPE_GEMMA4V || type==PROJECTOR_TYPE_GEMMA4UV) next.family="gemma4";
+    else return false;
+    const auto & h=*clip_get_hparams(ctx->ctx_v);
+    if (h.patch_size<=0 || h.n_merge<=0 || h.patch_size>1024/h.n_merge) return false;
+    const int alignment=h.patch_size*h.n_merge;
+    const int area=alignment*alignment;
+    next.patch_size=h.patch_size;next.merge=h.n_merge;
+    next.min_tokens=std::max(1,h.image_min_pixels/area);
+    next.max_tokens=h.image_max_pixels/area;
+    if (next.max_tokens<next.min_tokens || next.max_tokens>65536 ||
+            (next.family=="gemma4" && next.max_tokens>1120)) return false;
+    output=std::move(next);
+    return true;
+}
+
+bool mtmd_vision_shape_for_budget(const mtmd_vision_geometry & g, int budget,
+        int ratio_width, int ratio_height, mtmd_vision_shape & output) {
+    if ((g.family!="qwen3vl" && g.family!="gemma4") || g.patch_size<=0 || g.merge<=0 ||
+            g.patch_size>1024/g.merge || g.min_tokens<=0 || g.max_tokens<g.min_tokens ||
+            g.max_tokens>65536 || budget<g.min_tokens || budget>g.max_tokens ||
+            ratio_width<=0 || ratio_height<=0 || ratio_width>16 || ratio_height>16 ||
+            (g.family=="gemma4" && budget>1120)) return false;
+    const int alignment=g.patch_size*g.merge;
+    if (uint64_t(budget)*alignment*alignment>INT32_MAX) return false;
+    const int scale=int(std::sqrt(double(budget)/(ratio_width*ratio_height)))+1;
+    const int64_t width=int64_t(alignment)*ratio_width*scale;
+    const int64_t height=int64_t(alignment)*ratio_height*scale;
+    if (width>65536 || height>65536 || width*height>INT32_MAX) return false;
+    clip_hparams h;
+    h.patch_size=g.patch_size;h.n_merge=g.merge;
+    h.image_min_pixels=g.min_tokens*alignment*alignment;
+    h.image_max_pixels=budget*alignment*alignment;
+    const clip_image_size original{int(width),int(height)};
+    const auto size=g.family=="gemma4" ? mtmd_image_preprocessor_gemma4::target_size(h,original) :
+        mtmd_image_preprocessor_dyn_size::target_size(h,original);
+    if (size.width<=0 || size.height<=0 || size.width%alignment || size.height%alignment) return false;
+    mtmd_vision_shape next;
+    next.width=size.width;next.height=size.height;next.input_width=int(width);next.input_height=int(height);
+    next.budget=budget;next.tokens=size_t(size.width/alignment)*(size.height/alignment);
+    if (!next.tokens || next.tokens>size_t(budget)) return false;
+    output=next;
+    return true;
+}
+
+size_t mtmd_vision_weight_bytes(mtmd_context * ctx, ggml_backend_buffer_type_t type) {
+    return ctx && ctx->ctx_v ? clip_vision_weight_bytes(ctx->ctx_v,type) : 0;
+}
+
+bool mtmd_measure_vision_shape(mtmd_context * ctx, ggml_backend_buffer_t parent,
+        const mtmd_vision_shape & shape, mtmd_vision_phase_requirements & output) {
+    mtmd_vision_geometry g;
+    if (!parent || !mtmd_get_vision_geometry(ctx,g)) return false;
+    const int alignment=g.patch_size*g.merge;
+    if (shape.width<=0 || shape.height<=0 || shape.width>65536 || shape.height>65536 ||
+            shape.width%alignment || shape.height%alignment ||
+            size_t(shape.width/alignment)*(shape.height/alignment)!=shape.tokens ||
+            !shape.tokens || shape.tokens>size_t(g.max_tokens)) return false;
+    clip_image_f32 image;
+    image.set_size({shape.width,shape.height},true,false);
+    clip_image_f32_batch batch;
+    batch.entries.push_back(std::move(image));
+    mtmd_vision_phase_requirements next;
+    if (!clip_measure_vision_phase(ctx->ctx_v,batch,parent,next.weight_bytes,next.groups)) return false;
+    const auto type=ggml_backend_buffer_get_type(parent);
+    for (const auto & group : next.groups) {
+        if (group.buft!=type && !ggml_backend_buft_is_host(group.buft)) return false;
+        auto & bytes=group.buft==type ? next.device_compute_bytes : next.host_compute_bytes;
+        if (group.size>SIZE_MAX-bytes) return false;
+        bytes+=group.size;
+    }
+    if (!next.weight_bytes || !next.device_compute_bytes) return false;
+    output=std::move(next);
+    return true;
+}
+
+bool mtmd_batch_vision_shape(const mtmd_batch * batch, mtmd_vision_shape & output) {
+    if (!batch || batch->entries.size()!=1) return false;
+    const auto * chunk=batch->entries.front();
+    if (!chunk || !chunk->tokens_image || chunk->tokens_image->batch_f32.entries.size()!=1) return false;
+    const auto size=chunk->tokens_image->batch_f32.entries.front().get_size();
+    mtmd_vision_shape next;
+    next.width=size.width;next.height=size.height;next.tokens=mtmd_input_chunk_get_n_tokens(chunk);
+    output=next;
+    return true;
+}
+
 bool mtmd_attach_compute_workspace(mtmd_context * ctx,const std::vector<ggml_backend_memory_lease_t> & leases) {
     return ctx && ctx->ctx_v && clip_attach_compute_workspace(ctx->ctx_v,leases);
 }

@@ -56,7 +56,7 @@ python3 benchmarks/find-max-arena.py \
   --output benchmarks/results/my-dflash-image-fit
 ```
 
-The finder starts and cleans up its own servers. Image preflight executes the complete supplied image request and actual decoding; it does not replace images with a short causal text surrogate. A configured projector without an image remains a text check. `--initial-arena-mib` is an optional search guess. The development 1024 MiB image probe is a fixed-budget successful request, not a measured maximum for arbitrary images.
+The finder starts and cleans up its own servers. Image preflight executes the complete supplied image request and actual decoding; it does not replace images with a short causal text surrogate. With a projector and no supplied image, the finder instead runs the [automatic landscape/portrait capacity checks](vision-capacity.md). `--initial-arena-mib` is an optional search guess. The development 1024 MiB image probe is a fixed-budget successful request, not a measured maximum for arbitrary images.
 
 Read the selected `arena_mib`, then launch a fresh server:
 

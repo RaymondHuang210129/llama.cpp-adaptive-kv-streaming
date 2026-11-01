@@ -63,7 +63,7 @@ The recorded two-image 1120 workload has a 2143 MiB whole-MiB phase minimum and 
 
 No existing server, container or background service is required. Build the [vision-enabled server](../../README.md#build), make sufficient GPU memory available, and choose an unused port. The finder below launches and cleans up its own temporary servers; it neither contacts an existing inference server nor manages other services. Run commands from the repository root, using your own model/image paths and a fresh output directory.
 
-For text sizing with a configured projector, the [README's two native-context examples](../../README.md#find-a-usable-arena-size) use `--probe-mode preflight --validate-selected`: short real prefill/decode probes find the candidate limit, then the complete requested text workload runs once at the selected arena. The report separates probe history, requested history and full-workload validation. A configured projector without an image is not encoder validation. Supplying an image retains the complete image request even in preflight mode; it is never shortened into a causal text surrogate.
+For text sizing with a configured projector, the [README's two native-context examples](../../README.md#find-a-usable-arena-size) use `--probe-mode preflight --validate-selected`: short real prefill/decode probes find the candidate limit, then the complete requested text workload runs once at the selected arena. The report separates probe history, requested history and full-workload validation. With a projector and no supplied image, the finder now runs the [automatic resolution-capacity checks](vision-capacity.md), including real encoder execution for landscape and portrait shapes. Supplying an image retains the complete image request even in preflight mode; it is never shortened into a causal text surrogate.
 
 ```sh
 python3 benchmarks/find-max-arena.py \
@@ -77,7 +77,7 @@ python3 benchmarks/find-max-arena.py \
   --decode-tokens 16 --output benchmarks/results/fit-gemma-images
 ```
 
-The prompt file needs one `<__media__>` marker per image. In the recorded two-pattern run, selected fields were `arena_mib=2332`, `next_mib_rejected=2333`, `vision_execution_validated=true`, `draft_length=3`, and `decode_tokens=16`. These are real measured values for those pinned fixtures, not predicted results for the example's arbitrary photos. `--initial-arena-mib` is optional and is not a required arena input. A `--mmproj` run without `--image` remains only a configured-projector text fit.
+The prompt file needs one `<__media__>` marker per image. In the recorded two-pattern run, selected fields were `arena_mib=2332`, `next_mib_rejected=2333`, `vision_execution_validated=true`, `draft_length=3`, and `decode_tokens=16`. These are real measured values for those pinned fixtures, not predicted results for the example's arbitrary photos. `--initial-arena-mib` is optional and is not a required arena input. A `--mmproj` run without `--image` now reports [validated per-ratio processed resolutions](vision-capacity.md); it does not reuse these two-image measurements.
 
 ## Running an image request locally
 

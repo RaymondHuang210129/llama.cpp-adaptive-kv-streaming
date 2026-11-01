@@ -354,12 +354,15 @@ int32_t mtmd_batch_encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_cont
         if (result) return result;
         if (!returned.finish()) return -1;
         const bool after_ok = owner->diagnostics(after);
+        mtmd_vision_shape shape;
+        const bool single_image=mtmd_batch_vision_shape(batch,shape);
         // Resume rebuilds text grants. Attention uploads host KV lazily after this phase.
         // Match memory_phase visibility through the server's backend log callback.
-        LOG_WRN("vision_phase: parent=%zu weights=%zu compute=%zu host_compute=%zu grants=%zu before_kv=%zu resumed_kv=%zu borrowed_after=%zu suspended_after=%d diagnostics=%d measure_us=%lld suspend_us=%lld loan_us=%lld projector_reload_us=%lld encode_us=%lld release_us=%lld text_resume_us=%lld begin_us=%lld end_us=%lld\n",
+        LOG_WRN("vision_phase: parent=%zu weights=%zu compute=%zu host_compute=%zu grants=%zu before_kv=%zu resumed_kv=%zu borrowed_after=%zu suspended_after=%d diagnostics=%d image_width=%d image_height=%d image_tokens=%zu measure_us=%lld suspend_us=%lld loan_us=%lld projector_reload_us=%lld encode_us=%lld release_us=%lld text_resume_us=%lld begin_us=%lld end_us=%lld\n",
             ggml_backend_buffer_get_size(parent),plan.weight_bytes,plan.device_compute_bytes,plan.host_compute_bytes,
             during.borrowed_phase_bytes,before.kv_pool_bytes,after.kv_pool_bytes,after.borrowed_phase_bytes,int(after.kv_device_suspended),
-            int(before_ok && during_ok && after_ok),static_cast<long long>(measured_us-begin_us),
+            int(before_ok && during_ok && after_ok),single_image ? shape.width : 0,single_image ? shape.height : 0,
+            single_image ? shape.tokens : 0,static_cast<long long>(measured_us-begin_us),
             static_cast<long long>(suspended_us-measured_us),static_cast<long long>(loaned_us-suspended_us),
             static_cast<long long>(loaded_us-loaned_us),static_cast<long long>(encoded_us-encode_start),
             static_cast<long long>(returned.release_us),static_cast<long long>(returned.resume_us),

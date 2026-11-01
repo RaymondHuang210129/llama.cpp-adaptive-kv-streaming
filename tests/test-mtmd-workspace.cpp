@@ -88,6 +88,38 @@ int main(int argc,char ** argv) {
         else return 2;
     }
     testing t;
+    t.test("vision_capacity_shapes_follow_native_alignment_and_reject_bad_bounds",[](testing & t) {
+        for (bool gemma : {false,true}) {
+            mtmd_vision_geometry geometry;
+            geometry.family=gemma ? "gemma4" : "qwen3vl";
+            geometry.patch_size=16; geometry.merge=gemma ? 3 : 2;
+            geometry.min_tokens=64; geometry.max_tokens=gemma ? 1120 : 4096;
+            mtmd_vision_shape shape;
+            if (!t.assert_true(mtmd_vision_shape_for_budget(geometry,1120,16,9,shape))) return;
+            t.assert_equal(gemma ? 2112 : 1408,shape.width);
+            t.assert_equal(gemma ? 1200 : 800,shape.height);
+            t.assert_equal(size_t(1100),shape.tokens);
+            t.assert_true(shape.input_width*9==shape.input_height*16);
+            mtmd_vision_shape portrait;
+            t.assert_true(mtmd_vision_shape_for_budget(geometry,1120,9,16,portrait));
+            t.assert_equal(shape.width,portrait.height);t.assert_equal(shape.height,portrait.width);
+            for (int change=0;change<6;++change) {
+                auto bad=geometry;int budget=1120,x=1,y=1;
+                switch (change) {
+                    case 0:budget=0;break;
+                    case 1:x=0;break;
+                    case 2:bad.merge=0;break;
+                    case 3:bad.max_tokens=INT32_MAX;break;
+                    case 4:bad.family="unknown";break;
+                    case 5:budget=geometry.max_tokens+1;break;
+                }
+                mtmd_vision_shape unchanged;unchanged.width=123;
+                t.assert_true(!mtmd_vision_shape_for_budget(bad,budget,x,y,unchanged));
+                t.assert_equal(123,unchanged.width);
+            }
+        }
+    });
+
 #if !defined(_WIN32) || !defined(LLAMA_SHARED)
     t.test("vision_borrows_serial_target_scratch_and_returns_it_on_release", [](testing & t) {
         workspace_fixture f;

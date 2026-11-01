@@ -430,6 +430,13 @@ static void test(void) {
             }
 #endif
         }
+        {
+            common_params report;
+            std::vector<std::string> options={"binary_name","--vision-memory-report"};
+            assert(!report.vision_memory_report);
+            assert(common_params_parse(options.size(),list_str_to_char(options).data(),report,LLAMA_EXAMPLE_SERVER));
+            assert(report.vision_memory_report);
+        }
         argv = {"binary_name", "--spec-type", "draft-mtp", "-ctkd", "q5_1", "-ctvd", "q4_1"};
         common_params native;
         assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), native, LLAMA_EXAMPLE_SERVER));
