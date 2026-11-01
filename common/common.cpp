@@ -1304,7 +1304,9 @@ const char * common_streamed_dflash_config_error(const common_params & params) {
                 return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
                     type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
             })) return "adaptive DFlash2 requires one serial slot, no auxiliary MTP layers and optional ngram-map-k4v only";
-    if (!params.mmproj.path.empty()) return "adaptive DFlash2 currently supports text only, without mmproj";
+    if (!params.mmproj.path.empty() && std::find(params.speculative.types.begin(),params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)!=params.speculative.types.end())
+        return "adaptive DFlash2 with mmproj does not support K4V image history";
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED)
         return "adaptive DFlash2 requires -fa on";
     uint32_t depth = 0;

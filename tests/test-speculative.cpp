@@ -475,6 +475,17 @@ int main(int argc, char ** argv) {
         }
     });
 
+    t.test("pure_dflash_image_admission_preserves_the_mixed_vision_barrier",[&](testing & t) {
+        for (int depth : {1,3,7}) {
+            auto p=streamed_dflash_params(depth,7);
+            p.mmproj.path="projector.gguf";
+            t.assert_true(common_streamed_dflash_config_error(p)!=nullptr);
+            p.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+            t.assert_true("pure DFlash can measure image graphs before child capture",!common_streamed_dflash_config_error(p));
+            t.assert_equal(uint32_t(depth),common_context_params_to_llama(p).n_rs_seq);
+        }
+    });
+
     t.test("mixed_streaming_admission_preserves_other_source_and_configuration_guards", [&](testing & t) {
         for (int type=0;type<COMMON_SPECULATIVE_TYPE_COUNT;++type) {
             if (type==COMMON_SPECULATIVE_TYPE_NONE || type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||

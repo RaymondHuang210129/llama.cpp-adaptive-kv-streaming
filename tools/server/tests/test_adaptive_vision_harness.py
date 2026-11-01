@@ -2,6 +2,9 @@
 """Host-only tests for vision qualification launch and cleanup contracts."""
 
 import argparse
+import contextlib
+import importlib.util
+import io
 import os
 from pathlib import Path
 import signal
@@ -14,6 +17,24 @@ import test_adaptive_vision as harness
 
 
 class Launch(unittest.TestCase):
+    def test_finder_admits_complete_pure_dflash_images_but_not_mixed_vision(self):
+        root=Path(__file__).resolve().parents[3]
+        spec=importlib.util.spec_from_file_location("vision_arena_finder",root/"benchmarks/find-max-arena.py")
+        finder=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(finder)
+        base=["--model","target.gguf","--model-draft","draft.gguf","--mmproj","projector.gguf",
+              "--image","image.png","--probe-mode","preflight"]
+        with patch.object(finder.subprocess,"Popen") as process:
+            args=finder.arguments(base+["--spec-mode","dflash","--draft-length","3"])
+            command=finder.server_command(args,1024)
+            self.assertIn("--mmproj",command)
+            self.assertIn("--model-draft",command)
+            self.assertNotIn("--spec-draft-type-k",command)
+            self.assertEqual(args.image,[Path("image.png")])
+            with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
+                finder.arguments(base+["--spec-mode","dflash-k4v"])
+            process.assert_not_called()
+
     def test_startup_negative_profiles_do_not_reject_supported_cache_formats(self):
         cases=harness.vision_startup_rejections()
         self.assertEqual(len(cases),6)

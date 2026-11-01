@@ -1349,7 +1349,7 @@ private:
             if (vision_arena) {
                 auto * owner = llama_context_compute_memory(ctx_tgt);
                 if (!owner || !owner->valid() || !owner->shares_kv_memory() || !owner->can_suspend_for_vision() ||
-                        (streamed_mtp && (!ctx_dft || !llama_context_compute_memory(ctx_dft) ||
+                        ((streamed_mtp || streamed_dflash) && (!ctx_dft || !llama_context_compute_memory(ctx_dft) ||
                             !llama_context_compute_memory(ctx_dft)->valid() ||
                             !llama_context_compute_memory(ctx_dft)->borrows_serial_parent())) ||
                         !mtmd_vision_phase_compatible(mctx,model_tgt)) {

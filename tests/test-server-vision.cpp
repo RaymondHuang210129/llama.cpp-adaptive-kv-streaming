@@ -141,5 +141,51 @@ int main() {
         task.params.speculative.draft.n_max=1;
         t.assert_true(!server_vision_arena_request_error(task,true,&p.speculative));
     });
+    t.test("pure_dflash_vision_uses_declared_serial_width_and_inherited_formats",[](testing & t) {
+        for (int depth : {1,3,7}) for (auto value : {GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_Q5_1}) {
+            auto p=qualified(); p.n_batch=p.n_ubatch=256;
+            p.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+            p.speculative.draft.n_max=depth; p.speculative.draft.mparams.path="matching-dflash.gguf";
+            p.cache_type_k=value==GGML_TYPE_Q5_1 ? GGML_TYPE_Q5_1 : GGML_TYPE_Q8_0;
+            p.cache_type_v=value;
+            t.assert_true("pure DFlash reaches loaded-model validation",!server_vision_arena_config_error(p));
+            server_task task(SERVER_TASK_TYPE_COMPLETION); task.tokens=server_tokens(llama_tokens{1,2,3},true);
+            task.params.speculative=p.speculative;
+            t.assert_true("configured DFlash image requests are admitted",!server_vision_arena_request_error(task,false,&p.speculative));
+            for (int change=0;change<9;++change) {
+                auto bad=p;
+                switch (change) {
+                    case 0: bad.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V); break;
+                    case 1: bad.speculative.draft.n_max=8; break;
+                    case 2: bad.speculative.draft.mparams.path.clear(); break;
+                    case 3: bad.kv_stream_auxiliary_layers=1; break;
+                    case 4: bad.speculative.draft.cache_type_k_explicit=true; break;
+                    case 5: bad.n_ubatch=depth; break;
+                    case 6: bad.n_parallel=2; break;
+                    case 7: bad.fit_params=true; break;
+                    case 8: bad.mmproj_use_gpu=false; break;
+                }
+                t.assert_true(server_vision_arena_config_error(bad));
+            }
+            for (int change=0;change<6;++change) {
+                auto bad=task.params.speculative;
+                switch (change) {
+                    case 0: bad.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V); break;
+                    case 1: bad.draft.n_max=depth+1; break;
+                    case 2: bad.draft.n_max=0; break;
+                    case 3: bad.draft.mparams.path="foreign.gguf"; break;
+                    case 4: bad.draft.cache_type_v_explicit=true; break;
+                    case 5: bad.types={COMMON_SPECULATIVE_TYPE_DRAFT_MTP}; break;
+                }
+                task.params.speculative=bad;
+                t.assert_true(server_vision_arena_request_error(task,false,&p.speculative));
+                task.params.speculative=p.speculative;
+            }
+            task.params.speculative.types={COMMON_SPECULATIVE_TYPE_NONE};
+            t.assert_true(!server_vision_arena_request_error(task,false,&p.speculative));
+            task.params.speculative=p.speculative;
+            t.assert_true(server_vision_arena_request_error(task));
+        }
+    });
     return t.summary();
 }

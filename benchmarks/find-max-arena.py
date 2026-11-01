@@ -88,8 +88,8 @@ def arguments(argv=None):
         parser.error("--model-draft is required for DFlash")
     if args.spec_mode == "none" and args.model_draft:
         parser.error("--model-draft requires MTP or DFlash")
-    if args.image and not args.mmproj or args.mmproj and args.spec_mode in ("dflash", "dflash-k4v"):
-        parser.error("--image requires --mmproj; vision+DFlash is unsupported")
+    if args.image and not args.mmproj or args.mmproj and args.spec_mode == "dflash-k4v":
+        parser.error("--image requires --mmproj; DFlash+K4V vision is not qualified")
     if args.prompt_file and not args.image or args.prompt_tokens is not None and args.image:
         parser.error("--prompt-file requires image validation; --prompt-tokens is for text probes")
     if args.copy_probe and args.image:

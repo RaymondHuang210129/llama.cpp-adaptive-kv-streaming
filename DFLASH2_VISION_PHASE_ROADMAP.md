@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0-DV5 are complete; DV6-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: implementation in progress, 2026-11-01. DV0-DV6 are complete; DV7-DV9 remain pending. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -271,6 +271,8 @@ Exit: fitting native/internal streamed correctness is established for image-cond
 
 ### DV6 - Open scoped startup, requests and the image-aware finder
 
+Completed 2026-11-01: common and server admission allow pure DFlash1-7 with a matching external sidecar, inherited target cache formats and the registered bounded-writer owner. Mixed K4V vision, model/cache overrides, over-width requests and unsupported serial/phase configurations still reject. CPU red tests produced exactly 18 server failures, three common failures and one finder rejection before the narrow changes; green has 383 server assertions, 493 common assertions and 12 Python tests. Real public F1/F3/F7 each execute text, image, repeated-image and two-image requests with actual predictions. F1/F3 tokens and draft/accept/prompt counts exactly match their corresponding native requests; F7 public execution is paired with the separately qualified native-decoder reference, not a fitting full-native projector control. The existing finder completes an actual image request at 1024 MiB and returns 16 tokens with real drafting; this fixed-budget probe is not a maximum-fit search. Its first local driver used an image-token ceiling larger than the context and was rejected before model execution; the corrected driver sets a consistent ceiling without changing the actual image or request. Local public/finder cohorts preserve full provenance, original failures and healthy restoration of all managed services.
+
 After DV2-DV5 pass, update common, server startup, owner capability and per-request guards together for pure DFlash2+mmproj.
 
 - Validate the actual target/sidecar/projector contract, F bounds, output capacity, image extents, effective microbatches and inherited cache formats.
@@ -401,7 +403,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV3: native-policy feature behavior and exact owned image provenance pass, including one-row injection.
 - [x] DV4: validated bounded-writer state survives complete vision loans and strict memory checks.
 - [x] DV5: real encoder inputs, exact image-conditioned target/draft vectors and forced acceptance/correction match fitting native controls.
-- [ ] DV6: narrow common/server/request/finder integration works with actual images.
+- [x] DV6: pure DFlash common/server/request/finder integration works with actual images; mixed K4V vision remains closed.
 - [ ] DV7: cache, window, cancellation, state and process restart pass.
 - [ ] DV8: required numerical/memory/regression/performance evidence audited.
 - [ ] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored.

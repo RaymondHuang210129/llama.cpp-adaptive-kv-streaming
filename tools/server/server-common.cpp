@@ -48,6 +48,11 @@ const char * server_vision_arena_config_error(const common_params & params) {
     if (const auto * error = common_streamed_kv_config_error(params)) return error;
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED)
         return "vision arena requires -fa on; cache support is checked during context initialization";
+    if (common_params_uses_streamed_dflash(params)) {
+        if (const auto * error=common_streamed_dflash_config_error(params)) return error;
+        if (!params.speculative.has_dft()) return "vision DFlash2 requires a matching separate draft model";
+        return nullptr;
+    }
     const bool mtp = common_params_uses_streamed_mtp(params);
     if ((params.speculative.has_dft() && (!mtp || params.kv_stream_auxiliary_layers)) || (params.kv_stream_auxiliary_layers && !mtp) ||
             params.kv_stream_auxiliary_layers > 1 || (mtp && (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > 3)))
@@ -70,9 +75,17 @@ const char * server_vision_arena_request_error(const server_task & task, bool st
                 source.hf_file!=allowed.hf_file || source.docker_repo!=allowed.docker_repo)
             return "vision arena request cannot change the configured draft model";
     } else if (requested.has_dft()) return "vision arena request cannot enable a draft model";
+    const bool dflash=configured && configured->has_dft() &&
+        configured->draft.n_max>=1 && configured->draft.n_max<=7 &&
+        std::find(configured->types.begin(),configured->types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)!=configured->types.end() &&
+        std::all_of(configured->types.begin(),configured->types.end(),[](auto type) {
+            return type==COMMON_SPECULATIVE_TYPE_NONE || type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+        });
     for (auto type : task.params.speculative.types) if (type != COMMON_SPECULATIVE_TYPE_NONE &&
             !(streamed_mtp && type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && requested.draft.n_max >= 1 && requested.draft.n_max <= 3 &&
-                (!configured || requested.draft.n_max <= configured->draft.n_max)))
+                (!configured || requested.draft.n_max <= configured->draft.n_max)) &&
+            !(dflash && type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && requested.draft.n_max>=1 &&
+                requested.draft.n_max<=configured->draft.n_max))
         return "vision arena request cannot change the qualified speculation mode";
     try {
         for (size_t i = 0; i < task.tokens.size();) {
