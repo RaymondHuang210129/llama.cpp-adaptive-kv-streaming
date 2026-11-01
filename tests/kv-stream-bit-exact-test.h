@@ -5,6 +5,7 @@
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-memory-hybrid.h"
+#include "../src/llama-io.h"
 #include "../src/llama-kv-stream-model.h"
 
 #include <array>
@@ -81,6 +82,15 @@ public:
         data(label, count, [&](size_t offset, uint8_t * dest, size_t size) {
             if (size) std::memcpy(dest, static_cast<const uint8_t *>(source) + offset, size);
         });
+    }
+
+    // Load explicit test inputs through the same validated manifest as numerical records.
+    void input(const std::string & label, void * dest, size_t count) {
+        if (!comparing) { bytes(label,dest,count); return; }
+        if ((count && !dest) || cursor==entries.size() || entries[cursor].label!=label || entries[cursor].bytes!=count)
+            throw std::runtime_error("bit-exact input order/size differs: "+label);
+        if (count) read(file.get(),dest,count);
+        ++cursor;
     }
 
     void tensor(const std::string & label, ggml_tensor * tensor, bool finite = false) {
@@ -183,6 +193,68 @@ private:
     size_t cursor = 0;
     uint64_t total = 0;
     bool comparing = false;
+};
+
+// One real encoder result and its surrounding decoder tokens; no model weights are serialized.
+struct kv_stream_image_input {
+    size_t width = 0;
+    llama_pos next_position = 0;
+    llama_tokens prefix, suffix;
+    std::vector<float> values;
+    std::vector<std::array<llama_pos,GGML_MROPE_SECTIONS>> positions;
+
+    static std::array<uint64_t,16> profile(size_t width) {
+        std::array<uint64_t,16> result{};
+        result[0]=0x4446494d473031ULL; result[1]=width; result[2]=GGML_MROPE_SECTIONS;
+        return result;
+    }
+    void validate() const {
+        if (!width || width>65536 || prefix.empty() || prefix.size()>4096 || suffix.empty() || suffix.size()>4096 ||
+                positions.empty() || positions.size()>4096 || positions.size()>(size_t(128)<<20)/sizeof(float)/width ||
+                values.size()!=positions.size()*width || next_position<=0 || uint64_t(next_position)<=prefix.size())
+            throw std::runtime_error("invalid framed image extent");
+        for (auto token:prefix) if (token<0) throw std::runtime_error("invalid image prefix token");
+        for (auto token:suffix) if (token<0) throw std::runtime_error("invalid image suffix token");
+        for (const auto & position:positions) {
+            if (position[0]<0 || uint64_t(position[0])<prefix.size() || position[0]>=next_position)
+                throw std::runtime_error("invalid framed image temporal position");
+            for (auto p:position) if (p<0) throw std::runtime_error("invalid framed image spatial position");
+        }
+        for (float value:values) if (!std::isfinite(value)) throw std::runtime_error("nonfinite framed image input");
+    }
+    void save(FILE * file) const {
+        validate();
+        kv_stream_bit_oracle oracle;
+        const std::array<uint64_t,5> shape{width,prefix.size(),suffix.size(),positions.size(),uint64_t(next_position)};
+        oracle.bytes("image/shape",shape.data(),sizeof(shape));
+        oracle.bytes("image/prefix",prefix.data(),prefix.size()*sizeof(llama_token));
+        oracle.bytes("image/suffix",suffix.data(),suffix.size()*sizeof(llama_token));
+        oracle.bytes("image/positions",positions.data(),positions.size()*sizeof(positions[0]));
+        oracle.bytes("image/values",values.data(),values.size()*sizeof(float));
+        oracle.save_control(file,profile(width));
+    }
+    static kv_stream_image_input load(FILE * file,size_t expected_width) {
+        if (!file || !expected_width || expected_width>65536 || std::fseek(file,0,SEEK_END))
+            throw std::runtime_error("invalid image input file");
+        const auto bytes=std::ftell(file);
+        if (bytes<0 || uint64_t(bytes)>(uint64_t(256)<<20) || std::fseek(file,0,SEEK_SET))
+            throw std::runtime_error("image input file exceeds limit");
+        kv_stream_bit_oracle oracle;
+        oracle.load_control(file,profile(expected_width)); oracle.compare();
+        std::array<uint64_t,5> shape{};oracle.input("image/shape",shape.data(),sizeof(shape));
+        if (shape[0]!=expected_width || !shape[1] || shape[1]>4096 || !shape[2] || shape[2]>4096 ||
+                !shape[3] || shape[3]>4096 || shape[3]>(uint64_t(128)<<20)/sizeof(float)/expected_width ||
+                shape[4]>uint64_t(INT32_MAX)) throw std::runtime_error("invalid framed image shape");
+        kv_stream_image_input result;
+        result.width=expected_width; result.next_position=llama_pos(shape[4]);
+        result.prefix.resize(size_t(shape[1]));result.suffix.resize(size_t(shape[2]));
+        result.positions.resize(size_t(shape[3]));result.values.resize(size_t(shape[3])*expected_width);
+        oracle.input("image/prefix",result.prefix.data(),result.prefix.size()*sizeof(llama_token));
+        oracle.input("image/suffix",result.suffix.data(),result.suffix.size()*sizeof(llama_token));
+        oracle.input("image/positions",result.positions.data(),result.positions.size()*sizeof(result.positions[0]));
+        oracle.input("image/values",result.values.data(),result.values.size()*sizeof(float));
+        oracle.finish();result.validate();return result;
+    }
 };
 
 // Canonical serialization must not depend on write/write_tensor chunk boundaries.

@@ -6,6 +6,7 @@
 #include "../src/llama-context-memory.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "testing.h"
+#include "kv-stream-bit-exact-test.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -97,7 +98,7 @@ static std::vector<uint8_t> projector_test_pixels(size_t width,size_t height) {
 }
 
 int main(int argc,char ** argv) {
-    const char * model_path = nullptr, * projector_path = nullptr, * baseline = nullptr, * save = nullptr;
+    const char * model_path = nullptr, * projector_path = nullptr, * baseline = nullptr, * save = nullptr, * save_input = nullptr;
     bool cuda = false;
     bool phase_only = false;
     bool protected_target = false;
@@ -125,8 +126,10 @@ int main(int argc,char ** argv) {
         else if (!std::strcmp(argv[i],"--mmproj") && i+1 < argc) projector_path = argv[++i];
         else if (!std::strcmp(argv[i],"--baseline") && i+1 < argc) baseline = argv[++i];
         else if (!std::strcmp(argv[i],"--save-baseline") && i+1 < argc) save = argv[++i];
+        else if (!std::strcmp(argv[i],"--save-image-input") && i+1<argc) save_input=argv[++i];
         else return 2;
     }
+    if (save_input && (!save || phase_only || !model_path || !projector_path)) return 2;
     testing t;
     if (image_count>2 || image_budget>1120 ||
             (image_count!=1 && !phase_only) || (parent_explicit && !phase_only && !protected_target) ||
@@ -461,7 +464,7 @@ int main(int argc,char ** argv) {
         const auto pixels=projector_test_pixels(image_width,image_height);
         mtmd::bitmap_ptr image(mtmd_bitmap_init(uint32_t(image_width),uint32_t(image_height),pixels.data()));
         const auto * bitmap = image.get();
-        const std::string prompt = mtmd_get_marker(projector.get());
+        const std::string prompt = save_input ? std::string("Describe the pattern: ")+mtmd_get_marker(projector.get())+" Short answer: " : mtmd_get_marker(projector.get());
         mtmd_input_text input{prompt.c_str(),prompt.size(),true,true};
         mtmd::input_chunks_ptr chunks(mtmd_input_chunks_init());
         if (!t.assert_equal(0,mtmd_tokenize(projector.get(),chunks.get(),&input,&bitmap,1))) return;
@@ -480,6 +483,37 @@ int main(int argc,char ** argv) {
         mtmd_embedding_view output;
         if (!t.assert_true(mtmd_batch_acquire_output_embd(batch.get(),chunk,output))) return;
         const size_t bytes = output.n_tokens()*output.n_embd()*sizeof(float);
+        if (save_input) {
+            if (!t.assert_true(mtmd_decode_use_mrope(projector.get()) && !mtmd_decode_use_non_causal(projector.get(),chunk))) return;
+            kv_stream_image_input fixture;
+            fixture.width=output.n_embd();
+            bool seen_image=false;
+            for (size_t i=0;i<mtmd_input_chunks_size(chunks.get());++i) {
+                const auto * entry=mtmd_input_chunks_get(chunks.get(),i);
+                if (mtmd_input_chunk_get_type(entry)==MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                    if (!t.assert_true(!seen_image && entry==chunk)) return;
+                    seen_image=true;
+                } else {
+                    size_t count=0;const auto * tokens=mtmd_input_chunk_get_tokens_text(entry,&count);
+                    auto & dest=seen_image ? fixture.suffix : fixture.prefix;
+                    if (!t.assert_true(tokens!=nullptr)) return;
+                    dest.insert(dest.end(),tokens,tokens+count);
+                }
+            }
+            const auto * image_tokens=mtmd_input_chunk_get_tokens_image(chunk);
+            if (!t.assert_true(image_tokens && fixture.prefix.size()<=size_t(INT32_MAX))) return;
+            fixture.next_position=llama_pos(fixture.prefix.size())+mtmd_input_chunk_get_n_pos(chunk);
+            fixture.values.assign(output.data(),output.data()+output.n_tokens()*output.n_embd());
+            for (size_t i=0;i<output.n_tokens();++i) {
+                const auto pos=mtmd_image_tokens_get_decoder_pos(image_tokens,llama_pos(fixture.prefix.size()),i);
+                fixture.positions.push_back({pos.t,pos.y,pos.x,pos.z});
+            }
+            std::unique_ptr<FILE,kv_stream_exact_file_free> file(std::fopen(save_input,"wb"));
+            if (!t.assert_true(bool(file))) return;
+            fixture.save(file.get());
+            t.out << "real image input rows=" << fixture.positions.size() << " width=" << fixture.width
+                  << " prefix=" << fixture.prefix.size() << " suffix=" << fixture.suffix.size() << '\n';
+        }
         if (save) {
             std::ofstream file(save,std::ios::binary);
             file.write(reinterpret_cast<const char *>(output.data()),std::streamsize(bytes));

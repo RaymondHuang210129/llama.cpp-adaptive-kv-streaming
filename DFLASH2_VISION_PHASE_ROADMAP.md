@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0-DV4 are complete; DV5-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: implementation in progress, 2026-11-01. DV0-DV5 are complete; DV6-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -253,6 +253,8 @@ Exit: the live three-scheduler lifecycle is qualified with no second device pare
 
 ### DV5 - Integrate the internal image-conditioned speculative loop
 
+Completed 2026-11-01: the existing framed oracle now exports real MTMD embeddings, tokens and four-coordinate positions and compares all consumed target features, logits/hidden rows, selector outputs, encoded target/draft KV and recurrent state. F1/F3/F7 cover all accepted prefixes and actual TG1-TG8, including phase-loan overwrite/resume; F3 also covers Q8_0/Q8_0 and Q5_1/Q5_1. Exact records are 504 (815636404 bytes) for F1, 907 (1474031420 bytes) for F3 Q8_0/Q4_0, and 1749 (2834713708 bytes) for F7. Three fresh strict decoder checks and the phase encoder check report zero errors with API-all/error99/default PDL. The native encoder and decoder components use the same image payload and weights; F7 is component-level native arithmetic coverage because full native F7 still cannot allocate the 927588992-byte projector. A corrected local builder rebuilds every static server-archive member; fresh coherent F1/F3 public native controls reproduce all prior tokens and F7 reproduces its capacity limit. Decoder CLI evidence does not link that archive. CPU image-framing checks pass with 1531 assertions. Local evidence: `benchmarks/results/dflash2-vision-20261101/` (encoder-input, image-vectors-v2, image-matrix and native-coherent gates).
+
 Use the existing MTMD post-target-decode callback and stock speculative driver. Initially expose this only through focused test entry points; public startup/request guards remain closed until the internal path is green.
 
 Compare ordinary native and streamed runs under identical input, batching, position and verification geometry. Check complete relevant vectors and metadata, not just argmax tokens:
@@ -398,7 +400,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV2: image-input startup catalogs measured before child capture; both microbatch profiles validated.
 - [x] DV3: native-policy feature behavior and exact owned image provenance pass, including one-row injection.
 - [x] DV4: validated bounded-writer state survives complete vision loans and strict memory checks.
-- [ ] DV5: image-conditioned speculative acceptance/correction matches fitting native controls.
+- [x] DV5: real encoder inputs, exact image-conditioned target/draft vectors and forced acceptance/correction match fitting native controls.
 - [ ] DV6: narrow common/server/request/finder integration works with actual images.
 - [ ] DV7: cache, window, cancellation, state and process restart pass.
 - [ ] DV8: required numerical/memory/regression/performance evidence audited.

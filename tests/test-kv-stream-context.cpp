@@ -46,6 +46,10 @@ static bool wide_rollback_control = false;
 static bool vision_mtp_handoff = false;
 static bool dflash_vision_readiness = false;
 static uint32_t dflash_vision_microbatch = 256;
+static const char * dflash_vision_image = nullptr;
+static const char * dflash_vision_control = nullptr;
+static bool dflash_vision_writing = false, dflash_vision_native_check = false;
+static uint32_t dflash_vision_depth = 3;
 static bool serial_workspace_growth = false;
 static bool mtp_bit_exact_control = false;
 static const char * dflash_native_model = nullptr;
@@ -3342,6 +3346,25 @@ int main(int argc,char ** argv) {
         t.assert_true(!llama_memory_kv_context_get(recurrent_ctx.get()));
     });
     test_kv_stream_bit_exact_comparator(t);
+    t.test("image_oracle_roundtrip_preserves_bits_and_rejects_wrong_profile",[](testing & t) {
+        kv_stream_image_input image;
+        image.width=4; image.prefix={1,2}; image.suffix={3}; image.next_position=4;
+        image.values={0.0f,-0.0f,0.25f,0.5f,0.75f,1.0f,1.25f,1.5f};
+        image.positions={{{2,2,2,0}},{{2,3,2,0}}};
+        std::unique_ptr<FILE,kv_stream_exact_file_free> file(std::tmpfile());
+        if (!t.assert_true(bool(file))) return;
+        image.save(file.get()); std::rewind(file.get());
+        const auto actual=kv_stream_image_input::load(file.get(),4);
+        t.assert_true(actual.prefix==image.prefix && actual.suffix==image.suffix && actual.positions==image.positions);
+        t.assert_true(kv_stream_bytes_equal(actual.values.data(),actual.values.size()*sizeof(float),image.values.data(),image.values.size()*sizeof(float)));
+        std::rewind(file.get()); bool rejected=false;
+        try { auto invalid=kv_stream_image_input::load(file.get(),8); } catch (const std::runtime_error &) { rejected=true; }
+        t.assert_true("an image from another embedding geometry is rejected",rejected);
+        image.positions[0][0]=-1; rejected=false;
+        try { image.save(file.get()); } catch (const std::runtime_error &) { rejected=true; }
+        t.assert_true("negative image positions reject before use",rejected);
+    });
+
     t.test("independent_dflash_quota_fixture_declares_a_bounded_child", [&](testing & t) {
         auto target=llama_context_default_params();
         target.n_ctx=4096; target.n_rs_seq=7;
@@ -3530,6 +3553,16 @@ int main(int argc,char ** argv) {
         }
         if (!std::strcmp(argv[i], "--dflash-independent-quotas")) dflash_independent_quotas = true;
         if (!std::strcmp(argv[i], "--dflash-prefetch-hint")) dflash_prefetch_hint = true;
+        if (!std::strcmp(argv[i],"--dflash-vision-image") && i+1<argc) dflash_vision_image=argv[++i];
+        if ((!std::strcmp(argv[i],"--dflash-vision-export") || !std::strcmp(argv[i],"--dflash-vision-import") ||
+                !std::strcmp(argv[i],"--dflash-vision-native-check")) && i+1<argc) {
+            dflash_vision_writing=!std::strcmp(argv[i],"--dflash-vision-export");
+            dflash_vision_native_check=!std::strcmp(argv[i],"--dflash-vision-native-check");
+            dflash_vision_control=argv[++i];
+        }
+        if (!std::strcmp(argv[i],"--dflash-vision-depth") && i+1<argc) {
+            const auto depth=std::stoul(argv[++i]);if (depth<1 || depth>7) return 1;dflash_vision_depth=uint32_t(depth);
+        }
         if (!std::strcmp(argv[i], "--dflash-vision-readiness")) dflash_vision_readiness = true;
         if (!std::strcmp(argv[i], "--dflash-vision-microbatch") && i+1<argc) {
             const auto value=std::stoul(argv[++i]);
@@ -3573,7 +3606,7 @@ int main(int argc,char ** argv) {
         serial_workspace_growth = serial_workspace_growth || !std::strcmp(argv[i],"--serial-workspace-growth");
     }
     embedded_mtp_control |= vision_mtp_handoff;
-    if (test_cache_explicit && !mtp_bit_exact_control && !dflash_exact_control && !dflash_mixed_switching && !vision_mtp_handoff) {
+    if (test_cache_explicit && !mtp_bit_exact_control && !dflash_exact_control && !dflash_mixed_switching && !vision_mtp_handoff && !dflash_vision_control) {
         std::fprintf(stderr, "test cache types require a numerical oracle or vision handoff profile\n");
         return 1;
     }
@@ -3741,6 +3774,15 @@ int main(int argc,char ** argv) {
             [&](testing & t) { test_gemma_bounded_cache(t,model.get()); });
         return t.summary();
     }
+    if (dflash_vision_control) {
+        if (!t.assert_true(bool(model) && dflash_native_model && dflash_vision_image)) return t.summary();
+        t.test("DFlash_real_image_native_streamed_complete_values",[&](testing & t) {
+            test_dflash_vision_exact(t,model.get(),dflash_native_model,dflash_vision_image,dflash_vision_control,
+                dflash_vision_writing,dflash_vision_native_check,dflash_vision_depth,test_cache_k,test_cache_v);
+        });
+        return t.summary();
+    }
+
     if (dflash_vision_readiness) {
         if (!t.assert_true(bool(model) && dflash_native_model)) return t.summary();
         t.test("DFlash_image_provenance_and_vision_owner_readiness",[&](testing & t) {

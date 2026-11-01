@@ -425,6 +425,190 @@ static std::vector<uint32_t> dflash_exact_lattice(const float * data,size_t rows
     return result;
 }
 
+// Canonicalize every used row, including image groups sharing one temporal position.
+static void dflash_vision_visible_kv(kv_stream_bit_oracle & oracle,const std::string & name,llama_kv_cache * cache) {
+    const auto & cells=cache->get_cells(0);
+    std::vector<std::pair<llama_pos,uint32_t>> rows(cells.seq_pos_get(0).begin(),cells.seq_pos_get(0).end());
+    const auto key=[&](const auto & row) {
+        const auto & ext=cells.ext_get(row.second);
+        return std::array<llama_pos,3>{row.first,ext.y,ext.x};
+    };
+    std::stable_sort(rows.begin(),rows.end(),[&](const auto & a,const auto & b) {return key(a)<key(b);});
+    std::vector<std::array<llama_pos,3>> positions;
+    for (const auto & row:rows) positions.push_back(key(row));
+    oracle.bytes(name+"/positions",positions.data(),positions.size()*sizeof(positions[0]));
+    const auto layers=cache->get_layer_ids();
+    oracle.bytes(name+"/layers",layers.data(),layers.size()*sizeof(layers[0]));
+    for (auto layer:layers) for (bool value:{false,true}) {
+        auto * tensor=value ? cache->get_v_storage(layer) : cache->get_k_storage(layer);
+        if (!tensor || tensor->ne[2]!=1) throw std::runtime_error("invalid image KV storage");
+        const size_t row_bytes=ggml_row_size(tensor->type,tensor->ne[0]);
+        if (!row_bytes || tensor->nb[1]!=row_bytes || rows.size()>SIZE_MAX/row_bytes)
+            throw std::runtime_error("invalid image KV stride");
+        const auto label=name+"/"+std::to_string(layer)+(value ? "/V" : "/K");
+        const std::array<uint64_t,3> shape{uint64_t(tensor->type),uint64_t(tensor->ne[0]),rows.size()};
+        oracle.bytes(label+"/shape",shape.data(),sizeof(shape));
+        oracle.data(label,rows.size()*row_bytes,[&](size_t offset,uint8_t * dest,size_t count) {
+            while (count) {
+                const size_t index=offset/row_bytes,within=offset%row_bytes;
+                const size_t n=std::min(count,row_bytes-within);
+                if (size_t(rows[index].second)>(SIZE_MAX-within)/row_bytes)
+                    throw std::runtime_error("image KV offset overflow");
+                const size_t physical=size_t(rows[index].second)*row_bytes+within;
+                if (physical>ggml_nbytes(tensor) || n>ggml_nbytes(tensor)-physical)
+                    throw std::runtime_error("image KV extent exceeds storage");
+                ggml_backend_tensor_get(tensor,dest,physical,n);
+                dest+=n;count-=n;offset+=n;
+            }
+        });
+    }
+}
+
+static void test_dflash_vision_exact(testing & t,llama_model * model,const char * sidecar,const char * image_path,
+        const char * control_path,bool writing,bool native_check,uint32_t depth,ggml_type key,ggml_type value) {
+    if (!image_path || !control_path || depth<1 || depth>7) throw std::runtime_error("invalid image oracle profile");
+    const size_t hidden=llama_model_n_embd(model),vocab=llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::unique_ptr<FILE,kv_stream_exact_file_free> image_file(std::fopen(image_path,"rb"));
+    const auto image=kv_stream_image_input::load(image_file.get(),hidden);
+    for (auto token:image.prefix) if (uint64_t(token)>=vocab) throw std::runtime_error("image prefix exceeds vocabulary");
+    for (auto token:image.suffix) if (uint64_t(token)>=vocab) throw std::runtime_error("image suffix exceeds vocabulary");
+    if (image.prefix.size()+image.positions.size()+image.suffix.size()>1024 ||
+            uint64_t(image.next_position)+image.suffix.size()+256>=2048)
+        throw std::runtime_error("image input exceeds fitting oracle profile");
+    const bool streaming=!writing && !native_check;
+    const std::array<uint64_t,16> profile{0x44465649533031ULL,2048,depth,uint64_t(key),uint64_t(value),256,
+        hidden,image.positions.size(),image.prefix.size(),image.suffix.size(),uint64_t(image.next_position),1,0,0,0,0};
+    kv_stream_bit_oracle oracle;
+    if (!writing) {
+        std::unique_ptr<FILE,kv_stream_exact_file_free> file(std::fopen(control_path,"rb"));
+        oracle.load_control(file.get(),profile);oracle.compare();
+    }
+    oracle.bytes("input/prefix",image.prefix.data(),image.prefix.size()*sizeof(llama_token));
+    oracle.bytes("input/suffix",image.suffix.data(),image.suffix.size()*sizeof(llama_token));
+    oracle.bytes("input/positions",image.positions.data(),image.positions.size()*sizeof(image.positions[0]));
+    oracle.bytes("input/values",image.values.data(),image.values.size()*sizeof(float));
+    auto cp=llama_context_default_params();
+    cp.n_ctx=2048;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=1;cp.n_rs_seq=depth;
+    cp.n_outputs_max=cp.n_outputs_max_per_seq=depth+1;cp.type_k=key;cp.type_v=value;
+    cp.pooling_type=LLAMA_POOLING_TYPE_NONE;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    if (streaming) cp.shared_device_memory_bytes=size_t(1024)*1024*1024;
+    context_ptr target(llama_init_from_model(model,cp),llama_free);
+    if (!t.assert_true(bool(target))) return;
+    llama_set_embeddings_nextn(target.get(),true,false);
+    common_params base;
+    base.n_ctx=2048;base.n_batch=base.n_ubatch=256;base.n_parallel=1;base.n_gpu_layers=999;
+    base.shared_device_memory_bytes=cp.shared_device_memory_bytes;base.fit_params=false;
+    base.cache_type_k=key;base.cache_type_v=value;base.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    base.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+    base.speculative.draft.n_max=int(depth);base.speculative.draft.n_min=0;base.speculative.draft.p_min=0;
+    base.speculative.draft.n_gpu_layers=999;base.speculative.draft.mparams.path=sidecar;
+    base.speculative.draft.cache_type_k=key;base.speculative.draft.cache_type_v=value;
+    if (streaming) base.mmproj.path="frozen-encoder-input";
+    auto params=common_base_params_to_speculative(base);
+    auto child=common_speculative_init_from_params(params,model,target.get());
+    if (!t.assert_true(child && child->context())) return;
+    params.speculative.draft.ctx_tgt=target.get();params.speculative.draft.ctx_dft=child->context();
+    common_speculative_ptr spec(common_speculative_init(params.speculative,1));
+    if (!t.assert_true(bool(spec))) return;
+    auto * hybrid=dynamic_cast<llama_memory_hybrid *>(llama_get_memory(target.get()));
+    auto * window=dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(child->context()));
+    if (!t.assert_true(hybrid && window)) return;
+    llama_pos position=0;
+    llama_tokens history=image.prefix;
+    const auto capture=[&](const std::string & name,size_t rows,size_t logits) {
+        for (size_t i=0;i<logits;++i)
+            oracle.bytes(name+"/logits/"+std::to_string(i),llama_get_logits_ith(target.get(),logits==1 ? -1 : int(i)),vocab*sizeof(float));
+        oracle.bytes(name+"/hidden",llama_get_embeddings_nextn(target.get()),rows*hidden*sizeof(float));
+        const auto * layers=llama_model_target_layer_ids(child->model());
+        for (uint32_t i=0;i<llama_model_target_layer_ids_n(child->model());++i)
+            oracle.bytes(name+"/features/"+std::to_string(i),llama_get_embeddings_layer_inp(target.get(),uint32_t(layers[i])),rows*hidden*sizeof(float));
+    };
+    const auto submit=[&](const std::string & name,const llama_tokens & tokens,bool decode,bool all) {
+        common_batch batch(target.get());
+        for (size_t i=0;i<tokens.size();++i) batch.add(tokens[i],position+llama_pos(i),0,all || i+1==tokens.size());
+        llama_set_kv_stream_decode(target.get(),decode);
+        if (!t.assert_equal(0,llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get()))) return false;
+        capture(name,tokens.size(),all ? tokens.size() : 1);
+        if (!t.assert_true(common_speculative_process(spec.get(),batch))) return false;
+        llama_synchronize(child->context());position+=llama_pos(tokens.size());return true;
+    };
+    if (!submit("prefix",image.prefix,false,false)) return;
+    common_batch visual(target.get());
+    for (size_t row=0;row<image.positions.size();++row)
+        visual.add_embd({image.values.data()+row*hidden,1,hidden},image.positions[row].data(),0,false);
+    if (!t.assert_equal(0,llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,visual.get()))) return;
+    capture("image",image.positions.size(),0);
+    const auto before_image=llama_memory_seq_pos_max(llama_get_memory(child->context()),0);
+    if (!t.assert_true(common_speculative_process(spec.get(),visual))) return;
+    if (image.positions.size()>1 && image.positions.front()[0]==image.positions.back()[0])
+        t.assert_equal("native pinned-image skip preserves draft frontier",before_image,llama_memory_seq_pos_max(llama_get_memory(child->context()),0));
+    position=image.next_position;
+    if (!submit("suffix",image.suffix,false,false)) return;
+    history.insert(history.end(),image.suffix.begin(),image.suffix.end());
+    const auto state=[&](const std::string & name) {
+        llama_synchronize(target.get());llama_synchronize(child->context());
+        dflash_vision_visible_kv(oracle,name+"/target_KV",hybrid->get_mem_attn());
+        dflash_vision_visible_kv(oracle,name+"/draft_KV",window->get_swa());
+        kv_stream_exact_state recurrent;
+        hybrid->get_mem_recr()->state_write(recurrent,0,0);recurrent.compare_with(oracle,name+"/recurrent");
+    };
+    state("initial");
+    if (streaming) {
+        auto * parent=llama_context_compute_memory(target.get());
+        if (!t.assert_true(parent && parent->can_suspend_for_vision() && llama_context_suspend_kv_device(target.get()))) return;
+        std::vector<ggml_backend_memory_lease_t> loans;
+        if (!t.assert_true(parent->lend_suspended({parent->shared_parent_capacity()/2},loans))) return;
+        auto * buffer=ggml_backend_memory_lease_buffer(loans[0]);
+        ggml_backend_buffer_clear(buffer,0x65);
+        ggml_context_ptr metadata(ggml_init({2048,nullptr,true}));
+        auto * probe=ggml_new_tensor_1d(metadata.get(),GGML_TYPE_I8,64);
+        if (!t.assert_equal(GGML_STATUS_SUCCESS,ggml_backend_tensor_alloc(buffer,probe,ggml_backend_buffer_get_base(buffer)))) return;
+        std::array<uint8_t,64> bytes{};ggml_backend_tensor_get(probe,bytes.data(),0,bytes.size());
+        t.assert_true(std::all_of(bytes.begin(),bytes.end(),[](auto byte){return byte==0x65;}));
+        for (auto * lease:loans) ggml_backend_memory_lease_free(lease);
+        if (!t.assert_true(llama_context_resume_kv_device(target.get(),llama_memory_text_phase::prefill))) return;
+    }
+    common_speculative_begin(spec.get(),0,history);
+    for (uint32_t width=1;width<=depth+1;++width) {
+        const auto first=position;
+        llama_tokens tokens(width);
+        for (uint32_t i=0;i<width;++i) tokens[i]=1000+llama_token((uint32_t(position)+i)%17);
+        if (!submit("width/"+std::to_string(width),tokens,true,true)) return;
+        position=first+1;
+        if (!t.assert_true(llama_memory_seq_rm(llama_get_memory(target.get()),0,position,-1) &&
+                llama_memory_seq_rm(llama_get_memory(child->context()),0,position,-1))) return;
+        history.push_back(tokens[0]);state("width/"+std::to_string(width));
+    }
+    for (uint32_t keep=0;keep<=depth;++keep) {
+        const auto first=position;const llama_token anchor=1000+llama_token(uint32_t(position)%17);
+        llama_tokens proposed;auto & request=common_speculative_get_draft_params(spec.get(),0);
+        request.drafting=true;request.n_max=int(depth);request.pos0=position;request.id_last=anchor;
+        request.prompt=&history;request.result=&proposed;request.temp=0;request.seed=123;
+        common_speculative_draft(spec.get());llama_synchronize(child->context());
+        if (!t.assert_equal(size_t(depth),proposed.size())) return;
+        const auto name="keep/"+std::to_string(keep);
+        oracle.bytes(name+"/proposals",proposed.data(),proposed.size()*sizeof(llama_token));
+        const auto lattice=dflash_exact_lattice(llama_get_embeddings_nextn(child->context()),depth+1,
+            size_t(llama_model_n_embd(child->model())),size_t(llama_model_dflash_selector_top_k(child->model())),vocab);
+        oracle.bytes(name+"/selector",lattice.data(),lattice.size()*sizeof(uint32_t));
+        if (!t.assert_true(llama_memory_seq_rm(llama_get_memory(child->context()),0,first,-1))) return;
+        llama_tokens verified{anchor};verified.insert(verified.end(),proposed.begin(),proposed.end());
+        if (!submit(name,verified,true,true)) return;
+        position=first+1+llama_pos(keep);
+        if (!t.assert_true(llama_memory_seq_rm(llama_get_memory(target.get()),0,position,-1) &&
+                llama_memory_seq_rm(llama_get_memory(child->context()),0,position,-1))) return;
+        common_speculative_accept(spec.get(),0,uint16_t(keep));
+        history.insert(history.end(),verified.begin(),verified.begin()+1+keep);
+        state(name);
+    }
+    if (writing) {
+        std::unique_ptr<FILE,kv_stream_exact_file_free> file(std::fopen(control_path,"wb"));
+        oracle.save_control(file.get(),profile);
+    } else oracle.finish();
+    t.out << "DFlash image exact depth=" << depth << " streamed=" << streaming << " records=" << oracle.records()
+          << " bytes=" << oracle.byte_count() << " image_rows=" << image.positions.size() << '\n';
+}
+
 // Match the same block execution and force decisions independently of sampler acceptance.
 static void test_kv_stream_dflash_exact(testing & t,llama_model * model,const char * sidecar,bool lifecycle=false,bool context_end=false,bool sustained_rejection=false,
         ggml_type key=GGML_TYPE_Q8_0,ggml_type value=GGML_TYPE_Q4_0,bool matching_cache=false,bool short_profile=false,bool independent_rows=false,
