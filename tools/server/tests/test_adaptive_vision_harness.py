@@ -35,6 +35,40 @@ class Launch(unittest.TestCase):
                 finder.arguments(base+["--spec-mode","dflash-k4v"])
             process.assert_not_called()
 
+    def test_image_state_actions_require_complete_files_and_matching_counts(self):
+        directory=Path(self.directory.name); path=directory/"vision.bin"; path.write_bytes(b"exact-state")
+        saved={"n_saved":17,"n_written":path.stat().st_size}
+        with patch.object(harness,"request",return_value=(200,saved)):
+            self.assertEqual(harness.vision_state_action(1,directory,"save"),saved)
+        with patch.object(harness,"request",return_value=(200,{"n_restored":17,"n_read":saved["n_written"]})):
+            harness.vision_state_action(1,directory,"restore",saved)
+        for response in ({"n_restored":16,"n_read":saved["n_written"]},{"n_restored":17,"n_read":1}):
+            with patch.object(harness,"request",return_value=(200,response)),self.assertRaises(RuntimeError):
+                harness.vision_state_action(1,directory,"restore",saved)
+        path.write_bytes(b"short")
+        with patch.object(harness,"request",return_value=(200,saved)),self.assertRaises(RuntimeError):
+            harness.vision_state_action(1,directory,"save")
+
+    def test_image_completion_requires_real_drafts_and_exact_output_accounting(self):
+        result={"tokens":[2,3],"timings":{"predicted_n":2,"draft_n":3,"draft_n_accepted":1,"cache_n":0,"prompt_n":64}}
+        self.assertEqual(harness.vision_observation(result,2,True)["tokens"],[2,3])
+        import copy
+        for field,value in (("predicted_n",1),("draft_n",0),("draft_n_accepted",4),("cache_n",-1),("prompt_n",0)):
+            bad=copy.deepcopy(result);bad["timings"][field]=value
+            with self.subTest(field=field),self.assertRaises(RuntimeError):
+                harness.vision_observation(bad,2,True)
+
+    def test_lifecycle_restart_keeps_the_same_slot_directory(self):
+        self.args.lifecycle=True
+        for mode in ("arena-state","arena-restart"):
+            with self.launch("vision arena rejects this configuration"),patch.object(harness.os,"killpg",create=True):
+                with harness.server(self.args,mode,reject=True):pass
+        directories=[]
+        for command,_ in self.commands:
+            self.assertIn("--slot-save-path",command)
+            directories.append(command[command.index("--slot-save-path")+1])
+        self.assertEqual(directories[0],directories[1])
+
     def test_startup_negative_profiles_do_not_reject_supported_cache_formats(self):
         cases=harness.vision_startup_rejections()
         self.assertEqual(len(cases),6)

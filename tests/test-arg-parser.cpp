@@ -92,6 +92,10 @@ static void test(void) {
             }
             assert(common_streamed_dflash_config_error(invalid));
         }
+        auto image=dflash;
+        image.mmproj.path="vision.gguf";
+        assert(!common_streamed_dflash_config_error(image));
+        assert(common_base_params_to_speculative(image).mmproj.path==image.mmproj.path);
         assert(common_context_params_to_llama(dflash).n_rs_seq == 7);
         assert(common_kv_stream_auxiliary_layers(dflash,1) == 0);
         const auto draft=common_base_params_to_speculative(dflash);
@@ -104,7 +108,7 @@ static void test(void) {
                 case 1: invalid.speculative.draft.n_max=8; break;
                 case 2: invalid.kv_stream_auxiliary_layers=1; break;
                 case 3: invalid.fit_params=true; break;
-                case 4: invalid.mmproj.path="vision.gguf"; break;
+                case 4: invalid.mmproj.path="vision.gguf"; invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V); break;
                 case 5: invalid.n_ubatch=4; break;
                 case 6: invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP); break;
             }

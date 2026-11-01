@@ -4,6 +4,7 @@
 #include "../tools/mtmd/mtmd-workspace.h"
 #include "../tools/mtmd/mtmd-session.h"
 #include "../src/llama-context-memory.h"
+#include "../src/llama-kv-cache-iswa.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "testing.h"
 #include "kv-stream-bit-exact-test.h"
@@ -98,7 +99,7 @@ static std::vector<uint8_t> projector_test_pixels(size_t width,size_t height) {
 }
 
 int main(int argc,char ** argv) {
-    const char * model_path = nullptr, * projector_path = nullptr, * baseline = nullptr, * save = nullptr, * save_input = nullptr;
+    const char * model_path = nullptr, * projector_path = nullptr, * baseline = nullptr, * save = nullptr, * save_input = nullptr, * dflash_path = nullptr;
     bool cuda = false;
     bool phase_only = false;
     bool protected_target = false;
@@ -122,6 +123,7 @@ int main(int argc,char ** argv) {
             char * end=nullptr;value=std::strtoul(argv[++i],&end,10);
             if (!end || *end || !value || value>8192) return 2;
         }
+        else if (!std::strcmp(argv[i],"--dflash-model") && i+1<argc) dflash_path=argv[++i];
         else if (!std::strcmp(argv[i],"--model") && i+1 < argc) model_path = argv[++i];
         else if (!std::strcmp(argv[i],"--mmproj") && i+1 < argc) projector_path = argv[++i];
         else if (!std::strcmp(argv[i],"--baseline") && i+1 < argc) baseline = argv[++i];
@@ -129,6 +131,7 @@ int main(int argc,char ** argv) {
         else if (!std::strcmp(argv[i],"--save-image-input") && i+1<argc) save_input=argv[++i];
         else return 2;
     }
+    if (dflash_path && !protected_target) return 2;
     if (save_input && (!save || phase_only || !model_path || !projector_path)) return 2;
     testing t;
     if (image_count>2 || image_budget>1120 ||
@@ -151,7 +154,7 @@ int main(int argc,char ** argv) {
     }
     if (protected_target) {
         if (!cuda || phase_only || !model_path || !projector_path || !baseline) return 2;
-        t.set_filter("real_Gemma_target_preserves_KV_around_vision_encoding");
+        t.set_filter(dflash_path ? "real_DFlash_target_and_child_survive_encoder_failures" : "real_Gemma_target_preserves_KV_around_vision_encoding");
     }
     t.test("projector_pixel_fixture_geometry_is_explicit_and_bounded",[](testing & t) {
         const auto small=projector_test_pixels(2,3);
@@ -705,7 +708,7 @@ int main(int argc,char ** argv) {
         t.assert_true(after == before && output.data() != nullptr);
         reader.reset(); t.assert_true(!tensor->data && !tensor->buffer);
     });
-    if (protected_target) t.test("real_Gemma_target_preserves_KV_around_vision_encoding",[&](testing & t) {
+    if (protected_target) t.test(dflash_path ? "real_DFlash_target_and_child_survive_encoder_failures" : "real_Gemma_target_preserves_KV_around_vision_encoding",[&](testing & t) {
         ggml_backend_load_all();
         auto mp=llama_model_default_params();mp.n_gpu_layers=999;
         llama_model_ptr model(llama_model_load_from_file(model_path,mp));
@@ -714,6 +717,7 @@ int main(int argc,char ** argv) {
         std::vector<llama_token> tokens(1333);
         for (size_t i=0;i<tokens.size();++i) tokens[i]=llama_token(10+i%64);
         std::vector<std::vector<float>> expected;
+        llama_tokens expected_draft;
         for (bool streaming : {false,true}) {
             auto cp=llama_context_default_params();
             cp.n_ctx=4096;cp.n_batch=cp.n_ubatch=image_budget ? uint32_t((image_budget+255)/256*256) : 256;cp.n_seq_max=1;cp.swa_full=false;
@@ -721,11 +725,42 @@ int main(int argc,char ** argv) {
             cp.n_threads=cp.n_threads_batch=8;cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;
             cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
             if (streaming) cp.shared_device_memory_bytes=protected_test_parent_bytes(parent_explicit,parent_mib);
+            if (dflash_path) { cp.n_rs_seq=3; cp.n_outputs_max=cp.n_outputs_max_per_seq=4; }
             llama_context_ptr target(llama_init_from_model(model.get(),cp));
             if (!t.assert_true(bool(target))) return;
+            common_params draft_params;
+            common_speculative_init_result_ptr owned;
+            common_speculative_ptr spec;
+            if (dflash_path) {
+                draft_params.n_ctx=cp.n_ctx; draft_params.n_batch=draft_params.n_ubatch=cp.n_ubatch;
+                draft_params.n_parallel=1; draft_params.n_gpu_layers=999; draft_params.fit_params=false;
+                draft_params.cache_type_k=cp.type_k; draft_params.cache_type_v=cp.type_v;
+                draft_params.shared_device_memory_bytes=cp.shared_device_memory_bytes;
+                draft_params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                draft_params.mmproj.path=projector_path;
+                draft_params.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+                draft_params.speculative.draft.n_max=3; draft_params.speculative.draft.n_min=0; draft_params.speculative.draft.p_min=0;
+                draft_params.speculative.draft.mparams.path=dflash_path; draft_params.speculative.draft.n_gpu_layers=999;
+                draft_params.speculative.draft.cache_type_k=cp.type_k; draft_params.speculative.draft.cache_type_v=cp.type_v;
+                draft_params=common_base_params_to_speculative(draft_params);
+                owned=common_speculative_init_from_params(draft_params,model.get(),target.get());
+                if (!t.assert_true(owned && owned->context())) return;
+                auto * local=dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(owned->context()));
+                if (!t.assert_true(local && local->get_swa()->type_k()==cp.type_k && local->get_swa()->type_v()==cp.type_v)) return;
+                draft_params.speculative.draft.ctx_tgt=target.get(); draft_params.speculative.draft.ctx_dft=owned->context();
+                spec.reset(common_speculative_init(draft_params.speculative,1));
+                if (!t.assert_true(bool(spec))) return;
+            }
+            const auto process=[&](const llama_token * values,size_t first,size_t count) {
+                if (!spec) return llama_decode(target.get(),llama_batch_get_one(const_cast<llama_token *>(values),int32_t(count)));
+                common_batch batch(target.get());
+                for (size_t i=0;i<count;++i) batch.add(values[i],llama_pos(first+i),0,i+1==count);
+                const int status=llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get());
+                return status ? status : common_speculative_process(spec.get(),batch) ? 0 : 1;
+            };
             for (size_t first=0;first<tokens.size();first+=256) {
                 const auto count=int32_t(std::min(size_t(256),tokens.size()-first));
-                if (!t.assert_equal(0,llama_decode(target.get(),llama_batch_get_one(tokens.data()+first,count)))) return;
+                if (!t.assert_equal(0,process(tokens.data()+first,first,size_t(count)))) return;
             }
             if (long_vision) {
                 llama_set_kv_stream_decode(target.get(),true);
@@ -741,10 +776,16 @@ int main(int argc,char ** argv) {
                 auto * retained_owner=llama_context_compute_memory(target.get());
                 llama_context_memory_diagnostics retained_usage;
                 if (!t.assert_true(retained_owner && retained_owner->diagnostics(retained_usage) && retained_usage.persistent_cache_bytes>0)) return;
-                if (!image_budget) t.assert_equal(size_t(425984000),retained_usage.persistent_cache_bytes);
+                if (!image_budget && !dflash_path) t.assert_equal(size_t(425984000),retained_usage.persistent_cache_bytes);
                 auto snapshot=[&] {
                     std::vector<uint8_t> bytes(llama_state_get_size(target.get()));
-                    bytes.resize(llama_state_get_data(target.get(),bytes.data(),bytes.size()));return bytes;
+                    bytes.resize(llama_state_get_data(target.get(),bytes.data(),bytes.size()));
+                    if (owned) {
+                        std::vector<uint8_t> draft(llama_state_get_size(owned->context()));
+                        draft.resize(llama_state_get_data(owned->context(),draft.data(),draft.size()));
+                        bytes.insert(bytes.end(),draft.begin(),draft.end());
+                    }
+                    return bytes;
                 };
                 const auto before=snapshot();
                 auto params=mtmd_context_params_default();params.use_gpu=true;params.warmup=false;
@@ -818,11 +859,22 @@ int main(int argc,char ** argv) {
             }
             for (size_t step=0;step<8;++step) {
                 llama_token token=llama_token(80+step);
-                if (!t.assert_equal(0,llama_decode(target.get(),llama_batch_get_one(&token,1)))) return;
+                if (!t.assert_equal(0,process(&token,tokens.size()+(long_vision ? 1024 : 0)+step,1))) return;
                 const auto * logits=llama_get_logits_ith(target.get(),-1);
                 if (!t.assert_true(logits!=nullptr)) return;
                 if (!streaming) expected.emplace_back(logits,logits+vocab);
                 else if (!t.assert_true("native continuation after actual vision phase",std::memcmp(expected[step].data(),logits,vocab*sizeof(float))==0)) return;
+            }
+            if (spec) {
+                llama_tokens history=tokens;
+                for (size_t step=0;step<8;++step) history.push_back(llama_token(80+step));
+                llama_tokens proposed;
+                auto & dp=common_speculative_get_draft_params(spec.get(),0);
+                dp.drafting=true;dp.n_max=3;dp.pos0=llama_pos(history.size());dp.id_last=1000;dp.prompt=&history;dp.result=&proposed;
+                common_speculative_draft(spec.get());llama_synchronize(owned->context());
+                if (!t.assert_equal(size_t(3),proposed.size())) return;
+                if (!streaming) expected_draft=proposed;
+                else t.assert_true("DFlash predicts the native continuation after encoder failure/retry",proposed==expected_draft);
             }
         }
     });

@@ -66,6 +66,9 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
     with socket.socket() as available:
         available.bind(("127.0.0.1", 0))
         port = available.getsockname()[1]
+    slot_path=args.output/("arena-slots" if mode.startswith("arena") else "stock-slots")
+    if getattr(args,"lifecycle",False):
+        slot_path.mkdir(parents=True,exist_ok=True)
     log_path = args.output / f"{mode}.log"
     command = [str(args.server.resolve()), "--model", str(args.model.resolve()), "--mmproj", str(args.mmproj.resolve()),
                "--host", "127.0.0.1", "--port", str(port), "--offline", "--fit", "off", "--parallel", "1",
@@ -76,6 +79,8 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
     if mode.startswith("arena"):
         command += ["--shared-device-memory-mib", str(args.arena_mib)]
     command += speculative
+    if getattr(args,"lifecycle",False):
+        command += ["--slot-save-path",str(slot_path.resolve())]
     command += list(extra)
     env = dict(os.environ, LLAMA_MEDIA_MARKER="<__media__>")
     env.update(env_extra or {})
@@ -126,6 +131,37 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
                     os.killpg(process.pid, signal.SIGKILL)
 
 
+def vision_state_action(port, directory, action, saved=None, filename="vision.bin"):
+    status, result = request(port, "/slots/0?action="+action, {} if action=="erase" else {"filename":filename})
+    if status!=200:
+        raise RuntimeError("vision state action failed: "+action+" "+str(result))
+    path=directory/filename
+    if action=="save":
+        count,size=result.get("n_saved"),result.get("n_written")
+        if type(count) is not int or count<=0 or type(size) is not int or size<=0 or not path.is_file() or path.stat().st_size!=size:
+            raise RuntimeError("incomplete vision state save")
+    elif action=="restore":
+        if not saved or result.get("n_restored")!=saved["n_saved"] or result.get("n_read")!=saved["n_written"] or path.stat().st_size!=saved["n_written"]:
+            raise RuntimeError("incomplete vision state restore")
+    elif type(result.get("n_erased")) is not int or result["n_erased"]<0:
+        raise RuntimeError("invalid vision state erase")
+    return result
+
+
+def vision_observation(result, count, drafting=False):
+    tokens=result.get("tokens",[])
+    timing=result.get("timings",{})
+    generated,accepted=timing.get("draft_n",0),timing.get("draft_n_accepted",0)
+    if len(tokens)!=count or any(type(token) is not int or token<0 for token in tokens) or timing.get("predicted_n")!=count:
+        raise RuntimeError("incomplete vision completion")
+    if type(generated) is not int or type(accepted) is not int or accepted<0 or accepted>generated or (drafting and not generated):
+        raise RuntimeError("invalid vision draft counts")
+    reused,processed=timing.get("cache_n"),timing.get("prompt_n")
+    if type(reused) is not int or reused<0 or type(processed) is not int or processed<=0:
+        raise RuntimeError("invalid vision prompt counts")
+    return {"tokens":tokens,"content":result.get("content"),"cached":result.get("tokens_cached"),"timings":timing}
+
+
 def completion(prompt, images=(), cache=False, decode=16):
     return {"prompt": {"prompt_string": prompt, "multimodal_data": list(images)} if images else prompt,
             "n_predict": decode, "temperature": 0, "top_k": 1, "seed": 42,
@@ -148,20 +184,41 @@ def run(args, mode):
         ("adjacent_images", completion(f"Compare: {marker}{marker} One sentence: ", [image, changed], decode=args.decode)),
         ("after_other_prompt", completion(initial, [image], True, args.decode)),
     ]
+    if getattr(args,"lifecycle",False):
+        cases.extend([
+            ("image_only",completion(marker,[image],decode=args.decode)),
+            ("image_first",completion(marker+" Describe briefly: ",[large],decode=args.decode)),
+            ("image_last",completion("Describe: "+marker,[large],decode=args.decode)),
+            ("portrait",completion(initial,[png(384,512,3)],decode=args.decode)),
+            ("narrow",completion(initial,[png(32,1024,4)],decode=args.decode)),
+        ])
     results = {}
     with server(args, mode) as port:
         for name, body in cases:
             status, result = request(port, "/completion", body)
             assert status == 200, (mode, name, status, result)
             assert len(result.get("tokens", [])) == args.decode, (name, result)
-            results[name] = {"tokens": result["tokens"], "content": result["content"],
-                             "cached": result.get("tokens_cached"), "timings": result.get("timings")}
+            results[name] = vision_observation(result,args.decode,bool(getattr(args,"dflash_length",0)))
             (args.output / f"{mode}-partial.json").write_text(json.dumps(results,indent=2))
             print(mode, name, results[name]["cached"], flush=True)
         assert results["image"]["tokens"] == results["image_uncached_control"]["tokens"]
         assert (results["changed_image"]["timings"] or {})["prompt_n"] > (results["same_image_cached"]["timings"] or {})["prompt_n"]
         assert any((results[name]["timings"] or {}).get("prompt_n", args.context) < args.background_tokens
                    for name in ("same_image_cached", "followup_cached")) or args.background_tokens == 0, results
+
+        if getattr(args,"lifecycle",False):
+            from test_adaptive_gemma import vision_after_decode,vision_rejection_cases
+            after=vision_after_decode(completion(initial,[image],decode=args.decode),results["image"],changed)
+            status,result=request(port,"/completion",after)
+            assert status==200,(status,result)
+            results["image_after_decode"]=vision_observation(result,args.decode,bool(getattr(args,"dflash_length",0)))
+            for name,endpoint,body,expected in vision_rejection_cases(completion(initial,[image],decode=args.decode)):
+                status,result=request(port,endpoint,body)
+                assert status>=400 and expected in str(result),(name,status,result)
+                assert request(port,"/health")[0]==200
+            overflow=completion(" green"*(2*args.context)+marker,[image],decode=args.decode)
+            status,result=request(port,"/completion",overflow)
+            assert status>=400 and "context" in str(result).lower(),(status,result)
 
         chat = {"messages": [{"role": "user", "content": [
             {"type": "text", "text": "Describe this pattern briefly."},
@@ -200,6 +257,55 @@ def run(args, mode):
     return results
 
 
+def run_lifecycle(args, mode):
+    results=run(args,mode)
+    image=png(256,256)
+    high=completion(" green"*args.background_tokens+" Describe: <__media__> Short answer: ",[image],decode=args.decode)
+    low=completion("The capital of France is",decode=args.decode)
+    directory=args.output/("arena-slots" if mode.startswith("arena") else "stock-slots")
+    actions=[]
+    def action(port, kind, saved=None):
+        result=vision_state_action(port,directory,kind,saved)
+        actions.append({"action":kind,"result":result})
+        (args.output/(mode+"-state-actions.json")).write_text(json.dumps(actions,indent=2))
+        return result
+    def observe(port,label,body,cached=False):
+        status,result=request(port,"/completion",dict(body,cache_prompt=cached))
+        if status!=200:raise RuntimeError("vision lifecycle failed: "+label+" "+str(result))
+        row=vision_observation(result,args.decode,bool(getattr(args,"dflash_length",0)))
+        if cached and row["timings"]["cache_n"]<=0:raise RuntimeError("vision state replay did not reuse a checkpoint")
+        results[label]=row
+        (args.output/(mode+"-lifecycle-partial.json")).write_text(json.dumps(results,indent=2))
+        print(mode,label,row["timings"]["cache_n"],flush=True)
+        return row
+    with server(args,mode+"-state") as port:
+        original=observe(port,"save-image",high)
+        saved=action(port,"save")
+        text=observe(port,"low-after-save",low)
+        assert text["tokens"]==results["text"]["tokens"]
+        action(port,"erase");action(port,"restore",saved)
+        observe(port,"restored-image",high,True)
+        state=directory/"vision.bin"
+        import hashlib
+        with state.open("rb") as source:digest=hashlib.file_digest(source,"sha256").hexdigest()
+        truncated=directory/"truncated.bin"
+        with state.open("rb") as source:truncated.write_bytes(source.read(4096))
+        status,result=request(port,"/slots/0?action=restore",{"filename":truncated.name})
+        assert status>=400 and "restore" in str(result).lower(),result
+        with state.open("rb") as source:assert hashlib.file_digest(source,"sha256").hexdigest()==digest
+        recovered=observe(port,"invalid-state-recovery",high)
+        assert recovered["tokens"]==original["tokens"]
+        from test_adaptive_gemma import cancel_after_first_output
+        cancel_after_first_output("http://127.0.0.1:"+str(port),dict(high,stream=True,n_predict=512))
+        assert observe(port,"draft-cancel-recovery",low)["tokens"]==results["text"]["tokens"]
+    with server(args,mode+"-restart") as port:
+        action(port,"restore",saved)
+        observe(port,"restarted-restored-image",high,True)
+        assert observe(port,"restarted-fresh-image",high)["tokens"]==original["tokens"]
+        assert observe(port,"restarted-text",low)["tokens"]==results["text"]["tokens"]
+    return results
+
+
 def vision_startup_rejections():
     return [("parallel",("--parallel","2")),("mtp-length",("--spec-type","draft-mtp","--spec-draft-n-max","4")),
             ("cpu-projector",("--no-mmproj-offload",)),("kv-offload",("--no-kv-offload",)),
@@ -229,6 +335,7 @@ def main():
     parser.add_argument("--arena-uvm", action="store_true",
                         help="test managed model weights in the arena run; shared arena storage remains device-local")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--lifecycle", action="store_true", help="check complete image state files, erase/restore and process restart")
     parser.add_argument("--check-rejections", action="store_true")
     parser.add_argument("--skip-budget-rejection", action="store_true",
                         help="skip the oversized-image rejection assertion when testing a larger arena")
@@ -242,11 +349,13 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     results = {}
     for mode in (("stock", "arena") if args.mode == "compare" else (args.mode,)):
-        results[mode] = run(args, mode)
+        results[mode] = (run_lifecycle if args.lifecycle else run)(args, mode)
         (args.output / "results.json").write_text(json.dumps(results, indent=2))
     if args.mode == "compare":
         for name in results["stock"]:
             assert results["stock"][name]["tokens"] == results["arena"][name]["tokens"], name
+            for field in ("prompt_n","cache_n","predicted_n","draft_n","draft_n_accepted"):
+                assert results["stock"][name]["timings"].get(field)==results["arena"][name]["timings"].get(field),(name,field)
         print("Stock and arena token IDs match for every request.")
     if args.check_rejections:
         for name, extra in vision_startup_rejections():

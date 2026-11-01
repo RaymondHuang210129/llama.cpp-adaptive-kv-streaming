@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0-DV6 are complete; DV7-DV9 remain pending. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: implementation in progress, 2026-11-01. DV0-DV7 are complete; DV8-DV9 remain pending. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -287,6 +287,10 @@ Exit: real image requests through the common public API work in the admitted pur
 
 ### DV7 - Complete image-aware lifecycle and failure recovery
 
+Completed 2026-11-01: expanded F1/F3 controls each compare 23 native and 23 streamed scenarios with exact token IDs and prompt/cache/draft/accept counts (5888 output IDs combined). They include image-only/first/last, portrait/narrow, changed/adjacent/later images, malformed image/audio/file-URL/context rejection, cancellation, complete state save/erase/restore, truncated-state recovery and restart. Corresponding 321935388-byte native/streamed state files have identical SHA256 digests in each mode. A separate F7 65536-capacity/48000-text-prefix/512-output/1024-MiB arena run passes 23 streamed-only scenarios, 11776 IDs and four state actions; its 1799655104-byte state contains 48584 tokens. Initial, state and restart logs prove real nonresident decode traffic (188-191 active pages, 66 ring slots). This long profile establishes lifecycle self-consistency, not native equivalence. The first long driver failed the mandatory RAM-cache proof because a 2 GiB host cache evicted its 1.84 GiB entry when intervening images arrived. The successful rerun keeps every assertion, image, history and GPU allocation unchanged and explicitly uses a 4 GiB host prompt cache; short profiles retain 2 GiB.
+
+An existing projector test now attaches the real bounded DFlash writer and checks reload cancellation, an exception after encoder work is queued, no failed-output publication, byte-identical target/child state, successful exact encoder retry and eight native-exact continuation vectors plus real matching proposals. Its 93 assertions pass ordinarily, under ASAN/UBSAN and under strict device memcheck with zero errors. Thirteen host ASAN/UBSAN suites also pass; an obsolete all-mmproj-rejected argument assertion was updated to admit pure DFlash while retaining mixed-vision rejection. CUDA ASAN requires NVIDIA's documented `protect_shadow_gap=0` compatibility setting on this driver: an untraced no-model probe reproduces default initialization OOM and succeeds with that setting while retaining leak detection, UBSAN and halt-on-error. CPU ASAN suites retain their defaults. The first straced probe only established the known LSan/ptrace incompatibility and is not memory qualification. No numerical, API-reporting, arena, model or quantization checks were relaxed. Local evidence retains original failures, exact binaries, command/profile hashes and healthy service restoration.
+
 Extend the existing slot/checkpoint/cache behavior for the combined path without introducing another serialization system.
 
 Required scenarios:
@@ -404,7 +408,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV4: validated bounded-writer state survives complete vision loans and strict memory checks.
 - [x] DV5: real encoder inputs, exact image-conditioned target/draft vectors and forced acceptance/correction match fitting native controls.
 - [x] DV6: pure DFlash common/server/request/finder integration works with actual images; mixed K4V vision remains closed.
-- [ ] DV7: cache, window, cancellation, state and process restart pass.
+- [x] DV7: image/cache/window/cancellation/state/restart and attached-writer encoder failure/retry pass.
 - [ ] DV8: required numerical/memory/regression/performance evidence audited.
 - [ ] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored.
 - [ ] Optional mixed extension: media-bounded K4V separately qualified and documented, or explicitly left closed.
