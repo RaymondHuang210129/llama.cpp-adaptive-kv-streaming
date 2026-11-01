@@ -4,7 +4,7 @@ This report groups the recorded benchmarks by model, then separates implementati
 
 ## Reading the results
 
-The reference device is an RTX 5070 Ti with 16,303 MiB of VRAM. Compare only the configurations and runtime cohorts stated for each experiment. Maximum-fit sweeps, fixed-arena A/B studies, stock-UVM controls and image-phase measurements answer different questions; they are not interchangeable samples of one curve.
+The earlier reference cohorts use an RTX 5070 Ti with 16,303 MiB of VRAM. The separately labelled Windows cohort uses an RTX 3080 with 10,240 MiB. Compare only the configurations and runtime cohorts stated for each experiment. Maximum-fit sweeps, fixed-arena A/B studies, stock-UVM controls and image-phase measurements answer different questions; they are not interchangeable samples of one curve.
 
 Most sweep points are single retained measurements, not repeated statistical estimates. Independent maximum-fit arenas are not equal-memory comparisons between draft modes. Operator or fitting native controls establish numerical coverage separately; completion of a long streamed workload is not long-context native equivalence. Weight/KV quantization and draft acceptance can also change outputs or speed.
 
@@ -64,6 +64,68 @@ This earlier experiment holds the parent at 2,240 MiB and compares embedded MTP 
 ![Fixed-budget MTP draft-length prefill and decode comparison](../../media/adaptive-kv-stream-v2-throughput-combined.png)
 
 [Detailed plot: pool size and acceptance](../../media/adaptive-kv-stream-v2-mtp-sweep.png). Fixed-arena and independently maximum-fit curves answer different questions: the latter includes differences in available resident KV space. Neither equal arena size nor equal KV grant means equal total VRAM across different draft models.
+
+### Windows RTX 3080 text measurements
+
+This is a separate native Windows/CUDA cohort using [ISTA-DASLab's pinned model revision](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/tree/d562806dbafae37109975e970aae91b43e73b440), file `Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf`. It contains 16 target-only and 16 embedded-MTP3 measurements from 8 to 128 Ki at 8 Ki steps. The Linux IQ4_XS cohorts above use different hardware, weights and budgets.
+
+![Windows RTX 3080 IQ2_XS text generation and prompt throughput, target-only and MTP3](../../media/qwen38-rtx3080-windows-iq2xs-throughput.png)
+
+[Paired data (CSV)](../../media/qwen38-rtx3080-windows-iq2xs-throughput.csv) · [Profile, hashes and scope](../../media/qwen38-rtx3080-windows-iq2xs-throughput.json) · [Portable measurement records](../../benchmarks/data/windows-rtx3080-qwen38-iq2xs/results.jsonl) · [Selected fit and streaming evidence](../../benchmarks/data/windows-rtx3080-qwen38-iq2xs/evidence.json) · [Reproduction](#windows-rtx-3080-reproduction)
+
+| Property | Recorded configuration |
+| --- | --- |
+| Machine | RTX 3080, 10,240 MiB VRAM; Core i9-14900K; 64 GiB system RAM |
+| Runtime | Native Windows / WDDM, driver 610.88; CUDA 12.9 (NVCC 12.9.86); MSVC 14.35.32215; SM86 |
+| Inference | One slot; all target layers offloaded; flash attention; Q8_0 K / Q4_0 V; batch/microbatch 128; eight CPU threads |
+| Inputs | Checked-in article corpus, tokenized without added special tokens; prompt length = capacity minus 271 |
+| Outputs | 256 tokens; temperature 0; seed 123; EOS ignored; prompt reuse disabled |
+| Warmup | Fresh server per point; 256-token prompt and four outputs before the measured request |
+| Speculation / modalities | Target-only or embedded MTP=3; no external assistant; no mmproj or image request; UVM off |
+
+The arena was fitted **at 128 Ki for each mode**, then held fixed throughout that mode's sweep: target-only 1,440 MiB, MTP3 1,078 MiB. The adjacent 1 MiB-larger candidates were rejected. These are workload-specific fits under the available Windows GPU budget, without an arbitrary reserve. The target-only 128 Ki point reuses its successful full-workload arena-fit measurement; the other target-only points and all MTP3 points come from their fixed-arena sweeps. The arena-fit warmup and full request match the ordinary sweep protocol.
+
+The producing executable and sweep-script hashes are recorded in the profile. Its source base is `bcf1a81d641c478db5690d2f2c048c691801fcb2` plus the [retained Windows arena patch](../../benchmarks/data/windows-rtx3080-qwen38-iq2xs/measurement-source.patch), which was uncommitted at measurement time. The later sweep-script Windows/UTF-8 and bandwidth-reference fixes are separate from these recorded timings. Documentation export re-renders existing points; it does not rerun or replace them.
+
+| Capacity | Target-only prefill (tok/s) | MTP3 prefill (tok/s) | Target-only decode (tok/s) | MTP3 decode (tok/s) | Decode ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 Ki | 948.14 | 896.21 | 39.09 | 54.45 | 1.39x |
+| 16 Ki | 887.94 | 835.66 | 36.87 | 58.14 | 1.58x |
+| 24 Ki | 831.43 | 787.31 | 35.02 | 65.23 | 1.86x |
+| 32 Ki | 780.17 | 741.36 | 32.92 | 52.85 | 1.61x |
+| 40 Ki | 735.47 | 699.55 | 31.75 | 47.29 | 1.49x |
+| 48 Ki | 696.71 | 656.27 | 29.96 | 61.79 | 2.06x |
+| 56 Ki | 662.54 | 617.73 | 28.14 | 39.85 | 1.42x |
+| 64 Ki | 635.64 | 589.51 | 26.34 | 38.69 | 1.47x |
+| 72 Ki | 606.10 | 545.82 | 22.55 | 33.94 | 1.51x |
+| 80 Ki | 579.85 | 516.96 | 18.69 | 24.85 | 1.33x |
+| 88 Ki | 549.93 | 511.94 | 15.40 | 26.52 | 1.72x |
+| 96 Ki | 517.08 | 476.27 | 11.76 | 25.13 | 2.14x |
+| 104 Ki | 507.30 | 462.75 | 11.52 | 20.51 | 1.78x |
+| 112 Ki | 489.33 | 432.08 | 10.33 | 22.56 | 2.18x |
+| 120 Ki | 470.91 | 434.81 | 9.09 | 22.07 | 2.43x |
+| 128 Ki | 470.46 | 426.63 | 8.53 | 17.06 | 2.00x |
+
+Generation throughput increased 1.33-2.43x with MTP3 in these measurements. Prompt processing was slower with MTP3. At 128 Ki, server-reported prompt plus generation time was **307.93 s target-only versus 321.54 s with MTP3** for the 130,801-token prompt and 256 outputs. This excludes model loading, tokenization and warmup; a decode-throughput gain is not the same measurement as full-request latency.
+
+Each point is one retained measurement. Input prefixes and requested output lengths match, but generated continuations differ in 15 of 16 pairs. The mode-specific arena sizes also differ. This cohort measures observed throughput; numerical equivalence, long-context quality, repeated-trial uncertainty and a Windows-versus-Linux effect are not established by it.
+
+#### Memory and streaming onset
+
+| Mode | Last sampled decode without streaming | First sampled decode with streaming |
+| --- | ---: | ---: |
+| Target-only, 1,440 MiB arena | 48 Ki | 56 Ki |
+| MTP3, 1,078 MiB arena | 32 Ki | 40 Ki |
+
+The boundary logs change from `streaming=0` to `streaming=1`; the first streamed evaluations report 36.57 MiB target-only and 59.35 MiB with MTP3. These are per-evaluation byte counts, not MTP bytes per output token. An 8 Ki sampling interval brackets the onset rather than locating its exact token threshold. Initial cache uploads can occur below it. The retained capacity depends on the mode, arena, KV encoding and active workspace.
+
+Peak sampled dedicated usage across the sweeps was about **9.51 GiB for the server** and **9.81 GiB across the GPU**. The NVIDIA **Prefer No Sysmem Fallback** setting was manually applied to the actual server executable before fitting, and probes restarted that executable. The driver profile was user-confirmed, not programmatically verified. The fork's complete host KV history in system RAM was allowed; mapped host KV can appear in shared GPU-memory counters. Those aggregate counters do not independently prove the residency of every allocation. These records qualify this text workload through 128 Ki, with Gemma, DFlash2, vision and larger contexts outside the Windows cohort.
+
+#### Separate Windows PCIe check
+
+A later profiling run on the same machine confirmed Gen4 x16 while transferring data. Five-trial pinned-copy tests measured best chunk-size medians of **23.52 GB/s host-to-GPU** and **23.82 GB/s GPU-to-host**, in decimal units. Large in-application KV reloads reached 23.21 GB/s target-only and 22.68 GB/s with MTP3. The profiled target-only decode rate and logged KV bytes imply about 17.62 GB/s of streamed KV payload, approximately 75% of the measured host-to-GPU reference. This estimate excludes other PCIe traffic and is not a literal bus-utilization counter.
+
+NVML failed a known-byte calibration here: its raw receive readings implied roughly 41 GB/s during a separately timed 23.5 GB/s copy. The cause of the counter discrepancy was not established. Its literal bandwidth/utilization values were excluded, and no exact MTP3 average bus-utilization percentage is claimed. The legacy sweep's fixed-50-GB/s `h2d_util_pct` field is retained only in the raw historical records. The published throughput figure does not use it. PCIe profiling timings are a separate run and do not replace the sweep points. [PCIe summary and measurement limits](../../benchmarks/data/windows-rtx3080-qwen38-iq2xs/pcie-summary.json) · [Known-byte calibration trials](../../benchmarks/data/windows-rtx3080-qwen38-iq2xs/pcie-calibration.jsonl).
 
 ## Gemma 4 measurements
 
@@ -181,6 +243,43 @@ Correctness qualification compares matching formats and execution modes against 
 The Gemma command above reproduces the earlier all-mode 120 Ki cohort. To schedule only MTP3 through the native 256 Ki capacity, use `--mtp-lengths 3 --max-context 262144` with the matching external assistant. Use a new output directory and record the actual source, binaries, inputs and fitted arena at every point; a new run is a new cohort, not a replacement for the published records.
 
 Full sweeps can take hours. They are distinct from the [quick arena-sizing examples](../../README.md#find-a-usable-arena-size), which use short runtime probes and optionally one final full-workload validation. Neither tool needs an existing inference service.
+
+### Windows RTX 3080 reproduction
+
+Use a native CUDA server build and Python 3.10 or newer; Matplotlib is optional for the sweep's plots. Set **Prefer No Sysmem Fallback** for the exact server executable in NVIDIA Control Panel before dedicated-VRAM fitting, then restart the server. Keep the designed host KV history in system RAM. The scripts print the policy requirement but do not verify it. See the [arena-fitting instructions](../../README.md#find-a-usable-arena-size).
+
+The following PowerShell recipe refits the largest context separately for target-only and MTP3, then holds each winning arena fixed across its full range. Substitute the local executable and model paths; the timestamp gives every run a fresh destination. The measured 1,440/1,078 MiB grants are not portable recommendations.
+
+```powershell
+$python = 'C:\path\to\python.exe'
+$server = 'C:\path\to\llama-server.exe'
+$model = 'C:\models\Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf'
+$run = Get-Date -Format 'yyyyMMdd-HHmmss'
+$common = @(
+  '--server', $server, '--model', $model,
+  '--batch-size', '128', '--ubatch-size', '128',
+  '--cache-type-k', 'q8_0', '--cache-type-v', 'q4_0',
+  '--prompt-headroom', '15', '--decode-tokens', '256',
+  '--no-manage-production'
+)
+foreach ($mode in 0, 3) {
+  $fitDir = "benchmarks/results/windows-$run-fit-mtp$mode"
+  & $python benchmarks/run-fixed-span-sweep.py @common `
+    --contexts 131072 --mtp-lengths $mode --auto-max-arena `
+    --arena-mib 1024 --output $fitDir
+  if ($LASTEXITCODE -ne 0) { throw "Arena fitting failed for MTP=$mode" }
+  $fit = Get-Content "$fitDir/results.jsonl" -Tail 1 -Encoding UTF8 | ConvertFrom-Json
+  & $python benchmarks/run-fixed-span-sweep.py @common `
+    --min-context 8192 --max-context 131072 --context-step 8192 `
+    --mtp-lengths $mode --arena-mib $fit.arena_mib `
+    --output "benchmarks/results/windows-$run-sweep-mtp$mode"
+  if ($LASTEXITCODE -ne 0) { throw "Sweep failed for MTP=$mode" }
+}
+```
+
+This recipe measures a fresh full sweep after fitting. The historical target-only dataset instead retained its full-fit 128 Ki request as that point; record which measurement is retained and do not count fit validation as an independent throughput replicate. A fresh run is a new cohort. The fixed-span script uses eight CPU threads and a 256-token/four-output warmup. For a fixed arena per mode, keep `--auto-max-arena` on the single-context fitting step only: adding it to the range refits every context independently.
+
+For optional target-only KV-payload estimates, pass `--h2d-reference-gbps` with a known-byte pinned host-to-device measurement from the actual PC. The corrected scripts have no default 50 GB/s reference, and MTP payload percentages remain unknown without per-evaluation accounting. This is distinct from measuring all PCIe bus traffic.
 
 ## Image measurements
 

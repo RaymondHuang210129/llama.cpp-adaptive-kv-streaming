@@ -922,7 +922,7 @@ bool llama_context::prepare_compute_arenas(
         if (!compute_memory && serial_parent && !cparams.serial_block_rows && !cparams.kv_shared_read &&
                 admission.status == llama_context_memory_create_status::insufficient_budget) {
             // Keep separate scratch if the shared budget cannot hold the draft graph and live KV scratch.
-            LLAMA_LOG_INFO("%s: MTP graph exceeds shared arena quota: available=%zu required=%zu additional=%zu bytes; trying a separate workspace\n",
+            LLAMA_LOG_WARN("%s: MTP graph exceeds shared arena quota: available=%zu required=%zu additional=%zu bytes; trying a separate workspace\n",
                 __func__,admission.available_bytes,admission.required_bytes,admission.additional_bytes);
             llama_context_memory_create_result fallback;
             compute_memory = llama_context_memory::create(
