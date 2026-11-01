@@ -1,8 +1,8 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. DV10 characterization is complete; DV11-DV17 are in progress/pending for common Qwen/Gemma CUDA operator scratch and explicit cuBLAS workspace inside the same phase arena. Controlled operator scratch is not yet arena-backed. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The original implementation authorization through DV9 used TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
-Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
+Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
 ## User decisions
 
@@ -11,6 +11,8 @@ Recorded on 2026-11-01:
 - Qualify pure DFlash2 plus mmproj first; K4V vision is a separate follow-up, not a condition for the first release.
 - Correct image support with clearly reported performance is the release objective. A speedup over MTP3 is not required; existing supported-mode regressions still need investigation.
 - For reference capacity, first try a validated smaller DFlash quantization, with the user-suggested HermiHg Q2_K_S-MIX checkpoint as the initial candidate. If the full native target/projector/smaller-draft configuration still cannot fit, split-process encoder/native-decoder references are approved, with their component-level scope stated explicitly. The delivered server remains a single process. Use the same draft checkpoint on both sides of each native/streamed comparison; target/projector weights and numerical checks do not change.
+
+Extension decision, 2026-11-01: add a roadmap for arena ownership of application-controlled CUDA operator temporaries and explicit cuBLAS workspace, shared by Qwen and Gemma. Preserve the one-parent design and exact native arithmetic. Driver and opaque library state need separate accounting; planning this extension does not establish its runtime acceptance.
 
 ## Objective and release boundary
 
@@ -357,6 +359,156 @@ Completed 2026-11-01: the README gives brief pure-DFlash image support and the s
 
 Exit: pure DFlash2+mmproj is reviewable and documented with accurate support boundaries; temporary services and GPU work have ended and any managed services are restored to their original healthy state.
 
+## CUDA operator-scratch extension: DV10-DV17
+
+Status: implementation authorized and started, 2026-11-01. DV10 characterization is complete; DV11-DV17 remain to implement and qualify. This extends the completed vision feature with common CUDA workspace coverage for Qwen and Gemma. It does not reopen DV0-DV9, admit K4V images, or authorize different model/weight encodings. The starting source is `5927dd16b` plus the reviewed README follow-up; pin the actual source and binaries when implementation begins.
+
+### Evidence and remaining allocation boundary
+
+The automatic finder already measures native image geometry and encoder graph storage, executes all seven source aspect ratios, and validates one common budget with serial image requests. At the measured maximum arenas, Qwen DFlash3 fits 2066 MiB with common image budget 48; Gemma MTP3 fits 2410 MiB with common budget 143. Those are executed capacity observations, not model quality scores, intrinsic resolution limits or full-262144-token prefill passes. See the [capacity report](docs/multimodal/vision-capacity.md).
+
+Larger Qwen image probes passed the current graph/weight arena admission, then failed in `ggml_cuda_mul_mat_cublas` -> `ggml_cuda_pool_vmm::alloc` -> `cuMemCreate`. This establishes a real operator-private allocation outside the parent. It does not yet identify every allocation's size, lifetime or contribution to the peak; DV10 must measure those.
+
+| Allocation class | Current path | Extension contract |
+| --- | --- | --- |
+| Projector weights and scheduled encoder tensors/attention workspace | Existing vision-phase loans | Retain the same parent and existing persistent-region protections |
+| Converted matmul inputs, temporary outputs and batched pointer arrays | `ggml_cuda_pool_alloc` through the backend's per-stream pool | Quote the selected native dispatch and bind checked arena subregions |
+| Explicit cuBLAS workspace | `cublas_handle()` separately allocates with `cudaMalloc` | Supply a phase-owned workspace per active stream, with explicit ownership and completion |
+| Other operator-private buffers discovered in the encoder graph | Inventory incomplete | Bound and migrate every reachable controlled path before declaring full coverage |
+| Driver contexts, loaded code, CUDA graph executables and opaque library state | Outside the parent | Identify and account separately; do not claim a bound on all process VRAM |
+
+The current CUDA code selects 32 MiB per initialized cuBLAS stream on the reference GPU. Preserve that configured size during the allocation migration, together with math mode, precision, algorithms and stream topology. A different library recommendation is not permission to shrink workspace to force a fit. Any later size/performance tuning is a separate experiment.
+
+NVIDIA documents that caller-provided cuBLAS workspace requires at least 256-byte alignment, that `cublasSetStream` resets the workspace binding, and that concurrently used streams need safe workspace separation. Bind after setting the stream and retain storage through completion. See [cuBLAS workspace](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#cublassetworkspace), [stream selection](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#cublassetstream) and [reproducibility](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#results-reproducibility). Pin the installed toolkit/library versions; these references do not replace runtime qualification.
+
+### Common design and acceptance invariants
+
+- Implement a backend/operator workspace contract reusable by both models, with vision as the initial managed consumer. Derive sizes from actual tensors, native dispatch, dtype, strides, batching, device capabilities and execution topology; no Qwen/Gemma-specific scratch constant or model-specific CLI switch.
+- Extend the existing graph measurement, parent quote, leases and execution bindings. The current attention external-workspace mechanism does not already cover general matmul temporaries. Introduce only the missing private query/bind seam; do not create another parent, allocator, persistent GPU cache or implicit global/thread-local pool override.
+- Keep native conversions, chunking, tensor layouts, cuBLAS call sequence, compute types and reduction order unchanged. Moving an address is the initial change. Workspace/alignment changes can influence library dispatch, so exact native output checks remain mandatory.
+- Validate every size product, sum, alignment and subrange before arithmetic or pointer publication. Include padding and all simultaneously live input/output/pointer buffers. A maximum across operators is sufficient only when their actual queue dependencies prove reuse safe; concurrent streams need disjoint live regions.
+- Lease identity includes the parent, device/buffer type, physical range and generation. Do not overlap operator scratch with live graph tensors, protected SWA, DFlash KV, recurrent publication or another active consumer. Returning a host RAII object is not proof that its queued GPU work completed.
+- Arena-bound execution has no hidden fallback to the native pool or a separate device allocation. Missing support or inadequate storage rejects before encoder work, with structured required/available/additional bytes where applicable. Ordinary unbound execution retains its native behavior.
+- Track owned and borrowed cuBLAS pointers separately. Never `cudaFree` an arena view, retain a handle referencing returned KV storage, or leave an old owned 32 MiB workspace allocated while claiming it has been migrated. Drain and dispose of any previously created native pool/workspace only for the affected backend owner.
+- CUDA graph capture/replay must retain valid addresses, ownership and generation. Retire captures and clear/rebind borrowed library state before returning vision grants. Reuse the existing phase-return and executor protocol for success, cancellation and failures.
+- Prepare the supported library/kernel/handle state before final physical fitting where possible. Record opaque initialization costs separately; warmup cannot hide a retained GGML pool reservation or excuse unexplained request-time allocations.
+- Prefer private host-side adapters and the current ownership infrastructure to broad CUDA header changes. If `common.cuh` changes, its dependent shader objects are affected even when arithmetic is unchanged: record the real rebuild inventory and qualify those dependencies. Reuse legacy objects only when relevant sources/headers/commands match; use the existing serial legacy-compilation policy where needed, without claiming older physical-GPU runtime coverage. No kernel/generator packaging refactor or clean compile-time benchmark is part of this extension.
+
+```text
+Same physical parent during vision:
+  protected persistent state
+  + projector weights
+  + scheduled encoder tensors / attention workspace
+  + bounded operator-private temporaries
+  + explicit per-stream cuBLAS workspace
+
+After completion and capture retirement:
+  return temporary vision grants
+  -> rebuild text bindings
+  -> reuse reclaimable bytes for text workspace and device KV
+```
+
+The objective is complete ownership of the enumerated application-controlled vision workspace. It does not eliminate the model/assistant weights, protected KV, microbatch limits, driver state or physical VRAM limit. Peak capacity and throughput must be measured; neither a larger image budget nor a speedup is presumed.
+
+### DV10 - Inventory and reproduce private encoder allocations
+
+Status: complete for characterization, 2026-11-01. The opt-in CUDA host-adapter trace records operation/source shapes, dtypes/strides, context/stream identity, logical pool requests/frees, physical growth, retained capacity and explicit cuBLAS workspace. It adds no GPU waits or changed tensor arguments. Only the CUDA adapter and one host test object were rebuilt; shared CUDA headers and large D512 kernel units were unchanged. All 139 default projector host assertions pass.
+
+Four encoder controls match complete native F32 embeddings before exactly one intended coverage failure each; the small Qwen control also has a strict repeat with zero memcheck errors and only that coverage failure. The trace finds both `MUL_MAT` and `FLASH_ATTN_EXT` private allocations, so matmul-only migration is insufficient. Observed single-stream retained pool capacities are 4 MiB for Qwen's 64-token image, 172 MiB for its 4096-token image, 20 MiB for Gemma's 64-token image and 24 MiB for its 256-token image; each also has a separate 32 MiB cuBLAS workspace. These are retained native pool capacities, not all simultaneously live bytes or all process VRAM. The larger Qwen control is encoder-only with target weights unloaded, not full-model 4096-image-token qualification.
+
+Five actual server profiles (Qwen target-only/MTP3/Q2 DFlash3 and Gemma target-only/MTP3) each compare four native/arena scenarios with exact token IDs and prompt/cache/draft/accept counts: 20 paired cases, 640 generated IDs. Their completed encoder windows retain private pool requests and explicit cuBLAS workspace. Test-only CUDA API interception cross-checks direct allocations without changing their arguments/results or adding queue waits. All 14 gates pass their declared control or expected-red criteria; services restore healthy with unchanged identities/configuration.
+
+The first large Qwen export stopped at a historical fixture parser cap of 1120 before GPU work; it is preserved as a fixture failure, not a coverage red. The common fixture now admits the requested native Qwen 4096-token input range; its parent budgets, native arithmetic and byte-exact oracle remain unchanged. A fixture-only native-control build changes only that input cap. A local NVCC dependency-receipt parsing failure is also preserved separately from the successful adapter compile/link. Evidence and hashes are retained locally under `benchmarks/results/vision-operator-scratch-20261101/`; no raw results are committed.
+
+- Archive the qualified source/binaries and actual Qwen IQ4_XS + Q2 DFlash + F16 projector and Gemma Q3_K_S + Q8 assistant/projector profiles. Retain the current 48/143-budget results and failures as historical cohorts.
+- Extend existing opt-in test diagnostics to attribute CUDA allocation requests to an encoder operation, backend/context, stream, size, allocation family and lifetime. Distinguish graph storage, GGML temporary pools, explicit cuBLAS workspace and opaque initialization. Inspect retained capacity as well as allocation-call counts.
+- Trace actual target-only/MTP vision for both models and Qwen pure DFlash, starting with small controls and the preserved larger-image failure. Identify all pool-allocating operator paths reachable in the supported projector graphs, including relevant fused, quantized, contiguous/noncontiguous and batched paths.
+- TDD: after valid native image/vector controls, assert zero unquoted controlled scratch allocations during the managed encoder window. Expect the known private paths to fail that assertion. An OOM or missing trace alone is not this behavioral red.
+
+Exit: a bounded allocation inventory, reproducible coverage red and per-stream peak evidence exist. Instrumented timing is not an ordinary performance result.
+
+### DV11 - Quote operator-private and library workspace requirements
+
+Status: pending; depends on DV10.
+
+- Add a side-effect-free requirements query through the existing private backend/workspace planning infrastructure. Share native dispatch decisions with execution so quotes cannot drift from the actual conversion/output path. Planning reads tensor metadata and capabilities, not device payloads.
+- Cover each inventoried conversion, output and pointer-array interval, the existing bounded F32 conversion chunking, active-stream cuBLAS workspace and required alignment. Keep graph storage and operator scratch visible as separate components without counting bytes twice.
+- TDD in existing workspace/owner suites: exact totals and offsets; dtype/stride/batch variations; already-compatible operands; overflow and padding limits; unsupported device/dispatch; concurrent-stream sums; unchanged output on rejected measurement. No GPU allocation is allowed during the query itself.
+- Validate quotes against observed native peaks and actual dispatch on fitting operator fixtures. A quote is a coverage result only for its declared paths; an unknown allocation remains a blocking gap.
+
+Exit: complete, checked requirements exist before binding. No runtime allocation path has been silently redirected yet.
+
+### DV12 - Bind CUDA operator temporaries to arena leases
+
+Status: pending; depends on DV11.
+
+- Supply each quoted temporary from checked views of the existing arena grant. Extend the selected CUDA host adapters while retaining the native kernels and call order. Use the native pool only for ordinary unbound execution; do not replace `ctx.pool()` globally with a new allocator.
+- TDD: valid bound operations first reproduce the DV10 pool-allocation red, then execute with zero native-pool allocation/growth. Test exact-size and one-byte-short grants, wrong device/owner/generation, overlaps, misalignment, canaries, poisoned scratch, repeated operations and queued failure/retry.
+- Compare complete outputs byte-for-byte with the unchanged native operator across the inventoried precision, layout and batching paths. Include each projector's actual matmul geometries rather than using only small square matrices.
+- Keep distinct scratch for concurrent streams and retain it until its last consumer completes. Test host return before GPU completion, same-stream reuse, cross-stream ordering and retirement while work is pending.
+
+Exit: inventoried operator temporaries use bounded parent storage with exact native outputs, and insufficient/invalid bindings cannot allocate around the quota.
+
+### DV13 - Make explicit cuBLAS workspace phase-owned
+
+Status: pending; may share quote work with DV11, qualifies after DV12.
+
+- Separate handle creation from the current unconditional owned-workspace allocation for managed execution. Preserve the existing configured workspace size and math configuration. Track borrowed versus owned pointers in initialization, rebind and destruction.
+- Bind an aligned grant for each active handle/stream after stream selection. Ensure previously initialized native workspace/pool reservations are safely released or separately reported; merely adding an arena pointer while retaining the old allocation does not meet the memory objective.
+- TDD: first-use and reused handles, native-to-managed and managed-to-native transitions, stream changes, multiple backend contexts, repeated capture/replay, workspace rebind failure and destructor cleanup. Assert no frees of borrowed addresses, no stale references after phase return, and no explicit out-of-arena workspace allocation on the managed path.
+- Preserve exact outputs through all supported cuBLAS branches. Record opaque handle/library allocations separately; investigate unexpected allocation growth rather than declaring every library call covered.
+
+Exit: both the GGML temporary pool path and the explicit cuBLAS workspace path identified in DV10 have qualified arena ownership and completion.
+
+### DV14 - Integrate complete vision admission and phase recovery
+
+Status: pending; depends on DV12-DV13.
+
+- Extend MTMD graph/phase requirements and existing suspended-loan admission to include all controlled operator and cuBLAS scratch. The parent must cover every simultaneously live graph/weight/scratch region and all protected persistent regions. Use the current planner, not a replacement manual fit formula.
+- Revalidate startup ordering, native graph catalog/fusion choices, stream topology and graph revisions before the child captures addresses. Preserve Qwen's bounded-writer role, Gemma's shared-reader role, actual image provenance, SWA geometry and recurrent transfer fences.
+- Add component diagnostics for graph bytes, operator scratch, cuBLAS workspace, padding, retained state and total required parent bytes. A changed minimum must be explained by actual measured requirements; do not enlarge fixtures or reduce workspace merely to pass.
+- TDD: exact minimum/one-byte rejection before encoder enqueue; text -> vision -> text; small -> large -> small images; seven source ratios and portrait pairs; multiple images; changed images; capture/replay; cancel; queued conversion/GEMM failure; return failure; held grants; reconstruction; state restore and process restart. Verify source/KV/recurrent bytes and parent identity through recovery.
+- Prove that all affected work and captures retire before temporary bytes return to the text KV pool. Failed cleanup must retain ownership and close admission until safe recovery.
+
+Exit: both model families execute the complete controlled vision workspace inside one parent, with unchanged numerical/ownership contracts and no unexplained managed pool fallback.
+
+### DV15 - Requalify automatic resolution probing and physical capacity
+
+Status: pending; depends on DV14.
+
+- Extend the existing server planning report and finder to use the complete phase quote, with versioned/validated component diagnostics. Configure the projector and generate native fixtures automatically; do not require a user-provided image or introduce a manual-image recommendation in README.
+- Retain all seven ratios, native alignment, fixed decoder/batch configuration, actual processed dimensions, independent row settings and the common setting. Validate the common setting with all seven requests serially in one process after text; no command is published for incomplete coverage.
+- TDD: the former graph-only quote must fail the new complete-admission assertion. Cover old/missing report fields, wrong component totals, a dry-admitted shape that cannot execute, physical OOM versus quota versus device faults, no common fit, partial output and artifact/hash preservation.
+- Compare old and new at the same fixed parent and separately with independently detected maximum arenas on the same GPU. Moving previously external buffers into a fixed parent can raise its minimum; an improvement in total physical capacity must not be inferred from one budget column alone.
+- Refit the exact published Qwen/Gemma profiles using bounded runtime probes, actual +1 MiB rejected neighbors and immutable receipts. Run the selected full text workload once per published profile when claiming full-history validation. Keep bounded probes and full-history passes distinct.
+- Preserve native image ceilings and Gemma's whole-image microbatch/SWA constraints. A higher reported resolution must execute at unchanged model/KV settings; no silent quantization, offload, budget or assertion change.
+
+Exit: the finder publishes measured resolutions using complete controlled-workspace admission, with actual execution, auditable upper boundaries and scoped remaining opaque costs.
+
+### DV16 - Complete numerical, safety and performance qualification
+
+Status: pending; depends on DV14-DV15.
+
+- Fresh native/component image controls cover Qwen target-only/MTP1-3/pure DFlash1-7 and Gemma target-only/shared-KV MTP1-3. Retain Q8_0/Q4_0, Q8_0/Q8_0 and Q5_1/Q5_1 end-to-end controls. Use fitting full-native references first; the previously approved split-reference policy remains limited to genuine capacity failures.
+- Compare full encoder embeddings and consumed target/draft feature, logit/hidden, KV and recurrent vectors byte-for-byte. Preserve native preprocessing, M-RoPE positions, sampling and per-scenario prompt/cache/draft/accept counts. Include higher-resolution and repeated-vision cases actually enabled by this extension.
+- Run affected CPU ASAN/UBSAN suites, graph-enabled ownership checks, and strict encoder/public/decoder memcheck with default PDL, API-all reporting, error exit 99 and no filters. Eager execution is checker-only. Tool OOM/timeouts are findings, not passes; any material profile change needs an explicit scope decision.
+- Recheck common allocator/executor, existing all-64 reader guards, Qwen MTP/DFlash/K4V text, Gemma text/MTP, phase recovery and ordinary unbound CUDA paths as appropriate to the actual dependency changes. Preserve K4V vision rejection and deferred K15 boundaries.
+- Run repeated matched ordinary image requests for both families and several fitting image sizes, with exact same-mode outputs/work counts. Report complete request latency, encoder phase, prefill/decode throughput, peak/retained VRAM and allocation counts separately. Compare both equal-parent profiles and independently maximum-fit capacity; do not mix their interpretations.
+- Investigate material existing-mode regressions before release. This is ownership/capacity work: no raw throughput gain is assumed, and profiler timings do not prove one. Audit source, model, toolchain and binary provenance; reuse earlier evidence only with exact relevant identity and unchanged commands/profiles.
+
+Exit: the complete coverage claim is backed by current numerical, allocation, lifecycle and safety evidence, plus honest capacity/performance results and healthy restored local services.
+
+### DV17 - Publish the controlled-workspace contract and close the extension
+
+Status: pending; depends on DV16.
+
+- Update the focused vision/capacity reports and memory API documentation with exact controlled allocation classes, remaining driver/library costs, actual resolution results, changed minima and phase lifetime rules. Keep README concise and focused on automatic probing, supported configurations and launch commands.
+- Replace the current 48/143 examples only with new executed measurements; retain original failures/results with their source identity as historical evidence. State whether published values are fixed-parent, maximum-fit, bounded-preflight or full-history results. Do not turn resolution capacity into a visual-quality score.
+- Validate Markdown links/commands and preserve the upstream README section byte-for-byte. Keep raw benchmarks and server-AB changes local, as required by the existing publication boundary.
+- Close each stage only after its full acceptance criteria pass. Follow the user's one-sentence descriptive commit policy, with no stage-code-only titles, attribution trailers or pushes. Preserve unrelated working-tree changes, including the current README follow-up.
+
+Exit: DV10-DV17 are complete for the declared controlled CUDA vision workspace. Model weights and identified opaque runtime costs remain separately accounted; no global all-process OOM guarantee or K4V-vision qualification is implied.
+
 ## Separate follow-up: DFlash2 + K4V + mmproj
 
 This follow-up is planned but is not a dependency for declaring pure DFlash2 vision complete. It must not be enabled implicitly by DV6.
@@ -391,6 +543,9 @@ If boundary-aware lookup cannot be added without changing native shared history 
 | Parent/child phase lifetime | `src/llama-context-memory.cpp/.h`, existing bounded-cache and lease infrastructure |
 | Server startup/requests/cache | `tools/server/server-common.cpp/.h`, `tools/server/server-context.cpp` |
 | MTMD phase/execution | `tools/mtmd/mtmd-session.cpp`, `mtmd-workspace.cpp`, existing MTMD planning and helpers only when required |
+| CUDA operator scratch and cuBLAS ownership | `ggml/src/ggml-cuda/ggml-cuda.cu`, `common.cuh`, and only other host adapters identified by DV10 |
+| Workspace requirements/binding | Existing private `ggml/src/ggml-backend-memory.*`, execution bindings and `src/llama-memory-workspace.*` contracts; add only the missing generic operator seam |
+| Scratch/stream/quote regression tests | Existing `tests/test-memory-workspace.cpp`, `test-context-memory.cpp`, `test-mtmd-workspace.cpp` and backend operator tests |
 | CPU/owner/numerical tests | Existing `tests/test-context-memory.cpp`, `tests/test-speculative.cpp`, `tests/test-kv-stream-context.cpp` and private DFlash fixture helpers |
 | Public API/harness contracts | Existing `tools/server/tests/test_adaptive_vision.py`, its host harness tests and corresponding server tests |
 | Finder | `benchmarks/find-max-arena.py` and an appropriate tracked test home outside the excluded server-AB tree |
@@ -421,6 +576,16 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV7: image/cache/window/cancellation/state/restart and attached-writer encoder failure/retry pass.
 - [x] DV8: scoped numerical/memory/regression/performance evidence audited; approved finder-test correction passes.
 - [x] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored; finder-test maintenance complete.
+- [x] DV10: controlled encoder allocations inventoried and coverage red reproduced after exact native controls; private scratch remains to migrate.
+- [ ] DV11: complete operator/cuBLAS workspace requirements quoted with checked sizes and concurrency.
+- [ ] DV12: CUDA operator temporaries bound to parent leases with exact outputs and no pool escape.
+- [ ] DV13: explicit cuBLAS workspace has qualified borrowed ownership and stream/capture lifetime.
+- [ ] DV14: combined vision admission, phase transitions and failure recovery qualified for Qwen/Gemma.
+- [ ] DV15: automatic per-ratio/common-resolution fitting requalified against complete controlled scratch.
+- [ ] DV16: fresh numerical, allocation, sanitizer, lifecycle and regression/performance evidence audited.
+- [ ] DV17: extended memory/capacity contract documented and local resources restored.
 - [x] Mixed-mode boundary: K4V+mmproj remains explicitly rejected; its optional media-bounded extension is unimplemented and separately scoped.
 
 Pure DFlash2 vision is complete only when DV0-DV9 pass. A helper subgate, successful encoder call, configured projector, target-only fallback, or process exit does not satisfy whole-feature acceptance. Optional K4V vision has its own completion boundary.
+
+The controlled CUDA workspace extension is complete only when DV10-DV17 pass. DV0-DV9 remain complete for their recorded graph-workspace scope; neither the older feature ledger nor the completed automatic finder alone qualifies operator-private allocation coverage.

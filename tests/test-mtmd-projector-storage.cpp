@@ -18,6 +18,30 @@
 #include <thread>
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
+
+struct scratch_allocation_probe {
+    std::mutex mutex;
+    bool capture = false, installed = false;
+    size_t operations = 0, requests = 0, growth_bytes = 0, pool_capacity = 0, pool_used = 0, blas_workspace = 0;
+    static size_t field(const char * text,const char * key) {
+        const char * found=std::strstr(text,key);
+        return found ? size_t(std::strtoull(found+std::strlen(key),nullptr,10)) : 0;
+    }
+    static void log(ggml_log_level,const char * text,void * data) {
+        std::fputs(text,stderr);
+        auto & self=*static_cast<scratch_allocation_probe *>(data);
+        std::lock_guard<std::mutex> lock(self.mutex);
+        if (!self.capture || !std::strstr(text,"cuda_scratch:")) return;
+        if (std::strstr(text,"event=operation ")) ++self.operations;
+        if (std::strstr(text,"event=pool_alloc ")) ++self.requests;
+        if (std::strstr(text,"event=pool_grow ")) self.growth_bytes+=field(text,"bytes=");
+        self.pool_capacity=std::max(self.pool_capacity,field(text,"capacity="));
+        self.pool_used=std::max(self.pool_used,field(text,"used="));
+        if (std::strstr(text,"family=cublas_workspace ")) self.blas_workspace=std::max(self.blas_workspace,field(text,"bytes="));
+    }
+    ~scratch_allocation_probe() { if (installed) ggml_log_set(nullptr,nullptr); }
+};
 
 struct weight_buffer_probe {
     inline static weight_buffer_probe * active = nullptr;
@@ -104,7 +128,8 @@ int main(int argc,char ** argv) {
     bool phase_only = false;
     bool protected_target = false;
     bool measure_only = false;
-    bool parent_explicit=false,long_vision=false;
+    bool parent_explicit=false,long_vision=false,audit_scratch=false;
+    scratch_allocation_probe scratch;
     size_t image_budget=0,parent_mib=1024,image_count=1;
     size_t image_width=256,image_height=256;
     for (int i = 1; i < argc; ++i) {
@@ -112,6 +137,7 @@ int main(int argc,char ** argv) {
         else if (!std::strcmp(argv[i],"--phase-only")) phase_only = true;
         else if (!std::strcmp(argv[i],"--protected-target")) protected_target = true;
         else if (!std::strcmp(argv[i],"--long-vision")) long_vision = true;
+        else if (!std::strcmp(argv[i],"--audit-scratch")) audit_scratch = true;
         else if (!std::strcmp(argv[i],"--measure-only")) { measure_only=true;phase_only=true; }
         else if ((!std::strcmp(argv[i],"--image-budget") || !std::strcmp(argv[i],"--parent-mib") ||
                 !std::strcmp(argv[i],"--image-count") || !std::strcmp(argv[i],"--image-width") ||
@@ -132,9 +158,14 @@ int main(int argc,char ** argv) {
         else return 2;
     }
     if (dflash_path && !protected_target) return 2;
+    if (audit_scratch) {
+        const char * trace=std::getenv("GGML_CUDA_TRACE_SCRATCH");
+        if (!cuda || !phase_only || !baseline || !trace || std::strcmp(trace,"1")) return 2;
+        ggml_log_set(scratch_allocation_probe::log,&scratch);scratch.installed=true;
+    }
     if (save_input && (!save || phase_only || !model_path || !projector_path)) return 2;
     testing t;
-    if (image_count>2 || image_budget>1120 ||
+    if (image_count>2 || image_budget>4096 ||
             (image_count!=1 && !phase_only) || (parent_explicit && !phase_only && !protected_target) ||
             (long_vision && !protected_target) ||
             ((image_width!=256 || image_height!=256) && (protected_target || (!phase_only && !save && !baseline))) ||
@@ -685,7 +716,13 @@ int main(int argc,char ** argv) {
                 compute.push_back(host_leases.back().get());
             }
         }
-        if (!t.assert_true(mtmd_attach_compute_workspace(projector.get(),compute)) || !t.assert_equal(0,mtmd_batch_encode(batch.get()))) return;
+        if (!t.assert_true(mtmd_attach_compute_workspace(projector.get(),compute))) return;
+        { std::lock_guard<std::mutex> lock(scratch.mutex); scratch.capture=audit_scratch; }
+        if (audit_scratch) std::fprintf(stderr,"vision_scratch_window: begin_us=%lld\n",(long long)ggml_time_us());
+        const auto encode_result=mtmd_batch_encode(batch.get());
+        if (audit_scratch) std::fprintf(stderr,"vision_scratch_window: end_us=%lld\n",(long long)ggml_time_us());
+        { std::lock_guard<std::mutex> lock(scratch.mutex); scratch.capture=false; }
+        if (!t.assert_equal(0,encode_result)) return;
         mtmd_embedding_view output;
         if (!t.assert_true(mtmd_batch_acquire_output_embd(batch.get(),chunk,output))) return;
         const size_t bytes = output.n_tokens()*output.n_embd()*sizeof(float);
@@ -707,6 +744,14 @@ int main(int argc,char ** argv) {
         ggml_backend_tensor_get(tensor,after.data(),0,sample);
         t.assert_true(after == before && output.data() != nullptr);
         reader.reset(); t.assert_true(!tensor->data && !tensor->buffer);
+        if (audit_scratch) {
+            t.out << "vision-scratch-audit operations=" << scratch.operations << " private_pool_requests=" << scratch.requests
+                << " backing_growth_bytes=" << scratch.growth_bytes << " max_single_pool_capacity=" << scratch.pool_capacity
+                << " max_single_pool_used=" << scratch.pool_used << " max_blas_workspace=" << scratch.blas_workspace << '\n';
+            t.assert_true("CUDA operation trace is present after valid native encoder comparison",scratch.operations>0);
+            t.assert_equal("managed encoder has no unquoted operator-private or cuBLAS workspace",size_t(0),
+                scratch.requests+size_t(scratch.blas_workspace!=0));
+        }
     });
     if (protected_target) t.test(dflash_path ? "real_DFlash_target_and_child_survive_encoder_failures" : "real_Gemma_target_preserves_KV_around_vision_encoding",[&](testing & t) {
         ggml_backend_load_all();

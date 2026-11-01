@@ -436,6 +436,59 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// Opt-in host diagnostics; no allocation, stream or synchronization policy is changed.
+struct ggml_cuda_scratch_trace {
+    ggml_backend_cuda_context & ctx;
+    ggml_cgraph * graph;
+    int & node_index;
+    int first_index;
+    ggml_cuda_scratch_trace * previous = nullptr;
+    void * previous_blas[GGML_CUDA_MAX_STREAMS] = {};
+    inline static thread_local ggml_cuda_scratch_trace * active = nullptr;
+    static bool enabled() {
+        static const bool value=[] { const char * env=getenv("GGML_CUDA_TRACE_SCRATCH"); return env && !strcmp(env,"1"); }();
+        return value;
+    }
+    ggml_cuda_scratch_trace(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int & index) :
+        ctx(ctx),graph(graph),node_index(index),first_index(index) {
+        if (!enabled()) return;
+        previous=active;active=this;
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) previous_blas[i]=ctx.cublas_workspaces[ctx.device][i];
+        tensor(graph->nodes[first_index]);
+    }
+    static void tensor(const ggml_tensor * op) {
+        if (!active || !op) return;
+        auto & ctx=active->ctx;
+        GGML_LOG_INFO("cuda_scratch: event=operation time_us=%lld context=%p device=%d stream=%d op=%s tensor=%s type=%s ne=%lld,%lld,%lld,%lld\n",
+            (long long)ggml_time_us(),(void *)&ctx,ctx.device,ctx.curr_stream_no,ggml_op_name(op->op),op->name,
+            ggml_type_name(op->type),(long long)op->ne[0],(long long)op->ne[1],(long long)op->ne[2],(long long)op->ne[3]);
+        for (int i=0;i<GGML_MAX_SRC;++i) if (const auto * src=op->src[i]) {
+            GGML_LOG_INFO("cuda_scratch: event=source context=%p tensor=%s slot=%d type=%s ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu\n",
+                (void *)&ctx,op->name,i,ggml_type_name(src->type),(long long)src->ne[0],(long long)src->ne[1],
+                (long long)src->ne[2],(long long)src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
+        }
+    }
+    static void pool(const char * event,const char * family,const void * pool,const void * address,
+            size_t bytes,size_t capacity,size_t used) {
+        if (!active) return;
+        auto & ctx=active->ctx;
+        const auto * op=active->graph->nodes[active->first_index];
+        GGML_LOG_INFO("cuda_scratch: event=%s time_us=%lld context=%p device=%d stream=%d op=%s tensor=%s family=%s pool=%p address=%p bytes=%zu capacity=%zu used=%zu used_valid=%d\n",
+            event,(long long)ggml_time_us(),(void *)&ctx,ctx.device,ctx.curr_stream_no,ggml_op_name(op->op),op->name,
+            family,pool,address,bytes,capacity,used,int(!strcmp(family,"vmm")));
+    }
+    ~ggml_cuda_scratch_trace() {
+        if (!enabled()) return;
+        for (int i=first_index+1;i<=node_index && i<graph->n_nodes;++i) tensor(graph->nodes[i]);
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) if (ctx.cublas_workspaces[ctx.device][i]) {
+            GGML_LOG_INFO("cuda_scratch: event=%s time_us=%lld context=%p device=%d stream=%d family=cublas_workspace address=%p bytes=%zu\n",
+                previous_blas[i] ? "blas_retained" : "blas_alloc",(long long)ggml_time_us(),(void *)&ctx,ctx.device,i,
+                ctx.cublas_workspaces[ctx.device][i],ctx.cublas_workspace_sizes[ctx.device]);
+        }
+        active=previous;
+    }
+};
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -472,6 +525,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        ggml_cuda_scratch_trace::pool("pool_request","legacy",this,nullptr,size,pool_size,0);
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -495,6 +549,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                             *actual_size = b.size;
                             b.ptr = nullptr;
                             b.size = 0;
+                            ggml_cuda_scratch_trace::pool("pool_alloc","legacy",this,ptr,*actual_size,pool_size,0);
                             return ptr;
                         }
                     }
@@ -507,6 +562,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             *actual_size = b.size;
             b.ptr = nullptr;
             b.size = 0;
+            ggml_cuda_scratch_trace::pool("pool_alloc","legacy",this,ptr,*actual_size,pool_size,0);
             return ptr;
         }
         void * ptr;
@@ -529,6 +585,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        ggml_cuda_scratch_trace::pool("pool_grow","legacy",this,ptr,look_ahead_size,pool_size,0);
+        ggml_cuda_scratch_trace::pool("pool_alloc","legacy",this,ptr,*actual_size,pool_size,0);
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -542,6 +600,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
+                ggml_cuda_scratch_trace::pool("pool_free","legacy",this,ptr,size,pool_size,0);
                 return;
             }
         }
@@ -549,6 +608,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+        ggml_cuda_scratch_trace::pool("pool_backing_free","legacy",this,ptr,size,pool_size,0);
     }
 };
 
@@ -588,6 +648,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        ggml_cuda_scratch_trace::pool("pool_request","vmm",this,nullptr,size,pool_size,pool_used);
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
@@ -607,6 +668,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
+            ggml_cuda_scratch_trace::pool("pool_grow_request","vmm",this,nullptr,reserve_size,pool_size,pool_used);
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 
             // reserve virtual address space (if not already reserved)
@@ -671,6 +733,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            ggml_cuda_scratch_trace::pool("pool_grow","vmm",this,nullptr,reserve_size,pool_size,pool_used);
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
@@ -682,6 +745,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         void * ptr = (void *) ((CUdeviceptr)((char *)(pool_addr) + pool_used));
         *actual_size = size;
         pool_used += size;
+        ggml_cuda_scratch_trace::pool("pool_alloc","vmm",this,ptr,size,pool_size,pool_used);
 
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
@@ -699,6 +763,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+        ggml_cuda_scratch_trace::pool("pool_free","vmm",this,ptr,size,pool_size,pool_used);
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -4756,6 +4821,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_scratch_trace scratch_trace(*cuda_ctx,cgraph,i);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
