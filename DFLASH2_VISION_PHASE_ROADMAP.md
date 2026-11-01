@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0-DV2 are complete; DV3-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: implementation in progress, 2026-11-01. DV0-DV3 are complete; DV4-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -214,6 +214,8 @@ Exit: supported image/text graph shapes have explicit quotas and execute inside 
 
 ### DV3 - Make streamed feature provenance compatible with the native image policy
 
+Status: complete for the coordinated feature contract. Image-enabled targets retain owned input F32 bytes, input kinds/offsets and all M-RoPE coordinates for the last completed frame; matching is byte-exact rather than hash-only. Token-only paths keep their existing row metadata and do not copy embedding vectors. New forwards and full/sequence restores invalidate prior frames. Actual 64/256 controls now pass image provenance, changed-pixel/spatial/signed-zero negatives, original-byte restoration and stale-frame checks; only the deliberately pending owner-admission assertion remains. A one-row image tail additionally reaches real native-position draft injection, followed by text continuation. Ordinary and strict runs pass these checks; both strict component summaries report zero errors with only the known owner red. CPU owner/speculation regressions pass. These are frozen-input component controls, not actual encoder/public streamed qualification.
+
 Implement a minimal batch/provenance contract rather than disabling `serial_features_match()`.
 
 Required checks:
@@ -392,7 +394,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV0: artifacts and initial native image-conditioned controls pinned; F7 capacity limit preserved.
 - [x] DV1: image provenance/callback and writer admission barriers reproduced after valid controls; existing guards retained.
 - [x] DV2: image-input startup catalogs measured before child capture; both microbatch profiles validated.
-- [ ] DV3: native-policy feature behavior and image provenance exact.
+- [x] DV3: native-policy feature behavior and exact owned image provenance pass, including one-row injection.
 - [ ] DV4: persistent DFlash state and completion fences survive vision loans.
 - [ ] DV5: image-conditioned speculative acceptance/correction matches fitting native controls.
 - [ ] DV6: narrow common/server/request/finder integration works with actual images.

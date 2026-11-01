@@ -418,6 +418,15 @@ private:
     bool serial_feature_images = false;
     std::vector<int32_t> serial_feature_layers;
     std::vector<std::pair<llama_token,llama_pos>> serial_feature_rows;
+    struct serial_feature_image_row {
+        bool has_embd;
+        size_t offset;
+        std::array<llama_pos,GGML_MROPE_SECTIONS> position;
+    };
+    std::vector<serial_feature_image_row> serial_feature_image_rows;
+    std::vector<float> serial_feature_image_values;
+    size_t serial_feature_image_width = 0;
+    void clear_serial_features();
 
     llama_compute_reserve_state sched_reserve_state;
 

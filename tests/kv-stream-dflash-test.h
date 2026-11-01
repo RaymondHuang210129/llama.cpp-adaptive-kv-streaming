@@ -51,6 +51,30 @@ static void test_dflash_vision_readiness(testing & t, llama_model * model, const
     t.assert_true("the populated bounded draft writer permits vision suspension",parent && parent->can_suspend_for_vision());
     pixels[0]=0.25f;
     t.assert_true("different image at the same positions cannot use old features",!llama_serial_features_match(target.get(),image.get()));
+    pixels[0]=0.125f;
+    t.assert_true("the source owns the original embedding bytes",llama_serial_features_match(target.get(),image.get()));
+    image.tokens[1].pos[1]=2;
+    t.assert_true("wrong spatial coordinate cannot use old features",!llama_serial_features_match(target.get(),image.get()));
+    image.tokens[1].pos[1]=1;
+    pixels[0]=0.0f;
+    for (auto & token : image.tokens) token.pos[0]=5;
+    if (!t.assert_equal(0,llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,image.get())) ||
+            !t.assert_true(common_speculative_process(spec.get(),image))) return;
+    t.assert_true(llama_serial_features_match(target.get(),image.get()));
+    pixels[0]=-0.0f;
+    t.assert_true("signed zero changes the image source bits",!llama_serial_features_match(target.get(),image.get()));
+    pixels[0]=0.0f;
+    common_batch tail(target.get());
+    const llama_pos tail_position[4]={6,0,0,0};
+    tail.add_embd({pixels.data(),1,width},tail_position,0,false);
+    if (!t.assert_equal(0,llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,tail.get())) ||
+            !t.assert_true(common_speculative_process(spec.get(),tail))) return;
+    t.assert_equal("a one-row image tail uses native draft injection",llama_pos(6),
+        llama_memory_seq_pos_max(llama_get_memory(owned->context()),0));
+    common_batch resumed(target.get()); resumed.add(1004,7,0,true);
+    if (!t.assert_equal(0,llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,resumed.get())) ||
+            !t.assert_true(common_speculative_process(spec.get(),resumed))) return;
+    t.assert_true("another target forward stales the image frame",!llama_serial_features_match(target.get(),image.get()));
 }
 
 static void test_dflash_prefetch_intent(testing & t, llama_model * model, const char * sidecar) {
