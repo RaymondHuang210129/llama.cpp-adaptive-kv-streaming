@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0 baseline characterization and DV1 barrier reproduction are complete; DV2-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: implementation in progress, 2026-11-01. DV0-DV2 are complete; DV3-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -196,6 +196,8 @@ Exit: each barrier has an independently attributable red and the valid setup pre
 
 ### DV2 - Measure image-shaped target work before child attachment
 
+Status: complete for the admitted startup catalog. A private four-argument factory carries mmproj intent while preserving the old two/three-argument interfaces. Image-input target graph quotes are included before serial child registration, with feature outputs enabled and decode reservation intent restored before TG measurements. Changing image intent invalidates the old reservation. Actual 64/256-microbatch controls measure 3/6 distinct image widths and execute the image target forward, then reach exactly the three deliberately unfixed DV1 barriers. CPU owner/speculation regressions pass 1807/484 assertions. The missing-overload compile red and the reservation controls remain local; no public image admission is opened by this stage.
+
 Implement the startup ordering and measurement contract above using existing graph reservation and layout infrastructure.
 
 Required cases:
@@ -389,7 +391,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 
 - [x] DV0: artifacts and initial native image-conditioned controls pinned; F7 capacity limit preserved.
 - [x] DV1: image provenance/callback and writer admission barriers reproduced after valid controls; existing guards retained.
-- [ ] DV2: supported image/text workspaces measured and admitted before child capture.
+- [x] DV2: image-input startup catalogs measured before child capture; both microbatch profiles validated.
 - [ ] DV3: native-policy feature behavior and image provenance exact.
 - [ ] DV4: persistent DFlash state and completion fences survive vision loans.
 - [ ] DV5: image-conditioned speculative acceptance/correction matches fitting native controls.

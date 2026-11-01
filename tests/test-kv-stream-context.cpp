@@ -45,6 +45,7 @@ static bool rollback_probe = false;
 static bool wide_rollback_control = false;
 static bool vision_mtp_handoff = false;
 static bool dflash_vision_readiness = false;
+static uint32_t dflash_vision_microbatch = 256;
 static bool serial_workspace_growth = false;
 static bool mtp_bit_exact_control = false;
 static const char * dflash_native_model = nullptr;
@@ -3530,6 +3531,11 @@ int main(int argc,char ** argv) {
         if (!std::strcmp(argv[i], "--dflash-independent-quotas")) dflash_independent_quotas = true;
         if (!std::strcmp(argv[i], "--dflash-prefetch-hint")) dflash_prefetch_hint = true;
         if (!std::strcmp(argv[i], "--dflash-vision-readiness")) dflash_vision_readiness = true;
+        if (!std::strcmp(argv[i], "--dflash-vision-microbatch") && i+1<argc) {
+            const auto value=std::stoul(argv[++i]);
+            if (value<8 || value>256) return 1;
+            dflash_vision_microbatch=uint32_t(value);
+        }
         if (!std::strcmp(argv[i], "--dflash-stream-control")) dflash_stream_control = dflash_mixed_all_widths = dflash_mixed_switching = true;
         if (!std::strcmp(argv[i], "--dflash-full-prediction")) dflash_full_prediction = true;
         if (!std::strcmp(argv[i], "--dflash-native-f3")) dflash_native_f3 = dflash_short_control = dflash_exact_control = true;
@@ -3738,7 +3744,7 @@ int main(int argc,char ** argv) {
     if (dflash_vision_readiness) {
         if (!t.assert_true(bool(model) && dflash_native_model)) return t.summary();
         t.test("DFlash_image_provenance_and_vision_owner_readiness",[&](testing & t) {
-            test_dflash_vision_readiness(t,model.get(),dflash_native_model);
+            test_dflash_vision_readiness(t,model.get(),dflash_native_model,dflash_vision_microbatch);
         });
         return t.summary();
     }

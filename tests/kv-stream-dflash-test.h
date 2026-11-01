@@ -5,9 +5,9 @@
 
 #include <set>
 
-static void test_dflash_vision_readiness(testing & t, llama_model * model, const char * sidecar) {
+static void test_dflash_vision_readiness(testing & t, llama_model * model, const char * sidecar, uint32_t microbatch) {
     auto cp=llama_context_default_params();
-    cp.n_ctx=2048; cp.n_batch=cp.n_ubatch=256; cp.n_seq_max=1; cp.n_rs_seq=3;
+    cp.n_ctx=2048; cp.n_batch=cp.n_ubatch=microbatch; cp.n_seq_max=1; cp.n_rs_seq=3;
     cp.n_outputs_max=cp.n_outputs_max_per_seq=4;
     cp.type_k=GGML_TYPE_Q8_0; cp.type_v=GGML_TYPE_Q4_0;
     cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -15,13 +15,14 @@ static void test_dflash_vision_readiness(testing & t, llama_model * model, const
     context_ptr target(llama_init_from_model(model,cp),llama_free);
     if (!t.assert_true(bool(target))) return;
     common_params base;
-    base.n_ctx=cp.n_ctx; base.n_batch=base.n_ubatch=256; base.n_parallel=1;
+    base.n_ctx=cp.n_ctx; base.n_batch=base.n_ubatch=microbatch; base.n_parallel=1;
     base.n_gpu_layers=999; base.shared_device_memory_bytes=cp.shared_device_memory_bytes;
     base.fit_params=false; base.cache_type_k=cp.type_k; base.cache_type_v=cp.type_v;
     base.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
     base.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
     base.speculative.draft.n_max=3; base.speculative.draft.n_min=0; base.speculative.draft.p_min=0;
     base.speculative.draft.n_gpu_layers=999; base.speculative.draft.mparams.path=sidecar;
+    base.mmproj.path="frozen-image-fixture";
     auto params=common_base_params_to_speculative(base);
     auto owned=common_speculative_init_from_params(params,model,target.get());
     if (!t.assert_true(owned && owned->context())) return;

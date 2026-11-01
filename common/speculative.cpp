@@ -2785,7 +2785,7 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         llama_context * ctx_dft = streamed_block ?
-            llama_init_from_model(model_dft, cparams, uint32_t(params.speculative.draft.n_max) + 1) :
+            llama_init_from_model(model_dft, cparams, uint32_t(params.speculative.draft.n_max) + 1, !params.mmproj.path.empty()) :
             llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);

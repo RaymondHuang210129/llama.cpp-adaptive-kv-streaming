@@ -106,10 +106,13 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
     llama_context(model, params, 0) {}
 
+llama_context::llama_context(const llama_model & model, llama_context_params params,
+        uint32_t serial_prediction_rows) : llama_context(model, params, serial_prediction_rows, false) {}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params,
-              uint32_t serial_prediction_rows) :
+              uint32_t serial_prediction_rows, bool serial_image_inputs) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -124,6 +127,10 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    if (serial_image_inputs && !serial_prediction_rows) {
+        throw std::runtime_error("image feature preparation requires an attached serial block drafter");
+    }
 
     if (serial_prediction_rows && (model.arch != LLM_ARCH_DFLASH || !params.ctx_other ||
             !params.ctx_other->get_cparams().kv_streaming())) {
@@ -407,6 +414,10 @@ llama_context::llama_context(
             }
         }
         // Configure every retained feature before a child can capture the target's arena addresses.
+        if (target->serial_feature_images!=serial_image_inputs) {
+            target->serial_feature_images=serial_image_inputs;
+            target->sched_reserve_state.invalidate();
+        }
         target->serial_feature_producer=true;
         target->serial_feature_layers=model.target_layer_ids;
         for (auto id : model.target_layer_ids) target->set_embeddings_layer_inp(uint32_t(id),true);
@@ -1087,6 +1098,22 @@ void llama_context::sched_reserve() {
             n_seqs, n_seqs, n_seqs, mctx.get(), true,
             measurements.data() + backend_ptrs.size());
         if (!gf_pp || !gf_tg) return false;
+        if (serial_feature_images) {
+            const bool decode_intent=cparams.kv_stream_decode;
+            std::vector<uint32_t> measured;
+            for (uint32_t width : {1u,64u,128u,129u,n_injection ? n_injection-1 : 0,n_injection}) {
+                if (!width || width>n_injection || std::find(measured.begin(),measured.end(),width)!=measured.end()) continue;
+                measured.push_back(width);
+                for (uint32_t outputs : {1u,std::max(1u,std::min(width,cparams.n_outputs_max))}) {
+                    std::vector<size_t> image(backend_ptrs.size());
+                    cparams.kv_stream_decode=false;
+                    if (!graph_reserve(width,1,outputs,mctx.get(),true,image.data(),true)) return false;
+                    for (size_t i=0;i<backend_ptrs.size();++i) measurements[i]=std::max(measurements[i],image[i]);
+                }
+            }
+            cparams.kv_stream_decode=decode_intent;
+            LLAMA_LOG_INFO("%s: measured %zu image input widths before serial draft registration\n",__func__,measured.size());
+        }
         if (model.arch == LLM_ARCH_DFLASH && model.hparams.n_embd_inp_enc() > 0) {
             // Injection and block prediction use different graph inputs but the same workspace.
             std::vector<size_t> injection(backend_ptrs.size());
@@ -4933,7 +4960,7 @@ llama_context_params llama_context_default_params() {
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params,
-                    uint32_t   serial_prediction_rows) {
+                    uint32_t   serial_prediction_rows, bool serial_image_inputs) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -5021,7 +5048,7 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params, serial_prediction_rows);
+        auto * ctx = new llama_context(*model, params, serial_prediction_rows, serial_image_inputs);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -5036,6 +5063,10 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model(llama_model * model, llama_context_params params, uint32_t serial_prediction_rows) {
+    return llama_init_from_model(model, params, serial_prediction_rows, false);
 }
 
 llama_context * llama_init_from_model(llama_model * model, llama_context_params params) {
