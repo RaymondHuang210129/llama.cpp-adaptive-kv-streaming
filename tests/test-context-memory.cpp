@@ -179,6 +179,8 @@ int main(int argc, char ** argv) {
         auto child=llama_context_memory::borrow_workspace(reader.sched.get(),reader.backends,reader.groups,*parent);
         if (!t.assert_true(bool(child))) return;
         t.assert_true(!child->register_shared_read_consumer());
+        t.assert_true(!parent->register_bounded_write_consumer(nullptr));
+        t.assert_true(!child->register_bounded_write_consumer(nullptr));
         t.assert_true(parent->valid() && child->valid());
     });
 

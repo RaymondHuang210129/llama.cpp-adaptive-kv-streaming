@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0-DV3 are complete; DV4-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: implementation in progress, 2026-11-01. DV0-DV4 are complete; DV5-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -233,6 +233,8 @@ Exit: frozen-image and real-image target batches have native-matching feature/in
 
 ### DV4 - Qualify DFlash writer suspension and vision loans
 
+Status: complete for bounded-writer arena ownership. Serial DFlash construction registers the actual persistent cache lease by parent identity, resource/region, bounds, buffer type, base and size. Writer and shared-reader roles are mutually exclusive; failed null/workspace role declarations preserve the existing writer. The owner admits exactly one validated writer without auxiliary MTP. Actual 64/256 controls pass 1592 assertions each, including exact maximum loan and one-byte rejection, full-prefix GPU overwrite, byte-identical target/draft snapshots, retained-loan resume rejection and two successful resume/continuation cycles. Strict memcheck reports zero errors with all assertions passing. CPU owner/speculation regressions pass (1809/484 assertions), and original services are healthy. Actual projector failure/lifecycle and full-vector controls remain DV5-DV8 requirements.
+
 Extend owner admission only for the validated parent/child arrangement. The child's existing bounded-cache lease and registration must prove ownership; a generic boolean that admits arbitrary children is insufficient.
 
 Required tests:
@@ -395,7 +397,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV1: image provenance/callback and writer admission barriers reproduced after valid controls; existing guards retained.
 - [x] DV2: image-input startup catalogs measured before child capture; both microbatch profiles validated.
 - [x] DV3: native-policy feature behavior and exact owned image provenance pass, including one-row injection.
-- [ ] DV4: persistent DFlash state and completion fences survive vision loans.
+- [x] DV4: validated bounded-writer state survives complete vision loans and strict memory checks.
 - [ ] DV5: image-conditioned speculative acceptance/correction matches fitting native controls.
 - [ ] DV6: narrow common/server/request/finder integration works with actual images.
 - [ ] DV7: cache, window, cancellation, state and process restart pass.

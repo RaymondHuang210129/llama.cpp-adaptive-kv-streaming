@@ -977,6 +977,9 @@ bool llama_context::prepare_compute_arenas(
         }
         if (compute_memory && cparams.kv_shared_read && !compute_memory->register_shared_read_consumer())
             throw std::runtime_error("failed to register shared read-only serial consumer");
+        if (compute_memory && cparams.serial_block_rows &&
+                (!serial_cache || !compute_memory->register_bounded_write_consumer(serial_cache->lease())))
+            throw std::runtime_error("failed to register parent-owned bounded draft writer");
         if (compute_memory) compute_memory_graph_revision = compute_memory->graph_binding_revision();
         return compute_memory != nullptr;
     }

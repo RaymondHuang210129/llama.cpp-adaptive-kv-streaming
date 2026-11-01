@@ -47,7 +47,7 @@ static void test_dflash_vision_readiness(testing & t, llama_model * model, const
     llama_synchronize(target.get());
     t.assert_true("completed image features have valid provenance",llama_serial_features_match(target.get(),image.get()));
     t.assert_true("native pinned-image policy is available to the streamed callback",common_speculative_process(spec.get(),image));
-    auto * parent=target->get_compute_memory();
+    auto * parent=llama_context_compute_memory(target.get());
     t.assert_true("the populated bounded draft writer permits vision suspension",parent && parent->can_suspend_for_vision());
     pixels[0]=0.25f;
     t.assert_true("different image at the same positions cannot use old features",!llama_serial_features_match(target.get(),image.get()));
@@ -75,6 +75,49 @@ static void test_dflash_vision_readiness(testing & t, llama_model * model, const
     if (!t.assert_equal(0,llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,resumed.get())) ||
             !t.assert_true(common_speculative_process(spec.get(),resumed))) return;
     t.assert_true("another target forward stales the image frame",!llama_serial_features_match(target.get(),image.get()));
+    if (!parent || !parent->can_suspend_for_vision()) return;
+    auto * writer=const_cast<llama_context_memory *>(owned->context()->get_compute_memory());
+    t.assert_true("writer role rejects an empty lease",!writer->register_bounded_write_consumer(nullptr));
+    if (!writer->workspace_leases().empty())
+        t.assert_true("workspace is not the bounded cache",!writer->register_bounded_write_consumer(writer->workspace_leases().front()));
+    t.assert_true("a bounded writer cannot become a read-only alias",!writer->register_shared_read_consumer());
+    t.assert_true("failed role changes retain valid vision admission",parent->can_suspend_for_vision());
+    const auto snapshot=[&](llama_context * ctx) {
+        std::vector<uint8_t> bytes(llama_state_seq_get_size(ctx,0));
+        if (!t.assert_true(!bytes.empty()) || !t.assert_equal(bytes.size(),llama_state_seq_get_data(ctx,bytes.data(),bytes.size(),0))) bytes.clear();
+        return bytes;
+    };
+    for (int cycle=0;cycle<2;++cycle) {
+        const auto target_state=snapshot(target.get()),draft_state=snapshot(owned->context());
+        if (target_state.empty() || draft_state.empty()) return;
+        const auto parent_buffer=parent->shared_parent();
+        if (!t.assert_true("bounded writer can suspend after image-conditioned work",llama_context_suspend_kv_device(target.get()))) return;
+        size_t low=0,high=parent->shared_parent_capacity()+1;
+        while (low+1<high) {
+            const size_t middle=low+(high-low)/2;
+            llama_context_memory_create_result quote;
+            if (parent->quote_suspended_loans({middle},quote)) low=middle; else high=middle;
+        }
+        llama_context_memory_create_result exact,shortage;
+        if (!t.assert_true(low && parent->quote_suspended_loans({low},exact))) return;
+        t.assert_true("one byte beyond vision capacity rejects",!parent->quote_suspended_loans({low+1},shortage) &&
+            shortage.status==llama_context_memory_create_status::insufficient_budget);
+        std::vector<ggml_backend_memory_lease_t> loans;
+        if (!t.assert_true(parent->lend_suspended({low},loans) && loans.size()==1)) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(loans[0]),0x5a+cycle);
+        t.assert_true("vision writes preserve committed target state",snapshot(target.get())==target_state);
+        t.assert_true("vision writes preserve bounded draft state",snapshot(owned->context())==draft_state);
+        auto * held=ggml_backend_memory_lease_retain(loans[0]);
+        for (auto * lease:loans) ggml_backend_memory_lease_free(lease);
+        loans.clear();
+        t.assert_true("a held vision lease blocks text resume",!llama_context_resume_kv_device(target.get(),llama_memory_text_phase::prefill));
+        ggml_backend_memory_lease_free(held);
+        if (!t.assert_true(llama_context_resume_kv_device(target.get(),llama_memory_text_phase::prefill))) return;
+        t.assert_true(parent->shared_parent()==parent_buffer && parent->can_suspend_for_vision());
+        common_batch next(target.get());next.add(1005+cycle,8+cycle,0,true);
+        if (!t.assert_equal(0,llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,next.get())) ||
+                !t.assert_true(common_speculative_process(spec.get(),next))) return;
+    }
 }
 
 static void test_dflash_prefetch_intent(testing & t, llama_model * model, const char * sidecar) {
