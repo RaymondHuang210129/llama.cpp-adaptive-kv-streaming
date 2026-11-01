@@ -5,6 +5,53 @@
 
 #include <set>
 
+static void test_dflash_vision_readiness(testing & t, llama_model * model, const char * sidecar) {
+    auto cp=llama_context_default_params();
+    cp.n_ctx=2048; cp.n_batch=cp.n_ubatch=256; cp.n_seq_max=1; cp.n_rs_seq=3;
+    cp.n_outputs_max=cp.n_outputs_max_per_seq=4;
+    cp.type_k=GGML_TYPE_Q8_0; cp.type_v=GGML_TYPE_Q4_0;
+    cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.shared_device_memory_bytes=size_t(1024)*1024*1024;
+    context_ptr target(llama_init_from_model(model,cp),llama_free);
+    if (!t.assert_true(bool(target))) return;
+    common_params base;
+    base.n_ctx=cp.n_ctx; base.n_batch=base.n_ubatch=256; base.n_parallel=1;
+    base.n_gpu_layers=999; base.shared_device_memory_bytes=cp.shared_device_memory_bytes;
+    base.fit_params=false; base.cache_type_k=cp.type_k; base.cache_type_v=cp.type_v;
+    base.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    base.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+    base.speculative.draft.n_max=3; base.speculative.draft.n_min=0; base.speculative.draft.p_min=0;
+    base.speculative.draft.n_gpu_layers=999; base.speculative.draft.mparams.path=sidecar;
+    auto params=common_base_params_to_speculative(base);
+    auto owned=common_speculative_init_from_params(params,model,target.get());
+    if (!t.assert_true(owned && owned->context())) return;
+    params.speculative.draft.ctx_tgt=target.get(); params.speculative.draft.ctx_dft=owned->context();
+    common_speculative_ptr spec(common_speculative_init(params.speculative,1));
+    if (!t.assert_true(bool(spec))) return;
+    common_batch text(target.get());
+    for (int i=0;i<4;++i) text.add(1000+i,i,0,i==3);
+    if (!t.assert_equal(0,llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,text.get())) ||
+            !t.assert_true(common_speculative_process(spec.get(),text))) return;
+    t.assert_true("completed text features have valid provenance",llama_serial_features_match(target.get(),text.get()));
+    const size_t width=size_t(llama_model_n_embd(model));
+    std::vector<float> pixels(width*2,0.125f);
+    common_batch image(target.get());
+    for (int row=0;row<2;++row) {
+        const llama_pos position[4]={4,row,0,0};
+        image.add_embd({pixels.data()+row*width,1,width},position,0,false);
+    }
+    llama_set_kv_stream_decode(target.get(),false);
+    if (!t.assert_equal("image target forward succeeds before draft checks",0,
+            llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,image.get()))) return;
+    llama_synchronize(target.get());
+    t.assert_true("completed image features have valid provenance",llama_serial_features_match(target.get(),image.get()));
+    t.assert_true("native pinned-image policy is available to the streamed callback",common_speculative_process(spec.get(),image));
+    auto * parent=target->get_compute_memory();
+    t.assert_true("the populated bounded draft writer permits vision suspension",parent && parent->can_suspend_for_vision());
+    pixels[0]=0.25f;
+    t.assert_true("different image at the same positions cannot use old features",!llama_serial_features_match(target.get(),image.get()));
+}
+
 static void test_dflash_prefetch_intent(testing & t, llama_model * model, const char * sidecar) {
     for (bool custom : {true, false}) {
         auto cp = llama_context_default_params();

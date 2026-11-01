@@ -44,6 +44,7 @@ static bool target_drift_control = false, target_drift_rs_control = false;
 static bool rollback_probe = false;
 static bool wide_rollback_control = false;
 static bool vision_mtp_handoff = false;
+static bool dflash_vision_readiness = false;
 static bool serial_workspace_growth = false;
 static bool mtp_bit_exact_control = false;
 static const char * dflash_native_model = nullptr;
@@ -3528,6 +3529,7 @@ int main(int argc,char ** argv) {
         }
         if (!std::strcmp(argv[i], "--dflash-independent-quotas")) dflash_independent_quotas = true;
         if (!std::strcmp(argv[i], "--dflash-prefetch-hint")) dflash_prefetch_hint = true;
+        if (!std::strcmp(argv[i], "--dflash-vision-readiness")) dflash_vision_readiness = true;
         if (!std::strcmp(argv[i], "--dflash-stream-control")) dflash_stream_control = dflash_mixed_all_widths = dflash_mixed_switching = true;
         if (!std::strcmp(argv[i], "--dflash-full-prediction")) dflash_full_prediction = true;
         if (!std::strcmp(argv[i], "--dflash-native-f3")) dflash_native_f3 = dflash_short_control = dflash_exact_control = true;
@@ -3733,6 +3735,14 @@ int main(int argc,char ** argv) {
             [&](testing & t) { test_gemma_bounded_cache(t,model.get()); });
         return t.summary();
     }
+    if (dflash_vision_readiness) {
+        if (!t.assert_true(bool(model) && dflash_native_model)) return t.summary();
+        t.test("DFlash_image_provenance_and_vision_owner_readiness",[&](testing & t) {
+            test_dflash_vision_readiness(t,model.get(),dflash_native_model);
+        });
+        return t.summary();
+    }
+
     if (dflash_prefetch_hint) {
         if (!t.assert_true(bool(model) && dflash_native_model)) return t.summary();
         t.test("DFlash_context_owns_flexible_prefetch_and_restores_previous_intents", [&](testing & t) {

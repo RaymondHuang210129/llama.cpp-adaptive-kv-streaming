@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0 baseline characterization is complete; DV1-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: implementation in progress, 2026-11-01. DV0 baseline characterization and DV1 barrier reproduction are complete; DV2-DV9 remain pending. Public streamed DFlash2 plus mmproj admission remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -179,6 +179,8 @@ Deliverables:
 Exit: a reproducible native policy and fitting reference exist, with failure causes and unsupported native cases explicit. No streamed or public-API support claim yet.
 
 ### DV1 - Reproduce admission, feature and ownership barriers
+
+Status: complete as a controlled red stage. The opt-in `--dflash-vision-readiness` fixture passes text feature maintenance and an actual streamed two-row M-RoPE embedding forward, then fails exactly three assertions: image provenance, native image-skip callback availability and bounded-writer vision admission. The same-position changed-image negative remains rejected. The run reports 1538 assertions, three intended failures and zero exceptions, with all owned work drained and the original services healthy. This is preserved behavioral red evidence, not a positive feature qualification. Existing admission, parent-growth rejection and owner tests remain in force.
 
 Add focused tests in existing suites that separately demonstrate:
 
@@ -386,7 +388,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 ## Completion checklist
 
 - [x] DV0: artifacts and initial native image-conditioned controls pinned; F7 capacity limit preserved.
-- [ ] DV1: each admission/provenance/ownership barrier reproduced independently.
+- [x] DV1: image provenance/callback and writer admission barriers reproduced after valid controls; existing guards retained.
 - [ ] DV2: supported image/text workspaces measured and admitted before child capture.
 - [ ] DV3: native-policy feature behavior and image provenance exact.
 - [ ] DV4: persistent DFlash state and completion fences survive vision loans.
