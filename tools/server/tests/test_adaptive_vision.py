@@ -93,9 +93,15 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
         process = subprocess.Popen(command, stdout=log, stderr=log, env=env, start_new_session=os.name == "posix")
         try:
             if reject:
-                assert process.wait(timeout=30) != 0, f"unsupported startup admitted: {extra}"
+                assert process.wait(timeout=30) > 0, f"startup did not reject the configuration cleanly: {extra}"
                 diagnostic = log_path.read_text().lower()
-                assert "vision arena" in diagnostic or "attached mtp kv streaming supports at most 3 draft tokens" in diagnostic, log_path
+                assert not any(error in diagnostic for error in ("out of memory","cudamalloc failed","illegal memory access",
+                    "misaligned address","device-side assert","unspecified launch failure","no kernel image")), log_path
+                causes=("vision arena requires","vision arena supports","vision arena does not support","vision arena rejects",
+                    "vision kv streaming requires","attached mtp kv streaming supports at most 3 draft tokens",
+                    "adaptive dflash2 requires","adaptive dflash2 supports 1-7 draft tokens",
+                    "adaptive dflash2 with mmproj does not support k4v","adaptive kv speculation inherits target cache types")
+                assert any(cause in diagnostic for cause in causes), log_path
                 yield None
                 return
             deadline = time.monotonic() + 120

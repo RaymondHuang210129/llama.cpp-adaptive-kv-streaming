@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0-DV7 are complete; DV8-DV9 remain pending. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: implementation in progress, 2026-11-01. DV0-DV8 runtime qualification is complete; DV9 documentation remains pending. The excluded legacy finder test has one obsolete policy assertion, disclosed under DV8. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -308,6 +308,14 @@ Exit: image changes and state transitions cannot reuse stale features, draft KV,
 
 ### DV8 - Complete numerical, memory and performance qualification
 
+Completed runtime qualification 2026-11-01: sixteen fresh device/model gates cover CUDA owner/workspace/recurrent recovery, graph-enabled owner memcheck, Qwen MTP exact vectors with both target and auxiliary ring traffic (2666 records), original Q4 DFlash and K4V switching/all widths, public F3 Q8_0/Q8_0 and Q5_1/Q5_1 image pairs, existing Qwen target-only/MTP3 and Gemma target-only/shared-KV MTP3 vision, fresh F7 image-vector memcheck, F3 image-vector ASAN, and the complete encoder/target/draft public path under strict memcheck and ASAN/UBSAN. All three strict logs report zero errors with unchanged API-all/error99/default PDL; the owner keeps CUDA graphs and eager execution is checker-only. Fourteen host ASAN/UBSAN suites pass, including the 139-assertion projector suite. The first shortened MTP recipe matched its vectors but correctly failed the required nonresident proof after decode reclaimed workspace; restoring the existing 16381-token/eight-round recipe, without changing its 32 MiB bootstrap pool or assertions, proves both rings. Original failing artifacts remain preserved.
+
+Forty-four ordinary SWE benchmark requests form 22 baseline/current pairs with identical same-mode output IDs (11264 total), prompt/draft/source counts and physical decode layouts. The baseline is a coherent isolated build of 7425d14c3, including every static server-archive member. Three near-8-Ki pairs per Qwen mode give decode changes of -0.02%, +0.29%, +0.04% and +0.09% for target-only, MTP3, original Q4 DFlash7 and DFlash7+K4V; prefill changes stay within 0.09%. Three Gemma pairs use its own template/tokenizer (8191 tokens versus Qwen's 8186), with decode changes +0.17%/+1.24% and prefill within 0.07%. The four single 64524-token Qwen controls vary from -0.54% to +0.31% decode and within 0.05% prefill; they are not repeated statistical claims. No material regression is observed, and positive variation is not claimed as an optimization.
+
+Ordinary fixed-1-GiB image runs use one warmup and three uncached 256-output samples per profile, plus two alternating-order target-only process pairs to investigate an initial small-prefill difference. Across three target-only process pairs, median changes are -0.35% prefill, -0.08% decode and +0.18% total latency, with individual total changes within 0.41%; the initial 1.3% prefill sample does not reproduce consistently. Existing MTP image work/outputs/layouts match, with paired decode change +0.01% and total latency +0.04%. The new Q2 DFlash3/7 profiles measure 71.95/63.62 tok/s and 3.91/4.39 s median request latency versus existing MTP3 at 72.77 tok/s/3.87 s. These pattern fixtures establish support and acceptance costs, not a universal image speedup or quality certificate. Normal warmup startup also has fitting full native/streamed image controls.
+
+A final test review found that the old vision test harness accepted any failure log containing a vision banner. Six red subcases now prevent device faults/OOM from being counted as configuration rejections and recognize the specific DFlash guards; 17 host tests and nine real startup rejections plus native-matching recovery pass. This changes only the expected-rejection branch; an AST comparison proves all measured positive harness paths unchanged. The 45 Gemma host-harness tests and 132 other tracked benchmark host tests pass. One legacy finder assertion under the user-excluded benchmarks/server-ab tree still expects pure DFlash images to be rejected (29 other tests pass and one platform case skips); it remains unchanged pending the user's optional one-line exception. The current contract is covered by the new outside-tree tests. This obsolete assertion is disclosed, not counted as a pass, and does not alter numerical/API checks or runtime support. Raw data, benchmark harness additions and source/binary mappings remain local; measured binaries retain their actual pre-commit identities. Managed services are restored with unchanged IDs/configuration and healthy port 1234.
+
 Run a staged matrix, preserving successful artifacts and expanding only after smaller controls pass.
 
 | Dimension | Required coverage |
@@ -409,7 +417,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV5: real encoder inputs, exact image-conditioned target/draft vectors and forced acceptance/correction match fitting native controls.
 - [x] DV6: pure DFlash common/server/request/finder integration works with actual images; mixed K4V vision remains closed.
 - [x] DV7: image/cache/window/cancellation/state/restart and attached-writer encoder failure/retry pass.
-- [ ] DV8: required numerical/memory/regression/performance evidence audited.
+- [x] DV8: scoped numerical/memory/regression/performance evidence audited; excluded legacy test exception disclosed.
 - [ ] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored.
 - [ ] Optional mixed extension: media-bounded K4V separately qualified and documented, or explicitly left closed.
 

@@ -69,6 +69,19 @@ class Launch(unittest.TestCase):
             directories.append(command[command.index("--slot-save-path")+1])
         self.assertEqual(directories[0],directories[1])
 
+    def test_dflash_startup_rejections_accept_the_specific_common_diagnostics(self):
+        messages=("adaptive DFlash2 with mmproj does not support K4V image history",
+                  "adaptive DFlash2 supports 1-7 draft tokens")
+        for message in messages:
+            with self.subTest(message=message),self.launch(message),patch.object(harness.os,"killpg",create=True):
+                with harness.server(self.args,"arena-reject-dflash",reject=True):pass
+
+    def test_a_vision_banner_does_not_turn_device_faults_into_config_rejections(self):
+        for error in ("cudaMalloc failed: out of memory","illegal memory access","device-side assert","no kernel image"):
+            with self.subTest(error=error),self.launch("vision arena enabled\n"+error),patch.object(harness.os,"killpg",create=True):
+                with self.assertRaises(AssertionError):
+                    with harness.server(self.args,"arena-reject-fault",reject=True):pass
+
     def test_startup_negative_profiles_do_not_reject_supported_cache_formats(self):
         cases=harness.vision_startup_rejections()
         self.assertEqual(len(cases),6)
