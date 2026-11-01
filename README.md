@@ -403,7 +403,7 @@ The completed nine-band NVIDIA Open-SWE comparison measures an earlier V2 baseli
 
 ![Natural SWE histories: baseline and optimized MTP3/DFlash7, plus optimized DFlash7+K4V prefill and decode](media/dflash2-k4v-swe-throughput.png)
 
-K4V's additional benefit is workload dependent: the 32 Ki equal-output case improved 3.22% over DFlash7 with the scheduling fixes, while most others changed little. The 192 Ki mixed response differs and is excluded from matched-work gains. Each configuration retains one natural completion with a 2,048-output cap at its full-workload maximum-fit arena; actual prompt/capacity and output counts vary. These are not repeated statistics or agent task-success scores, and the older article/prose chart above remains a separate cohort. [Methods and full results](docs/development/dflash2-k4v-swe.md) - [CSV](benchmarks/data/dflash2-k4v-swe-branches.csv) - [Profile and hashes](benchmarks/data/dflash2-k4v-swe-branches.json).
+K4V's additional benefit is workload dependent: the 32 Ki equal-output case improved 3.22% over DFlash7 with the scheduling fixes, while most others changed little. The 192 Ki mixed response differs and is excluded from matched-work gains. Each configuration retains one natural completion with a 2,048-output cap at its full-workload maximum-fit arena; actual prompt/capacity and output counts vary. These are not repeated statistics or agent task-success scores, and the older article/prose chart above remains a separate cohort. [Methods and full results](docs/development/dflash2-k4v-swe.md).
 
 ### Gemma 4 measurements
 

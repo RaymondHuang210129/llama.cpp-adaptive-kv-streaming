@@ -85,11 +85,11 @@ Adding K4V itself has a different, smaller effect. On 20 natural Open-SWE cases,
 
 A separate six-context sample used independent maximum-fit arenas for MTP3, DFlash7 and mixed mode, with selected full requests and actual rejected +1 MiB neighbors at all 18 points. That sample uses the earlier prefetch-only runtime. It covers natural prompt bands near 8/64/128/160/200/256 Ki; it is not an equal-memory/equal-response comparison or a fresh restore-overlap sweep. The earlier 96-point sweep remains intentionally stopped.
 
-Data: [prefetch CSV](../../benchmarks/data/dflash2-k4v-flexible-prefetch.csv), [restore CSV](../../benchmarks/data/dflash2-k4v-restore-overlap.csv), [maximum-arena sample](../../benchmarks/data/dflash2-k4v-swe-maxarena.csv), [NK7 evidence index](../../benchmarks/data/dflash2-k4v-nk7.json). Inputs are pinned historical prefixes, not synthetic repetition or live agent task-success evaluation; no replayed tool command is executed.
+Raw qualification JSON, measurement CSVs and profiler receipts are retained locally rather than versioned with the source. Inputs are pinned historical prefixes, not synthetic repetition or live agent task-success evaluation; no replayed tool command is executed.
 
 ## Lookup cost
 
-Historical accepted whole-call diagnostics, before the two scheduling fixes, measured the following. They include initial indexing/statistics work rather than timing one hash access. Full p50/p95/p99 counts and first-statistics/outcome classes are in the NK7 JSON.
+Historical accepted whole-call diagnostics, before the two scheduling fixes, measured the following. They include initial indexing/statistics work rather than timing one hash access. Full p50/p95/p99 counts and first-statistics/outcome classes are retained in the local NK7 receipts.
 
 | Context / fixture | Calls | All-call p50 / p95 / p99 (us) | Steady p50 (us) | Map reserved bytes |
 | --- | ---: | ---: | ---: | ---: |
@@ -107,7 +107,7 @@ NK0-NK6 cover CPU n-gram correctness, independent widths, every accepted prefix,
 
 Strict checks keep default PDL, API-all reporting, error exit 99 and no filters; eager execution is limited to instrumented runs. Full F7 matched-streamed controls compare 3,195 records/~10.47 GB. Fitting native F3 controls cover the three cache pairs. The streamed MTP strict process checks all 1,725 records of the complete ordinary-native oracle with actual target/MTP ring activity. Two native-instrumented-prefill attempts did not finish and are not passes. Preserved native F7 capacity failures are not claimed as native passes, and long streamed measurements are not long-context native-equivalence proof.
 
-The normal runtime was rebuilt consistently across all 16 dependent host translation units; CUDA libraries remain byte-identical. Commit/source mappings preserve the measured pre-commit identities rather than relabelling binaries after Git metadata changes. Raw local receipts remain under `benchmarks/results/dflash-prefetch-fix-20261029/` and `benchmarks/results/recurrent-restore-overlap-20261030/`; their hashes are indexed in the NK7 JSON.
+The normal runtime was rebuilt consistently across all 16 dependent host translation units; CUDA libraries remain byte-identical. Commit/source mappings preserve the measured pre-commit identities rather than relabelling binaries after Git metadata changes. Raw local receipts remain under `benchmarks/results/dflash-prefetch-fix-20261029/` and `benchmarks/results/recurrent-restore-overlap-20261030/`; their hashes are retained in the local NK7 evidence index.
 
 For a portable ordinary reproduction, use `benchmarks/run_dflash_controls.py` with `--spec-mode dflash-k4v`, explicit `--ngram-n/--ngram-m/--ngram-min-hits`, the pinned target/draft/config files and a fresh output directory. Start with several representative prompts. The optional `--cpu-profile --trace-library` adds a separate exact-output/counter-matched host diagnostic; its whole-call lookup p50/p95/p99, first-use/statistics classes and reserved-map bytes are not ordinary speed evidence. The finder and control harness start only their own servers and do not assume a production service exists.
 

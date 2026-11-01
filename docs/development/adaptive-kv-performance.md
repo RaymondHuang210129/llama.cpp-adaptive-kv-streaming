@@ -12,7 +12,7 @@ Most sweep points are single retained measurements, not repeated statistical est
 
 ### DFlash2 + K4V scheduling studies
 
-The completed [bounded K7 support report](dflash2-k4v.md#measured-performance) separates two matched fixed-arena optimization studies from the older context curves. Flexible target prefetch improved the selected long DFlash7/mixed sample by 3.40%; restore overlap, over that fixed baseline, improved the selected 8K/64K samples by about 5.1-5.4%. These are separate single-pair cohorts, not additive gains or a rerun of the introductory sweep. Whole-call lookup studies and a separate six-context maximum-arena Open-SWE sample are indexed in [NK7 data](../../benchmarks/data/dflash2-k4v-nk7.json). K4V itself has no demonstrated broad natural-workload gain and remains opt-in.
+The completed [bounded K7 support report](dflash2-k4v.md#measured-performance) separates two matched fixed-arena optimization studies from the older context curves. Flexible target prefetch improved the selected long DFlash7/mixed sample by 3.40%; restore overlap, over that fixed baseline, improved the selected 8K/64K samples by about 5.1-5.4%. These are separate single-pair cohorts, not additive gains or a rerun of the introductory sweep. Whole-call lookup studies and a separate six-context maximum-arena Open-SWE sample are summarized in the support report, with raw receipts retained locally. K4V itself has no demonstrated broad natural-workload gain and remains opt-in.
 
 ### Natural Open-SWE branch comparison
 

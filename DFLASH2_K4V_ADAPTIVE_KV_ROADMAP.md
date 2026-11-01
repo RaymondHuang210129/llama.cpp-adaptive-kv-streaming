@@ -1,6 +1,6 @@
 # DFlash2 + K4V adaptive KV streaming roadmap
 
-Status: complete for the bounded K7 implementation on `feature/adaptive-kv-dflash2-k4v`. NK0-NK7 are complete within the seven-token scope. The two qualified scheduling fixes are `985c8cac4` (flexible target prefetch) and `8793469b2` (post-input recurrent restore overlap). Mixed mode remains opt-in; its correctness and useful scheduling gains do not establish a general K4V-over-DFlash speedup. Updated: 2026-10-31. See the [support/reproduction report](docs/development/dflash2-k4v.md) and [NK7 evidence index](benchmarks/data/dflash2-k4v-nk7.json).
+Status: complete for the bounded K7 implementation on `feature/adaptive-kv-dflash2-k4v`. NK0-NK7 are complete within the seven-token scope. The two qualified scheduling fixes are `985c8cac4` (flexible target prefetch) and `8793469b2` (post-input recurrent restore overlap). Mixed mode remains opt-in; its correctness and useful scheduling gains do not establish a general K4V-over-DFlash speedup. Updated: 2026-10-31. See the [support/reproduction report](docs/development/dflash2-k4v.md) for the qualification summary. Raw stage JSON, CSVs and benchmark receipts are retained locally rather than versioned with the source.
 
 The user selected completion of K7 and separate preservation of the unfinished K15/TG16 extension on 2026-10-31. Its exact tracked snapshot is on `wip/dflash2-k4v-k15-20261031` at `e59e929e9`; full native-equivalence qualification remains unfinished there. No K15 source is admitted by this completion. The old 96-point sweep remains intentionally stopped; no completed full-sweep claim is added.
 
@@ -170,7 +170,7 @@ Do not multiply separate phase costs when they share mutually exclusive lifetime
 
 ### NK0 - Pin controls and observability
 
-Status: complete, committed as `2d94f6a3d`. See the [pinned NK0 report](benchmarks/data/dflash2-k4v-nk0.json).
+Status: complete, committed as `2d94f6a3d`. See the local pinned NK0 report.
 
 Added read-only common-layer snapshots of existing source counters and last supplying implementation, plus a successful DFlash/DSpark prediction-forward counter. These are host observations, not new C inference APIs or backend synchronization. The forward count distinguishes a dispatcher call from a completed neural prediction, including context-end abstention.
 
@@ -188,7 +188,7 @@ Exit: reproducible controls, an inventory of reused test hooks, and fixtures tha
 
 ### NK1 - K4V CPU correctness
 
-Status: complete, committed as `86fbbec7a`. See the [NK1 red/green report](benchmarks/data/dflash2-k4v-nk1.json).
+Status: complete, committed as `86fbbec7a`. See the local NK1 red/green report.
 
 The initial behavioral suite reproduced 29 failures in 143 assertions before the fixes. The expanded 18-case/161-assertion suite reproduces 35 failures against the pinned NK0 n-gram implementation and passes with zero failures normally and under ASAN/UBSAN. Existing argument tests pass in both builds. Raw evidence is retained in `benchmarks/results/dflash2-k4v-20261026-nk1-OlLbS0/`.
 
@@ -213,7 +213,7 @@ Exit: correct emitted continuation and statistics attribution, no invalid histor
 
 ### NK2 - Common mixed-workload limits and admission
 
-Status: complete for common workload resolution and validation. See the [NK2 report](benchmarks/data/dflash2-k4v-nk2.json). Admission was deliberately kept closed at this stage; NK4 records its later scoped opening.
+Status: complete for common workload resolution and validation. See the local NK2 report. Admission was deliberately kept closed at this stage; NK4 records its later scoped opening.
 
 The existing `common_speculative_n_max` is reused to resolve the streamed target rollback depth from both sources; no new public API, allocation or independent limit registry was added. Shared validation checks neural/K4V bounds, allowed source families, lookup parameters and effective microbatch capacity. Native/non-streaming rollback parameters and standalone DFlash/MTP behavior remain unchanged.
 
@@ -236,7 +236,7 @@ Exit: one tested source of verification limits; invalid combinations fail before
 
 ### NK3 - Target and child workspace sizing
 
-Status: complete for independent resource sizing and its qualified controls. See the [NK3 qualification report](benchmarks/data/dflash2-k4v-nk3.json). Admission was still closed at this stage; see NK4 for the switching qualification and scoped opening, and NK5/NK6 for remaining lifecycle and whole-path work.
+Status: complete for independent resource sizing and its qualified controls. See the local NK3 qualification report. Admission was still closed at this stage; see NK4 for the switching qualification and scoped opening, and NK5/NK6 for remaining lifecycle and whole-path work.
 
 A private C++ constructor/factory overload now declares the neural prediction rows independently of target verification. The existing C factory, two-argument constructor and public C parameter layout are preserved. Common startup reuses the resolved target-depth validation before loading the child or mutating target features. Token prediction uses the measured neural block, while embedding injection follows the actual target phase rather than inferring it from the prediction row count. The existing serial owner, physical arena and bounded-cache admission are reused; no kernel, arithmetic, allocator or cache format was added. Bounded-draft admission now retains the existing structured required/available/additional-byte result.
 
@@ -261,7 +261,7 @@ Exit: every admitted workload is measured and executes inside the declared owner
 
 ### NK4 - Switching, feature continuity and rollback
 
-Status: complete for source switching, feature continuity and forced rollback. See the [NK4 qualification report](benchmarks/data/dflash2-k4v-nk4.json) and NK5 for later lifecycle qualification. NK6/NK7 remain required before final whole-path qualification and performance promotion.
+Status: complete for source switching, feature continuity and forced rollback. See the local NK4 qualification report and NK5 for later lifecycle qualification. NK6/NK7 remain required before final whole-path qualification and performance promotion.
 
 The dispatcher now clears the selected-source pointer only for sequences starting a new draft attempt. A both-empty attempt therefore reports no supplier and cannot charge acceptance feedback to an earlier source; inactive sequences retain pending acceptance. The focused CPU red reproduced three failures, and the actual mixed-model test against archived NK3 libraries reproduced exactly the late both-empty supplier failure after valid native/reference controls. Public common admission now permits optional K4V alongside DFlash2, while preserving the single-slot, text-only, no-MTP/media/other-drafter, inherited-cache-type and bounded-limit guards. All 49 independent F/K combinations and the mixed CLI/environment override tests pass; the old K4V M=48 default receives an actionable size-m error rather than clamping.
 
@@ -294,7 +294,7 @@ Exit: no stale DFlash history, rejected suffix, incorrect accepted-row offset or
 
 ### NK5 - Lifecycle, failure recovery and sampling
 
-Status: complete for the declared lifecycle/recovery and stock sampling scope. See the [NK5 qualification report](benchmarks/data/dflash2-k4v-nk5.json). The final whole-path/format matrix and performance/finder promotion remain NK6/NK7.
+Status: complete for the declared lifecycle/recovery and stock sampling scope. See the local NK5 qualification report. The final whole-path/format matrix and performance/finder promotion remain NK6/NK7.
 
 The generation-begin hook now clears only that sequence's previous supplier before invoking the existing implementation hooks. The CPU red reproduced nine stale supplier/acceptance failures across same, equal-length replaced, shortened and empty histories. All 484 speculative assertions pass normally and under ASAN/UBSAN, including discarded acceptance suppression and another sequence's pending acceptance. K4V remains disposable derived CPU state: the existing begin hook rebuilds it before predicting in the restored/replaced generation. No serialized map, new reset registry, GPU allocation or sampler algorithm was added.
 
@@ -322,7 +322,7 @@ Exit: no stale map/cache/feature state after reset or failure, no leaked borrowe
 
 ### NK6 - Whole-path numerical and safety qualification
 
-Status: complete. See the [audited NK6 report](benchmarks/data/dflash2-k4v-nk6.json). Only the existing actual-model test and its private entry flag changed; production arithmetic, scheduling, CUDA code and arena ownership are unchanged.
+Status: complete. See the local audited NK6 report. Only the existing actual-model test and its private entry flag changed; production arithmetic, scheduling, CUDA code and arena ownership are unchanged.
 
 The coverage red failed exactly one assertion after valid native execution: the existing 21-round source-switching program did not exercise TG5-TG7. Seven descending K4V proposal limits extend it to 28 rounds and explicitly require all target verification widths TG1-TG8. Across Q8_0/Q4_0, Q8_0/Q8_0 and Q5_1/Q5_1, each native hybrid, independent native DFlash feature-maintenance reference and streamed hybrid matches all 3175 full records, plus 919 independent continuity records. The respective record extents are 7289091972, 8018873220 and 7106646660 bytes. This fitting profile uses capacity 8192, prefix 2047, target microbatch 256, child microbatch eight and F=3/K=7/N=2/minimum hits one; streamed executions use a 228 MiB arena. Each streamed run observes real ring use and reaches the context boundary.
 
@@ -355,7 +355,7 @@ Exit: exact matched-path correctness, clean strict memory qualification, bounded
 
 ### NK7 - Performance, arena finder and documentation
 
-Status: complete for bounded K7. The user selected this release scope and preservation of K15 separately. The [NK7 report](docs/development/dflash2-k4v.md) records portable launch/finder examples, reset/memory limits, measured lookup costs, natural-workload tradeoffs and the two qualified scheduling fixes; [data and raw receipt hashes](benchmarks/data/dflash2-k4v-nk7.json) preserve separate runtime cohorts.
+Status: complete for bounded K7. The user selected this release scope and preservation of K15 separately. The [NK7 report](docs/development/dflash2-k4v.md) records portable launch/finder examples, reset/memory limits, measured lookup costs, natural-workload tradeoffs and the two qualified scheduling fixes; local data and raw receipt hashes preserve separate runtime cohorts.
 
 The finder supports `dflash-k4v` with explicit N/M/min-hits, rejects unsupported M>7, inherits target KV types and proves both K4V and actual DFlash forwards with a separate resource probe. Preflight and selected full validation remain distinct. An earlier prefetch-only natural Open-SWE cohort completed 18 independently maximum-fit points near 8/64/128/160/200/256 Ki, each with actual selected full work and a rejected +1 MiB neighbor. Those timings are not relabelled as a restore-overlap sweep.
 
