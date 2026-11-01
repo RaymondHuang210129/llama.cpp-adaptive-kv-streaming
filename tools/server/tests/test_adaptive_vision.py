@@ -42,8 +42,27 @@ def request(port, path, body=None):
         return error.code, json.load(error)
 
 
+def speculative_arguments(args, mode):
+    mtp = getattr(args, "mtp_length", 0)
+    dflash = getattr(args, "dflash_length", 0)
+    draft = getattr(args, "model_draft", None)
+    if not 0 <= mtp <= 3 or not 0 <= dflash <= 7 or (mtp and dflash) or bool(draft) != bool(dflash):
+        raise ValueError("choose embedded MTP1-3 or DFlash1-7 with its matching --model-draft")
+    if not (mtp or dflash):
+        return ["--spec-type", "none"]
+    flags = ["--spec-type", "draft-dflash" if dflash else "draft-mtp", "--spec-draft-n-max", str(dflash or mtp)]
+    if dflash:
+        flags += ["--model-draft", str(draft.resolve()), "--spec-draft-ngl", "999",
+                  "--spec-draft-n-min", "0", "--spec-draft-p-min", "0"]
+    if not mode.startswith("arena"):
+        flags += ["--spec-draft-type-k", getattr(args, "cache_type_k", "q8_0"),
+                  "--spec-draft-type-v", getattr(args, "cache_type_v", "q4_0")]
+    return flags
+
+
 @contextlib.contextmanager
 def server(args, mode, extra=(), reject=False, env_extra=None):
+    speculative = speculative_arguments(args, mode)
     with socket.socket() as available:
         available.bind(("127.0.0.1", 0))
         port = available.getsockname()[1]
@@ -51,15 +70,12 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
     command = [str(args.server.resolve()), "--model", str(args.model.resolve()), "--mmproj", str(args.mmproj.resolve()),
                "--host", "127.0.0.1", "--port", str(port), "--offline", "--fit", "off", "--parallel", "1",
                "--ctx-size", str(args.context), "-b", str(args.batch_size), "-ub", str(args.ubatch_size), "-ngl", "999", "-fa", "on",
-               "-ctk", "q8_0", "-ctv", "q4_0", "--spec-type", "none", "--no-context-shift", "--no-warmup",
+               "-ctk", getattr(args, "cache_type_k", "q8_0"), "-ctv", getattr(args, "cache_type_v", "q4_0"), "--no-context-shift", "--no-warmup",
                "--cache-ram", str(args.cache_ram_mib), "--ctx-checkpoints", "8", "--image-min-tokens", "64",
                "--image-max-tokens", "4096", "--slots", "--no-webui", "--log-verbosity", str(getattr(args, "log_verbosity", 4))]
     if mode.startswith("arena"):
         command += ["--shared-device-memory-mib", str(args.arena_mib)]
-    if getattr(args,"mtp_length",0):
-        command += ["--spec-type","draft-mtp","--spec-draft-n-max",str(args.mtp_length)]
-        if not mode.startswith("arena"):
-            command += ["--spec-draft-type-k","q8_0","--spec-draft-type-v","q4_0"]
+    command += speculative
     command += list(extra)
     env = dict(os.environ, LLAMA_MEDIA_MARKER="<__media__>")
     env.update(env_extra or {})
@@ -201,6 +217,10 @@ def main():
     parser.add_argument("--ubatch-size", type=int, default=64)
     parser.add_argument("--decode", type=int, default=16)
     parser.add_argument("--mtp-length", type=int, choices=(0,1,2,3), default=0)
+    parser.add_argument("--dflash-length", type=int, choices=range(8), default=0)
+    parser.add_argument("--model-draft", type=Path)
+    parser.add_argument("--cache-type-k", choices=("q8_0", "q5_1"), default="q8_0")
+    parser.add_argument("--cache-type-v", choices=("q4_0", "q8_0", "q5_1"), default="q4_0")
     parser.add_argument("--cache-ram-mib", type=int, default=2048)
     parser.add_argument("--background-tokens", type=int, default=128)
     parser.add_argument("--mode", choices=("arena", "stock", "compare"), default="compare")
@@ -213,6 +233,10 @@ def main():
     parser.add_argument("--skip-budget-rejection", action="store_true",
                         help="skip the oversized-image rejection assertion when testing a larger arena")
     args = parser.parse_args()
+    try:
+        speculative_arguments(args, "stock")
+    except ValueError as error:
+        parser.error(str(error))
     if min(args.arena_mib, args.context, args.decode, args.batch_size, args.ubatch_size) <= 0 or args.background_tokens < 0:
         parser.error("memory/context/batch/decode values must be positive, background must be nonnegative")
     args.output.mkdir(parents=True, exist_ok=True)

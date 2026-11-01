@@ -56,6 +56,45 @@ class Launch(unittest.TestCase):
             return process
         return patch.object(harness.subprocess, 'Popen', side_effect=popen)
 
+    def test_native_dflash_uses_matching_sidecar_and_cache_types(self):
+        self.args.mtp_length = 0
+        self.args.dflash_length = 3
+        self.args.model_draft = Path(self.directory.name)/'draft.gguf'
+        with self.launch('vision arena rejects this configuration'), patch.object(harness.os,'killpg',create=True):
+            with harness.server(self.args,'stock',reject=True):
+                pass
+        command,_ = self.commands[0]
+        self.assertIn('--model-draft',command)
+        self.assertEqual(command[command.index('--model-draft')+1],str(self.args.model_draft.resolve()))
+        modes=[command[i+1] for i,value in enumerate(command) if value=='--spec-type']
+        self.assertEqual(modes,['draft-dflash'])
+        self.assertEqual(command[command.index('--spec-draft-n-max')+1],'3')
+        self.assertEqual(command[command.index('--spec-draft-type-k')+1],'q8_0')
+        self.assertEqual(command[command.index('--spec-draft-type-v')+1],'q4_0')
+
+    def test_arena_dflash_inherits_target_cache_types(self):
+        self.args.mtp_length = 0
+        self.args.dflash_length = 7
+        self.args.model_draft = Path(self.directory.name)/'draft.gguf'
+        with self.launch('vision arena rejects this configuration'), patch.object(harness.os,'killpg',create=True):
+            with harness.server(self.args,'arena-reject-dflash',reject=True):
+                pass
+        command,_ = self.commands[0]
+        self.assertIn('--model-draft',command)
+        self.assertNotIn('--spec-draft-type-k',command)
+        self.assertNotIn('--spec-draft-type-v',command)
+
+    def test_invalid_dflash_configuration_is_rejected_before_process_launch(self):
+        for mtp,draft,length in ((0,None,3),(3,Path('draft.gguf'),3),(0,Path('draft.gguf'),8)):
+            with self.subTest(mtp=mtp,draft=draft,length=length), patch.object(harness.subprocess,'Popen') as launch:
+                self.args.mtp_length=mtp
+                self.args.model_draft=draft
+                self.args.dflash_length=length
+                with self.assertRaises(ValueError):
+                    with harness.server(self.args,'stock'):
+                        pass
+                launch.assert_not_called()
+
     def test_launch_sets_matching_mtp_kv_and_arena_disables_inherited_uvm(self):
         with self.launch('vision arena rejects this configuration'), patch.dict(os.environ, {'GGML_CUDA_ENABLE_UNIFIED_MEMORY': '1'}), \
                 patch.object(harness.os, 'killpg', create=True):
