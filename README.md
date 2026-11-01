@@ -34,7 +34,7 @@ The reference targets are Unsloth Qwen3.8-27B `UD-IQ4_XS` and Gemma 4 31B `Q3_K_
 | --- | --- | --- | --- | --- |
 | Qwen3.8-27B, target-only | Up to 262,144 positions | None | None | Matching F16 mmproj supported |
 | Qwen3.8-27B, embedded MTP | Up to 262,144 positions | 1-3 predictions; target verification through TG4 | Full history, streamed as an auxiliary KV layer | Supported with the matching mmproj and shared arena |
-| Qwen3.8-27B + matching IncoAI DFlash2 sidecar | Up to 262,144 positions | 1-7 neural proposals; target verification through TG8 | Bounded 2,048-position draft window plus execution headroom | Not supported with the vision arena |
+| Qwen3.8-27B + matching DFlash2 sidecar | Text up to 262,144 positions; image scope below | 1-7 neural proposals; target verification through TG8 | Bounded 2,048-position draft window plus execution headroom | Matching F16 mmproj supported; Q2 sidecar is the measured image profile |
 | Qwen3.8-27B + DFlash2 + CPU K4V | Same target capacity; fit this configuration separately | Independently 1-7 neural/copied proposals; target verification up to max(F,M)+1 rows | Same bounded draft KV; token-history map in RAM | Text only; no simultaneous MTP |
 | Gemma 4 31B, target-only | 8-120 Ki target-only sweep; metadata capacity 262144 | None | Ten full-attention histories streamed; fifty bounded SWA histories resident | Matching local Q8 projector with Q3_K_S; scoped below |
 | Gemma 4 31B + matching MTP assistant | 8-120 Ki text sweep, all lengths 1-3; MTP3-only through 256 Ki | 1-3 predictions; target verification TG1-TG4 | Read-only target KV; no assistant KV append/catch-up | Matching local Q8 projector with Q3_K_S; lengths 1-3, scoped below |
@@ -48,11 +48,11 @@ Gemma's 120 Ki endpoint is the completed all-mode text sweep. The separate post-
 
 ### Vision support
 
-Both Qwen3.8-27B and Gemma 4 31B support still images and interleaved image/text prompts, target-only or with MTP lengths 1-3, on one CUDA GPU. Each requires a matching vision projector (`--mmproj`). Qwen uses its matching F16 projector; the qualified Gemma image profile uses a `Q3_K_S` target and matching local `Q8_0` projector, separate from the Q3_K_M text benchmarks above.
+Both Qwen3.8-27B and Gemma 4 31B support still images and interleaved image/text prompts, target-only or with MTP lengths 1-3, on one CUDA GPU. Qwen also supports pure DFlash2 lengths 1-7 with a matching external sidecar; DFlash+K4V vision remains closed. Each requires a matching vision projector (`--mmproj`). Qwen uses its matching F16 projector; the qualified Gemma image profile uses a `Q3_K_S` target and matching local `Q8_0` projector, separate from the Q3_K_M text benchmarks above.
 
-Both models reuse the text phase arena for vision weights and encoder workspace; main-model and optional assistant weights stay outside it. Model-specific position/cache handling remains separate: Gemma preserves its resident SWA cache and uses shared-KV MTP, while Qwen retains its image-aware auxiliary MTP history. Image count, token budget and batch size need their own fit; this profile excludes audio/video, LoRA, parallel slots and DFlash.
+Both models reuse the text phase arena for vision weights and encoder workspace; main-model and optional assistant weights stay outside it. Model-specific position/cache handling remains separate: Gemma preserves its resident SWA cache and uses shared-KV MTP, while Qwen preserves its image-aware auxiliary MTP history or bounded DFlash draft window, according to the selected mode. Image count, token budget and batch size need their own fit; these profiles exclude audio/video, LoRA, parallel slots and mixed K4V vision.
 
-See the shared [vision launch examples](#vision-launch-examples). The [Gemma vision report](docs/multimodal/gemma4-vision.md) contains its projector preparation, sizing tables, measurements, qualification limits and internal APIs; [vision tests](tools/server/tests/README.md#adaptive-kv-vision-qualification) document Qwen's separate controls.
+See the shared [vision launch examples](#vision-launch-examples). The [Gemma vision report](docs/multimodal/gemma4-vision.md) contains its projector preparation, sizing tables, measurements, qualification limits and internal APIs; [DFlash2 vision report](docs/multimodal/dflash2-vision.md) covers its bounded draft state, measured Q2 sidecar profile and native-reference limits; [vision tests](tools/server/tests/README.md#adaptive-kv-vision-qualification) document Qwen's controls.
 
 ### KV-cache formats
 
@@ -93,7 +93,7 @@ For SM61/SM70 builds, use a toolkit that still compiles those targets, such as C
 | DFlash+K4V | Matching Qwen pair, one serial text request, F/M 1-7; no mixed vision or MTP admission |
 | Attention | Flash Attention and GPU KV offload required |
 | Batch / microbatch | 256/256 is the full text-matrix reference; other settings need their own fit test and backend admission |
-| Vision | Qwen with matching F16 projector; Gemma 4 31B Q3_K_S with matching local Q8 projector and optional matching shared-KV MTP1-3. Image/text only, no LoRA/embeddings/DFlash |
+| Vision | Qwen: matching F16 projector, target-only/MTP1-3/pure DFlash1-7. Gemma: Q3_K_S with matching local Q8 projector, target-only/shared-KV MTP1-3. Image/text only; no LoRA/embeddings or mixed K4V vision |
 | Image batching | Multiple images are supported within the admitted vision-batch and context limits; there is no universal image-count or resolution guarantee |
 | UVM | Optional for model weights; the shared KV/phase arena stays device-local |
 | Other GPU applications | Managed weights may migrate under pressure; the device-local arena itself is not automatically pageable |
@@ -350,6 +350,16 @@ VISION_COMMON=(--parallel 1 --batch-size 256 --ubatch-size 256 --n-gpu-layers 99
 ./build-v2/bin/llama-server "${VISION_MODEL_ARGS[@]}" "${VISION_COMMON[@]}" "${VISION_DRAFT_ARGS[@]}" \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 0 --spec-draft-p-min 0
 ```
+
+For the Qwen profile, pure DFlash2 uses the same image API. Stop the prior server, substitute its matching sidecar and fit that image configuration separately; the Q2 mixed sidecar is the measured vision profile:
+
+```bash
+./build-v2/bin/llama-server "${VISION_MODEL_ARGS[@]}" "${VISION_COMMON[@]}" \
+  --model-draft /path/to/Qwen3.8-27B-DFlash2-Q2_K_S-MIX.gguf --spec-draft-ngl 999 \
+  --spec-type draft-dflash --spec-draft-n-max 3 --spec-draft-n-min 0 --spec-draft-p-min 0
+```
+
+Use lengths 1-7 and inherited target K/V types; omit K4V. Main and sidecar weights stay outside the parent while vision borrows its reclaimable workspace. The [DFlash2 image report](docs/multimodal/dflash2-vision.md) explains sizing and the distinction between full native controls and split component references.
 
 Once the server is ready, open `http://127.0.0.1:8080` and attach an image. No pre-existing server or container is required. The [vision report](docs/multimodal/gemma4-vision.md#running-an-image-request-locally) includes the same HTTP image-request shape for either model. Gemma's projector preparation, larger budgets and protected SWA details remain in that report rather than requiring a different client API.
 

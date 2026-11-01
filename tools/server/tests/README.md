@@ -213,3 +213,21 @@ The temporary servers use image-token limits 64-4096 to exercise different encod
 - Sampled peaks are lower bounds on the true instantaneous peak. They include all activity on the selected device and can miss brief allocations. The fixed parent intentionally remains allocated after vision; successful cleanup returns grants, not the entire parent to the driver.
 
 For host-only report tests, run `python3 -B tools/server/tests/test_adaptive_vision_measurements.py`. These tests require neither a model nor a GPU and are registered with CTest when server tests and Python are available.
+
+### Pure DFlash2 vision qualification
+
+The existing vision harness also accepts `--dflash-length 1..7 --model-draft /path/to/matching-sidecar.gguf`, with `--mtp-length 0`. Adaptive drafting inherits the target K/V formats; the native control selects matching independent formats. `--lifecycle` adds complete state-file checks, erase/restore, truncated-state recovery, restart and later/aspect-varied images. Each scenario compares with its corresponding native scenario, including draft and cache counters. The public image wire format is unchanged.
+
+The measured Qwen profile uses the matching Q2 mixed sidecar and F16 projector. Full native F1/F3 controls fit; F7 uses separately pinned native encoder/decoder component references after its full-native projector allocation fails. Long F7 image lifecycle is explicitly streamed self-consistency. K4V vision remains rejected. See the [DFlash2 vision report](../../../docs/multimodal/dflash2-vision.md) for artifact hashes, performance, strict-memory scope and the known legacy finder-test expectation.
+
+```bash
+python3 tools/server/tests/test_adaptive_vision.py \
+  --server build-v2/bin/llama-server --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --mmproj /path/to/mmproj-Qwen3.8-27B-F16.gguf \
+  --model-draft /path/to/Qwen3.8-27B-DFlash2-Q2_K_S-MIX.gguf --dflash-length 3 \
+  --context 2048 --batch-size 256 --ubatch-size 256 --arena-mib 1024 \
+  --background-tokens 128 --decode 64 --cache-ram-mib 2048 \
+  --lifecycle --mode compare --output benchmarks/results/my-dflash-vision-check
+```
+
+This command starts and cleans up its own servers. Make GPU memory available first; it does not manage other services. A failing capacity or numerical check is not an accepted profile.

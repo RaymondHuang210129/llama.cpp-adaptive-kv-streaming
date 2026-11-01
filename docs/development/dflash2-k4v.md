@@ -1,13 +1,13 @@
 # Bounded DFlash2 + K4V with adaptive KV streaming
 
-The bounded seven-token implementation is complete on `feature/adaptive-kv-dflash2-k4v`. It combines the existing CPU K4V map with the admitted Qwen DFlash2 sidecar, shared phase arena and target verification. K4V remains opt-in: skipping neural predictions does not guarantee faster generation.
+The bounded seven-token implementation combines the existing CPU K4V map with the admitted Qwen DFlash2 sidecar, shared phase arena and target verification. K4V remains opt-in: skipping neural predictions does not guarantee faster generation.
 
 ## Supported scope
 
 - The pinned Qwen3.8-27B target (`qwen35` metadata) and matching [DFlash2 sidecar](../../benchmarks/data/dflash2-qwen27b-artifacts.json), one serial text request on one CUDA GPU.
 - Independently configured DFlash proposal maximum F=1-7 and K4V continuation maximum M=1-7. Target verification and recurrent rollback use max(F,M); verification executes TG1-TG8, including intermediate widths. Neural prediction still respects its own trained block size.
 - Full-model qualification covers Q8_0/Q4_0, Q8_0/Q8_0 and Q5_1/Q5_1. Adaptive drafting inherits target cache types; explicit draft-cache overrides are rejected.
-- No simultaneous MTP, image/projector, parallel-slot, multi-GPU, Gemma+DFlash, DSpark or EAGLE admission. Native non-streaming modes retain their separate contracts.
+- The mixed K4V mode has no simultaneous MTP, image/projector, parallel-slot, multi-GPU, Gemma+DFlash, DSpark or EAGLE admission. Pure DFlash2 has separate [shared-arena image support](../multimodal/dflash2-vision.md); that does not enable K4V image history. Native non-streaming modes retain their separate contracts.
 
 The unfinished K15/TG16 extension is preserved on `wip/dflash2-k4v-k15-20261031` at `e59e929e9`. It is outside this release. Its source and partial evidence were preserved; they are not labelled qualified.
 

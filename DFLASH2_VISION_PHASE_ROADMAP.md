@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: implementation in progress, 2026-11-01. DV0-DV8 runtime qualification is complete; DV9 documentation remains pending. The excluded legacy finder test has one obsolete policy assertion, disclosed under DV8. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. One obsolete assertion in the user-excluded legacy finder test remains unchanged, explicitly disclosed under DV8; a uniformly green full-project test suite is not claimed. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The user authorized implementation through DV9 with TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -346,6 +346,8 @@ Exit: required functional/safety matrices pass, existing modes have no material 
 
 ### DV9 - Document and close pure DFlash2 vision support
 
+Completed 2026-11-01: the README gives brief pure-DFlash image support and the shared launch flow; the linked docs/multimodal/dflash2-vision.md report records pinned artifacts, one-parent lifetime/ownership, image-aware sizing, native versus component references, lifecycle/memory coverage, actual acceptance/latency and regression measurements. The K4V guide keeps mixed vision closed and links the pure path; infrastructure/consumer and original DFlash roadmaps identify their dated status as historical. No benchmark harness additions or raw measurement data are committed. Documentation validation checks 174 local links/anchors, 61 shell blocks and five finder examples. Existing Mermaid blocks are byte-identical (no new grammar/rendering claim). The original 7640-byte upstream README section retains SHA256 394fdd330057ca2d50a84097f2ae438ceeb70a1138a4fdc9cc301b79b0596ad6. Current vision/Gemma host contracts pass; the excluded legacy finder expectation remains the disclosed maintenance exception. All owned GPU scopes are inactive and the original four managed services are restored healthy with unchanged identities/configuration.
+
 - Update concise README concept/support/run entries and the DFlash guide; keep detailed measurements and implementation contracts in a linked vision report.
 - Show the existing image-request API, a matching projector/sidecar launch, inherited cache types, explicit F, image-aware finder usage and the distinction between configured-projector text checks and real encoder execution.
 - Document native-compatible image skipping, bounded draft state during vision, startup image-graph measurements, quota causes and all unsupported modes.
@@ -418,7 +420,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV6: pure DFlash common/server/request/finder integration works with actual images; mixed K4V vision remains closed.
 - [x] DV7: image/cache/window/cancellation/state/restart and attached-writer encoder failure/retry pass.
 - [x] DV8: scoped numerical/memory/regression/performance evidence audited; excluded legacy test exception disclosed.
-- [ ] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored.
-- [ ] Optional mixed extension: media-bounded K4V separately qualified and documented, or explicitly left closed.
+- [x] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored; legacy test-maintenance exception disclosed.
+- [x] Mixed-mode boundary: K4V+mmproj remains explicitly rejected; its optional media-bounded extension is unimplemented and separately scoped.
 
 Pure DFlash2 vision is complete only when DV0-DV9 pass. A helper subgate, successful encoder call, configured projector, target-only fallback, or process exit does not satisfy whole-feature acceptance. Optional K4V vision has its own completion boundary.

@@ -1,5 +1,7 @@
 # Device memory consumers: implementation roadmap
 
+Current implementation reference: serial Qwen DFlash/K4V text execution and pure DFlash vision are now implemented; see the [current support guide](docs/development/dflash2-k4v.md), [vision report](docs/multimodal/dflash2-vision.md) and [DV ledger](DFLASH2_VISION_PHASE_ROADMAP.md). The dated consumer/DFlash status below records earlier checkpoints. Backend-view tests do not establish non-CUDA streaming or older physical-GPU qualification.
+
 Gemma 4 31B target and shared-KV assistant extension: [GEMMA4_ADAPTIVE_KV_ROADMAP.md](GEMMA4_ADAPTIVE_KV_ROADMAP.md). Its G1-G6 stages are independent of the milestone identifiers below; the extension is planned, not implemented or qualified.
 
 Qwen3.8-27B DFlash2 extension: [DFLASH2_ADAPTIVE_KV_ROADMAP.md](DFLASH2_ADAPTIVE_KV_ROADMAP.md). D1-D4 are qualified on RTX 5070 Ti, including wrapped-wave batching, inactive-block exclusion, address resolution, checkpoint compaction and two-slot target rollback through depth seven. The 5-10 percent routing-overhead goal is met in the sampled 128K FP16 cases, not every short-history path. Older-device execution and D5-D7 remain pending; live DFlash2 streaming remains unimplemented and unqualified.
@@ -728,7 +730,7 @@ No mandatory full-context sweep after every tiny change. Start with targeted fai
 
 #### C6b documentation and hardware handoff
 
-Base is committed C6a `89e3d48fe`. This checkpoint changes documentation only; it adds no kernels, allocation/dispatch policy, tolerance or production configuration. The [README](README.md#cuda-compatibility-and-qualification) now states the actual serial IQ4_XS/Q8/Q4 text/MTP/vision scope and corrects its obsolete vision-plus-MTP warning. [Build instructions](docs/build.md#adaptive-kv-cuda-qualification-and-startup-errors) provide real-device commands, toolkit/all-quants prerequisites and failure categories. The [HTTP harness instructions](tools/server/tests/README.md#adaptive-kv-vision-qualification) distinguish native capacity from populated history and independent eager/arena UVM controls.
+Base is committed C6a `89e3d48fe`. This checkpoint changes documentation only; it adds no kernels, allocation/dispatch policy, tolerance or production configuration. The [README](README.md#platforms-and-operational-limits) now states the actual serial IQ4_XS/Q8/Q4 text/MTP/vision scope and corrects its obsolete vision-plus-MTP warning. [Build instructions](docs/build.md#adaptive-kv-cuda-qualification-and-startup-errors) provide real-device commands, toolkit/all-quants prerequisites and failure categories. The [HTTP harness instructions](tools/server/tests/README.md#adaptive-kv-vision-qualification) distinguish native capacity from populated history and independent eager/arena UVM controls.
 
 | Target | Toolkit/build evidence | Runtime evidence | Remaining acceptance |
 | --- | --- | --- | --- |
