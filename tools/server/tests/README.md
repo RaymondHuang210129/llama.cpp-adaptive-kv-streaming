@@ -218,7 +218,7 @@ For host-only report tests, run `python3 -B tools/server/tests/test_adaptive_vis
 
 The existing vision harness also accepts `--dflash-length 1..7 --model-draft /path/to/matching-sidecar.gguf`, with `--mtp-length 0`. Adaptive drafting inherits the target K/V formats; the native control selects matching independent formats. `--lifecycle` adds complete state-file checks, erase/restore, truncated-state recovery, restart and later/aspect-varied images. Each scenario compares with its corresponding native scenario, including draft and cache counters. The public image wire format is unchanged.
 
-The measured Qwen profile uses the matching Q2 mixed sidecar and F16 projector. Full native F1/F3 controls fit; F7 uses separately pinned native encoder/decoder component references after its full-native projector allocation fails. Long F7 image lifecycle is explicitly streamed self-consistency. K4V vision remains rejected. See the [DFlash2 vision report](../../../docs/multimodal/dflash2-vision.md) for artifact hashes, performance, strict-memory scope and the known legacy finder-test expectation.
+The measured Qwen profile uses the matching Q2 mixed sidecar and F16 projector. Full native F1/F3 controls fit; F7 uses separately pinned native encoder/decoder component references after its full-native projector allocation fails. Long F7 image lifecycle is explicitly streamed self-consistency. K4V vision remains rejected. See the [DFlash2 vision report](../../../docs/multimodal/dflash2-vision.md) for artifact hashes, performance, strict-memory scope and finder admission coverage.
 
 ```bash
 python3 tools/server/tests/test_adaptive_vision.py \

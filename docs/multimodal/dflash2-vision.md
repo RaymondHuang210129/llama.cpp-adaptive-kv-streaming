@@ -124,6 +124,6 @@ The [implementation roadmap](../../DFLASH2_VISION_PHASE_ROADMAP.md) records stag
 
 K4V vision needs a separate media-boundary-aware text lookup and its own numerical/lifecycle qualification. It is explicitly rejected today. Text DFlash+K4V and existing Qwen/Gemma target-only/MTP vision retain their existing contracts; this work introduces no attention kernel, second arena or projector-weight quantization change.
 
-### Test-maintenance exception
+### Finder admission tests
 
-The legacy finder suite under `benchmarks/server-ab/tests` still has one obsolete assertion that pure DFlash+images must be rejected. It is not counted as passing. Current pure-DFlash admission and mixed-K4V rejection are covered by 17 host tests in the server vision harness and nine actual startup rejections plus a native-matching positive request. The remaining tracked benchmark host suites pass. This known historical test expectation does not change the implemented API or the numerical/memory evidence.
+The existing finder rejection test retains the unsupported mixed DFlash+K4V image case; pure DFlash image admission is covered by the server vision host harness. All 31 finder tests complete successfully with one platform skip. The 17 vision-harness tests and nine actual startup rejections plus a native-matching positive request cover the current pure/mixed policy; the remaining tracked benchmark host suites also pass.
