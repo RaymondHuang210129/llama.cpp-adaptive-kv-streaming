@@ -788,6 +788,10 @@ ggml_backend_buffer_t ggml_backend_memory_lease_buffer(ggml_backend_memory_lease
     return lease != nullptr ? lease->buffer : nullptr;
 }
 
+ggml_backend_buffer_t ggml_backend_memory_lease_parent(ggml_backend_memory_lease_t lease) {
+    return lease != nullptr ? lease->arena->parent : nullptr;
+}
+
 bool ggml_backend_memory_lease_get_region(
         ggml_backend_memory_lease_t lease,
         struct ggml_backend_memory_region * region) {

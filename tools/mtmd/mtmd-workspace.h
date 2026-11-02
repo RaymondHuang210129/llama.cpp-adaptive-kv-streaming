@@ -11,6 +11,10 @@
 
 class llama_context_memory;
 
+struct mtmd_workspace_details {
+    size_t graph_bytes = 0, operator_bytes = 0, library_bytes = 0, padding_bytes = 0, total_bytes = 0;
+};
+
 // Internal serial scheduler adapter. The scheduler and backends outlive this owner.
 class MTMD_API mtmd_compute_workspace {
 public:
@@ -34,6 +38,7 @@ public:
     bool retire_graph();
     // Drain, retire native captures, and detach leases before storage can be reused.
     bool release();
+    bool details(ggml_backend_buffer_type_t type,mtmd_workspace_details & output) const noexcept;
     bool supported() const noexcept;
     bool ready() const noexcept;
 
@@ -55,9 +60,13 @@ MTMD_API bool mtmd_release_compute_workspace(mtmd_context * ctx);
 struct mtmd_vision_phase_requirements {
     size_t weight_bytes = 0, device_compute_bytes = 0, host_compute_bytes = 0;
     std::vector<ggml_backend_memory_workspace_group> groups;
+    mtmd_workspace_details workspace;
 };
 // Plan from unbound weight descriptors without uploading or reading the parent's device bytes.
 MTMD_API bool mtmd_batch_measure_vision_phase(mtmd_batch * batch,ggml_backend_buffer_t parent,
+    mtmd_vision_phase_requirements & output);
+// Describe the current batch before testing the complete shared-parent quota.
+MTMD_API bool mtmd_batch_quote_vision_phase(mtmd_batch * batch,ggml_backend_buffer_t parent,
     mtmd_vision_phase_requirements & output);
 MTMD_API mtmd_context * mtmd_batch_context(mtmd_batch * batch) noexcept;
 

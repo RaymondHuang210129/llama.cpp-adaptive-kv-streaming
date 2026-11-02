@@ -2356,6 +2356,19 @@ bool ggml_backend_sched_attach_memory_lease(
     return true;
 }
 
+bool ggml_backend_sched_set_memory_lease_limit(ggml_backend_sched_t sched, ggml_backend_t backend, size_t size) {
+    GGML_ASSERT(sched);
+    const int index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(index >= 0 && index < sched->n_backends);
+    auto * lease = sched->memory_leases[index];
+    ggml_backend_memory_region region{};
+    if (!size || !ggml_backend_memory_lease_get_region(lease, &region) || region.flags || size > region.size) return false;
+    ggml_backend_sched_synchronize(sched);
+    if (!ggml_gallocr_set_buffer_range_limit(sched->galloc, index, size)) return false;
+    ggml_backend_sched_reset(sched);
+    return true;
+}
+
 bool ggml_backend_sched_detach_memory_lease(
         ggml_backend_sched_t sched, ggml_backend_t backend) {
     GGML_ASSERT(sched);

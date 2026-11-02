@@ -476,7 +476,7 @@ struct ggml_cuda_scratch_trace {
         const auto * op=active->graph->nodes[active->first_index];
         GGML_LOG_INFO("cuda_scratch: event=%s time_us=%lld context=%p device=%d stream=%d op=%s tensor=%s family=%s pool=%p address=%p bytes=%zu capacity=%zu used=%zu used_valid=%d\n",
             event,(long long)ggml_time_us(),(void *)&ctx,ctx.device,ctx.curr_stream_no,ggml_op_name(op->op),op->name,
-            family,pool,address,bytes,capacity,used,int(!strcmp(family,"vmm")));
+            family,pool,address,bytes,capacity,used,int(!strcmp(family,"vmm") || !strcmp(family,"bounded")));
     }
     ~ggml_cuda_scratch_trace() {
         if (!enabled()) return;
@@ -827,12 +827,13 @@ struct ggml_cuda_pool_bounded : ggml_cuda_pool {
         size_t rounded=0;GGML_ASSERT(ggml_backend_operator_workspace_align(size,128,rounded));
         GGML_ASSERT(plan.offsets[depth]<=capacity && rounded<=capacity-plan.offsets[depth]);
         void * ptr=base+plan.offsets[depth];sizes[depth++]=rounded;*actual_size=rounded;
-        ggml_cuda_scratch_trace::pool("arena_alloc","bounded",this,ptr,size,capacity,depth);
+        ggml_cuda_scratch_trace::pool("arena_alloc","bounded",this,ptr,size,capacity,plan.offsets[depth-1]+rounded);
         return ptr;
     }
     void free(void * ptr,size_t size) override {
         GGML_ASSERT(depth && ptr==base+plan.offsets[depth-1] && size==sizes[depth-1]);
-        --depth;ggml_cuda_scratch_trace::pool("arena_free","bounded",this,ptr,size,capacity,depth);
+        --depth;const size_t used=depth ? plan.offsets[depth-1]+sizes[depth-1] : 0;
+        ggml_cuda_scratch_trace::pool("arena_free","bounded",this,ptr,size,capacity,used);
     }
 };
 
@@ -858,7 +859,8 @@ struct ggml_backend_cuda_workspace_context : ggml_backend_cuda_context {
     }
     bool operator_library_attach() {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
-        auto * base=static_cast<char *>(ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(operator_binding.scratch)));
+        auto scratch=ggml_backend_memory_lease_buffer(operator_binding.scratch);
+        auto * base=scratch ? static_cast<char *>(ggml_backend_buffer_get_base(scratch)) : nullptr;
         for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) {
             const auto & part=operator_binding.layout.streams[i];
             const bool active=size_t(i)<operator_binding.layout.count && part.library_bytes;
@@ -6673,8 +6675,8 @@ static ggml_backend_operator_workspace_status ggml_cuda_operator_graph_plan(
     if (!ggml_backend_operator_workspace_group(plans.data(),streams.data(),plans.size(),stream_count,output)) return status::invalid;
     if (!check_payload) return status::success;
     auto scratch=ggml_backend_memory_lease_buffer(ctx.operator_binding.scratch);
-    const uintptr_t begin=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch));
-    const size_t size=ggml_backend_buffer_get_size(scratch);
+    const uintptr_t begin=scratch ? reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch)) : 0;
+    const size_t size=scratch ? ggml_backend_buffer_get_size(scratch) : 0;
     if (size>UINTPTR_MAX-begin) return status::invalid;
     const auto valid_tensor=[&](const ggml_tensor * tensor) {
         if (!tensor || ggml_is_empty(tensor)) return true;
@@ -6742,27 +6744,30 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
     auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
     if (!ctx.operator_caps.ready) return status::unprepared;
     if (ctx.operator_executing || ctx.operator_pending) return status::busy;
-    ggml_backend_memory_region root,scratch;
+    ggml_backend_memory_region root,scratch{};
     if (!ggml_backend_operator_workspace_phase_valid(binding->layout) || binding->layout.count>GGML_CUDA_MAX_STREAMS ||
-            !binding->parent || !ggml_backend_memory_lease_get_region(binding->root,&root) ||
-            !ggml_backend_memory_lease_get_region(binding->scratch,&scratch) || root.flags || scratch.flags ||
-            root.id!=binding->root_id || scratch.id!=binding->scratch_id ||
-            !binding->root_generation || !binding->scratch_generation ||
-            ggml_backend_memory_lease_generation(binding->root)!=binding->root_generation ||
-            ggml_backend_memory_lease_generation(binding->scratch)!=binding->scratch_generation) return status::invalid;
+            !binding->parent || !ggml_backend_memory_lease_get_region(binding->root,&root) || root.flags ||
+            root.id!=binding->root_id || !binding->root_generation ||
+            ggml_backend_memory_lease_generation(binding->root)!=binding->root_generation) return status::invalid;
+    if (binding->scratch) {
+        if (!ggml_backend_memory_lease_get_region(binding->scratch,&scratch) || scratch.flags ||
+                scratch.id!=binding->scratch_id || !binding->scratch_generation ||
+                ggml_backend_memory_lease_generation(binding->scratch)!=binding->scratch_generation) return status::invalid;
+    } else if (binding->layout.bytes || binding->scratch_id || binding->scratch_generation) return status::invalid;
     auto root_buffer=ggml_backend_memory_lease_buffer(binding->root);
     auto scratch_buffer=ggml_backend_memory_lease_buffer(binding->scratch);
     const auto type=ggml_backend_cuda_device_buffer_type(ctx.device);
     if (ggml_backend_buffer_get_type(binding->parent)!=type || ggml_backend_buffer_get_type(root_buffer)!=type ||
-            ggml_backend_buffer_get_type(scratch_buffer)!=type) return status::invalid;
+            (scratch_buffer && ggml_backend_buffer_get_type(scratch_buffer)!=type)) return status::invalid;
     const uintptr_t parent_base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(binding->parent));
     const uintptr_t root_base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(root_buffer));
-    const uintptr_t scratch_base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch_buffer));
+    const uintptr_t scratch_base=scratch_buffer ? reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch_buffer)) : 0;
     const size_t capacity=ggml_backend_buffer_get_size(binding->parent);
     if (!parent_base || capacity>UINTPTR_MAX-parent_base || root.offset>capacity || root.size>capacity-root.offset ||
-            root_base!=parent_base+root.offset || ggml_backend_buffer_get_size(root_buffer)!=root.size ||
-            scratch_base<root_base || scratch_base-root_base>root.size || scratch.size>root.size-(scratch_base-root_base) ||
-            ggml_backend_buffer_get_size(scratch_buffer)!=scratch.size || scratch_base%256) return status::invalid;
+            root_base!=parent_base+root.offset || ggml_backend_buffer_get_size(root_buffer)!=root.size) return status::invalid;
+    if (scratch_buffer && (scratch_base<root_base || scratch_base-root_base>root.size ||
+            scratch.size>root.size-(scratch_base-root_base) ||
+            ggml_backend_buffer_get_size(scratch_buffer)!=scratch.size || scratch_base%256)) return status::invalid;
     if (binding->layout.bytes>scratch.size) return status::insufficient;
     for (size_t i=0;i<binding->layout.count;++i) {
         const auto bytes=binding->layout.streams[i].library_bytes;
@@ -6782,7 +6787,8 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
     for (size_t i=0;i<pools.size();++i) {
         const auto & part=binding->layout.streams[i];
         const size_t offset=i<binding->layout.count ? part.scratch_offset : 0;
-        pools[i]=std::make_unique<ggml_cuda_pool_bounded>(reinterpret_cast<char *>(scratch_base)+offset,
+        auto * base=reinterpret_cast<char *>(scratch_base);
+        pools[i]=std::make_unique<ggml_cuda_pool_bounded>(offset ? base+offset : base,
             i<binding->layout.count ? part.scratch_bytes : 0);
     }
     auto next=*binding;
@@ -6806,6 +6812,7 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
     auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
     if (ctx.operator_pending || ctx.operator_executing) return status::busy;
     if (ctx.operator_bound()) {
+        if (ggml_cuda_scratch_trace::enabled()) GGML_LOG_INFO("cuda_scratch: event=operator_retire context=%p\n",(void *)&ctx);
 #ifdef USE_CUDA_GRAPH
         ctx.cuda_graphs.clear();
 #endif

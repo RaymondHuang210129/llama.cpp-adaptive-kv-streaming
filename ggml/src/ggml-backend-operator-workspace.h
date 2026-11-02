@@ -25,7 +25,7 @@ using ggml_backend_operator_workspace_prepare_t = ggml_backend_operator_workspac
 using ggml_backend_operator_workspace_query_t = ggml_backend_operator_workspace_status (*)(
     ggml_backend_t,const ggml_tensor *,ggml_backend_operator_workspace *);
 
-// The root loan pins phase ownership; the scratch lease may be a nested checked view.
+// The root loan pins phase ownership; scratch is a nested checked view or null for an empty layout.
 struct ggml_backend_operator_workspace_binding {
     ggml_backend_buffer_t parent = nullptr;
     ggml_backend_memory_lease_t root = nullptr, scratch = nullptr;

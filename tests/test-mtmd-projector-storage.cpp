@@ -20,6 +20,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 
 struct scratch_allocation_probe {
     std::mutex mutex;
@@ -70,6 +73,29 @@ struct scratch_allocation_probe {
         if (std::strstr(text,"family=cublas_workspace ")) self.blas_workspace=std::max(self.blas_workspace,field(text,"bytes="));
     }
     ~scratch_allocation_probe() { if (installed) ggml_log_set(nullptr,nullptr); }
+};
+
+struct library_retirement_failure {
+    using faults_t=void (*)(int,bool,bool);
+    using hits_t=int (*)();
+    faults_t faults=nullptr;
+    hits_t hits=nullptr;
+    bool armed=false;
+    library_retirement_failure() {
+#if defined(__linux__)
+        faults=reinterpret_cast<faults_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_workspace_faults"));
+        hits=reinterpret_cast<hits_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_workspace_hits"));
+#endif
+        if (!faults || !hits) throw std::runtime_error("missing cuBLAS retirement fault library");
+        faults(0,false,false);
+        ggml_log_set([](ggml_log_level,const char * text,void * opaque) {
+            std::fputs(text,stderr);auto & self=*static_cast<library_retirement_failure *>(opaque);
+            if (!self.armed && std::strstr(text,"event=operator_retire ")) {
+                self.armed=true;self.faults(1,false,false);
+            }
+        },this);
+    }
+    ~library_retirement_failure() { ggml_log_set(nullptr,nullptr);faults(0,false,false); }
 };
 
 struct weight_buffer_probe {
@@ -156,7 +182,7 @@ int main(int argc,char ** argv) {
     bool cuda = false;
     bool phase_only = false;
     bool protected_target = false;
-    bool measure_only = false;
+    bool measure_only = false,library_release_faults=false;
     bool parent_explicit=false,long_vision=false,audit_scratch=false,quote_scratch=false;
     scratch_allocation_probe scratch;
     size_t image_budget=0,parent_mib=1024,image_count=1;
@@ -166,6 +192,7 @@ int main(int argc,char ** argv) {
         else if (!std::strcmp(argv[i],"--phase-only")) phase_only = true;
         else if (!std::strcmp(argv[i],"--protected-target")) protected_target = true;
         else if (!std::strcmp(argv[i],"--long-vision")) long_vision = true;
+        else if (!std::strcmp(argv[i],"--library-release-faults")) library_release_faults=true;
         else if (!std::strcmp(argv[i],"--audit-scratch")) audit_scratch = true;
         else if (!std::strcmp(argv[i],"--quote-scratch")) { audit_scratch=true;quote_scratch=true; }
         else if (!std::strcmp(argv[i],"--measure-only")) { measure_only=true;phase_only=true; }
@@ -188,6 +215,13 @@ int main(int argc,char ** argv) {
         else return 2;
     }
     if (dflash_path && !protected_target) return 2;
+    if (library_release_faults) {
+        const char * trace=std::getenv("GGML_CUDA_TRACE_SCRATCH");
+        if (!cuda || !protected_target || !baseline || !trace || std::strcmp(trace,"1")) return 2;
+#if !defined(__linux__)
+        return 2;
+#endif
+    }
     if (audit_scratch) {
         const char * trace=std::getenv("GGML_CUDA_TRACE_SCRATCH");
         if (!cuda || !phase_only || !baseline || !trace || std::strcmp(trace,"1")) return 2;
@@ -711,16 +745,25 @@ int main(int argc,char ** argv) {
         std::vector<uint8_t> canary_before(64),canary_after(64);
         ggml_backend_tensor_get(canary,canary_before.data(),0,64);
         const auto usage = ggml_backend_buffer_get_usage(parent);
-        if (!t.assert_true(mtmd_batch_measure_vision_phase(batch.get(),parent,plan))) return;
+        const bool measured=measure_only ? mtmd_batch_quote_vision_phase(batch.get(),parent,plan) :
+            mtmd_batch_measure_vision_phase(batch.get(),parent,plan);
+        if (!t.assert_true(measured)) return;
+        t.assert_equal(plan.device_compute_bytes,plan.workspace.total_bytes);
+        t.assert_true(plan.workspace.total_bytes==plan.workspace.graph_bytes+plan.workspace.operator_bytes+
+            plan.workspace.library_bytes+plan.workspace.padding_bytes);
+        if (cuda) t.assert_true(plan.workspace.operator_bytes>0 && plan.workspace.library_bytes>0);
         ggml_backend_tensor_get(canary,canary_after.data(),0,64);
         t.assert_true(canary_before == canary_after && ggml_backend_buffer_get_usage(parent) == usage);
-        t.assert_true(plan.weight_bytes+plan.device_compute_bytes <= parent_bytes);
+        if (!measure_only) t.assert_true(plan.weight_bytes+plan.device_compute_bytes <= parent_bytes);
         t.assert_true(plan.groups.size() == 1 || (plan.groups.size() == 2 && plan.host_compute_bytes > 0));
         auto tiny = ggml_backend_buffer_ptr(ggml_backend_buffer_view(ggml_backend_memory_arena_parent(arena.get()),0,1048576));
         mtmd_vision_phase_requirements unchanged; unchanged.weight_bytes = 123;
         t.assert_true(!mtmd_batch_measure_vision_phase(batch.get(),tiny.get(),unchanged) && unchanged.weight_bytes == 123);
         auto weights_only = ggml_backend_buffer_ptr(ggml_backend_buffer_view(parent,0,plan.weight_bytes));
         t.assert_true(!mtmd_batch_measure_vision_phase(batch.get(),weights_only.get(),unchanged) && unchanged.weight_bytes == 123);
+        mtmd_vision_phase_requirements quoted;
+        t.assert_true(mtmd_batch_quote_vision_phase(batch.get(),weights_only.get(),quoted) &&
+            quoted.weight_bytes==plan.weight_bytes && quoted.device_compute_bytes==plan.device_compute_bytes);
         ggml_backend_tensor_get(canary,canary_after.data(),0,64);
         t.assert_true(canary_after == canary_before && !mtmd_acquire_projector_weights(projector.get()));
         const size_t alignment = ggml_backend_buft_get_alignment(type);
@@ -733,6 +776,8 @@ int main(int argc,char ** argv) {
         t.out << "vision-phase-measured image_budget=" << image_budget << " image_tokens=" << mtmd_input_chunk_get_n_tokens(chunk)
             << " images=" << image_count << " batch_images=" << (split ? 1 : image_count) << " batches=" << (split ? 2 : 1)
             << " weights=" << plan.weight_bytes << " compute=" << plan.device_compute_bytes
+            << " graph=" << plan.workspace.graph_bytes << " operator=" << plan.workspace.operator_bytes
+            << " library=" << plan.workspace.library_bytes << " padding=" << plan.workspace.padding_bytes
             << " host=" << plan.host_compute_bytes << " alignment=" << alignment << " parent=" << parent_bytes << '\n';
         if (measure_only) return;
         GGML_ASSERT(ggml_backend_memory_arena_begin(arena.get(),0));
@@ -925,6 +970,21 @@ int main(int argc,char ** argv) {
                     t.assert_equal(stop,progress.first);
                     t.assert_true(owner->valid() && !owner->kv_device_suspended() && snapshot()==before);
                     t.assert_true(!mtmd_acquire_projector_weights(projector.get()));
+                }
+                if (library_release_faults) {
+                    {
+                        library_retirement_failure retirement;
+                        t.assert_true(mtmd_batch_encode_arena(projector.get(),batch.get(),target.get())!=0);
+                        t.assert_true(retirement.armed && retirement.hits()==1);
+                    }
+                    llama_context_memory_diagnostics held;
+                    t.assert_true(owner->valid() && owner->kv_device_suspended() && owner->diagnostics(held) && held.borrowed_phase_bytes>0);
+                    mtmd_embedding_view unpublished;
+                    t.assert_true("failed vision retirement publishes no image output",!mtmd_batch_acquire_output_embd(batch.get(),chunk,unpublished));
+                    t.assert_true(mtmd_release_compute_workspace(projector.get()) && mtmd_unload_projector_weights(projector.get()));
+                    t.assert_true(llama_context_resume_kv_device(target.get(),llama_memory_text_phase::prefill));
+                    t.assert_true(owner->valid() && !owner->kv_device_suspended() && snapshot()==before);
+                    t.out << "vision-retirement: retained loans, closed target, explicit recovery exact\n";
                 }
                 fault.abort=true;
                 t.assert_true("queued encoder exception is returned as failure",mtmd_batch_encode_arena(projector.get(),batch.get(),target.get())!=0);

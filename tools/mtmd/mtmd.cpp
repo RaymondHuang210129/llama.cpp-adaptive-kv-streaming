@@ -2182,7 +2182,7 @@ bool mtmd_batch_measure_compute_workspace(mtmd_batch * batch,std::vector<ggml_ba
     }
 }
 
-bool mtmd_batch_measure_vision_phase(mtmd_batch * batch,ggml_backend_buffer_t parent,mtmd_vision_phase_requirements & output) {
+bool mtmd_batch_quote_vision_phase(mtmd_batch * batch,ggml_backend_buffer_t parent,mtmd_vision_phase_requirements & output) {
     try {
         auto chunk = mtmd_batch_prepare_chunk(batch);
         mtmd_vision_phase_requirements next;
@@ -2195,12 +2195,19 @@ bool mtmd_batch_measure_vision_phase(mtmd_batch * batch,ggml_backend_buffer_t pa
             if (group.size > SIZE_MAX-bytes) return false;
             bytes += group.size;
         }
-        if (!next.device_compute_bytes || next.weight_bytes > ggml_backend_buffer_get_size(parent) ||
-                next.device_compute_bytes > ggml_backend_buffer_get_size(parent)-next.weight_bytes) return false;
+        if (!next.device_compute_bytes || !clip_compute_workspace_details(batch->ctx->ctx_v,type,next.workspace)) return false;
         output = std::move(next);
         return true;
     } catch (const std::exception & error) { LOG_ERR("%s: %s\n",__func__,error.what()); return false; }
 }
+bool mtmd_batch_measure_vision_phase(mtmd_batch * batch,ggml_backend_buffer_t parent,mtmd_vision_phase_requirements & output) {
+    mtmd_vision_phase_requirements next;
+    if (!parent || !mtmd_batch_quote_vision_phase(batch,parent,next) ||
+            next.weight_bytes>ggml_backend_buffer_get_size(parent) ||
+            next.device_compute_bytes>ggml_backend_buffer_get_size(parent)-next.weight_bytes) return false;
+    output=std::move(next);return true;
+}
+
 mtmd_context * mtmd_batch_context(mtmd_batch * batch) noexcept { return batch ? batch->ctx : nullptr; }
 
 bool mtmd_get_vision_geometry(mtmd_context * ctx, mtmd_vision_geometry & output) {
@@ -2280,7 +2287,7 @@ bool mtmd_measure_vision_shape(mtmd_context * ctx, ggml_backend_buffer_t parent,
         if (group.size>SIZE_MAX-bytes) return false;
         bytes+=group.size;
     }
-    if (!next.weight_bytes || !next.device_compute_bytes) return false;
+    if (!next.weight_bytes || !next.device_compute_bytes || !clip_compute_workspace_details(ctx->ctx_v,type,next.workspace)) return false;
     output=std::move(next);
     return true;
 }

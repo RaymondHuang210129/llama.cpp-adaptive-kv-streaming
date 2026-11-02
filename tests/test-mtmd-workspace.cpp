@@ -2,11 +2,17 @@
 #include "../tools/mtmd/mtmd-embeddings.h"
 #include "../tools/mtmd/mtmd-projector-storage.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-operator-workspace.h"
 #include "../src/llama-context-memory.h"
 #include "testing.h"
 #include "ggml-cpu.h"
 #include <cmath>
+#include <stdexcept>
 #include <cstring>
+#include <tuple>
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 
 using arena_ptr = std::unique_ptr<ggml_backend_memory_arena, decltype(&ggml_backend_memory_arena_free)>;
 using lease_ptr = std::unique_ptr<ggml_backend_memory_lease, decltype(&ggml_backend_memory_lease_free)>;
@@ -68,6 +74,33 @@ struct synchronization_probe {
     ~synchronization_probe() { backend->iface.synchronize=original; active=nullptr; }
 };
 
+struct queued_workspace_failure {
+    inline static queued_workspace_failure * active=nullptr;
+    ggml_backend_t backend;
+    decltype(ggml_backend_i::graph_compute) original;
+    size_t calls=0;
+    explicit queued_workspace_failure(ggml_backend_t backend) : backend(backend),original(backend->iface.graph_compute) {
+        GGML_ASSERT(!active);active=this;
+        backend->iface.graph_compute=[](ggml_backend_t backend,ggml_cgraph * graph) {
+            const auto result=active->original(backend,graph);
+            if (result!=GGML_STATUS_SUCCESS) return result;
+            ++active->calls;return GGML_STATUS_FAILED;
+        };
+    }
+    ~queued_workspace_failure() { backend->iface.graph_compute=original;active=nullptr; }
+};
+struct workspace_sync_failure {
+    inline static workspace_sync_failure * active=nullptr;
+    ggml_backend_t backend;
+    decltype(ggml_backend_i::synchronize) original;
+    size_t calls=0;
+    explicit workspace_sync_failure(ggml_backend_t backend) : backend(backend),original(backend->iface.synchronize) {
+        GGML_ASSERT(!active);active=this;
+        backend->iface.synchronize=[](ggml_backend_t) { ++active->calls;throw std::runtime_error("vision completion failure"); };
+    }
+    ~workspace_sync_failure() { backend->iface.synchronize=original;active=nullptr; }
+};
+
 static void verify_graph(testing & t, mtmd_compute_workspace & owner, workspace_graph & g) {
     const size_t elements=ggml_nelements(g.input);
     std::vector<float> input(elements,3),output(elements,0);
@@ -80,14 +113,185 @@ static void verify_graph(testing & t, mtmd_compute_workspace & owner, workspace_
 int main(int argc,char ** argv) {
     const char * model_path=nullptr;
     const char * projector_path=nullptr;
-    bool cuda=false;
+    bool cuda=false,operator_failures=false;
     for (int i=1;i<argc;++i) {
         if (!std::strcmp(argv[i],"--cuda")) cuda=true;
+        else if (!std::strcmp(argv[i],"--cuda-operator-failures")) { cuda=true;operator_failures=true; }
         else if (!std::strcmp(argv[i],"--model") && i+1<argc) model_path=argv[++i];
         else if (!std::strcmp(argv[i],"--mmproj") && i+1<argc) projector_path=argv[++i];
         else return 2;
     }
+#if !defined(__linux__)
+    if (operator_failures) return 2;
+#endif
     testing t;
+    t.test("compute_root_lease_exposes_its_retained_physical_parent",[](testing & t) {
+        workspace_grant grant(ggml_backend_cpu_buffer_type(),1024);
+        auto * expected=ggml_backend_memory_arena_parent(grant.arena.get());
+        auto * parent=ggml_backend_memory_lease_parent(grant.lease.get());
+        t.assert_true(parent==expected && ggml_backend_memory_lease_parent(nullptr)==nullptr);
+        grant.arena.reset();
+        t.assert_true(ggml_backend_memory_lease_parent(grant.lease.get())==expected);
+        t.assert_true(ggml_backend_buffer_get_base(parent)!=nullptr && ggml_backend_buffer_get_size(parent)>=1024);
+    });
+    if (cuda) t.test("cuda_vision_graph_without_operator_scratch_needs_no_extra_bank",[](testing & t) {
+        ggml_backend_load_all();auto * dev=ggml_backend_dev_by_name("CUDA0");
+        if (!t.assert_true(dev!=nullptr)) return;
+        ggml_backend_ptr gpu(ggml_backend_dev_init(dev,nullptr)),cpu(ggml_backend_cpu_init());auto * reg=ggml_backend_dev_backend_reg(dev);
+        using type_t=ggml_backend_buffer_type_t (*)(int);
+        auto type=reinterpret_cast<type_t>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_device_buffer_type"));
+        auto release=reinterpret_cast<ggml_backend_operator_workspace_release_t>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_operator_workspace_release"));
+        if (!t.assert_true(gpu && type && release)) return;
+        std::vector<ggml_backend_t> backends{gpu.get(),cpu.get()};auto * buft=type(0);
+        ggml_backend_buffer_type_t types[]={buft,ggml_backend_cpu_buffer_type()};
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends.data(),types,2,128,false,true));
+        mtmd_compute_workspace owner(sched.get(),backends,128);
+        ggml_context_ptr inputs(ggml_init({16384,nullptr,true})),ctx(ggml_init({16384,nullptr,true}));
+        auto * source=ggml_new_tensor_2d(inputs.get(),GGML_TYPE_F32,64,8);ggml_set_input(source);
+        ggml_backend_buffer_ptr source_buffer(ggml_backend_alloc_ctx_tensors_from_buft(inputs.get(),buft));
+        if (!t.assert_true(bool(source_buffer))) return;
+        auto * result=ggml_scale(ctx.get(),source,2);ggml_set_output(result);
+        auto * graph=ggml_new_graph_custom(ctx.get(),32,false);ggml_build_forward_expand(graph,result);
+        std::vector<ggml_backend_memory_workspace_group> groups;mtmd_workspace_details detail;
+        if (!t.assert_true(owner.supported() && owner.measure(graph,groups) && groups.size()==1 && owner.details(buft,detail))) return;
+        t.assert_true(detail.total_bytes==detail.graph_bytes && !detail.operator_bytes && !detail.library_bytes && !detail.padding_bytes);
+        workspace_grant grant(buft,detail.total_bytes);
+        if (!t.assert_true(owner.attach({grant.lease.get()}) && owner.alloc_graph(graph))) return;
+        grant.lease.reset();std::vector<float> input(512,3),output(512);
+        ggml_backend_tensor_set(source,input.data(),0,input.size()*sizeof(float));
+        t.assert_equal(GGML_STATUS_SUCCESS,owner.compute_async(graph));
+        t.assert_true(release(gpu.get())==ggml_backend_operator_workspace_status::busy);
+        t.assert_equal(size_t(1),ggml_backend_memory_arena_lease_count(grant.arena.get()));
+        t.assert_true(owner.drain());ggml_backend_tensor_get(result,output.data(),0,output.size()*sizeof(float));
+        t.assert_true(std::all_of(output.begin(),output.end(),[](float value) { return value==6; }));
+        t.assert_true(owner.release());t.assert_equal(size_t(0),ggml_backend_memory_arena_lease_count(grant.arena.get()));
+        t.out << "vision-zero-operators: graph-only bytes, root completion pin, no extra bank\n";
+    });
+    if (cuda) t.test("cuda_vision_operator_bank_uses_the_same_root_and_preserves_native_results",[&](testing & t) {
+        ggml_backend_load_all();auto * dev=ggml_backend_dev_by_name("CUDA0");
+        if (!t.assert_true(dev!=nullptr)) return;
+        ggml_backend_ptr gpu(ggml_backend_dev_init(dev,nullptr)),cpu(ggml_backend_cpu_init());
+        auto * reg=ggml_backend_dev_backend_reg(dev);
+        using type_t=ggml_backend_buffer_type_t (*)(int);
+        auto type=reinterpret_cast<type_t>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_device_buffer_type"));
+        if (!t.assert_true(gpu && type)) return;
+        ggml_context_ptr weights_ctx(ggml_init({16384,nullptr,true}));
+        auto * weights=ggml_new_tensor_2d(weights_ctx.get(),GGML_TYPE_F16,64,64);
+        ggml_backend_buffer_ptr weights_buffer(ggml_backend_alloc_ctx_tensors_from_buft(weights_ctx.get(),type(0)));
+        if (!t.assert_true(bool(weights_buffer))) return;
+        ggml_backend_buffer_set_usage(weights_buffer.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<ggml_fp16_t> a(64*64);std::vector<float> input(64*128),native(64*128),actual(native.size());
+        for (size_t i=0;i<a.size();++i) a[i]=ggml_fp32_to_fp16(float(int(i%17)-8)/16);
+        for (size_t i=0;i<input.size();++i) input[i]=float(int(i%19)-9)/32;
+        ggml_backend_tensor_set(weights,a.data(),0,ggml_nbytes(weights));
+        const auto build=[&](ggml_context * ctx) {
+            auto * source=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,64,128);ggml_set_input(source);
+            auto * output=ggml_mul_mat(ctx,weights,source);ggml_set_output(output);
+            auto * graph=ggml_new_graph_custom(ctx,32,false);ggml_build_forward_expand(graph,output);
+            return std::make_tuple(graph,source,output);
+        };
+        ggml_context_ptr native_ctx(ggml_init({65536,nullptr,true}));auto reference=build(native_ctx.get());
+        ggml_backend_buffer_ptr native_buffer(ggml_backend_alloc_ctx_tensors(native_ctx.get(),gpu.get()));
+        if (!t.assert_true(bool(native_buffer))) return;
+        ggml_backend_tensor_set(std::get<1>(reference),input.data(),0,input.size()*sizeof(float));
+        if (!t.assert_true(ggml_backend_graph_compute(gpu.get(),std::get<0>(reference))==GGML_STATUS_SUCCESS)) return;
+        ggml_backend_synchronize(gpu.get());ggml_backend_tensor_get(std::get<2>(reference),native.data(),0,native.size()*sizeof(float));
+        if (!t.assert_true(std::all_of(native.begin(),native.end(),[](float x) { return std::isfinite(x); }) &&
+                std::any_of(native.begin(),native.end(),[](float x) { return x!=0; }))) return;
+        t.out << "vision-native-control: finite nonzero CUDA reference ready\n";
+        using faults_t=void (*)(int,bool,bool);using hits_t=int (*)();
+        faults_t faults=nullptr;hits_t hits=nullptr;
+#if defined(__linux__)
+        if (operator_failures) {
+            faults=reinterpret_cast<faults_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_workspace_faults"));
+            hits=reinterpret_cast<hits_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_workspace_hits"));
+            if (!t.assert_true(faults && hits)) return;
+        }
+#endif
+        for (int mode=0;mode<(operator_failures ? 7 : 1);++mode) {
+            if (faults) faults(0,false,false);
+            std::vector<ggml_backend_t> backends{gpu.get(),cpu.get()};
+            ggml_backend_buffer_type_t types[]={type(0),ggml_backend_cpu_buffer_type()};
+            ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends.data(),types,2,128,false,true));
+            mtmd_compute_workspace owner(sched.get(),backends,128);
+            ggml_context_ptr ctx(ggml_init({65536,nullptr,true}));auto graph=build(ctx.get());
+            std::vector<ggml_backend_memory_workspace_group> groups;
+            if (!t.assert_true(owner.supported() && owner.measure(std::get<0>(graph),groups))) return;
+            mtmd_workspace_details detail;
+            auto device_group=std::find_if(groups.begin(),groups.end(),[&](const auto & group) { return group.buft==type(0); });
+            if (!t.assert_true(device_group!=groups.end() && owner.details(type(0),detail) && detail.total_bytes==device_group->size &&
+                    detail.graph_bytes>0 && detail.operator_bytes>0 && detail.library_bytes>0 &&
+                    detail.total_bytes==detail.graph_bytes+detail.operator_bytes+detail.library_bytes+detail.padding_bytes)) return;
+            t.assert_equal(size_t(128),detail.padding_bytes);
+            workspace_grant grant(type(0),detail.total_bytes,91);
+            std::vector<std::unique_ptr<workspace_grant>> host;
+            const auto attach=[&](const std::vector<ggml_backend_memory_workspace_group> & plan,ggml_backend_memory_lease_t device_lease) {
+                host.clear();std::vector<ggml_backend_memory_lease_t> leases;
+                for (size_t i=0;i<plan.size();++i) {
+                    if (plan[i].buft==type(0)) leases.push_back(device_lease);
+                    else {
+                        host.push_back(std::make_unique<workspace_grant>(plan[i].buft,plan[i].size,101+i));
+                        leases.push_back(host.back()->lease.get());
+                    }
+                }
+                const bool result=owner.attach(leases);
+                for (auto & entry : host) entry->lease.reset();
+                return result;
+            };
+            if (mode==0) {
+                workspace_grant short_grant(type(0),detail.total_bytes-1,92);
+                t.assert_true(!attach(groups,short_grant.lease.get()));
+            }
+            t.out << "vision-workspace-quote: graph=" << detail.graph_bytes << " operator=" << detail.operator_bytes
+                << " library=" << detail.library_bytes << " padding=" << detail.padding_bytes << " root_residue="
+                << reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(grant.lease.get())))%256 << '\n';
+            if (!t.assert_true(attach(groups,grant.lease.get()))) return;
+            grant.lease.reset();
+            if (mode==1 || mode==2) faults(1,true,mode==2);
+            const bool allocated=owner.alloc_graph(std::get<0>(graph));
+            if (mode==1 || mode==2) {
+                t.assert_true(!allocated && !owner.ready());t.assert_equal(1,hits());
+                t.assert_equal(size_t(1),ggml_backend_memory_arena_lease_count(grant.arena.get()));
+                t.assert_equal(GGML_STATUS_FAILED,owner.compute_async(std::get<0>(graph)));
+            } else {
+                if (!t.assert_true(allocated && owner.ready())) return;
+                t.assert_equal(detail.graph_bytes,ggml_backend_sched_get_buffer_size(sched.get(),gpu.get()));
+                ggml_backend_tensor_set(std::get<1>(graph),input.data(),0,input.size()*sizeof(float));
+                if (mode==5) {
+                    queued_workspace_failure failure(gpu.get());
+                    t.assert_equal(GGML_STATUS_FAILED,owner.compute_async(std::get<0>(graph)));t.assert_equal(size_t(1),failure.calls);
+                    t.assert_true(!owner.ready());
+                } else t.assert_equal(GGML_STATUS_SUCCESS,owner.compute_async(std::get<0>(graph)));
+                if (mode==6) {
+                    workspace_sync_failure failure(gpu.get());
+                    t.assert_true(!owner.release() && !owner.ready());t.assert_equal(size_t(1),failure.calls);
+                    t.assert_equal(size_t(1),ggml_backend_memory_arena_lease_count(grant.arena.get()));
+                }
+                if (!t.assert_true(owner.drain())) return;
+                ggml_backend_tensor_get(std::get<2>(graph),actual.data(),0,actual.size()*sizeof(float));
+                t.assert_true(std::memcmp(native.data(),actual.data(),native.size()*sizeof(float))==0);
+                if (mode==3 || mode==4) {
+                    faults(1,false,mode==4);
+                    t.assert_true(!owner.release() && !owner.ready());t.assert_equal(1,hits());
+                    t.assert_equal(size_t(1),ggml_backend_memory_arena_lease_count(grant.arena.get()));
+                    t.assert_equal(GGML_STATUS_FAILED,owner.compute_async(std::get<0>(graph)));
+                }
+            }
+            if (faults) faults(0,false,false);
+            if (!t.assert_true(owner.release())) return;
+            t.assert_equal(size_t(0),ggml_backend_memory_arena_lease_count(grant.arena.get()));
+            ggml_context_ptr retry_ctx(ggml_init({65536,nullptr,true}));auto retry=build(retry_ctx.get());
+            if (!t.assert_true(owner.measure(std::get<0>(retry),groups))) return;
+            grant.lease.reset(ggml_backend_memory_arena_acquire(grant.arena.get(),91));
+            if (!t.assert_true(attach(groups,grant.lease.get()) && owner.alloc_graph(std::get<0>(retry)))) return;
+            grant.lease.reset();ggml_backend_tensor_set(std::get<1>(retry),input.data(),0,input.size()*sizeof(float));
+            t.assert_equal(GGML_STATUS_SUCCESS,owner.compute_async(std::get<0>(retry)));t.assert_true(owner.drain());
+            ggml_backend_tensor_get(std::get<2>(retry),actual.data(),0,actual.size()*sizeof(float));
+            t.assert_true(std::memcmp(native.data(),actual.data(),native.size()*sizeof(float))==0);
+            t.assert_true(owner.release());t.assert_equal(size_t(0),ggml_backend_memory_arena_lease_count(grant.arena.get()));
+        }
+        t.out << "vision-operator-bridge: native-exact root limit, failure pins and recovery\n";
+    });
     t.test("vision_capacity_shapes_follow_native_alignment_and_reject_bad_bounds",[](testing & t) {
         for (bool gemma : {false,true}) {
             mtmd_vision_geometry geometry;
@@ -405,6 +609,7 @@ int main(int argc,char ** argv) {
             t.assert_equal(2, mtmd_batch_add_chunk(batch.get(), duplicate.get()));
             t.assert_true(mtmd_batch_get_output_embd(batch.get(), duplicate.get()) == nullptr);
             if (!t.assert_true(std::all_of(actual,actual+elements,[](float value) { return std::isfinite(value); }))) return;
+            t.assert_true(std::memcmp(actual,expected.data(),elements*sizeof(float))==0);
             float error=0;
             for (size_t i=0;i<elements;++i) {
                 error=std::max(error,std::abs(actual[i]-expected[i]));

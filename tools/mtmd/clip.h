@@ -98,6 +98,8 @@ bool clip_measure_compute_workspace(clip_ctx * ctx,const clip_image_f32_batch & 
 bool clip_attach_compute_workspace(clip_ctx * ctx,const std::vector<ggml_backend_memory_lease_t> & leases);
 bool clip_release_compute_workspace(clip_ctx * ctx);
 bool clip_borrow_compute_workspace(clip_ctx * ctx, llama_context_memory & parent);
+struct mtmd_workspace_details;
+bool clip_compute_workspace_details(clip_ctx * ctx,ggml_backend_buffer_type_t type,mtmd_workspace_details & output);
 bool clip_measure_vision_phase(clip_ctx * ctx,const clip_image_f32_batch & batch,ggml_backend_buffer_t parent,
     size_t & weight_bytes,std::vector<ggml_backend_memory_workspace_group> & groups);
 size_t clip_vision_weight_bytes(clip_ctx * ctx, ggml_backend_buffer_type_t type);

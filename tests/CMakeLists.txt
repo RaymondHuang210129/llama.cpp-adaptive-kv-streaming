@@ -388,6 +388,8 @@ if (GGML_CUDA AND GGML_CUDA_FA)
         target_link_libraries(test-cuda-workspace-faults PRIVATE CUDA::cublas ${CMAKE_DL_LIBS})
         add_test(NAME test-cuda-workspace-failures COMMAND ${CMAKE_COMMAND} -E env
             LD_PRELOAD=$<TARGET_FILE:test-cuda-workspace-faults> $<TARGET_FILE:test-memory-workspace> --cuda-library-failures)
+        add_test(NAME test-cuda-vision-workspace-failures COMMAND ${CMAKE_COMMAND} -E env
+            LD_PRELOAD=$<TARGET_FILE:test-cuda-workspace-faults> $<TARGET_FILE:test-mtmd-workspace> --cuda-operator-failures)
     endif()
     get_target_property(FATTN_TEST_ARCHITECTURES ggml-cuda CUDA_ARCHITECTURES)
     # skipped on Windows shared builds where the kv-stream test targets are not created
@@ -501,6 +503,9 @@ unset(LLAMA_TEST_NAME)
 foreach(TEST IN ITEMS workspace embeddings session projector-storage)
     llama_build_and_test(test-mtmd-${TEST}.cpp)
     target_link_libraries(test-mtmd-${TEST} PRIVATE mtmd)
+    if (("${TEST}" STREQUAL "workspace" OR "${TEST}" STREQUAL "projector-storage") AND CMAKE_DL_LIBS)
+        target_link_libraries(test-mtmd-${TEST} PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 endforeach()
 
 llama_build_and_test(test-mtmd-impl.cpp)
