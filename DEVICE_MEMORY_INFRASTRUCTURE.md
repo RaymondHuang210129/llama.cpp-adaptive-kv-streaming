@@ -11,6 +11,7 @@ The implementation is infrastructure. It does not yet choose how much memory wei
 - [Architecture overview](#architecture-overview)
 - [Core concepts](#core-concepts)
 - [Public API](#public-api)
+- [Private phase and operator workspace](#private-phase-and-operator-workspace)
 - [Placement and lifetime](#placement-flow)
 - [Backend implementations](#backend-implementations)
 - [Validation and safety](#validation-and-failure-behavior)
@@ -253,6 +254,22 @@ bool ggml_backend_sched_set_buffer_range(
 ~~~
 
 The scheduler maps a backend to its gallocr slot and delegates the retained workspace contract to gallocr.
+
+### Private phase and operator workspace
+
+The shared vision consumer combines graph storage, native CUDA operator temporaries, explicit cuBLAS workspace and alignment in one retained compute loan. Projector weights use a separate temporary grant in the same parent. Protected recurrent, SWA and bounded draft state remain live; main/draft model weights and owned host embeddings have separate lifetimes. This is a common CUDA workspace adapter used by Qwen and Gemma, not another device allocator.
+
+The private capability interface in `ggml/src/ggml-backend-operator-workspace.h` separates prepare, metadata query, graph query, bind and release. Preparation requires exclusive backend ownership and may initialize opaque kernel/handle state. Subsequent queries use cached native capabilities and tensor metadata; they neither read device payloads nor allocate device storage. The quote preserves native dispatch, conversion chunking, precision, tiling, split/reduction order and explicit library workspace size. Sequential operators reuse a stream's peak; concurrent streams require disjoint banks. Unsupported managed paths reject rather than allocating around the quota. Ordinary unbound execution keeps its native allocation path.
+
+`mtmd_compute_workspace` measures graph storage and sums operator/library banks with the existing checked planner. Its `mtmd_workspace_details` reports `graph_bytes`, `operator_bytes`, `library_bytes`, `padding_bytes` and `total_bytes`. The total includes placement gaps; summing occupied payload bytes alone is insufficient when graph and operator alignments differ. Each actual split is revalidated after input copies, including full scratch/source/output separation.
+
+`ggml_backend_sched_set_memory_lease_limit` limits graph placement to its measured prefix while retaining the complete root loan. `ggml_backend_memory_lease_parent` returns a borrowed parent handle valid while its lease is held. Nested `ggml_backend_memory_arena_new_from_buffer` views expose checked operator regions without allocating GPU storage. Root and nested scratch pins stay independent; a graph needing no operator storage has no dummy scratch bank.
+
+Active cuBLAS handles borrow the quoted native-size regions after stream selection. Borrowed pointers never enter the native `cudaFree` ownership array; successful managed binding retires old native pool/explicit-workspace reservations. Completion joins affected work, captures retire and library pointers detach before loans return. Native execution restores native owned workspace when needed. Failed setup or retirement retains cleanup ownership and closes admission until cleanup succeeds. Image output is published only after the target owner resumes successfully.
+
+Cached tensor/executor metadata must retain its source and destination buffer handles until queued work and captures retire. The KV writer follows this rule even when the caller releases its scratch view during a phase change. A backend-buffer reference keeps metadata/backing storage alive; it is not a logical arena lease that prevents repartition. A repeated physical address alone does not validate an old binding.
+
+The controlled contract excludes model weights, host preprocessing/history/output, CUDA code/module initialization, graph-executable bookkeeping, opaque library state and ordinary decoder allocations. Those costs can still cause physical OOM. The versioned planning report and [runtime capacity checks](docs/multimodal/vision-capacity.md) distinguish quota, unsupported operation, device fault and physical-capacity failure.
 
 ## Placement flow
 

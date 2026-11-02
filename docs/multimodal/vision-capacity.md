@@ -1,6 +1,6 @@
 # Finding image capacity in a shared arena
 
-`benchmarks/find-max-arena.py` reports processed image resolutions for Qwen and Gemma when `--mmproj` is configured and `--image` is omitted. Supply the actual target, matching projector, optional draft/assistant and decoder settings. No sample image is required. The finder starts and cleans up its own temporary servers; make GPU memory available and choose an unused port.
+`benchmarks/find-max-arena.py` reports processed image resolutions for Qwen and Gemma when `--mmproj` is configured; no sample image files are required. Supply the actual target, matching projector, optional draft/assistant and decoder settings. The finder starts and cleans up its own temporary servers; make GPU memory available and choose an unused port.
 
 ## What the report means
 
@@ -8,7 +8,7 @@ The report covers source ratios **1:1, 4:3, 3:4, 16:9, 9:16, 2:1 and 1:2**. Widt
 
 The finder first searches for the maximum arena that completes its text workload and minimum images for all seven ratios. At the selected arena it reports each ratio's largest validated resolution, including the required `--image-max-tokens` setting. It then validates one shared setting for the generated launch command. If that setting produces smaller resolutions than the individual row settings, the console prints a second table. It does not publish a command if any ratio or the common setting fails.
 
-The native planner considers every image budget up to the configured ceiling. Runtime capacity uses a boundary search ordered by processed token count, including the selected boundary and rejected neighbor where one exists. These are executed fits, not a mathematical proof that every larger shape fails: native graph choices and CUDA scratch requirements can vary with shape. Unsupported operations, device faults and incomplete responses stop the search rather than being counted as capacity failures.
+The matching server emits `vision-memory-v2`: graph, operator, explicit library and alignment bytes sum to its complete compute grant, with projector weights reported separately. The finder rejects older graph-only reports and inconsistent or executed-mismatched totals. Opaque runtime allocations are explicitly excluded. The native planner considers every image budget up to the configured ceiling. Runtime capacity uses a boundary search ordered by processed token count, including the selected boundary and rejected neighbor where one exists. These are executed fits, not a mathematical proof that every larger shape fails: native graph choices and CUDA scratch requirements can vary with shape. Unsupported operations, device faults and incomplete responses stop the search rather than being counted as capacity failures.
 
 One image is tested at a time, with real preprocessing, encoder execution, text decoding and actual drafts when speculation is enabled. The shared setting is also checked with the seven images issued serially in one server after text. Arbitrary other ratios, multiple-image requests, other batch sizes, changed weights and concurrent GPU users are outside these receipts. Use `--image` for a specific image or multi-image workload.
 
@@ -35,35 +35,58 @@ Omitting image-budget flags uses projector metadata. `--image-max-tokens` can se
 
 ## Measured examples
 
-The following runs used one RTX 5070 Ti, UVM off, Q8_0 K / Q4_0 V, 256/256 batching, native context capacity 262144, a 2048-token preflight and eight generated tokens per request. They did **not** prefill 262144 tokens. Qwen used IQ4_XS + Q2_K_S-MIX DFlash3 + F16 projector; Gemma used Q3_K_S + external Q8 MTP3 + local Q8 projector. These are different weight profiles, not a model-performance comparison.
+The current qualified examples use one RTX 5070 Ti, UVM off, native context capacity 262144, b/ub256, MTP3 and Q8_0 K / Q4_0 V. Qwen uses IQ4_XS with embedded MTP and its matching F16 projector; Gemma uses Q3_K_S, the matching external Q8 assistant and local Q8 projector. The search starts at the default 2240 MiB guess, uses a 2048-token bounded prefill plus actual decoding/images, and independently detects each parent. No arena input, sample image, arbitrary reserve or running inference service is required.
 
-| Source ratio | Qwen processed maximum | Row budget | Gemma processed maximum | Row budget |
-| --- | ---: | ---: | ---: | ---: |
-| 1:1 | 192x192 | 48 | 528x528 | 143 |
-| 4:3 | 256x192 | 60 | 720x528 | 191 |
-| 3:4 | 192x256 | 60 | 528x720 | 191 |
-| 16:9 | 288x160 | 56 | 720x384 | 143 |
-| 9:16 | 160x288 | 56 | 384x720 | 143 |
-| 2:1 | 288x128 | 49 | 912x432 | 199 |
-| 1:2 | 128x288 | 49 | 432x912 | 199 |
+| Model profile | Selected parent MiB | Rejected neighbor MiB | Common image-max-tokens |
+| --- | ---: | ---: | ---: |
+| Qwen embedded MTP3 | 2314 | 2315 | 2186 |
+| Gemma shared-KV MTP3 | 2462 | 2463 | 256 |
 
-Qwen selected **2066 MiB**, with 2067 MiB rejected; its common setting is `--image-max-tokens 48`. Gemma selected **2410 MiB**, with 2411 MiB rejected; its common setting is `--image-max-tokens 143`. Qwen's common setting achieves its independent maxima. Gemma's shared setting produces the following resolutions; use an individual row setting above when running only that ratio from a fresh server.
+Both selected commands complete one full 261873-token text request and 256 outputs, then all seven image requests with 256 outputs each in the same process. This validates the exact published configuration, rather than a smaller bootstrap image setting. The image requests are separate prompts after text, not images appended to a full 262K prefix. Long lifecycle and fitting native/component numerical controls have their own scopes.
 
-| Source ratio | Gemma at shared budget 143 |
-| --- | ---: |
-| 1:1 | 528x528 |
-| 4:3 | 624x480 |
-| 3:4 | 480x624 |
-| 16:9 | 720x384 |
-| 9:16 | 384x720 |
-| 2:1 | 768x384 |
-| 1:2 | 384x768 |
+### Qwen processed resolutions
 
-The independent row settings and the common setting are stored in `result.json`; use the generated `command.txt` or `command.ps1`. Image dimensions and token counts are checked against the native encoder's completed `vision_phase` diagnostic, together with actual weight/workspace bytes and successful return of its arena grants.
+The shared setting is `--image-max-tokens 2186`. Independent row settings and one common serial setting are separate executed controls.
 
-A maximum arena need not allow the largest images. Main/draft weights and some CUDA/cuBLAS scratch live outside the arena; taking almost all available VRAM for the arena can leave little room for encoder scratch. The live checks observed this limit after valid text execution. A smaller arena can therefore allow larger images. To require a larger minimum image profile without a sample file, raise `--image-min-tokens` and keep a compatible maximum/batch configuration; the arena search will then execute those larger native shapes. Token budgets still round to native processed dimensions. There is no arbitrary safety reserve and no claim that allocation success bounds all driver allocations.
+| Source ratio | Independent processed maximum | Row budget | At the common setting |
+| --- | ---: | ---: | ---: |
+| 1:1 | 2048x2048 | 4096 | 1472x1472 |
+| 4:3 | 2336x1760 | 4096 | 1696x1280 |
+| 3:4 | 1760x2336 | 4096 | 1280x1696 |
+| 16:9 | 2720x1536 | 4096 | 1984x1120 |
+| 9:16 | 1536x2720 | 4096 | 1120x1984 |
+| 2:1 | 2880x1440 | 4096 | 2112x1056 |
+| 1:2 | 1440x2880 | 4096 | 1056x2112 |
 
-For contrast, separate fixed-arena checks at context 8192 completed all seven ratios with a 1024 MiB Qwen parent (square 928x928) and a 2048 MiB Gemma parent (square 768x768). Those are fitting fixed-budget controls, not maximum-arena results or full-context text checks.
+### Gemma processed resolutions
+
+The shared setting is `--image-max-tokens 256`. Independent row settings and one common serial setting are separate executed controls.
+
+| Source ratio | Independent processed maximum | Row budget | At the common setting |
+| --- | ---: | ---: | ---: |
+| 1:1 | 768x768 | 256 | 768x768 |
+| 4:3 | 864x624 | 256 | 864x624 |
+| 3:4 | 624x864 | 256 | 624x864 |
+| 16:9 | 1008x576 | 256 | 1008x576 |
+| 9:16 | 576x1008 | 256 | 576x1008 |
+| 2:1 | 1056x528 | 256 | 1056x528 |
+| 1:2 | 528x1056 | 256 | 528x1056 |
+
+Budgets are ceilings, so processed token counts may round down. Qwen's common square is 2116 tokens. Gemma's current ceiling is limited by the tested 256-row microbatch; its native 1120-budget profile requires a wider microbatch, larger protected SWA and a separate fit. These tables describe processed dimensions for the seven generated source ratios, not visual quality, maximum upload-file dimensions or arbitrary image batches.
+
+The fitter records each independent boundary, the common sequence, the actual rejected +1 MiB arena neighbor and the final full-workload receipt. CUDA code/module initialization, graph executables and ordinary decoder allocations can still limit a common sequence after the encoder has returned its loans. The current Qwen 4096 setting succeeds independently but its serial sequence fails decoder capacity; do not substitute independent maxima into the shared launch command.
+
+Earlier fixed 2048 MiB controls complete all seven ratios at their configured 4096/256 Qwen/Gemma ceilings. Those are separate equal-parent capacity controls from before the writer metadata fix, not fresh maximum-arena measurements or a full-history native-equivalence claim. The historical 48/143 figures are explained below.
+
+## What consumes the vision loan
+
+The active vision phase may reclaim text graph workspace and reusable device KV storage. It preserves registered target recurrent state, bounded draft state and Gemma SWA. Its temporary loans hold projector weights and complete controlled encoder compute: graph tensors, backend operator conversions/outputs/pointer arrays, native-size explicit cuBLAS workspace and placement padding. Main/assistant/DFlash weights remain outside the parent. Host KV, decoded pixels and completed embeddings are host allocations.
+
+The compute allowance is bounded by `parent - protected persistent state - projector weights - placement padding`; an image borrows its actual measured requirement, not a fixed percentage. For the 2048 MiB Gemma b/ub256 reference, 406.25 MiB SWA and 770.41 MiB projector weights leave about 871.34 MiB for compute and placement. A Qwen square image with 4096 tokens uses 884.62 MiB weights plus 682.75 MiB complete compute: 480.25 MiB graph, 170.50 MiB operator scratch, 32 MiB library and 128 padding bytes. These are different workloads/weight profiles, not a model-performance comparison.
+
+The earlier 48-token Qwen DFlash3 and 143-token Gemma results predate this migration. Their larger image requests could allocate graph/weights inside the parent but then run out of free VRAM for backend-private encoder scratch outside it. Those historical budgets are not fixed arena partitions, MiB values, intrinsic image ceilings or visual-quality scores. The matched earlier embedded-MTP Qwen control used common budget 47 rather than the separate DFlash budget 48 profile.
+
+A maximum parent still need not allow every larger image sequence. CUDA code/module initialization, graph executables, opaque library state and ordinary decoder allocations remain outside the controlled encoder contract. The earlier complete-workspace Qwen capacity run reached a decoder `cudaFuncSetAttribute` OOM after six encoder phases had returned their loans. Preserve such failures as physical-capacity evidence, not an encoder quota pass or a guarantee for arbitrary future requests. To require a larger minimum generated image profile, raise `--image-min-tokens` with compatible batch settings and refit. No arbitrary safety reserve is added.
 
 ## Explicit images and saved evidence
 

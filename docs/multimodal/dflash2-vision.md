@@ -25,10 +25,10 @@ Proposal maxima are F=1-7 and verification widths TG1-TG8. Q8_0/Q4_0, Q8_0/Q8_0 
 | Full target KV history | Authoritative host history survives; resident/ring bindings retire and rebuild |
 | Bounded DFlash KV and rollback publication staging | Protected persistent regions inside the same parent |
 | Projector weights, 927588992 allocated bytes | Temporary vision grant inside the parent |
-| Encoder attention and activations | Measured temporary vision workspace; no decoder history |
+| Encoder graph, operator scratch and explicit cuBLAS workspace | One complete measured compute loan, including alignment; no decoder history |
 | Completed image embeddings | Owned host data survives release of the vision grants |
 
-The arena bounds its participating allocations, not total VRAM, decoded host images, saved states, driver allocations or every future request. Image dimensions, token budget, batching, context and proposal width need their own fit. The existing fixed 2K-row prefill preparation stage and pipeline remain unchanged.
+Managed CUDA encoder temporaries and explicit native-size cuBLAS workspace now use the same parent; successful bound execution neither grows a separate native pool nor retains an old native owned library reservation. The arena bounds these participating allocations, not total VRAM, decoded host images, saved states, driver/library state, ordinary decoder allocations or every future request. Image dimensions, token budget, batching, context and proposal width need their own fit. The existing fixed 2K-row prefill preparation stage and pipeline remain unchanged.
 
 The attached draft registers its actual bounded-storage lease with the parent. Suspension admits that validated writer rather than pretending it is a shared-cache reader. Existing phase fences complete outstanding work before temporary grants can overwrite scratch. Persistent target/draft state stays protected; failed reload, queued encoder failure and held grants cannot expose stale graphs or half-returned storage.
 
@@ -50,18 +50,19 @@ python3 benchmarks/find-max-arena.py \
   --mmproj /path/to/mmproj-Qwen3.8-27B-F16.gguf \
   --context-size 8192 --batch-size 256 --ubatch-size 256 \
   --cache-type-k q8_0 --cache-type-v q4_0 \
-  --spec-mode dflash --draft-length 3 --image /path/to/photo.png \
+  --spec-mode dflash --draft-length 3 \
   --image-min-tokens 64 --image-max-tokens 4096 \
   --decode-tokens 256 --probe-mode preflight --no-webui --port 1249 \
   --output benchmarks/results/my-dflash-image-fit
 ```
 
-The finder starts and cleans up its own servers. Image preflight executes the complete supplied image request and actual decoding; it does not replace images with a short causal text surrogate. With a projector and no supplied image, the finder instead runs the [automatic landscape/portrait capacity checks](vision-capacity.md). `--initial-arena-mib` is an optional search guess. The development 1024 MiB image probe is a fixed-budget successful request, not a measured maximum for arbitrary images.
+The finder starts and cleans up its own servers. With `--mmproj`, it measures complete controlled workspace, runs the [automatic landscape/portrait capacity checks](vision-capacity.md), and prints independent resolutions plus a common image setting. No sample images or existing inference service are required. `--initial-arena-mib` is an optional search guess. The development 1024 MiB image probe is a fixed-budget successful request, not a measured maximum for arbitrary images.
 
-Read the selected `arena_mib`, then launch a fresh server:
+Use the generated `command.txt`, or read both selected arena and common image setting before launching a fresh server:
 
 ```bash
 DF_ARENA=$(python3 -c 'import json; print(json.load(open("benchmarks/results/my-dflash-image-fit/result.json"))["arena_mib"])')
+DF_IMAGE_MAX=$(python3 -c 'import json; print(json.load(open("benchmarks/results/my-dflash-image-fit/result.json"))["vision_capacity"]["common_image_max_tokens"])')
 build-v2/bin/llama-server \
   --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf \
   --model-draft /path/to/Qwen3.8-27B-DFlash2-Q2_K_S-MIX.gguf \
@@ -72,7 +73,7 @@ build-v2/bin/llama-server \
   --cache-type-k q8_0 --cache-type-v q4_0 \
   --spec-type draft-dflash --spec-draft-n-max 3 \
   --spec-draft-n-min 0 --spec-draft-p-min 0 \
-  --image-min-tokens 64 --image-max-tokens 4096 \
+  --image-min-tokens 64 --image-max-tokens "$DF_IMAGE_MAX" \
   --offline --no-context-shift --host 127.0.0.1 --port 8080
 ```
 
@@ -80,17 +81,19 @@ Open that server's Web UI and attach an image, or use the existing [HTTP image r
 
 ## Numerical and lifecycle qualification
 
-Fitting full native F1/F3 servers and streamed servers compare corresponding image scenarios with exact tokens and draft/prompt/cache counts. F7 full native startup cannot allocate the 927588992-byte projector alongside its decoder state, even with the smaller draft. That capacity failure is preserved. F7 instead has separately qualified native encoder export and native-decoder import of identical embeddings, positions and weights, plus end-to-end streamed API/lifecycle tests. This is native-arithmetic component coverage, not full native-server equivalence.
+Fresh fitting full native F1-F4 servers and streamed servers at context 2048, b/ub256 and image budget 256 compare corresponding image scenarios with exact tokens and draft/prompt/cache counts. F5-F7 at the recorded complete-workspace control profile reach preserved native physical capacity failures; unchanged smaller Q2 weights are tried first. Native encoder/native-decoder component references and the archived streamed end-to-end reference are explicitly distinguished from full native-server equivalence. F7 full native startup cannot allocate the 927588992-byte projector alongside its decoder state, even with the smaller draft. That capacity failure is preserved. F7 instead has separately qualified native encoder export and native-decoder import of identical embeddings, positions and weights, plus end-to-end streamed API/lifecycle tests. This is native-arithmetic component coverage, not full native-server equivalence.
 
 The internal framed oracle checks complete consumed target features, logits/hidden rows, selector outputs, target/draft KV and recurrent state through every accepted prefix, correction and TG1-TG8. F1/F3/F7 compare 504/907/1749 exact records; F7 covers 2834713708 bytes. The additional KV pairs retain exact native comparisons. The complete public image path also passes fresh strict device memcheck with API-all reporting and real DFlash predictions, plus actual host ASAN/UBSAN image checks. Normal warmup has a separate fitting native/streamed API control.
 
-Expanded F1/F3 lifecycle tests each compare 23 native and 23 streamed scenarios. Their corresponding 321935388-byte state files have identical SHA256 digests. Tests cover changed/adjacent/interleaved/later images, portrait/narrow and first/last/only-image prompts, malformed media, image/context limits, cancellation, truncated state, erase/restore and process restart. Rewinds into an image or unavailable old history remain rejected. Each cached/restored scenario uses its corresponding native scenario; fresh-versus-cached native identity is not assumed.
+Earlier F1/F3 lifecycle tests each compare 23 native and 23 streamed scenarios. Their corresponding 321935388-byte state files have identical SHA256 digests. Tests cover changed/adjacent/interleaved/later images, portrait/narrow and first/last/only-image prompts, malformed media, image/context limits, cancellation, truncated state, erase/restore and process restart. Rewinds into an image or unavailable old history remain rejected. Each cached/restored scenario uses its corresponding native scenario; fresh-versus-cached native identity is not assumed.
 
 The long F7 profile uses capacity 65536, a 48000-token text prefix, 512 outputs, a 1024 MiB device parent and a 4096 MiB host prompt cache. All 23 streamed scenarios pass; three initial/state/restart logs prove 188-191 active nonresident pages with 66 ring slots. A complete 1799655104-byte state with 48584 tokens survives restart. These are long lifecycle/self-consistency checks, not long native equivalence or a full native-context image-prefill qualification. The earlier 2048 MiB host-cache attempt correctly failed its cache-restoration proof because intervening entries evicted the large prompt; that failure remains recorded.
 
 Attached-writer reload cancellation and a queued encoder exception preserve target/child state byte-for-byte, publish no failed output, retry exact encoder values and resume native-matching prediction. Fourteen host ASAN/UBSAN suites pass with leak detection. GPU ASAN uses NVIDIA's documented [CUDA compatibility setting](https://docs.nvidia.com/deeplearning/tensorrt/11.4.1/reference/troubleshooting-analysis-tools.html) `protect_shadow_gap=0`, retaining leak detection and halt-on-error. Strict device checks use default PDL, API-all reporting, error exit 99 and no filters; eager execution is limited to checker runs. No instrumentation OOM or initialization failure is counted as a pass.
 
 ## Ordinary performance
+
+The first measurements below belong to the initial DFlash image feature, before complete CUDA scratch joined the parent. Current migration regression checks follow them; these cohorts must not be combined into a speedup figure.
 
 The ordinary image workload uses a 256x256 pattern, Q8_0/Q4_0 KV, a 4096-position context, 256/256 batching, a fixed 1024 MiB parent and 256 generated tokens. Each process has one warmup and three uncached measured requests. Median results for the implementation are:
 
@@ -117,6 +120,16 @@ Separate text regression checks use natural NVIDIA Open-SWE request prefixes and
 | Gemma shared-KV MTP3 | 8191 | 3 | +0.06% | +1.24% |
 
 Single 64524-token Qwen controls for all four modes vary from -0.54% to +0.31% decode and within 0.05% prefill. Those long controls are single paired observations, not repeated statistical results. Positive variation is not claimed as a new optimization. Text, image and independently maximum-fit sweeps remain separate cohorts.
+
+## Complete-workspace regression controls
+
+The shared extension audit passes 128 runtime gates, sixteen host ASAN/UBSAN suites and thirteen zero-error strict GPU gates, with actual graph-enabled ownership and MTP2 replay where required. Fresh framed decoder controls cover all F1-F7; full native/API versus component-reference scopes remain separate. A cached writer destination lifetime failure was reproduced with one valid behavioral red, fixed by retaining its existing buffer metadata through executor retirement, and requalified without a new allocation, logical lease, fence or arithmetic change. The long F7 state/cancel/restart profile passes again with actual ring traffic.
+
+Three ordinary Open-SWE process pairs per existing text mode retain exact IDs, work/source counts and decode layouts. Median paired prefill/decode changes are -0.059%/-0.152% target-only, -0.043%/-0.001% MTP3, -0.054%/+0.215% original Q4 DFlash7 and -0.057%/-0.615% Q4 DFlash7+K4V. No material existing text regression is observed on these scoped checks; this is not statistical proof of zero overhead.
+
+Current image comparisons use three warmed uncached samples at each of 256x256, 1024x1024 and 2048x2048 source sizes, with 128 outputs and exact same-mode responses. Target-only/MTP3 retain 2048 MiB parents. The archived Q2 DFlash3 baseline at 2048 MiB runs out of memory in decoder CUDA kernel preparation after the medium encoder phase returns. The complete workspace quote for the current 4096-token square needs 1682285312 bytes; 1605 MiB admits it and 1604 rejects. The fitting DFlash comparison uses that same 1605 MiB parent on both implementations, unchanged images/models/outputs/ordinary graphs. It is a separate equal-parent cohort, not a maximum-arena or old-failure pass.
+
+Image request-latency median changes span -0.292%..+0.423% for Qwen target/MTP and -0.138%..+0.240% for Q2 DFlash3. Small roughly 6.4 ms encodes add about 0.3-0.4 ms of admission/ownership overhead; largest roughly 2648 ms encodes remain close to baseline. Sampled 50 ms device peaks decrease by about 202-204 MiB at matched parents. These samples may miss shorter transients and are not a hardware utilization measurement. Current processed-capacity examples are in the [common capacity report](vision-capacity.md).
 
 ## Reproduction and release boundary
 
