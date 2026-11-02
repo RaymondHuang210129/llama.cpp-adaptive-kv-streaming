@@ -839,9 +839,70 @@ struct ggml_cuda_pool_bounded : ggml_cuda_pool {
 struct ggml_backend_cuda_workspace_context : ggml_backend_cuda_context {
     ggml_cuda_operator_workspace_caps operator_caps;
     ggml_backend_operator_workspace_binding operator_binding;
-    bool operator_pending=false, operator_executing=false;
+    bool operator_pending=false, operator_executing=false, operator_library_ready=false;
     explicit ggml_backend_cuda_workspace_context(int device) : ggml_backend_cuda_context(device) {}
     bool operator_bound() const { return operator_binding.root!=nullptr; }
+    bool operator_library_handle(int index) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        auto & handle=cublas_handles[device][index];
+        if (!handle) {
+            cublasHandle_t created=nullptr;
+            if (cublasCreate(&created)!=CUBLAS_STATUS_SUCCESS) return false;
+            handle=created;
+        }
+        return cublasSetMathMode(handle,CUBLAS_TF32_TENSOR_OP_MATH)==CUBLAS_STATUS_SUCCESS &&
+            cublasSetStream(handle,stream(device,index))==CUBLAS_STATUS_SUCCESS;
+#else
+        GGML_UNUSED(index);return false;
+#endif
+    }
+    bool operator_library_attach() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        auto * base=static_cast<char *>(ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(operator_binding.scratch)));
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) {
+            const auto & part=operator_binding.layout.streams[i];
+            const bool active=size_t(i)<operator_binding.layout.count && part.library_bytes;
+            if (active && !operator_library_handle(i)) return false;
+            auto handle=cublas_handles[device][i];
+            if (!handle) continue;
+            void * address=active ? base+part.library_offset : nullptr;
+            if (cublasSetWorkspace(handle,address,active ? operator_caps.library_bytes : 0)!=CUBLAS_STATUS_SUCCESS) return false;
+            auto & owned=cublas_workspaces[device][i];
+            if (owned) { CUDA_CHECK(cudaFree(owned));owned=nullptr; }
+            if (active && ggml_cuda_scratch_trace::enabled()) GGML_LOG_INFO(
+                "cuda_scratch: event=blas_borrowed context=%p stream=%d address=%p bytes=%zu\n",
+                (void *)this,i,address,operator_caps.library_bytes);
+        }
+        operator_library_ready=true;return true;
+#else
+        return false;
+#endif
+    }
+    bool operator_library_detach() {
+        operator_library_ready=false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) if (cublas_handles[device][i]) {
+            if (cublasSetWorkspace(cublas_handles[device][i],nullptr,0)!=CUBLAS_STATUS_SUCCESS) return false;
+            auto & owned=cublas_workspaces[device][i];
+            if (owned) { CUDA_CHECK(cudaFree(owned));owned=nullptr; }
+        }
+#endif
+        return true;
+    }
+    void operator_library_native() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) {
+            auto handle=cublas_handles[device][i];auto & owned=cublas_workspaces[device][i];
+            if (!handle || owned) continue;
+            if (!cublas_workspace_sizes[device]) cublas_workspace_sizes[device]=operator_caps.library_bytes;
+            GGML_ASSERT(cublas_workspace_sizes[device]);
+            CUBLAS_CHECK(cublasSetMathMode(handle,CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetStream(handle,stream(device,i)));
+            CUDA_CHECK(cudaMalloc(&owned,cublas_workspace_sizes[device]));
+            CUBLAS_CHECK(cublasSetWorkspace(handle,owned,cublas_workspace_sizes[device]));
+        }
+#endif
+    }
     void operator_synchronize() {
         ggml_cuda_set_device(device);
         for (auto stream : streams[device]) if (stream) CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -858,7 +919,13 @@ struct ggml_backend_cuda_workspace_context : ggml_backend_cuda_context {
         operator_binding={};
     }
     ~ggml_backend_cuda_workspace_context() {
-        if (operator_bound()) { operator_synchronize();operator_clear(); }
+        if (operator_bound()) {
+            operator_synchronize();
+            if (!operator_library_detach()) {
+                for (auto & handle : cublas_handles[device]) if (handle) { CUBLAS_CHECK(cublasDestroy(handle));handle=nullptr; }
+            }
+            operator_clear();
+        }
     }
 };
 
@@ -5053,6 +5120,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     auto & bound_state=static_cast<ggml_backend_cuda_workspace_context &>(*cuda_ctx);
+    if (!bound_state.operator_bound()) bound_state.operator_library_native();
     if (bound_state.operator_executing ||
             (bound_state.operator_bound() && !ggml_cuda_operator_graph_admitted(bound_state,cgraph))) return GGML_STATUS_FAILED;
     struct execution_guard {
@@ -6548,7 +6616,11 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
             GGML_LOG_ERROR("CUDA operator workspace kernel preparation failed: %s\n",cudaGetErrorString(error));return status::failed;
         }
     }
-    next.ready=true;ctx.operator_caps=next;return status::success;
+    next.ready=true;ctx.operator_caps=next;
+    if (!ctx.cublas_handles[ctx.device][0] && !ctx.operator_library_handle(0)) {
+        ctx.operator_caps.ready=false;return status::failed;
+    }
+    return status::success;
 #endif
 }
 
@@ -6637,6 +6709,7 @@ static ggml_backend_operator_workspace_status ggml_cuda_operator_graph_plan(
 }
 
 static bool ggml_cuda_operator_graph_admitted(ggml_backend_cuda_workspace_context & ctx,const ggml_cgraph * graph) {
+    if (!ctx.operator_library_ready) return false;
     ggml_backend_operator_phase_workspace required;
     const auto result=ggml_cuda_operator_graph_plan(ctx,graph,required,true);
     if (result!=ggml_backend_operator_workspace_status::success || required.count>ctx.operator_binding.layout.count) {
@@ -6691,6 +6764,10 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
             scratch_base<root_base || scratch_base-root_base>root.size || scratch.size>root.size-(scratch_base-root_base) ||
             ggml_backend_buffer_get_size(scratch_buffer)!=scratch.size || scratch_base%256) return status::invalid;
     if (binding->layout.bytes>scratch.size) return status::insufficient;
+    for (size_t i=0;i<binding->layout.count;++i) {
+        const auto bytes=binding->layout.streams[i].library_bytes;
+        if (bytes && bytes<ctx.operator_caps.library_bytes) return status::insufficient;
+    }
     if (ctx.operator_bound()) return status::busy;
     for (int d=0;d<GGML_CUDA_MAX_DEVICES;++d) for (int stream=0;stream<GGML_CUDA_MAX_STREAMS;++stream) {
         if (d!=ctx.device && ctx.pools[d][stream]) return status::unsupported;
@@ -6718,6 +6795,8 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
     ctx.operator_binding=next;
     if (ggml_cuda_scratch_trace::enabled()) GGML_LOG_INFO("cuda_scratch: event=operator_bind context=%p address=%p bytes=%zu streams=%zu\n",
         (void *)&ctx,reinterpret_cast<void *>(scratch_base),scratch.size,binding->layout.count);
+    // Partial library setup retains both loans until release succeeds.
+    if (!ctx.operator_library_attach()) return status::failed;
     return status::success;
 }
 
@@ -6726,7 +6805,13 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
     if (!backend || !ggml_backend_is_cuda(backend)) return status::invalid;
     auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
     if (ctx.operator_pending || ctx.operator_executing) return status::busy;
-    if (ctx.operator_bound()) ctx.operator_clear();
+    if (ctx.operator_bound()) {
+#ifdef USE_CUDA_GRAPH
+        ctx.cuda_graphs.clear();
+#endif
+        if (!ctx.operator_library_detach()) return status::failed;
+        ctx.operator_clear();
+    }
     return status::success;
 }
 
