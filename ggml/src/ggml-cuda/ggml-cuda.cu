@@ -8,6 +8,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/vmm-probe.h"
 #include "ggml-cuda/kv-stream-partial.cuh"
+#include "ggml-cuda/scratch-plan.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -485,6 +486,8 @@ struct ggml_cuda_scratch_trace {
                 previous_blas[i] ? "blas_retained" : "blas_alloc",(long long)ggml_time_us(),(void *)&ctx,ctx.device,i,
                 ctx.cublas_workspaces[ctx.device][i],ctx.cublas_workspace_sizes[ctx.device]);
         }
+        GGML_LOG_INFO("cuda_scratch: event=operation_end time_us=%lld context=%p tensor=%s\n",
+            (long long)ggml_time_us(),(void *)&ctx,graph->nodes[first_index]->name);
         active=previous;
     }
 };
@@ -807,6 +810,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
 }
 
+
+// Host planning state stays private to backend-owned contexts.
+struct ggml_backend_cuda_workspace_context : ggml_backend_cuda_context {
+    ggml_cuda_operator_workspace_caps operator_caps;
+    explicit ggml_backend_cuda_workspace_context(int device) : ggml_backend_cuda_context(device) {}
+};
+
+static ggml_backend_operator_workspace_status ggml_cuda_operator_workspace_query_context(
+    ggml_backend_cuda_workspace_context &,const ggml_tensor *,ggml_backend_operator_workspace &);
 
 // cuda buffer
 
@@ -1689,6 +1701,17 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+static bool ggml_cuda_cublas_f32_output(ggml_type compute_type,int cc) {
+    bool prefer_f32_output = false;
+    if (compute_type == GGML_TYPE_F16) {
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+    } else if (compute_type == GGML_TYPE_BF16) {
+        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+    }
+
+    return prefer_f32_output;
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1791,12 +1814,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * beta = traits::get_beta();
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    bool prefer_f32_output = false;
-    if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
-    } else if (compute_type == GGML_TYPE_BF16) {
-        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
-    }
+    const bool prefer_f32_output=ggml_cuda_cublas_f32_output(compute_type,cc);
 
     if (prefer_f32_output) {
         dst_ptr = (char *) dst_ddf;
@@ -1903,8 +1921,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+static ggml_type ggml_cuda_cublas_compute_type(const ggml_tensor * src0,const ggml_tensor * src1,const ggml_tensor * dst,int cc) {
     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type)) {
@@ -1943,7 +1960,14 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
-    constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
+    return compute_type;
+}
+
+static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_type compute_type=ggml_cuda_cublas_compute_type(src0,src1,dst,cc);
+
+    constexpr size_t max_src0_convert_size = ggml_cuda_operator_conversion_chunk_bytes;
     const size_t src0_f32_size = ggml_nelements(src0) * sizeof(float);
 
     if (compute_type == GGML_TYPE_F32 &&
@@ -2187,59 +2211,38 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
-static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_TENSOR_BINARY_OP_LOCALS
+enum class ggml_cuda_matmul_route { cublas, vector_f, vector_transposed, matrix_f, vector_q, matrix_q };
 
-    if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
-    }
+static ggml_cuda_matmul_route ggml_cuda_matmul_route_for(const ggml_tensor * src0,const ggml_tensor * src1,
+        const ggml_tensor * dst,int cc,int warp_size) {
+    const bool bad_padding=src0->buffer && ggml_backend_buffer_get_usage(src0->buffer)==GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(src0)!=ggml_backend_buffer_get_alloc_size(src0->buffer,src0) && src0->view_src;
+    if (bad_padding || src1->type!=GGML_TYPE_F32 || dst->type!=GGML_TYPE_F32) return ggml_cuda_matmul_route::cublas;
+    if (ggml_cuda_should_use_mmvf(src0->type,cc,warp_size,src0->ne,src0->nb,src1->ne[1])) return ggml_cuda_matmul_route::vector_f;
+    if (src0->ne[1]==1 && src1->ne[1]>MMVF_MAX_BATCH_SIZE && dst->ne[2]==1 && dst->ne[3]==1 &&
+            src0->type==GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+            ggml_cuda_should_use_mmvf(src1->type,cc,warp_size,src1->ne,src1->nb,1)) return ggml_cuda_matmul_route::vector_transposed;
+    if (ggml_cuda_should_use_mmf(src0->type,cc,warp_size,src0->ne,src0->nb,src1->ne[1],false)) return ggml_cuda_matmul_route::matrix_f;
+    if (ggml_cuda_should_use_mmvq(src0->type,cc,src1->ne[1])) return ggml_cuda_matmul_route::vector_q;
+    if (ggml_cuda_should_use_mmq(src0->type,cc,src1->ne[1],0)) return ggml_cuda_matmul_route::matrix_q;
+    return ggml_cuda_matmul_route::cublas;
+}
 
-    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
-    // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
-    // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
+static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx,const ggml_tensor * src0,const ggml_tensor * src1,ggml_tensor * dst) {
+    if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx,src1,dst)) return;
+    const auto & device=ggml_cuda_info().devices[ctx.device];
+    switch (ggml_cuda_matmul_route_for(src0,src1,dst,device.cc,device.warp_size)) {
+        case ggml_cuda_matmul_route::vector_f:ggml_cuda_mul_mat_vec_f(ctx,src0,src1,nullptr,dst);return;
+        case ggml_cuda_matmul_route::vector_transposed: {
+            ggml_tensor view=*dst;view.ne[0]=src1->ne[1];view.ne[1]=1;
+            view.nb[1]=view.nb[0]*src1->ne[1];view.nb[2]=view.nb[1];view.nb[3]=view.nb[1];
+            ggml_cuda_mul_mat_vec_f(ctx,src1,src0,nullptr,&view);return;
+        }
+        case ggml_cuda_matmul_route::matrix_f:ggml_cuda_mul_mat_f(ctx,src0,src1,nullptr,dst);return;
+        case ggml_cuda_matmul_route::vector_q:ggml_cuda_mul_mat_vec_q(ctx,src0,src1,nullptr,dst);return;
+        case ggml_cuda_matmul_route::matrix_q:ggml_cuda_mul_mat_q(ctx,src0,src1,nullptr,dst);return;
+        case ggml_cuda_matmul_route::cublas:ggml_cuda_mul_mat_cublas(ctx,src0,src1,dst);return;
     }
-
-    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
-    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
-        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
-        // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
-    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
-            && src0->type == GGML_TYPE_F32
-            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
-            && ggml_cuda_should_use_mmvf(src1->type, cc, warp_size, src1->ne, src1->nb, /*ne11 =*/ 1)) {
-        ggml_tensor dst_vec = *dst;
-        dst_vec.ne[0] = ne11;
-        dst_vec.ne[1] = 1;
-        dst_vec.nb[1] = dst_vec.nb[0]*ne11;
-        dst_vec.nb[2] = dst_vec.nb[1];
-        dst_vec.nb[3] = dst_vec.nb[1];
-        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
-        return;
-    }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -2808,7 +2811,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    delete cuda_ctx;
+    delete static_cast<ggml_backend_cuda_workspace_context *>(cuda_ctx);
     delete backend;
 }
 
@@ -4822,6 +4825,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 ggml_cuda_scratch_trace scratch_trace(*cuda_ctx,cgraph,i);
+                if (ggml_cuda_scratch_trace::enabled()) {
+                    auto & state=static_cast<ggml_backend_cuda_workspace_context &>(*cuda_ctx);
+                    if (state.operator_caps.ready) {
+                        ggml_backend_operator_workspace plan;
+                        GGML_LOG_INFO("cuda_scratch: event=quote_begin time_us=%lld context=%p tensor=%s\n",(long long)ggml_time_us(),(void *)cuda_ctx,node->name);
+                        const auto status=ggml_cuda_operator_workspace_query_context(state,node,plan);
+                        char requests[256]={};size_t cursor=0;
+                        for (size_t n=0;n<plan.count;++n) {
+                            const int written=snprintf(requests+cursor,sizeof(requests)-cursor,"%s%zu",n ? "," : "",plan.requests[n]);
+                            if (written<0 || size_t(written)>=sizeof(requests)-cursor) break;
+                            cursor+=size_t(written);
+                        }
+                        GGML_LOG_INFO("cuda_scratch: event=quote time_us=%lld context=%p tensor=%s status=%d bytes=%zu library_bytes=%zu count=%zu requests=%s\n",
+                            (long long)ggml_time_us(),(void *)cuda_ctx,node->name,int(status),plan.bytes,plan.library_bytes,plan.count,plan.count ? requests : "-");
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -6380,7 +6400,101 @@ static bool ggml_backend_cuda_graph_is_captured(ggml_backend_t backend, const vo
 }
 #endif
 
+static ggml_backend_operator_workspace_status ggml_cuda_operator_workspace_query_context(
+        ggml_backend_cuda_workspace_context & ctx,const ggml_tensor * op,ggml_backend_operator_workspace & output) {
+    using status=ggml_backend_operator_workspace_status;
+    const auto & caps=ctx.operator_caps;
+    if (!caps.ready) return status::unprepared;
+    if (!op || op->type<0 || op->type>=GGML_TYPE_COUNT) return status::invalid;
+    ggml_backend_operator_workspace next;
+    if (ggml_is_empty(op)) { output=next;return status::success; }
+    size_t elements;
+    if (!ggml_cuda_operator_elements(op,elements)) return status::invalid;
+    if (op->op==GGML_OP_MUL_MAT) {
+        if (!op->src[0] || !op->src[1] || !ggml_cuda_operator_elements(op->src[0],elements) ||
+                !ggml_cuda_operator_elements(op->src[1],elements)) return status::invalid;
+        const auto * a=op->src[0];const auto * b=op->src[1];
+        if (ggml_cuda_op_mul_mat_use_fwht(op)) return status::unsupported;
+        if (a->type!=GGML_TYPE_F16 && a->type!=GGML_TYPE_BF16 && a->type!=GGML_TYPE_F32 && a->type!=GGML_TYPE_Q8_0) return status::unsupported;
+        switch (ggml_cuda_matmul_route_for(a,b,op,caps.cc,caps.warp_size)) {
+            case ggml_cuda_matmul_route::vector_f:
+            case ggml_cuda_matmul_route::vector_transposed:
+            case ggml_cuda_matmul_route::matrix_f:break;
+            case ggml_cuda_matmul_route::vector_q: {
+                size_t bytes;
+                if (!ggml_backend_operator_workspace_align(size_t(b->ne[0]),MATRIX_ROW_PADDING,bytes)) return status::invalid;
+                for (int i=1;i<GGML_MAX_DIMS;++i) if (!ggml_cuda_operator_product(bytes,size_t(b->ne[i]))) return status::invalid;
+                if (!ggml_cuda_operator_product(bytes,sizeof(block_q8_1)) ||
+                        !ggml_backend_operator_workspace_add(next,bytes/QK8_1)) return status::invalid;
+                break;
+            }
+            case ggml_cuda_matmul_route::matrix_q:
+                if (!ggml_cuda_mmq_workspace_plan(a,b,op,caps.cc,caps.shared_bytes_per_block,caps.nsm,next)) return status::unsupported;
+                break;
+            case ggml_cuda_matmul_route::cublas: {
+                const auto type=ggml_cuda_cublas_compute_type(a,b,op,caps.cc);
+                if (!ggml_cuda_cublas_workspace_plan(op,type,ggml_cuda_cublas_f32_output(type,caps.cc),caps.library_bytes,next)) return status::unsupported;
+                break;
+            }
+        }
+    } else if (op->op==GGML_OP_FLASH_ATTN_EXT) {
+        if (!ggml_cuda_attention_workspace_plan(caps,op,next) ||
+                ggml_cuda_flash_attn_ext_kernel_family(ctx.device,op)!=ggml_cuda_kv_stream_kernel_family::tile) return status::unsupported;
+    } else {
+        switch (op->op) {
+            case GGML_OP_NONE:case GGML_OP_VIEW:case GGML_OP_RESHAPE:case GGML_OP_TRANSPOSE:case GGML_OP_PERMUTE:
+            case GGML_OP_SCALE:case GGML_OP_IM2COL:case GGML_OP_CONT:case GGML_OP_ADD:case GGML_OP_UPSCALE:
+            case GGML_OP_NORM:case GGML_OP_RMS_NORM:case GGML_OP_MUL:case GGML_OP_ROPE:case GGML_OP_CPY:
+            case GGML_OP_UNARY:case GGML_OP_CLAMP:case GGML_OP_GET_ROWS:case GGML_OP_GLU:case GGML_OP_POOL_2D:
+            case GGML_OP_SUB:case GGML_OP_PAD:case GGML_OP_CONCAT:break;
+            default:return status::unsupported;
+        }
+    }
+    output=next;return status::success;
+}
+
+static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_prepare(ggml_backend_t backend) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!backend || !ggml_backend_is_cuda(backend)) return status::unsupported;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return status::unsupported;
+#else
+    auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
+    if (ctx.operator_caps.ready) return status::success;
+    ggml_cuda_set_device(ctx.device);
+    const auto & info=ggml_cuda_info().devices[ctx.device];
+    ggml_cuda_operator_workspace_caps next;next.cc=info.cc;next.nsm=info.nsm;
+    next.warp_size=info.warp_size;next.shared_bytes_per_block=info.smpbo;
+    next.library_bytes=ctx.cublas_workspace_sizes[ctx.device];
+    if (!next.library_bytes) next.library_bytes=info.cc>=GGML_CUDA_CC_HOPPER ? 32*1024*1024 : 4*1024*1024;
+    for (int softcap=0;softcap<2;++softcap) for (int index=0,columns=2;index<5;++index,columns*=2) {
+        ggml_cuda_operator_kernel_metadata kernel;
+        if (!ggml_cuda_operator_tile_kernel_metadata(columns,bool(softcap),info.cc,kernel) || !kernel.kernel) return status::unsupported;
+        auto & traits=next.tile[softcap][index];traits.nbatch=kernel.nbatch;traits.threads=kernel.threads;
+        const auto error=cudaOccupancyMaxActiveBlocksPerMultiprocessor(&traits.occupancy,kernel.kernel,kernel.threads,0);
+        if (error!=cudaSuccess) {
+            GGML_LOG_ERROR("CUDA operator workspace kernel preparation failed: %s\n",cudaGetErrorString(error));return status::failed;
+        }
+    }
+    next.ready=true;ctx.operator_caps=next;return status::success;
+#endif
+}
+
+static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_query(ggml_backend_t backend,
+        const ggml_tensor * op,ggml_backend_operator_workspace * output) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!backend || !ggml_backend_is_cuda(backend) || !output) return status::invalid;
+    auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
+    ggml_backend_operator_workspace next;
+    const auto result=ggml_cuda_operator_workspace_query_context(ctx,op,next);
+    if (result==status::success) *output=next;
+    return result;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (!strcmp(name,"ggml_backend_operator_workspace_prepare")) return (void *)ggml_backend_cuda_operator_workspace_prepare;
+    if (!strcmp(name,"ggml_backend_operator_workspace_query")) return (void *)ggml_backend_cuda_operator_workspace_query;
+
     GGML_UNUSED(reg);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name,"ggml_backend_cuda_graph_is_capturing") == 0) return (void *)ggml_backend_cuda_graph_is_capturing;
@@ -6496,7 +6610,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
 
-    ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
+    ggml_backend_cuda_context * ctx = new ggml_backend_cuda_workspace_context(device);
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;

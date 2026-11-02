@@ -6,6 +6,7 @@
 #include "../src/llama-context-memory.h"
 #include "../src/llama-kv-cache-iswa.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-operator-workspace.h"
 #include "testing.h"
 #include "kv-stream-bit-exact-test.h"
 #include "ggml-cpu.h"
@@ -24,6 +25,9 @@ struct scratch_allocation_probe {
     std::mutex mutex;
     bool capture = false, installed = false;
     size_t operations = 0, requests = 0, growth_bytes = 0, pool_capacity = 0, pool_used = 0, blas_workspace = 0;
+    bool quote_mode = false, quoted = false;
+    size_t quotes = 0, quote_errors = 0, mismatches = 0, cursor = 0, quoted_bytes = 0, quoted_library = 0;
+    std::vector<size_t> expected_requests;
     static size_t field(const char * text,const char * key) {
         const char * found=std::strstr(text,key);
         return found ? size_t(std::strtoull(found+std::strlen(key),nullptr,10)) : 0;
@@ -33,6 +37,31 @@ struct scratch_allocation_probe {
         auto & self=*static_cast<scratch_allocation_probe *>(data);
         std::lock_guard<std::mutex> lock(self.mutex);
         if (!self.capture || !std::strstr(text,"cuda_scratch:")) return;
+        if (std::strstr(text,"event=quote ")) {
+            ++self.quotes;self.quoted=field(text,"status=")==0;
+            self.quote_errors+=!self.quoted;self.cursor=0;
+            self.quoted_bytes=field(text,"bytes=");self.quoted_library=field(text,"library_bytes=");
+            self.expected_requests.clear();
+            const char * values=std::strstr(text,"requests=");
+            if (values) {
+                values+=9;
+                while (*values>='0' && *values<='9' && self.expected_requests.size()<8) {
+                    char * end=nullptr;self.expected_requests.push_back(size_t(std::strtoull(values,&end,10)));
+                    values=end;if (*values!=',') break;++values;
+                }
+            }
+        }
+        if (self.quote_mode && std::strstr(text,"event=pool_request ")) {
+            const size_t bytes=field(text,"bytes=");
+            if (!self.quoted || self.expected_requests.empty()) ++self.mismatches;
+            else {
+                self.mismatches+=bytes>self.expected_requests[self.cursor];
+                self.cursor=(self.cursor+1)%self.expected_requests.size();
+            }
+        }
+        if (self.quote_mode && std::strstr(text,"event=pool_alloc ") && std::strstr(text,"used_valid=1"))
+            self.mismatches+=!self.quoted || field(text,"used=")>self.quoted_bytes;
+        if (self.quote_mode && std::strstr(text,"event=blas_alloc ")) self.mismatches+=field(text,"bytes=")>self.quoted_library;
         if (std::strstr(text,"event=operation ")) ++self.operations;
         if (std::strstr(text,"event=pool_alloc ")) ++self.requests;
         if (std::strstr(text,"event=pool_grow ")) self.growth_bytes+=field(text,"bytes=");
@@ -128,7 +157,7 @@ int main(int argc,char ** argv) {
     bool phase_only = false;
     bool protected_target = false;
     bool measure_only = false;
-    bool parent_explicit=false,long_vision=false,audit_scratch=false;
+    bool parent_explicit=false,long_vision=false,audit_scratch=false,quote_scratch=false;
     scratch_allocation_probe scratch;
     size_t image_budget=0,parent_mib=1024,image_count=1;
     size_t image_width=256,image_height=256;
@@ -138,6 +167,7 @@ int main(int argc,char ** argv) {
         else if (!std::strcmp(argv[i],"--protected-target")) protected_target = true;
         else if (!std::strcmp(argv[i],"--long-vision")) long_vision = true;
         else if (!std::strcmp(argv[i],"--audit-scratch")) audit_scratch = true;
+        else if (!std::strcmp(argv[i],"--quote-scratch")) { audit_scratch=true;quote_scratch=true; }
         else if (!std::strcmp(argv[i],"--measure-only")) { measure_only=true;phase_only=true; }
         else if ((!std::strcmp(argv[i],"--image-budget") || !std::strcmp(argv[i],"--parent-mib") ||
                 !std::strcmp(argv[i],"--image-count") || !std::strcmp(argv[i],"--image-width") ||
@@ -162,6 +192,7 @@ int main(int argc,char ** argv) {
         const char * trace=std::getenv("GGML_CUDA_TRACE_SCRATCH");
         if (!cuda || !phase_only || !baseline || !trace || std::strcmp(trace,"1")) return 2;
         ggml_log_set(scratch_allocation_probe::log,&scratch);scratch.installed=true;
+        scratch.quote_mode=quote_scratch;
     }
     if (save_input && (!save || phase_only || !model_path || !projector_path)) return 2;
     testing t;
@@ -624,6 +655,15 @@ int main(int argc,char ** argv) {
             projector.reset(mtmd_init_from_file_deferred(projector_path,model.get(),params));
         }
         if (!t.assert_true(bool(projector) && !mtmd_acquire_projector_weights(projector.get()))) return;
+        if (quote_scratch) {
+            auto * backend=mtmd_vision_backend(projector.get());
+            if (!t.assert_true(backend!=nullptr)) return;
+            auto * reg=ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            auto prepare=reinterpret_cast<ggml_backend_operator_workspace_prepare_t>(
+                ggml_backend_reg_get_proc_address(reg,"ggml_backend_operator_workspace_prepare"));
+            if (!t.assert_true(prepare!=nullptr) ||
+                    !t.assert_true(prepare(backend)==ggml_backend_operator_workspace_status::success)) return;
+        }
         auto * type = ggml_backend_cpu_buffer_type();
         if (cuda) {
             auto * dev = ggml_backend_dev_by_name("CUDA0");
@@ -749,7 +789,11 @@ int main(int argc,char ** argv) {
                 << " backing_growth_bytes=" << scratch.growth_bytes << " max_single_pool_capacity=" << scratch.pool_capacity
                 << " max_single_pool_used=" << scratch.pool_used << " max_blas_workspace=" << scratch.blas_workspace << '\n';
             t.assert_true("CUDA operation trace is present after valid native encoder comparison",scratch.operations>0);
-            t.assert_equal("managed encoder has no unquoted operator-private or cuBLAS workspace",size_t(0),
+            if (quote_scratch) {
+                t.out << "vision-scratch-quote quotes=" << scratch.quotes << " unsupported=" << scratch.quote_errors
+                    << " mismatches=" << scratch.mismatches << '\n';
+                t.assert_true(scratch.quotes>0);t.assert_equal(size_t(0),scratch.quote_errors);t.assert_equal(size_t(0),scratch.mismatches);
+            } else t.assert_equal("managed encoder has no unquoted operator-private or cuBLAS workspace",size_t(0),
                 scratch.requests+size_t(scratch.blas_workspace!=0));
         }
     });

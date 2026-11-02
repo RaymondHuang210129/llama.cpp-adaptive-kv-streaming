@@ -2256,6 +2256,8 @@ size_t mtmd_vision_weight_bytes(mtmd_context * ctx, ggml_backend_buffer_type_t t
     return ctx && ctx->ctx_v ? clip_vision_weight_bytes(ctx->ctx_v,type) : 0;
 }
 
+ggml_backend_t mtmd_vision_backend(mtmd_context * ctx) { return ctx ? clip_vision_backend(ctx->ctx_v) : nullptr; }
+
 bool mtmd_measure_vision_shape(mtmd_context * ctx, ggml_backend_buffer_t parent,
         const mtmd_vision_shape & shape, mtmd_vision_phase_requirements & output) {
     mtmd_vision_geometry g;

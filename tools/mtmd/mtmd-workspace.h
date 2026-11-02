@@ -77,3 +77,5 @@ MTMD_API size_t mtmd_vision_weight_bytes(mtmd_context * ctx, ggml_backend_buffer
 MTMD_API bool mtmd_measure_vision_shape(mtmd_context * ctx, ggml_backend_buffer_t parent,
     const mtmd_vision_shape & shape, mtmd_vision_phase_requirements & output);
 MTMD_API bool mtmd_batch_vision_shape(const mtmd_batch * batch, mtmd_vision_shape & output);
+// Borrowed primary backend; the vision context retains its ownership.
+MTMD_API ggml_backend_t mtmd_vision_backend(mtmd_context * ctx);

@@ -1,6 +1,8 @@
 #include "../src/llama-memory-workspace.h"
 #include "../src/llama-context-workspace.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-operator-workspace.h"
+#include "../ggml/src/ggml-cuda/scratch-plan.h"
 #include "testing.h"
 #include "ggml-cpp.h"
 #include "ggml-cpu.h"
@@ -126,6 +128,139 @@ struct fixture {
 
 int main(int argc, char ** argv) {
     testing t;
+    t.test("operator_scratch_layout_checks_alignment_overflow_and_request_limits",[](testing & t) {
+        ggml_backend_operator_workspace plan;
+        t.assert_true(ggml_backend_operator_workspace_add(plan,129));
+        t.assert_equal(size_t(0),plan.offsets[0]);t.assert_equal(size_t(256),plan.bytes);
+        t.assert_true(ggml_backend_operator_workspace_add(plan,128));
+        t.assert_equal(size_t(256),plan.offsets[1]);t.assert_equal(size_t(384),plan.bytes);
+        const auto saved=plan;
+        t.assert_true(!ggml_backend_operator_workspace_add(plan,SIZE_MAX));
+        t.assert_equal(saved.bytes,plan.bytes);t.assert_equal(saved.count,plan.count);
+        t.assert_true(ggml_backend_operator_workspace_add(plan,0));t.assert_equal(saved.count,plan.count);
+        auto invalid=plan;invalid.alignment=3;
+        t.assert_true(!ggml_backend_operator_workspace_add(invalid,1));t.assert_equal(plan.bytes,invalid.bytes);
+        while (plan.count<plan.requests.size()) t.assert_true(ggml_backend_operator_workspace_add(plan,1));
+        const auto full=plan;
+        t.assert_true(!ggml_backend_operator_workspace_add(plan,1));t.assert_equal(full.bytes,plan.bytes);
+    });
+    t.test("operator_phase_adds_concurrent_stream_peaks_and_one_library_workspace_per_stream",[](testing & t) {
+        ggml_backend_operator_workspace ops[3];
+        t.assert_true(ggml_backend_operator_workspace_add(ops[0],384));
+        t.assert_true(ggml_backend_operator_workspace_add(ops[1],128));
+        t.assert_true(ggml_backend_operator_workspace_add(ops[2],128));
+        for (auto & op : ops) op.library_bytes=32*1024*1024;
+        const uint32_t streams[]={0,0,1};ggml_backend_operator_phase_workspace phase;
+        t.assert_true(ggml_backend_operator_workspace_group(ops,streams,3,2,phase));
+        t.assert_equal(size_t(384),phase.streams[0].scratch_bytes);
+        t.assert_equal(size_t(128),phase.streams[1].scratch_bytes);
+        t.assert_equal(size_t(64*1024*1024+768),phase.bytes);
+        t.assert_equal(size_t(0),phase.streams[0].library_offset%256);
+        t.assert_equal(size_t(0),phase.streams[1].library_offset%256);
+        t.assert_true(phase.streams[0].scratch_offset+384<=phase.streams[1].library_offset);
+        const auto before=phase;const uint32_t bad[]={0,0,2};
+        t.assert_true(!ggml_backend_operator_workspace_group(ops,bad,3,2,phase));
+        t.assert_equal(before.bytes,phase.bytes);t.assert_equal(before.count,phase.count);
+        ops[2].library_bytes=SIZE_MAX;
+        t.assert_true(!ggml_backend_operator_workspace_group(ops,streams,3,2,phase));
+        t.assert_equal(before.bytes,phase.bytes);
+    });
+    t.test("native_plain_tile_attention_quote_matches_observed_split_storage_without_device_payloads",[](testing & t) {
+        ggml_context_ptr ctx(ggml_init({16384,nullptr,true}));
+        ggml_cuda_operator_workspace_caps caps;caps.ready=true;caps.nsm=70;
+        for (auto & row : caps.tile) for (auto & config : row) { config.occupancy=2;config.nbatch=64; }
+        for (const auto pair : {std::pair<int64_t,size_t>{256,2424832},{576,19095552},{16,0}}) {
+            auto * q=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,72,pair.first,16);
+            auto * k=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,72,pair.first,16);
+            auto * v=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,72,pair.first,16);
+            auto * op=ggml_flash_attn_ext(ctx.get(),q,k,v,nullptr,0.125f,0.0f,0.0f);
+            ggml_backend_operator_workspace plan;
+            t.assert_true(ggml_cuda_attention_workspace_plan(caps,op,plan));
+            t.assert_equal(pair.second,plan.bytes);
+            t.assert_true(!q->data && !k->data && !v->data && !op->data);
+            const auto saved=plan;caps.ready=false;
+            t.assert_true(!ggml_cuda_attention_workspace_plan(caps,op,plan));
+            t.assert_equal(saved.bytes,plan.bytes);caps.ready=true;
+            const auto width=k->ne[0];k->ne[0]=80;
+            t.assert_true(!ggml_cuda_attention_workspace_plan(caps,op,plan));k->ne[0]=width;
+            t.assert_equal(saved.bytes,plan.bytes);
+        }
+    });
+    t.test("native_cublas_quote_includes_conversions_outputs_batch_pointers_and_bounded_weight_chunks",[](testing & t) {
+        ggml_context_ptr ctx(ggml_init({16384,nullptr,true}));
+        auto * a=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,1152,4304);
+        auto * b=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,1152,256);
+        auto * op=ggml_mul_mat(ctx.get(),a,b);
+        ggml_backend_operator_workspace plan;
+        t.assert_true(ggml_cuda_cublas_workspace_plan(op,GGML_TYPE_F16,false,32*1024*1024,plan));
+        t.assert_equal(size_t(2),plan.count);t.assert_equal(size_t(589824),plan.requests[0]);
+        t.assert_equal(size_t(2203648),plan.requests[1]);t.assert_equal(size_t(2793472),plan.bytes);
+        t.assert_equal(size_t(32*1024*1024),plan.library_bytes);
+        auto * large_a=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,8192,65536);
+        auto * large_b=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,8192,32);
+        auto * large=ggml_mul_mat(ctx.get(),large_a,large_b);
+        t.assert_true(ggml_cuda_cublas_workspace_plan(large,GGML_TYPE_F32,true,32*1024*1024,plan));
+        t.assert_equal(size_t(512*1024*1024),plan.bytes);t.assert_equal(size_t(1),plan.count);
+        auto * batch_a=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,16,32,1);
+        auto * batch_b=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,16,24,4);
+        auto * batched=ggml_mul_mat(ctx.get(),batch_a,batch_b);
+        t.assert_true(ggml_cuda_cublas_workspace_plan(batched,GGML_TYPE_F16,false,32*1024*1024,plan));
+        t.assert_equal(size_t(3),plan.count);t.assert_equal(size_t(6400),plan.bytes);
+        t.assert_equal(size_t(64),plan.requests[1]);t.assert_equal(size_t(32),plan.requests[2]);
+        const auto saved=plan;batch_b->ne[3]=INT64_MAX;
+        t.assert_true(!ggml_cuda_cublas_workspace_plan(batched,GGML_TYPE_F16,false,32*1024*1024,plan));
+        t.assert_equal(saved.bytes,plan.bytes);t.assert_true(!large_a->data && !large_b->data);
+    });
+    t.test("native_mmq_quote_includes_stream_k_fixup_only_for_fractional_tiles",[](testing & t) {
+        size_t bytes=123;
+        t.assert_true(ggml_cuda_mmq_fixup_workspace(1152,576,1,1,128,128,70,true,true,bytes));
+        t.assert_equal(size_t(4587520),bytes);
+        t.assert_true(ggml_cuda_mmq_fixup_workspace(1280,896,1,1,128,128,70,true,true,bytes));
+        t.assert_equal(size_t(0),bytes);
+        t.assert_true(ggml_cuda_mmq_fixup_workspace(1152,576,1,1,128,128,70,false,true,bytes));
+        t.assert_equal(size_t(0),bytes);
+        bytes=123;
+        t.assert_true(!ggml_cuda_mmq_fixup_workspace(INT64_MAX,576,1,1,128,128,70,true,true,bytes));
+        t.assert_equal(size_t(123),bytes);
+    });
+    if (argc>1 && !std::strcmp(argv[1],"--cuda")) t.test("cuda_operator_queries_require_preparation_and_never_read_tensor_payloads",[](testing & t) {
+        ggml_backend_load_all();auto * dev=ggml_backend_dev_by_name("CUDA0");
+        if (!t.assert_true(dev!=nullptr)) return;
+        ggml_backend_ptr backend(ggml_backend_dev_init(dev,nullptr));
+        auto * reg=ggml_backend_dev_backend_reg(dev);
+        auto prepare=reinterpret_cast<ggml_backend_operator_workspace_prepare_t>(
+            ggml_backend_reg_get_proc_address(reg,"ggml_backend_operator_workspace_prepare"));
+        auto query=reinterpret_cast<ggml_backend_operator_workspace_query_t>(
+            ggml_backend_reg_get_proc_address(reg,"ggml_backend_operator_workspace_query"));
+        if (!t.assert_true(prepare && query && backend)) return;
+        ggml_context_ptr ctx(ggml_init({16384,nullptr,true}));
+        auto * a=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,1152,4304);
+        auto * b=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,1152,256);auto * op=ggml_mul_mat(ctx.get(),a,b);
+        ggml_backend_operator_workspace plan;plan.bytes=123;
+        t.assert_true(query(backend.get(),op,&plan)==ggml_backend_operator_workspace_status::unprepared);
+        t.assert_equal(size_t(123),plan.bytes);
+        if (!t.assert_true(prepare(backend.get())==ggml_backend_operator_workspace_status::success)) return;
+        const auto begin=ggml_time_us();
+        t.assert_true(query(backend.get(),op,&plan)==ggml_backend_operator_workspace_status::success);
+        t.assert_true(ggml_backend_operator_workspace_valid(plan) && plan.library_bytes>0);
+        auto * quantized=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_Q8_0,1152,4304);
+        auto * quant_op=ggml_mul_mat(ctx.get(),quantized,b);
+        t.assert_true(query(backend.get(),quant_op,&plan)==ggml_backend_operator_workspace_status::success);
+        t.assert_true(ggml_backend_operator_workspace_valid(plan) && plan.bytes>0);
+        auto * q=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,72,576,16);
+        auto * k=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,72,576,16);auto * v=ggml_dup_tensor(ctx.get(),k);
+        auto * attention=ggml_flash_attn_ext(ctx.get(),q,k,v,nullptr,0.125f,0,0);
+        t.assert_true(query(backend.get(),attention,&plan)==ggml_backend_operator_workspace_status::success);
+        t.assert_true(ggml_backend_operator_workspace_valid(plan) && plan.library_bytes==0);
+        const auto before=plan;auto * unsupported=ggml_soft_max(ctx.get(),q);
+        t.assert_true(query(backend.get(),unsupported,&plan)==ggml_backend_operator_workspace_status::unsupported);
+        t.assert_equal(before.bytes,plan.bytes);
+        q->ne[1]=INT64_MAX;
+        t.assert_true(query(backend.get(),attention,&plan)!=ggml_backend_operator_workspace_status::success);
+        t.assert_equal(before.bytes,plan.bytes);
+        t.assert_true(!a->data && !b->data && !q->data && !k->data && !v->data);
+        t.out << "operator-query-window: begin_us=" << begin << " end_us=" << ggml_time_us() << '\n';
+    });
     t.test("scheduler_pre_compute_runs_after_input_copies_and_can_reject_without_output", [&](testing & t) {
         const bool gpu=argc>1 && !std::strcmp(argv[1],"--cuda");
         ggml_backend_ptr cpu(ggml_backend_cpu_init()),device;

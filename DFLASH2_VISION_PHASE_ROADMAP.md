@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. DV10 characterization is complete; DV11-DV17 are in progress/pending for common Qwen/Gemma CUDA operator scratch and explicit cuBLAS workspace inside the same phase arena. Controlled operator scratch is not yet arena-backed. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The original implementation authorization through DV9 used TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. DV10 characterization and DV11 requirements querying are complete; DV12-DV17 are in progress/pending for common Qwen/Gemma CUDA operator scratch and explicit cuBLAS workspace inside the same phase arena. Controlled operator scratch is not yet arena-backed. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The original implementation authorization through DV9 used TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -361,7 +361,7 @@ Exit: pure DFlash2+mmproj is reviewable and documented with accurate support bou
 
 ## CUDA operator-scratch extension: DV10-DV17
 
-Status: implementation authorized and started, 2026-11-01. DV10 characterization is complete; DV11-DV17 remain to implement and qualify. This extends the completed vision feature with common CUDA workspace coverage for Qwen and Gemma. It does not reopen DV0-DV9, admit K4V images, or authorize different model/weight encodings. The starting source is `5927dd16b` plus the reviewed README follow-up; pin the actual source and binaries when implementation begins.
+Status: implementation authorized and started, 2026-11-01. DV10 characterization and DV11 requirements querying are complete; DV12-DV17 remain to implement and qualify. This extends the completed vision feature with common CUDA workspace coverage for Qwen and Gemma. It does not reopen DV0-DV9, admit K4V images, or authorize different model/weight encodings. The starting source is `5927dd16b` plus the reviewed README follow-up; pin the actual source and binaries when implementation begins.
 
 ### Evidence and remaining allocation boundary
 
@@ -429,7 +429,13 @@ Exit: a bounded allocation inventory, reproducible coverage red and per-stream p
 
 ### DV11 - Quote operator-private and library workspace requirements
 
-Status: pending; depends on DV10.
+Status: complete for the declared native vision dispatches, 2026-11-01. A private metadata-only contract now describes aligned operator requests and concurrent-stream peaks, with one explicit library workspace per stream. CUDA preparation caches actual kernel occupancy/configuration; subsequent queries read tensor metadata without device payloads or intercepted CUDA allocations. Unsupported operations/geometries return explicit status and preserve caller output. Native matmul route and precision rules are shared, the native 512 MiB F32 conversion chunk is retained, and Q8 MMQ selection is shared without removing the ordinary native path for other cases.
+
+Four small/large Qwen/Gemma encoder controls compare complete native F32 embeddings and validate every traced private allocation against its quote: 617 quoted dispatches per Qwen fixture and 937 per Gemma fixture, with zero unsupported paths or mismatches. The strict small-Qwen repeat passes all controls with zero memcheck errors, unchanged API-all/error99/default PDL and checker-only eager execution. A standalone GPU test covers preparation, payload-free F16/Q8/attention queries, unsupported and invalid metadata, plus existing scheduler controls. All six device gates pass; six host ASAN/UBSAN suites also pass, including 582 workspace assertions. Pure query windows contain no intercepted CUDA allocations. Services are restored healthy.
+
+The first Gemma run preserved exact native embeddings but reported 326 quote mismatches: MMQ's templated Stream-K launcher needs a fixup allocation in addition to quantized input. The corrected query follows the native tiling efficiency/fractional-tile rule; a measured example adds 4587520 bytes. An earlier CPU red also caught an incorrect proposed 256 MiB conversion bound against the actual native 512 MiB limit. Both failures are preserved, and neither was resolved by changing arithmetic, reducing workspace, enlarging arenas or relaxing assertions.
+
+Only the CUDA adapters and existing head-72 tile unit were rebuilt. A source-local compile definition enables host metadata export for kernels already instantiated in that unit; the original tile header's active prefix, common CUDA header, generator and generated files remain unchanged. Unaffected objects use the original prefix with the added EOF block inactive; this is an explicit preprocessor-identity mapping rather than a claim of raw full-header identity. All 75 original head-72 device kernel names/resource records match. CUDA queries currently cover the observed plain F32/F16 head-72 vision attention and supported float/Q8 matmul paths; this does not advertise managed decoder support for every head geometry. Binding and phase integration are still DV12-DV14. Local evidence: `benchmarks/results/vision-operator-scratch-20261101/dv11-quotes-v2/` and `dv11-audit.json`.
 
 - Add a side-effect-free requirements query through the existing private backend/workspace planning infrastructure. Share native dispatch decisions with execution so quotes cannot drift from the actual conversion/output path. Planning reads tensor metadata and capabilities, not device payloads.
 - Cover each inventoried conversion, output and pointer-array interval, the existing bounded F32 conversion chunking, active-stream cuBLAS workspace and required alignment. Keep graph storage and operator scratch visible as separate components without counting bytes twice.
@@ -577,7 +583,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV8: scoped numerical/memory/regression/performance evidence audited; approved finder-test correction passes.
 - [x] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored; finder-test maintenance complete.
 - [x] DV10: controlled encoder allocations inventoried and coverage red reproduced after exact native controls; private scratch remains to migrate.
-- [ ] DV11: complete operator/cuBLAS workspace requirements quoted with checked sizes and concurrency.
+- [x] DV11: declared operator/cuBLAS workspace requirements quoted with checked metadata, concurrency and native-allocation comparisons.
 - [ ] DV12: CUDA operator temporaries bound to parent leases with exact outputs and no pool escape.
 - [ ] DV13: explicit cuBLAS workspace has qualified borrowed ownership and stream/capture lifetime.
 - [ ] DV14: combined vision admission, phase transitions and failure recovery qualified for Qwen/Gemma.

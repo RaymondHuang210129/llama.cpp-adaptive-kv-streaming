@@ -4641,6 +4641,8 @@ size_t clip_vision_weight_bytes(clip_ctx * ctx, ggml_backend_buffer_type_t type)
         ggml_backend_alloc_ctx_tensors_from_buft_size(ctx->weight_metadata->context(),type) : 0;
 }
 
+ggml_backend_t clip_vision_backend(clip_ctx * ctx) { return ctx ? ctx->backend : nullptr; }
+
 // Describe resident leaves for graph-size planning only; no weight upload or backend tensor initialization occurs.
 bool clip_measure_vision_phase(clip_ctx * ctx,const clip_image_f32_batch & batch,ggml_backend_buffer_t parent,
         size_t & weight_bytes,std::vector<ggml_backend_memory_workspace_group> & groups) {

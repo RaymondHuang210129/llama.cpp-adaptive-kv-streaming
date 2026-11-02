@@ -119,6 +119,8 @@ if (CUDAToolkit_FOUND)
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/template-instances/fattn-tile-instance-dkq72-dv72.cu"
+        APPEND PROPERTY COMPILE_DEFINITIONS GGML_CUDA_FATTN72_WORKSPACE_METADATA)
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
