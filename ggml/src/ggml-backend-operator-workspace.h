@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-backend.h"
+#include "ggml-backend-memory.h"
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -8,7 +9,7 @@
 
 // Prepare under exclusive backend ownership; it may initialize native kernel metadata.
 // Subsequent queries describe native scratch without reading payloads or allocating device storage.
-enum class ggml_backend_operator_workspace_status { success, unsupported, unprepared, invalid, failed };
+enum class ggml_backend_operator_workspace_status { success, unsupported, unprepared, invalid, failed, busy, insufficient };
 struct ggml_backend_operator_workspace {
     std::array<size_t,8> requests{}, offsets{};
     size_t count = 0, bytes = 0, alignment = 128, library_bytes = 0;
@@ -23,6 +24,19 @@ struct ggml_backend_operator_phase_workspace {
 using ggml_backend_operator_workspace_prepare_t = ggml_backend_operator_workspace_status (*)(ggml_backend_t);
 using ggml_backend_operator_workspace_query_t = ggml_backend_operator_workspace_status (*)(
     ggml_backend_t,const ggml_tensor *,ggml_backend_operator_workspace *);
+
+// The root loan pins phase ownership; the scratch lease may be a nested checked view.
+struct ggml_backend_operator_workspace_binding {
+    ggml_backend_buffer_t parent = nullptr;
+    ggml_backend_memory_lease_t root = nullptr, scratch = nullptr;
+    uint64_t root_id = 0, root_generation = 0, scratch_id = 0, scratch_generation = 0;
+    ggml_backend_operator_phase_workspace layout;
+};
+using ggml_backend_operator_workspace_graph_query_t = ggml_backend_operator_workspace_status (*)(
+    ggml_backend_t,const ggml_cgraph *,ggml_backend_operator_phase_workspace *);
+using ggml_backend_operator_workspace_bind_t = ggml_backend_operator_workspace_status (*)(
+    ggml_backend_t,const ggml_backend_operator_workspace_binding *);
+using ggml_backend_operator_workspace_release_t = ggml_backend_operator_workspace_status (*)(ggml_backend_t);
 
 static inline bool ggml_backend_operator_workspace_align(size_t bytes,size_t alignment,size_t & output) {
     if (!alignment || (alignment&(alignment-1)) || bytes>SIZE_MAX-(alignment-1)) return false;
@@ -72,4 +86,20 @@ static inline bool ggml_backend_operator_workspace_group(const ggml_backend_oper
     }
     if (!ggml_backend_operator_workspace_align(next.bytes,next.alignment,next.bytes)) return false;
     output=next;return true;
+}
+
+static inline bool ggml_backend_operator_workspace_phase_valid(const ggml_backend_operator_phase_workspace & phase) {
+    if (!phase.count || phase.count>phase.streams.size() || phase.alignment!=256) return false;
+    size_t bytes=0;
+    for (size_t i=0;i<phase.count;++i) {
+        const auto & stream=phase.streams[i];size_t offset;
+        if (stream.scratch_bytes%128 || stream.library_bytes%256 ||
+                !ggml_backend_operator_workspace_align(bytes,256,offset) || offset!=stream.library_offset ||
+                stream.library_bytes>SIZE_MAX-offset) return false;
+        bytes=offset+stream.library_bytes;
+        if (!ggml_backend_operator_workspace_align(bytes,256,offset) || offset!=stream.scratch_offset ||
+                stream.scratch_bytes>SIZE_MAX-offset) return false;
+        bytes=offset+stream.scratch_bytes;
+    }
+    return ggml_backend_operator_workspace_align(bytes,256,bytes) && bytes==phase.bytes;
 }

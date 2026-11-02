@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. DV10 characterization and DV11 requirements querying are complete; DV12-DV17 are in progress/pending for common Qwen/Gemma CUDA operator scratch and explicit cuBLAS workspace inside the same phase arena. Controlled operator scratch is not yet arena-backed. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The original implementation authorization through DV9 used TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. DV10 characterization, DV11 requirements querying and DV12 operator binding are complete; DV13-DV17 are in progress/pending for common Qwen/Gemma CUDA operator scratch and explicit cuBLAS workspace inside the same phase arena. Native operator components can use checked arena leases; complete MTMD integration and explicit cuBLAS workspace remain pending. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The original implementation authorization through DV9 used TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -361,7 +361,7 @@ Exit: pure DFlash2+mmproj is reviewable and documented with accurate support bou
 
 ## CUDA operator-scratch extension: DV10-DV17
 
-Status: implementation authorized and started, 2026-11-01. DV10 characterization and DV11 requirements querying are complete; DV12-DV17 remain to implement and qualify. This extends the completed vision feature with common CUDA workspace coverage for Qwen and Gemma. It does not reopen DV0-DV9, admit K4V images, or authorize different model/weight encodings. The starting source is `5927dd16b` plus the reviewed README follow-up; pin the actual source and binaries when implementation begins.
+Status: implementation authorized and started, 2026-11-01. DV10 characterization, DV11 requirements querying and DV12 operator binding are complete; DV13-DV17 remain to implement and qualify. This extends the completed vision feature with common CUDA workspace coverage for Qwen and Gemma. It does not reopen DV0-DV9, admit K4V images, or authorize different model/weight encodings. The starting source is `5927dd16b` plus the reviewed README follow-up; pin the actual source and binaries when implementation begins.
 
 ### Evidence and remaining allocation boundary
 
@@ -446,7 +446,11 @@ Exit: complete, checked requirements exist before binding. No runtime allocation
 
 ### DV12 - Bind CUDA operator temporaries to arena leases
 
-Status: pending; depends on DV11.
+Status: complete for bounded native operator components, 2026-11-01. A private CUDA binding retains both the root phase loan and its nested scratch lease. Per-stream adapters supply the existing native pool requests from checked offsets in that grant; ordinary unbound execution keeps its native pool. Whole-graph admission checks supported dispatch, stream quotas and payload separation before compute. Invalid IDs/generations/types/layouts and short grants reject without output; managed execution owners cannot bypass the native contract. Pending work blocks release, completion joins active streams, and captured graphs retire before leases return.
+
+Eight final GPU gates pass with current compiled dependencies and six host ASAN/UBSAN suites pass. The operator matrix covers all 24 inventoried matmul shapes and four strided head-72 attention shapes, repeated native-exact outputs, poisoned scratch, canaries, exact-size/one-byte-short grants, nested root ownership and a failure reported after real enqueue. A native three-branch fork/join uses four distinct stream regions and matches exact output in normal and strict captured execution. The eager strict matrix and small Qwen encoder strict control also report zero errors with default PDL and full API reporting. Traces show zero native-pool requests/growth while bound; all 75 head-72 kernel names/resource records match the prior build. Four complete encoder controls still match original native embeddings in ordinary pool mode.
+
+The initial missing-binding API red and the later managed-owner admission bypass red are preserved. Early concurrency fixtures exposed reusable scheduler inputs and a self-referencing cast root with four consumers; stable dedicated tensor storage and a supported three-consumer native fork fixed the fixtures without changing arithmetic or weakening the required four-stream check. The final source/binary audit is `benchmarks/results/vision-operator-scratch-20261101/dv12-audit.json`; gates are in `dv12-qualification-v2/`. Explicit cuBLAS workspace is still outside the arena until DV13, and production MTMD hookup remains DV14. This component stage does not claim complete vision allocation coverage.
 
 - Supply each quoted temporary from checked views of the existing arena grant. Extend the selected CUDA host adapters while retaining the native kernels and call order. Use the native pool only for ordinary unbound execution; do not replace `ctx.pool()` globally with a new allocator.
 - TDD: valid bound operations first reproduce the DV10 pool-allocation red, then execute with zero native-pool allocation/growth. Test exact-size and one-byte-short grants, wrong device/owner/generation, overlaps, misalignment, canaries, poisoned scratch, repeated operations and queued failure/retry.
@@ -584,7 +588,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored; finder-test maintenance complete.
 - [x] DV10: controlled encoder allocations inventoried and coverage red reproduced after exact native controls; private scratch remains to migrate.
 - [x] DV11: declared operator/cuBLAS workspace requirements quoted with checked metadata, concurrency and native-allocation comparisons.
-- [ ] DV12: CUDA operator temporaries bound to parent leases with exact outputs and no pool escape.
+- [x] DV12: native CUDA operator components bound to parent leases with exact outputs, completion ownership and no native-pool escape; MTMD hookup remains DV14.
 - [ ] DV13: explicit cuBLAS workspace has qualified borrowed ownership and stream/capture lifetime.
 - [ ] DV14: combined vision admission, phase transitions and failure recovery qualified for Qwen/Gemma.
 - [ ] DV15: automatic per-ratio/common-resolution fitting requalified against complete controlled scratch.
