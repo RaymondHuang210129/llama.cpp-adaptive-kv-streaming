@@ -1,6 +1,6 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. DV10 characterization, DV11 requirements querying, DV12 operator binding, DV13 cuBLAS ownership and DV14 vision integration are complete; DV15-DV17 are in progress/pending for common Qwen/Gemma CUDA operator scratch and explicit cuBLAS workspace inside the same phase arena. MTMD vision now places the declared CUDA operator scratch and explicit cuBLAS workspace inside the same phase parent; capacity, broad performance and documentation closure remain DV15-DV17. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The original implementation authorization through DV9 used TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
+Status: DV0-DV9 complete for scoped pure DFlash2 shared-arena vision, 2026-11-01. DV10 characterization, DV11 requirements querying, DV12 operator binding, DV13 cuBLAS ownership and DV14 vision integration are complete; DV15 capacity and exact-launch validation are complete; DV16-DV17 are in progress/pending for common Qwen/Gemma CUDA operator scratch and explicit cuBLAS workspace inside the same phase arena. MTMD vision now places the declared CUDA operator scratch and explicit cuBLAS workspace inside the same phase parent; broad performance and documentation closure remain DV16-DV17. Pure streamed DFlash2 plus mmproj is admitted; K4V vision remains closed. The original implementation authorization through DV9 used TDD, regression checks and one descriptive one-sentence commit per completed stage, without attribution trailers.
 
 Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -361,7 +361,7 @@ Exit: pure DFlash2+mmproj is reviewable and documented with accurate support bou
 
 ## CUDA operator-scratch extension: DV10-DV17
 
-Status: implementation authorized and started, 2026-11-01. DV10 characterization, DV11 requirements querying, DV12 operator binding, DV13 cuBLAS ownership and DV14 vision integration are complete; DV15-DV17 remain to implement and qualify. This extends the completed vision feature with common CUDA workspace coverage for Qwen and Gemma. It does not reopen DV0-DV9, admit K4V images, or authorize different model/weight encodings. The starting source is `5927dd16b` plus the reviewed README follow-up; pin the actual source and binaries when implementation begins.
+Status: implementation authorized and started, 2026-11-01. DV10 characterization, DV11 requirements querying, DV12 operator binding, DV13 cuBLAS ownership and DV14 vision integration are complete; DV15 capacity and exact-launch validation are complete; DV16-DV17 remain to qualify and document. This extends the completed vision feature with common CUDA workspace coverage for Qwen and Gemma. It does not reopen DV0-DV9, admit K4V images, or authorize different model/weight encodings. The starting source is `5927dd16b` plus the reviewed README follow-up; pin the actual source and binaries when implementation begins.
 
 ### Evidence and remaining allocation boundary
 
@@ -496,7 +496,23 @@ Exit: both model families execute the complete controlled vision workspace insid
 
 ### DV15 - Requalify automatic resolution probing and physical capacity
 
-Status: pending; depends on DV14.
+Status: complete, 2026-11-02. The versioned `vision-memory-v2` report and finder require graph, operator, explicit library and padding bytes to sum to the actual compute grant. Old graph-only reports, missing/bool/negative/inconsistent components and mismatched executed bytes reject. Opaque runtime allocations are explicitly excluded. The shared-MTP quota diagnostic is retained as a lower bound even when a separate-workspace fallback reaches the vision guard.
+
+The eight capacity comparisons use one RTX 5070 Ti, native context capacity 262144, MTP3, Q8_0/Q4_0, b/ub256, UVM off, 2048-token bounded probes and 256 outputs. Qwen uses IQ4_XS with the matching F16 projector; Gemma uses Q3_K_S, its matching external Q8 assistant and local Q8 projector. Baseline/current controls use their own immutable libraries and unchanged weights. Fixed 2048 MiB parents validate all seven ratios at the respective 4096/256 image-budget ceilings on both implementations. The original fixed 1024 MiB Qwen attempt correctly rejects its 1197 MiB shared-MTP startup minimum; it is preserved rather than counted as a numerical pass.
+
+| Profile | Baseline maximum MiB | Current maximum MiB | Current rejected neighbor MiB | Baseline common image budget | Current common image budget |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen embedded MTP3 | 2280 | 2314 | 2315 | 47 | 2186 |
+| Gemma shared-KV MTP3 | 2410 | 2462 | 2463 | 143 | 256 |
+
+The current Qwen individual ratio maxima reach budget 4096; its common setting is smaller because a combined larger sequence reaches an opaque target-decoder `cudaFuncSetAttribute` OOM after six successful, returned encoder phases. Those failures remain preserved. Gemma's current 256 ceiling is imposed by the tested microbatch. These are measured processed-image fits for seven source ratios, not visual-quality scores, arbitrary-image guarantees or native long-context equivalence. Fixed-parent and independently maximum-fit comparisons remain separate.
+
+A publication-fidelity red proved that the old final text check used the bootstrap image setting while the generated command used the larger common setting. Final validation now runs after selecting that common setting and requires the exact published command. Each current maximum completes 261873 text tokens and 256 outputs, followed by seven image requests with 256 outputs each in the same process. The Qwen full text also reproduces every earlier text output ID and prompt/cache/draft/accept count. Default full search and opt-in selected validation retain the same publication check; failed final checks keep their receipts and publish no command.
+
+The optional text resource probe has its own exact-launch test. Its source-accounting red exposed seven completed image requests omitted from expected draft totals; the fix includes their existing timings and still rejects generated or accepted count drift. The live fixed 2048 MiB control completes 8169 text tokens, eight outputs, the 32-output constrained text proof and all seven images. Host checks pass 44 vision and 182 benchmark tests, with one expected platform skip; type checking has the same five diagnostics as the unchanged baseline. No native arithmetic, GPU allocation policy or model encoding changes were made in this stage.
+
+The audit checks 1447 artifact references, current native/model hashes, all ratio/common receipts and real +1 MiB rejections. Six accepted capacity gates are reused only with archived source, identical runtime/commands and a specialized AST proof that changed final-validation and opt-in accounting branches do not alter those probes; both published full-profile checks and the optional branch have fresh execution. Original services are restored with unchanged IDs/configurations and healthy port 1234. Local evidence: `benchmarks/results/vision-operator-scratch-20261101/` (`dv15-audit.json`, `dv15-v2-reuse-qualified.json`, `dv15-v3-reuse-qualified.json`, finder and copy qualification directories). Raw results remain local.
+
 
 - Extend the existing server planning report and finder to use the complete phase quote, with versioned/validated component diagnostics. Configure the projector and generate native fixtures automatically; do not require a user-provided image or introduce a manual-image recommendation in README.
 - Retain all seven ratios, native alignment, fixed decoder/batch configuration, actual processed dimensions, independent row settings and the common setting. Validate the common setting with all seven requests serially in one process after text; no command is published for incomplete coverage.
@@ -603,7 +619,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV12: native CUDA operator components bound to parent leases with exact outputs, completion ownership and no native-pool escape; MTMD hookup remains DV14.
 - [x] DV13: explicit cuBLAS workspace has qualified borrowed ownership, stream/capture lifetime and setup/retirement recovery; MTMD hookup remains DV14.
 - [x] DV14: combined vision admission, phase transitions and failure recovery qualified for Qwen/Gemma, with exact native output and controlled CUDA storage inside one parent.
-- [ ] DV15: automatic per-ratio/common-resolution fitting requalified against complete controlled scratch.
+- [x] DV15: automatic per-ratio/common-resolution fitting requalified against complete controlled scratch and exact published full-profile execution.
 - [ ] DV16: fresh numerical, allocation, sanitizer, lifecycle and regression/performance evidence audited.
 - [ ] DV17: extended memory/capacity contract documented and local resources restored.
 - [x] Mixed-mode boundary: K4V+mmproj remains explicitly rejected; its optional media-bounded extension is unimplemented and separately scoped.

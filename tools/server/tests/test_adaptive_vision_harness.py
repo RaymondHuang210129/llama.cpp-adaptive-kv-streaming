@@ -233,14 +233,51 @@ class FinderCapacity(unittest.TestCase):
 
     def plan(self):
         module=self.finder()
-        plan={"schema":"vision-memory-v1","arena_bytes":1024*1048576,"family":"qwen3vl","alignment":32,
+        plan={"schema":"vision-memory-v2","controlled_workspace":["graph","operator","library"],
+              "opaque_runtime_allocations_included":False,"weight_bytes":100,
+              "arena_bytes":1024*1048576,"family":"qwen3vl","alignment":32,
               "min_image_tokens":64,"effective_image_max_tokens":256,"images_per_probe":1,"microbatch":256,"ratios":[]}
         for ratio in ("1:1","4:3","3:4","16:9","9:16","2:1","1:2"):
             p,q=map(int,ratio.split(":"))
             plan["ratios"].append({"ratio":ratio,"shapes_measured":1,"candidates":[{"width":256,"height":256,
                 "input_width":p*256,"input_height":q*256,"image_tokens":64,"image_max_tokens":64,
-                "weight_bytes":100,"compute_bytes":200,"required_arena_bytes":400,"shape_id":1}],"budget_shape_ids":[1]*193})
+                "weight_bytes":100,"compute_bytes":200,"workspace":{"graph_bytes":150,"operator_bytes":25,
+                "library_bytes":20,"padding_bytes":5,"total_bytes":200},"required_arena_bytes":400,"shape_id":1}],"budget_shape_ids":[1]*193})
         return module,plan
+
+    def test_controlled_workspace_report_accepted(self):
+        module,plan=self.plan()
+        self.assertIs(module.validate_vision_plan(plan,1024),plan)
+
+    def test_graph_only_reports_cannot_admit_complete_vision(self):
+        module,plan=self.plan();plan["schema"]="vision-memory-v1"
+        plan.pop("controlled_workspace");plan.pop("opaque_runtime_allocations_included")
+        for row in plan["ratios"]:
+            for shape in row["candidates"]:shape.pop("workspace")
+        with self.assertRaises(RuntimeError):module.validate_vision_plan(plan,1024)
+
+    def test_vision_execution_requires_all_planned_components(self):
+        module,plan=self.plan();shape=plan["ratios"][0]["candidates"][0]
+        legacy="vision_phase: parent=1073741824 image_width=256 image_height=256 image_tokens=64 weights=100 compute=200 borrowed_after=0 suspended_after=0 diagnostics=1"
+        with self.assertRaises(RuntimeError):module.check_vision_phase(legacy,shape,1024)
+        complete=legacy+" graph=150 operator=25 library=20 padding=5"
+        for bad in (complete.replace("library=20","library=0"),complete.replace("operator=25","operator=24"),complete.replace("padding=5","padding=4")):
+            with self.assertRaises(RuntimeError):module.check_vision_phase(bad,shape,1024)
+
+    def test_workspace_components_reject_missing_bad_or_inconsistent_totals(self):
+        import copy
+        module,original=self.plan()
+        for mutation in range(8):
+            plan=copy.deepcopy(original);shape=plan["ratios"][0]["candidates"][0]
+            if mutation==0:shape.pop("workspace")
+            elif mutation==1:shape["workspace"]["total_bytes"]+=1
+            elif mutation==2:shape["workspace"]["operator_bytes"]=-1
+            elif mutation==3:shape["workspace"]["library_bytes"]=True
+            elif mutation==4:shape["workspace"].pop("padding_bytes")
+            elif mutation==5:plan["controlled_workspace"]=["graph"]
+            elif mutation==6:plan["opaque_runtime_allocations_included"]=True
+            else:shape["weight_bytes"]+=1
+            with self.subTest(mutation=mutation),self.assertRaises(RuntimeError):module.validate_vision_plan(plan,1024)
 
     def test_capacity_output_contains_landscape_portrait_and_actual_pixels(self):
         module,plan=self.plan()
@@ -267,7 +304,7 @@ class FinderCapacity(unittest.TestCase):
 
     def test_vision_boundary_cannot_pass_with_silently_smaller_encoded_shape(self):
         module,plan=self.plan();shape=plan["ratios"][0]["candidates"][0]
-        line="vision_phase: parent=1073741824 image_width=256 image_height=256 image_tokens=64 weights=100 compute=200 borrowed_after=0 suspended_after=0 diagnostics=1"
+        line="vision_phase: parent=1073741824 image_width=256 image_height=256 image_tokens=64 weights=100 compute=200 graph=150 operator=25 library=20 padding=5 borrowed_after=0 suspended_after=0 diagnostics=1"
         self.assertEqual(module.check_vision_phase(line,shape,1024)["image_tokens"],64)
         for bad in (line.replace("image_width=256","image_width=128"),line.replace("compute=200","compute=201"),line+"\n"+line):
             with self.assertRaises(RuntimeError):module.check_vision_phase(bad,shape,1024)
@@ -349,6 +386,20 @@ class FinderCapacity(unittest.TestCase):
         self.assertIsNone(module.vision_runtime_boundary([1,2],lambda _:False))
         self.assertEqual(module.vision_runtime_boundary([1,2],lambda _:True),2)
 
+    def test_vision_shared_mtp_rejection_reports_its_quota_lower_bound(self):
+        module=self.finder();args=module.arguments(["--model","model","--mmproj","projector"]);args.port=0
+        text=("MTP graph exceeds shared arena quota: available=1073741824 required=1254383744 additional=180641920 bytes; trying a separate workspace\n"
+              "unsupported vision arena model/projector capabilities\n")
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            class Process:
+                def wait(self,**kwargs):return 1
+            def launch(command,**kwargs):
+                kwargs["stderr"].write(text);kwargs["stderr"].flush();return Process()
+            with patch.object(module.subprocess,"Popen",side_effect=launch),patch.object(module.SWEEP,"stop_process"),self.assertRaises(module.SWEEP.ArenaTooSmallError) as failure:
+                module.vision_plan_probe(args,1024)
+            self.assertEqual(failure.exception.minimum_mib,(1254383744+1048575)//1048576)
+
     def test_failed_planner_keeps_upper_boundary_artifacts(self):
         module=self.finder();args=module.arguments(["--model","model","--mmproj","projector"])
         with tempfile.TemporaryDirectory() as directory:
@@ -369,6 +420,58 @@ class FinderCapacity(unittest.TestCase):
             with patch.object(module.SWEEP,"find_max_arena_mib",side_effect=search),patch.object(module,"probe_with_vision",return_value={"fits":True,"arena_mib":1024,"timings":{"predicted_n":256},"vision_plan":plan}),patch.object(module,"vision_capacity",return_value={"common_image_max_tokens":None,"common":None,"all_ratios_validated":True}):
                 with self.assertRaisesRegex(RuntimeError,"common"):module.fit(args,report_vision=True)
             self.assertFalse((args.output/"command.txt").exists())
+
+    def full_vision_fit(self, succeeds=True):
+        module,plan=self.plan();args=module.arguments(["--model","model","--mmproj","projector","--probe-mode","preflight","--validate-selected"])
+        def search(start,check):
+            self.assertTrue(check(1024));self.assertFalse(check(1025));return 1024
+        def bootstrap(config,arena):
+            config=argparse.Namespace(**vars(config));config.image_min_tokens=64;config.image_max_tokens=64
+            return {"fits":arena==1024,"arena_mib":arena,"timings":{"predicted_n":256},"vision_plan":plan,"command":module.server_command(config,arena)}
+        def runtime(config,arena):
+            self.assertEqual(config.probe_mode,"full")
+            self.assertEqual(len(config._vision_bootstrap),7)
+            self.assertEqual(module.probe_text_tokens(config),module.requested_text_tokens(config))
+            return {"fits":succeeds,"arena_mib":arena,"probe_mode":config.probe_mode,"timings":{"predicted_n":256},"command":module.server_command(config,arena)}
+        return module,args,search,bootstrap,runtime, {"common_image_max_tokens":128,"all_ratios_validated":True}
+
+    def test_selected_full_vision_validates_the_published_image_setting(self):
+        module,args,search,bootstrap,runtime,capacity=self.full_vision_fit()
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module.SWEEP,"find_max_arena_mib",side_effect=search),patch.object(module,"probe_with_vision",side_effect=bootstrap),patch.object(module,"vision_capacity",return_value=capacity),patch.object(module,"_runtime_probe",side_effect=runtime):
+                result=module.fit(args,report_vision=True)
+            self.assertTrue(result["full_workload_validated"])
+            self.assertEqual(result["selected_validation"]["command"],result["command"])
+
+    def test_full_search_also_checks_the_final_common_image_setting(self):
+        module,args,search,bootstrap,runtime,capacity=self.full_vision_fit()
+        args.probe_mode="full";args.validate_selected=False
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module.SWEEP,"find_max_arena_mib",side_effect=search),patch.object(module,"probe_with_vision",side_effect=bootstrap),patch.object(module,"vision_capacity",return_value=capacity),patch.object(module,"_runtime_probe",side_effect=runtime):
+                result=module.fit(args,report_vision=True)
+            self.assertEqual(result["selected_validation"]["command"],result["command"])
+
+    def test_failed_published_full_vision_keeps_receipt_without_command(self):
+        module,args,search,bootstrap,runtime,capacity=self.full_vision_fit(False)
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module.SWEEP,"find_max_arena_mib",side_effect=search),patch.object(module,"probe_with_vision",side_effect=bootstrap),patch.object(module,"vision_capacity",return_value=capacity),patch.object(module,"_runtime_probe",side_effect=runtime):
+                with self.assertRaisesRegex(RuntimeError,"full workload validation"):module.fit(args,report_vision=True)
+            self.assertFalse((args.output/"command.txt").exists())
+            self.assertFalse(module.json.loads((args.output/"selected-validation/record.json").read_text())["fits"])
+
+    def test_full_common_sequence_preserves_requested_history_and_budget(self):
+        module,plan=self.plan();args=module.arguments(["--model","model","--mmproj","projector","--context-size","8192"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"_runtime_probe",return_value={"fits":True}) as probe:
+                module.vision_common_sequence(args,1024,plan,128,args.output/"sequence",probe_mode="full")
+            config=probe.call_args.args[0]
+            self.assertEqual(module.probe_text_tokens(config),8192-args.decode_tokens-15)
+            self.assertEqual(config.image_max_tokens,128)
+            self.assertEqual(len(config._vision_bootstrap),7)
 
     def test_supplied_image_cli_keeps_the_complete_request_mode(self):
         module=self.finder()
@@ -396,6 +499,52 @@ class FinderCapacity(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,"numerical mismatch"):
                     module.vision_common_sequence(args,1024,plan,64,args.output/"failed")
 
+    def test_full_common_sequence_preserves_optional_text_resource_probe(self):
+        module,plan=self.plan();args=module.arguments(["--model","model","--mmproj","projector","--copy-probe"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            for mode in ("preflight","full"):
+                with self.subTest(mode=mode),patch.object(module,"_runtime_probe",return_value={"fits":True}) as probe:
+                    module.vision_common_sequence(args,1024,plan,128,args.output/mode,probe_mode=mode)
+                    config=probe.call_args.args[0]
+                    self.assertEqual(config.copy_probe,mode=="full")
+                    if mode=="full":
+                        expected=argparse.Namespace(**vars(args));expected.image_min_tokens=64;expected.image_max_tokens=128
+                        self.assertEqual(module.server_command(config,1024),module.server_command(expected,1024))
+
+    def test_copy_accounting_includes_all_completed_vision_requests_and_rejects_drift(self):
+        module=self.finder()
+        for drift in (None,"generated_tokens","accepted_tokens"):
+            with self.subTest(drift=drift),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);image=root/"image.png";image.write_bytes(b"fixture")
+                corpus=root/"corpus";corpus.write_text("fixture")
+                args=module.arguments(["--model","model","--mmproj","projector","--copy-probe","--spec-mode","mtp",
+                    "--context-size","8192","--decode-tokens","8","--probe-mode","preflight","--prefill-text",str(corpus)])
+                args.port=0;args.output=root
+                args._vision_bootstrap=[{"ratio":r,"image":str(image),"shape":{}} for r in module.VISION_RATIOS]
+                def request(url,body,**kwargs):
+                    if url.endswith("/tokenize"):return {"tokens":[7] if body["content"]=="B" else list(range(2048))}
+                    proof="logit_bias" in body;vision=isinstance(body["prompt"],dict)
+                    generated,accepted=(11,8) if proof else (5,3) if vision else (3,2)
+                    return {"tokens":[7 if proof else 42]*body["n_predict"],"timings":{"prompt_n":64 if vision else len(body["prompt"]),
+                        "predicted_n":body["n_predict"],"draft_n":generated,"draft_n_accepted":accepted}}
+                def launch(command,**kwargs):
+                    kwargs["stdout"].write("completed fixture\n");kwargs["stdout"].flush();return object()
+                stats={"draft-mtp":{"generated_tokens":49,"accepted_tokens":31}}
+                if drift:stats["draft-mtp"][drift]+=1
+                with patch.object(module.subprocess,"Popen",side_effect=launch),patch.object(module,"request_json",side_effect=request), \
+                        patch.object(module.SWEEP,"wait_ready"),patch.object(module.SWEEP,"stop_process"), \
+                        patch.object(module.SWEEP,"validate_execution_log"),patch.object(module,"check_vision_phases") as phases, \
+                        patch.object(module,"speculative_source_stats",return_value=stats):
+                    if drift:
+                        with self.assertRaisesRegex(RuntimeError,"source totals"):module._runtime_probe(args,2048)
+                    else:
+                        try:result=module._runtime_probe(args,2048)
+                        except RuntimeError as error:self.fail("valid text, proof and seven-image totals were rejected: "+str(error))
+                        self.assertTrue(result["fits"])
+                        self.assertEqual(len(result["vision_bootstrap"]),7)
+                    self.assertEqual(len(phases.call_args.args[1]),7)
+
     def test_failed_serial_common_setting_lowers_the_published_budget(self):
         module,plan=self.plan();plan["effective_image_max_tokens"]=66
         for row in plan["ratios"]:
@@ -412,7 +561,7 @@ class FinderCapacity(unittest.TestCase):
 
     def test_serial_vision_phase_validation_requires_every_completed_shape(self):
         module,plan=self.plan();shape=plan["ratios"][0]["candidates"][0]
-        line="vision_phase: parent=1073741824 image_width=256 image_height=256 image_tokens=64 weights=100 compute=200 borrowed_after=0 suspended_after=0 diagnostics=1"
+        line="vision_phase: parent=1073741824 image_width=256 image_height=256 image_tokens=64 weights=100 compute=200 graph=150 operator=25 library=20 padding=5 borrowed_after=0 suspended_after=0 diagnostics=1"
         self.assertEqual(len(module.check_vision_phases(line+"\n"+line,[shape,shape],1024)),2)
         with self.assertRaises(RuntimeError):module.check_vision_phases(line,[shape,shape],1024)
         with self.assertRaises(RuntimeError):module.check_vision_phases(line+"\n"+line.replace("image_height=256","image_height=128"),[shape,shape],1024)

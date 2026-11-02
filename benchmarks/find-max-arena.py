@@ -309,7 +309,7 @@ def _runtime_probe(args, candidate):
             elif mixed_proof is not None:
                 mixed_proof["source_stats"] = speculative_source_stats(text)
                 for source_key, timing_key in (("generated_tokens", "draft_n"), ("accepted_tokens", "draft_n_accepted")):
-                    expected = result["timings"].get(timing_key, 0)+mixed_proof["timings"].get(timing_key, 0)
+                    expected = result["timings"].get(timing_key, 0)+mixed_proof["timings"].get(timing_key, 0)+sum(row["timings"].get(timing_key, 0) for row in vision_result or [])
                     if sum(row[source_key] for row in mixed_proof["source_stats"].values()) != expected:
                         raise ValueError("copy-path source totals differ from completed request counters")
         except (RuntimeError, ValueError) as error:
@@ -350,14 +350,26 @@ def vision_png(width, height):
     return b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))+chunk(b"IDAT", bytes(encoded))+chunk(b"IEND", b"")
 
 
+def validate_vision_workspace(workspace, compute_bytes):
+    names=("graph_bytes", "operator_bytes", "library_bytes", "padding_bytes", "total_bytes")
+    if (not isinstance(workspace, dict) or any(type(workspace.get(key)) is not int or workspace[key] < 0 for key in names) or
+            not workspace["graph_bytes"] or not workspace["total_bytes"] or
+            sum(workspace[key] for key in names[:-1]) != workspace["total_bytes"] or workspace["total_bytes"] != compute_bytes):
+        raise RuntimeError("invalid or incomplete vision workspace components")
+    return workspace
+
+
 def validate_vision_plan(plan, arena_mib):
-    if not isinstance(plan, dict) or plan.get("schema") != "vision-memory-v1" or plan.get("arena_bytes") != arena_mib*1048576:
+    if not isinstance(plan, dict) or plan.get("schema") != "vision-memory-v2" or plan.get("arena_bytes") != arena_mib*1048576:
         raise RuntimeError("missing or mismatched server vision-memory report; use the matching server revision")
     integer = lambda value: type(value) is int and value > 0
     if (plan.get("family") not in ("qwen3vl", "gemma4") or not integer(plan.get("alignment")) or
             not integer(plan.get("min_image_tokens")) or not integer(plan.get("effective_image_max_tokens")) or
             not 1 <= plan["min_image_tokens"] <= plan["effective_image_max_tokens"] <= 65536 or plan.get("images_per_probe") != 1):
         raise RuntimeError("invalid vision geometry report")
+    if (plan.get("controlled_workspace") != ["graph", "operator", "library"] or
+            plan.get("opaque_runtime_allocations_included") is not False or not integer(plan.get("weight_bytes"))):
+        raise RuntimeError("vision report does not cover the complete controlled workspace")
     rows = plan.get("ratios")
     if not isinstance(rows, list) or len(rows) != len(VISION_RATIOS) or {r.get("ratio") for r in rows if isinstance(r, dict)} != set(VISION_RATIOS):
         raise RuntimeError("incomplete or repeated vision ratio coverage")
@@ -372,6 +384,9 @@ def validate_vision_plan(plan, arena_mib):
             fields = ("width", "height", "input_width", "input_height", "image_tokens", "image_max_tokens", "weight_bytes", "compute_bytes", "required_arena_bytes")
             if any(not integer(shape.get(key)) for key in fields):
                 raise RuntimeError("invalid vision shape values")
+            validate_vision_workspace(shape.get("workspace"), shape["compute_bytes"])
+            if shape["weight_bytes"] != plan["weight_bytes"]:
+                raise RuntimeError("vision shape weight storage differs from the configured projector")
             width, height, alignment = shape["width"], shape["height"], plan["alignment"]
             if (max(width,height,shape["input_width"],shape["input_height"]) > 65536 or width%alignment or height%alignment or
                     width//alignment*(height//alignment) != shape["image_tokens"] or
@@ -408,9 +423,14 @@ def check_vision_fields(phase, expected, arena_mib):
     fields = {"image_width":expected["width"], "image_height":expected["height"], "image_tokens":expected["image_tokens"], "parent":arena_mib*1048576}
     if any(phase.get(key) != str(value) for key,value in fields.items()) or phase.get("borrowed_after") != "0" or phase.get("suspended_after") != "0" or phase.get("diagnostics") != "1":
         raise RuntimeError("actual vision shape or phase return differs from the server plan")
-    if int(phase["weights"]) != expected["weight_bytes"] or int(phase["compute"]) != expected["compute_bytes"]:
+    if phase.get("weights") != str(expected["weight_bytes"]) or phase.get("compute") != str(expected["compute_bytes"]):
         raise RuntimeError("executed vision allocations differ from the planned shape")
-    return {key:int(phase[key]) for key in (*fields,"weights","compute","borrowed_after","suspended_after")}
+    workspace=validate_vision_workspace(expected.get("workspace"),expected["compute_bytes"])
+    components={"graph":"graph_bytes", "operator":"operator_bytes", "library":"library_bytes", "padding":"padding_bytes"}
+    if any(phase.get(key) != str(workspace[value]) for key,value in components.items()):
+        raise RuntimeError("executed vision workspace components differ from the controlled plan")
+    return {key:int(phase[key]) for key in (*fields,"weights","compute",*components,"borrowed_after","suspended_after")}
+
 
 
 def vision_plan_probe(args, candidate):
@@ -432,7 +452,8 @@ def vision_plan_probe(args, candidate):
     if re.search(r"illegal memory access|misaligned address|device-side assert|unspecified launch failure",text,re.I):
         raise RuntimeError("vision planning reported a device fault: "+str(log_path))
     if code:
-        minimum = SWEEP.arena_minimum_mib(text,include_mtp_fallback_hint=SWEEP.is_arena_capacity_failure(text))
+        shared_vision_rejected = "unsupported vision arena model/projector capabilities" in text.lower()
+        minimum = SWEEP.arena_minimum_mib(text,include_mtp_fallback_hint=SWEEP.is_arena_capacity_failure(text) or shared_vision_rejected)
         if minimum is not None:raise SWEEP.ArenaTooSmallError(minimum)
         if SWEEP.is_arena_capacity_failure(text):return None
         raise RuntimeError("server vision planning failed; see "+str(log_path))
@@ -499,11 +520,12 @@ def vision_runtime_boundary(values, fits):
     return values[lower]
 
 
-def vision_common_sequence(args, candidate, plan, budget, directory):
+def vision_common_sequence(args, candidate, plan, budget, directory, probe_mode="preflight"):
     directory.mkdir(parents=True)
     config=argparse.Namespace(**vars(args))
-    config.output=directory;config.image=[];config.prompt_file=None;config.copy_probe=False
-    config.probe_mode="preflight";config._vision_capacity_probe=True
+    config.output=directory;config.image=[];config.prompt_file=None
+    config.copy_probe=args.copy_probe if probe_mode=="full" else False
+    config.probe_mode=probe_mode;config._vision_capacity_probe=True
     config.image_min_tokens=plan["min_image_tokens"];config.image_max_tokens=budget
     config._vision_bootstrap=[]
     for row in plan["ratios"]:
@@ -519,7 +541,9 @@ def vision_common_sequence(args, candidate, plan, budget, directory):
 
 def vision_capacity(args, candidate, plan):
     validate_vision_plan(plan,candidate)
-    result = {"arena_mib":candidate,"family":plan["family"],"alignment":plan["alignment"],"images_per_probe":1,
+    result = {"schema":"vision-capacity-v2", "controlled_workspace":plan["controlled_workspace"],
+        "opaque_runtime_allocations_included":plan["opaque_runtime_allocations_included"],
+        "arena_mib":candidate,"family":plan["family"],"alignment":plan["alignment"],"images_per_probe":1,
         "effective_image_max_tokens":plan["effective_image_max_tokens"],"microbatch":plan["microbatch"],"ratios":[],
         "planning_report":{"path":plan.get("artifact"),"sha256":plan.get("sha256")},
         "scope":"Per-source-aspect single-image capacity. The native planner measures every budget; runtime uses a boundary search ordered by processed token count. These are validated fits, not proof that every larger shape fails. Native alignment can change the processed ratio. Independent maxima have row-specific settings; the common command is validated for all listed ratios. Arbitrary ratios and image batches are not validated."}
@@ -634,20 +658,7 @@ def fit(args, report_vision=False):
     selected = next((row for row in records if row["arena_mib"] == maximum and row.get("fits")), None)
     runtime_validated = selected is not None and selected.get("timings") is not None
     selected_validation = None
-    if args.validate_selected:
-        full = argparse.Namespace(**vars(args))
-        full.probe_mode, full.validate_selected = "full", False
-        full.output = args.output/"selected-validation"
-        full.output.mkdir(exist_ok=False)
-        try:
-            selected_validation = operation(full, maximum)
-        except Exception as error:
-            (full.output/"record.json").write_text(json.dumps({"arena_mib":maximum,"fits":False,"error":str(error)},indent=2)+"\n")
-            raise RuntimeError(f"selected arena full workload validation failed: {error}; see {full.output}") from error
-        (full.output/"record.json").write_text(json.dumps(selected_validation,indent=2)+"\n")
-        if not selected_validation["fits"]:
-            raise RuntimeError(f"selected arena failed full workload validation; no fit published; see {full.output}")
-    plan=(selected_validation or {}).get("vision_plan") or (selected or {}).get("vision_plan")
+    plan=(selected or {}).get("vision_plan")
     if report_vision and args.mmproj and not plan and (selected or {}).get("vision_capacity_requested"):
         plan=vision_plan_probe(args,maximum)
         if plan is None:raise RuntimeError("selected arena failed its vision planning initialization")
@@ -658,6 +669,25 @@ def fit(args, report_vision=False):
     if capacity and capacity["common_image_max_tokens"] is not None:
         command_args.image_min_tokens=plan["min_image_tokens"]
         command_args.image_max_tokens=capacity["common_image_max_tokens"]
+    if args.validate_selected or (capacity and args.probe_mode == "full"):
+        full = argparse.Namespace(**vars(command_args))
+        full.probe_mode, full.validate_selected = "full", False
+        full.output = args.output/"selected-validation"
+        try:
+            if capacity:
+                selected_validation = vision_common_sequence(full,maximum,plan,capacity["common_image_max_tokens"],full.output,probe_mode="full")
+            else:
+                full.output.mkdir(exist_ok=False)
+                selected_validation = operation(full,maximum)
+        except Exception as error:
+            full.output.mkdir(parents=True,exist_ok=True)
+            (full.output/"record.json").write_text(json.dumps({"arena_mib":maximum,"fits":False,"error":str(error)},indent=2)+"\n")
+            raise RuntimeError(f"selected arena full workload validation failed: {error}; see {full.output}") from error
+        (full.output/"record.json").write_text(json.dumps(selected_validation,indent=2)+"\n")
+        if not selected_validation["fits"]:
+            raise RuntimeError(f"selected arena failed full workload validation; no fit published; see {full.output}")
+        if capacity and selected_validation.get("command") != server_command(command_args,maximum):
+            raise RuntimeError("full workload validation used a different vision launch configuration")
     full_validated = bool(selected_validation and selected_validation["fits"]) or runtime_validated and (args.probe_mode == "full" or bool(args.image))
     report = {"arena_mib":maximum, "initial_arena_mib":args.initial_arena_mib,
         "next_mib_rejected":maximum+1 if next_rejected else None,

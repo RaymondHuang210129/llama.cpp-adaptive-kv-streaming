@@ -4846,6 +4846,9 @@ json server_context::get_vision_memory_report() const {
             admitted.push_back({{"width",shape.width},{"height",shape.height},{"input_width",shape.input_width},
                 {"input_height",shape.input_height},{"image_tokens",shape.tokens},{"image_max_tokens",shape.budget},
                 {"weight_bytes",plan.weight_bytes},{"compute_bytes",plan.device_compute_bytes},
+                {"workspace",{{"graph_bytes",plan.workspace.graph_bytes},{"operator_bytes",plan.workspace.operator_bytes},
+                    {"library_bytes",plan.workspace.library_bytes},{"padding_bytes",plan.workspace.padding_bytes},
+                    {"total_bytes",plan.workspace.total_bytes}}},
                 {"host_compute_bytes",plan.host_compute_bytes},{"required_arena_bytes",admission.required_bytes},{"shape_id",id}});
         }
         std::sort(admitted.begin(),admitted.end(),[](const json & a,const json & b) {
@@ -4859,7 +4862,8 @@ json server_context::get_vision_memory_report() const {
             {"minimum_rejected_bytes",rejected_minimum==SIZE_MAX ? json(nullptr) : json(rejected_minimum)}});
     }
     if (!mtmd_release_compute_workspace(impl->mctx)) throw std::runtime_error("cannot retire vision planning metadata");
-    return {{"schema","vision-memory-v1"},{"family",geometry.family},{"patch_size",geometry.patch_size},
+    return {{"schema","vision-memory-v2"},{"controlled_workspace",json::array({"graph","operator","library"})},
+        {"opaque_runtime_allocations_included",false},{"family",geometry.family},{"patch_size",geometry.patch_size},
         {"merge",geometry.merge},{"alignment",geometry.patch_size*geometry.merge},
         {"min_image_tokens",geometry.min_tokens},{"effective_image_max_tokens",geometry.max_tokens},
         {"image_limit_before_batch",impl->vision_image_limit_before_batch},
