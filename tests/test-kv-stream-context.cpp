@@ -49,7 +49,7 @@ static uint32_t dflash_vision_microbatch = 256;
 static const char * dflash_vision_image = nullptr;
 static const char * dflash_vision_control = nullptr;
 static bool dflash_vision_writing = false, dflash_vision_native_check = false;
-static uint32_t dflash_vision_depth = 3;
+static uint32_t dflash_vision_depth = 3, dflash_vision_ngram = 0;
 static bool serial_workspace_growth = false;
 static bool mtp_bit_exact_control = false;
 static const char * dflash_native_model = nullptr;
@@ -3560,6 +3560,9 @@ int main(int argc,char ** argv) {
             dflash_vision_native_check=!std::strcmp(argv[i],"--dflash-vision-native-check");
             dflash_vision_control=argv[++i];
         }
+        if (!std::strcmp(argv[i],"--dflash-vision-ngram") && i+1<argc) {
+            const auto depth=std::stoul(argv[++i]);if (depth<1 || depth>7) return 1;dflash_vision_ngram=uint32_t(depth);
+        }
         if (!std::strcmp(argv[i],"--dflash-vision-depth") && i+1<argc) {
             const auto depth=std::stoul(argv[++i]);if (depth<1 || depth>7) return 1;dflash_vision_depth=uint32_t(depth);
         }
@@ -3778,7 +3781,7 @@ int main(int argc,char ** argv) {
         if (!t.assert_true(bool(model) && dflash_native_model && dflash_vision_image)) return t.summary();
         t.test("DFlash_real_image_native_streamed_complete_values",[&](testing & t) {
             test_dflash_vision_exact(t,model.get(),dflash_native_model,dflash_vision_image,dflash_vision_control,
-                dflash_vision_writing,dflash_vision_native_check,dflash_vision_depth,test_cache_k,test_cache_v);
+                dflash_vision_writing,dflash_vision_native_check,dflash_vision_depth,test_cache_k,test_cache_v,dflash_vision_ngram);
         });
         return t.summary();
     }

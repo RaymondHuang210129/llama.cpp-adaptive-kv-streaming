@@ -695,7 +695,9 @@ Exit: source identity and acceptance lifetime survive every supported recovery p
 
 #### DV21 - Qualify actual image-conditioned source switching and rollback
 
-Status: pending; depends on DV20; public mixed vision still closed.
+Status: complete; public mixed vision remains closed until DV22. The existing image-conditioned framed oracle now accepts an independent K4V limit and bounds lookup to its post-image text. F3/K7, F7/K3 and F7/K7 pass complete native-decoder/streamed comparisons for copied/neural/copied switching, ambiguity, every accepted prefix for both sources, limited proposals and TG1-TG8. Each verification still processes target features into the DFlash cache. Full logits, hidden/layer vectors, selector values, visible image-aware KV, recurrent state, source counters and true frontiers match exactly. A one-row tail from the real encoder fixture injects features, while the original pinned multirow image policy remains checked. The streamed contexts retain the same physical parent across vision loans and source changes.
+
+The real frozen encoder input and Q2 sidecar provide a component-level native decoder reference; they are not described as a complete native server with the projector loaded. The smaller-sidecar full-native F7 projector-capacity failure remains in the DV0 ledger. The initial context-end fixture confused image positions with occupied KV rows; its failure is retained separately. The corrected test fills the actual physical row limit, rejects an oversized append and resumes with the final fitting row without changing the context or arena. Four current GPU gates pass, including the unchanged pure-image vector oracle. Native framed controls are preserved in SHA-checked lossless archives, and every production library remains byte-identical to DV20. Source/build/model hashes and restored healthy services are audited locally in `benchmarks/results/k4v-vision-20261102/dv21-*`.
 
 - Extend existing `test-speculative.cpp`, `kv-stream-dflash-test.h` and `test-kv-stream-context.cpp` controls; combine the real exported image fixture with the existing mixed-source program rather than adding a replacement inference driver.
 - Force actual K4V -> DFlash -> K4V, misses/ambiguity, both-empty and every accepted prefix 0..L, including F3/K7, F7/K3 and F7/K7. Exercise actual TG1-TG8 and context/window boundaries with real post-image copied candidates and neural prediction forwards.
@@ -822,7 +824,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV18: current mixed-image artifacts, source contracts and unsafe history joins reproduced with valid controls.
 - [x] DV19: checked K4V-only post-image text view passes positive, boundary and existing text-map CPU tests.
 - [x] DV20: generation, media identity, cache/checkpoint and pending acceptance lifetime are integrated safely.
-- [ ] DV21: actual mixed image source switching, every accepted prefix and TG1-TG8 match scoped native/component controls.
+- [x] DV21: actual mixed image source switching, every accepted prefix and TG1-TG8 match scoped native/component controls.
 - [ ] DV22: only the qualified mixed startup/request set is admitted, with independent widths, exact quotas and preserved guards.
 - [ ] DV23: image-aware finder/ratio output and real post-image copy/neural resource proofs execute and account correctly.
 - [ ] DV24: public images, cache/state/cancel/restart/window lifecycle pass with real mixed source coverage.
