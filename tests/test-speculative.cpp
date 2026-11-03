@@ -535,6 +535,26 @@ int main(int argc, char ** argv) {
         bool rejected=false;try { common_speculative_begin(spec.get(),0,h[0],{SIZE_MAX,4}); } catch (const std::invalid_argument &) { rejected=true; }
         t.assert_true(rejected);
     });
+    t.test("replay_boundary_keeps_logical_proposal_feedback_separate",[&](testing & t) {
+        auto params=ngram_params();common_speculative_ptr spec(common_speculative_init(params,1));
+        const auto history=history_for({0,0});llama_tokens result;
+        common_speculative_begin(spec.get(),0,history);draft(spec.get(),history,result);
+        t.assert_true(result==continuation(0));
+        common_speculative_accept(spec.get(),0,2,1);
+        t.assert_equal(size_t(1),common_speculative_get_stats(spec.get())[0].n_acc_tokens);
+        result.clear();draft(spec.get(),history,result);t.assert_true(result==continuation(0,1));
+        common_speculative_begin(spec.get(),0,history);result.clear();draft(spec.get(),history,result);
+        const auto before=common_speculative_get_stats(spec.get())[0];
+        bool rejected=false;try { common_speculative_accept(spec.get(),0,1,2); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected);t.assert_equal(before.n_call_accept,common_speculative_get_stats(spec.get())[0].n_call_accept);
+        common_speculative_accept(spec.get(),0,1,0);
+        const auto after=common_speculative_get_stats(spec.get())[0];
+        t.assert_equal(before.n_acc_tokens,after.n_acc_tokens);t.assert_equal(before.n_call_accept+1,after.n_call_accept);
+        result.clear();draft(spec.get(),history,result);t.assert_true(result.empty());
+        common_speculative_begin(spec.get(),0,history);result.clear();draft(spec.get(),history,result);
+        common_speculative_accept(spec.get(),0,2);result.clear();draft(spec.get(),history,result);
+        t.assert_true(result==continuation(0,2));
+    });
     t.test("streamed_dflash_rollback_covers_both_independent_proposal_limits", [&](testing & t) {
         for (int predictions = 1; predictions <= 7; ++predictions) {
             for (uint16_t ngram = 1; ngram <= 7; ++ngram) {

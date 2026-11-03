@@ -4608,8 +4608,6 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
-
                 slot.spec_draft = std::move(accepted);
             }
 
@@ -4619,6 +4617,7 @@ private:
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
+            common_speculative_accept(spec.get(), slot.id, ids.size() - 1, n_accepted);
             slot.spec_is_replay = false;
 
             slot.stats.update_gen_last();

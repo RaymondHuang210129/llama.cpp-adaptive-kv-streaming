@@ -126,6 +126,33 @@ class Launch(unittest.TestCase):
             return process
         return patch.object(harness.subprocess, 'Popen', side_effect=popen)
 
+    def test_mixed_dflash_vision_keeps_independent_limits_and_inherited_cache(self):
+        self.args.mtp_length=0;self.args.dflash_length=3;self.args.model_draft=Path("draft")
+        self.args.ngram_m=7;self.args.ngram_n=2;self.args.ngram_min_hits=1
+        for mode in ("stock","arena"):
+            flags=harness.speculative_arguments(self.args,mode)
+            self.assertEqual(flags[flags.index("--spec-type")+1],"ngram-map-k4v,draft-dflash")
+            self.assertEqual(flags[flags.index("--spec-draft-n-max")+1],"3")
+            self.assertEqual(flags[flags.index("--spec-ngram-map-k4v-size-m")+1],"7")
+            self.assertEqual("--spec-draft-type-k" in flags,mode=="stock")
+
+    def test_mixed_vision_policy_errors_reject_before_launch(self):
+        self.args.mtp_length=0;self.args.dflash_length=3;self.args.model_draft=Path("draft")
+        for n,k,hits in [(0,7,1),(1025,7,1),(2,8,1),(2,-1,1),(2,7,0)]:
+            self.args.ngram_n=n;self.args.ngram_m=k;self.args.ngram_min_hits=hits
+            with self.subTest(policy=(n,k,hits)),patch.object(harness.subprocess,"Popen") as process:
+                with self.assertRaises(ValueError):harness.speculative_arguments(self.args,"arena")
+                process.assert_not_called()
+
+    def test_image_source_accounting_rejects_a_replayed_correction_as_an_accept(self):
+        value={"tokens":[17,17],"timings":{"predicted_n":2,"prompt_n":64,"cache_n":0,"draft_n":7,"draft_n_accepted":0}}
+        stats={"ngram-map-k4v":{"generated_tokens":7,"accepted_tokens":0},"draft-dflash":{"generated_tokens":0,"accepted_tokens":0}}
+        self.assertEqual(harness.vision_observation(value,2,True,stats)["source_stats"],stats)
+        import copy
+        for field in ("generated_tokens","accepted_tokens"):
+            bad=copy.deepcopy(stats);bad["ngram-map-k4v"][field]+=1
+            with self.subTest(field=field),self.assertRaises(RuntimeError):harness.vision_observation(value,2,True,bad)
+
     def test_native_dflash_uses_matching_sidecar_and_cache_types(self):
         self.args.mtp_length = 0
         self.args.dflash_length = 3

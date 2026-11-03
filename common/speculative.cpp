@@ -212,7 +212,7 @@ struct common_speculative_impl {
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
-    virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+    virtual void accept(llama_seq_id seq_id, uint16_t boundary_row, bool is_other, uint16_t n_accepted) = 0;
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -475,7 +475,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         // noop
     }
 };
@@ -921,7 +921,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1405,7 +1405,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         // noop
     }
 };
@@ -1877,7 +1877,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1958,7 +1958,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         // noop
     }
 };
@@ -2034,7 +2034,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+    void accept(llama_seq_id seq_id, uint16_t /*boundary_row*/, bool is_other, uint16_t n_accepted) override {
         GGML_ASSERT((seq_id < (llama_seq_id) config.size()));
 
         if (is_other) {
@@ -2192,7 +2192,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+    void accept(llama_seq_id seq_id, uint16_t /*boundary_row*/, bool is_other, uint16_t n_accepted) override {
         if (is_other) {
             return;
         }
@@ -2354,7 +2354,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         // noop
     }
 };
@@ -3172,6 +3172,13 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_accept(spec, seq_id, n_accepted, n_accepted);
+}
+
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id,
+        uint16_t boundary_row, uint16_t n_accepted) {
+    GGML_ASSERT(spec && seq_id >= 0 && size_t(seq_id) < spec->impl_last.size());
+    if (n_accepted > boundary_row) throw std::invalid_argument("accepted proposals exceed the verified boundary");
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3195,14 +3202,14 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(seq_id, n_accepted, false);
+        impl->accept(seq_id, boundary_row, false, n_accepted);
         impl->n_call_accept++;
     }
 
     // accept with the rest of the implementations, using is_other == true
     for (auto & impl_other : spec->impls) {
         if (impl_other.get() != impl) {
-            impl_other->accept(seq_id, n_accepted, true);
+            impl_other->accept(seq_id, boundary_row, true, n_accepted);
         }
     }
 }
