@@ -92,8 +92,8 @@ def arguments(argv=None):
         parser.error("--model-draft is required for DFlash")
     if args.spec_mode == "none" and args.model_draft:
         parser.error("--model-draft requires MTP or DFlash")
-    if args.image and not args.mmproj or args.mmproj and args.spec_mode == "dflash-k4v":
-        parser.error("--image requires --mmproj; DFlash+K4V vision is not qualified")
+    if args.image and not args.mmproj:
+        parser.error("--image requires --mmproj")
     if args.prompt_file and not args.image or args.prompt_tokens is not None and args.image:
         parser.error("--prompt-file requires image validation; --prompt-tokens is for text probes")
     if args.copy_probe and args.image:
@@ -226,6 +226,67 @@ def mixed_route_probe(args, url, prompt, candidate):
             "scope":"Separate target-bias-constrained text path/resource check; mixed mode additionally proves both sources. Not performance or model quality evidence"}
 
 
+def mixed_image_route_probe(args, url, images, candidate):
+    settings = ngram_settings(args)
+    if settings is None or not images:
+        raise ValueError("mixed image route proof requires configured K4V and real image inputs")
+    tail = 2*settings["ngram_n"]+settings["ngram_m"]+2
+    count = max(32, (args.draft_length+1)*settings["ngram_min_hits"]+settings["ngram_m"]+2)
+    if tail+count+15 >= args.context_size:
+        raise ValueError("context cannot hold the mixed image proof history and outputs")
+    fragment = " B"
+    tokenized = request_json(url+"/tokenize", {"content":fragment, "add_special":False}, timeout=args.request_timeout)["tokens"]
+    if len(tokenized)!=1 or type(tokenized[0]) is not int or not 0<=tokenized[0]<=2**31-1:
+        raise ValueError("mixed image route proof requires a single ordinary token")
+    repeated = request_json(url+"/tokenize", {"content":fragment*tail, "add_special":False}, timeout=args.request_timeout)["tokens"]
+    if repeated != tokenized*tail:
+        raise ValueError("mixed image proof history does not preserve the repeated token")
+    media = " ".join([MARKER]*len(images))
+    requests = []
+    for route, prompt, outputs in (("image-miss", fragment*tail+" Describe: "+media+" Answer:", args.draft_length+2),
+                                    ("image-copy", "Describe: "+media+fragment*tail, count)):
+        config = argparse.Namespace(**vars(args));config.decode_tokens=outputs
+        body = payload(config,prompt,images);body["logit_bias"]=[[tokenized[0],1000]]
+        result = request_json(url+"/completion",body,timeout=args.request_timeout)
+        path = args.output/f"arena-{candidate}-mixed-{route}.json"
+        path.write_text(json.dumps({"payload":body,"result":result},indent=2)+"\n")
+        validate_result(config,result,None)
+        if result["tokens"] != tokenized*outputs:
+            raise RuntimeError("mixed image route proof violated the target sampling constraint")
+        requests.append({"route":route,"response":str(path),"response_sha256":hashlib.sha256(path.read_bytes()).hexdigest(),
+                         "decode_tokens":outputs,"timings":result["timings"]})
+    timing = {key:sum(row["timings"].get(key,0) for row in requests) for key in ("draft_n","draft_n_accepted","predicted_n","prompt_n")}
+    return {"requests":requests,"timings":timing,"ngram":settings,
+            "scope":"Separate image-conditioned target-biased copy and genuine-miss resource checks. Not performance or image quality evidence."}
+
+
+def validate_completed_image_sources(text, completed):
+    totals = {key:sum(row["timings"].get(key,0) for row in completed) for key in ("draft_n","draft_n_accepted")}
+    result = validate_mixed_sources(text,generated_tokens=totals["draft_n"],accepted_tokens=totals["draft_n_accepted"])
+    snapshots = {}
+    for line in text.splitlines():
+        for name,row in speculative_source_stats(line).items():
+            snapshots.setdefault(row["begin_calls"],{})[name]=row
+    fields = ("generated_tokens","accepted_tokens","accept_calls","prediction_forwards")
+    for ordinal,request in enumerate(completed,1):
+        current,previous = snapshots.get(ordinal),snapshots.get(ordinal-1)
+        if not current or set(current)!=set(result) or ordinal>1 and (not previous or set(previous)!=set(result)):
+            raise RuntimeError("missing per-request mixed image source counters")
+        delta = {name:{key:row[key]-(previous[name][key] if previous else 0) for key in fields} for name,row in current.items()}
+        if any(value<0 for row in delta.values() for value in row.values()):
+            raise RuntimeError("mixed image source counters moved backward")
+        for source_key,timing_key in (("generated_tokens","draft_n"),("accepted_tokens","draft_n_accepted")):
+            if sum(row[source_key] for row in delta.values())!=request["timings"].get(timing_key,0):
+                raise RuntimeError("per-request mixed image source totals differ from completed response")
+        if request["label"]=="image-copy" and not (delta["ngram-map-k4v"]["generated_tokens"]>0 and delta["ngram-map-k4v"]["accept_calls"]>0):
+            raise RuntimeError("image copy route did not exercise post-image K4V")
+        if request["label"]=="image-miss" and not (delta["draft-dflash"]["generated_tokens"]>0 and
+                delta["draft-dflash"]["prediction_forwards"]>0 and delta["ngram-map-k4v"]["generated_tokens"]==0):
+            raise RuntimeError("image miss route did not exercise genuine neural fallback")
+        request["source_stats"] = delta
+    return result
+
+
 def _runtime_probe(args, candidate):
     try:
         with socket.socket() as available:
@@ -242,6 +303,9 @@ def _runtime_probe(args, candidate):
     vision_result = None
     response_path = None
     prompt_sha256 = None
+    completed = []
+    mixed_image = bool(args.mmproj and args.spec_mode=="dflash-k4v")
+    expected_phases = []
     with log_path.open("x", encoding="utf-8") as log:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment(), creationflags=flags)
@@ -257,6 +321,7 @@ def _runtime_probe(args, candidate):
                 if len(ids)<count:raise ValueError("corpus is too short for vision transition validation")
                 response=request_json(url+"/completion",payload(args,ids[:count],[]),timeout=args.request_timeout)
                 validate_result(args,response,count)
+                completed.append({"label":"text-prelude","timings":response["timings"]})
                 (args.output/f"arena-{candidate}-text-prelude.json").write_text(json.dumps(response,indent=2)+"\n")
             if args.image:
                 images = [base64.b64encode(bounded_bytes(path)).decode("ascii") for path in args.image]
@@ -275,7 +340,11 @@ def _runtime_probe(args, candidate):
             if not args.image:
                 prompt_sha256 = hashlib.sha256(json.dumps(prompt, separators=(",", ":")).encode()).hexdigest()
             validate_result(args, result, expected)
-            mixed_proof = mixed_route_probe(args, url, prompt, candidate)
+            completed.append({"label":"image" if args.image else "text","timings":result["timings"]})
+            if getattr(args,"_expected_vision_shape",None):expected_phases.append(args._expected_vision_shape)
+            if not mixed_image:
+                mixed_proof = mixed_route_probe(args, url, prompt, candidate)
+                if mixed_proof:completed.append({"label":"text-proof","timings":mixed_proof["timings"]})
             bootstrap=getattr(args,"_vision_bootstrap",None)
             if bootstrap:
                 vision_result=[]
@@ -283,11 +352,19 @@ def _runtime_probe(args, candidate):
                     data=base64.b64encode(bounded_bytes(Path(item["image"]))).decode("ascii")
                     response=request_json(url+"/completion",payload(args,"Describe: "+MARKER,[data]),timeout=args.request_timeout)
                     validate_result(args,response,None)
+                    completed.append({"label":"vision-"+item["ratio"],"timings":response["timings"]})
+                    expected_phases.append(item["shape"])
                     path=args.output/f"arena-{candidate}-vision-{item['ratio'].replace(':','x')}-response.json"
                     path.write_text(json.dumps(response,indent=2)+"\n")
                     vision_result.append({"ratio":item["ratio"],"response":str(path),
                         "response_sha256":hashlib.sha256(path.read_bytes()).hexdigest(),"timings":response["timings"],
                         "image":item["image"],"image_sha256":hashlib.sha256(Path(item["image"]).read_bytes()).hexdigest()})
+            if mixed_image:
+                proof_images=images if args.image else [base64.b64encode(bounded_bytes(Path(bootstrap[0]["image"]))).decode("ascii")] if bootstrap else []
+                mixed_proof=mixed_image_route_probe(args,url,proof_images,candidate)
+                for row in mixed_proof["requests"]:completed.append({"label":row["route"],"timings":row["timings"]})
+                shape=getattr(args,"_expected_vision_shape",None) if args.image else bootstrap[0]["shape"]
+                if shape:expected_phases.extend([shape]*(2*len(proof_images)))
         except Exception as error:
             failure = error
         finally:
@@ -298,18 +375,21 @@ def _runtime_probe(args, candidate):
     if failure is None:
         try:
             SWEEP.validate_execution_log(text)
-            if getattr(args,"_expected_vision_shape",None):check_vision_phase(text,args._expected_vision_shape,candidate)
-            if bootstrap:check_vision_phases(text,[item["shape"] for item in bootstrap],candidate)
+            if expected_phases:check_vision_phases(text,expected_phases,candidate)
+            elif mixed_image:
+                phases=[dict(re.findall(r"([a-z][a-z0-9_]*)=([^\s]+)",line)) for line in text.splitlines() if "vision_phase:" in line]
+                if len(phases)!=3*len(args.image) or any(row.get("borrowed_after")!="0" or row.get("suspended_after")!="0" or row.get("diagnostics")!="1" for row in phases):
+                    raise RuntimeError("mixed image probes did not complete and return all encoder loans")
             if args.spec_mode == "dflash-k4v":
                 if mixed_proof is None:
                     raise RuntimeError("missing completed mixed route probe")
-                mixed_proof["source_stats"] = validate_mixed_sources(text,
-                    generated_tokens=result["timings"]["draft_n"]+mixed_proof["timings"]["draft_n"],
-                    accepted_tokens=result["timings"]["draft_n_accepted"]+mixed_proof["timings"]["draft_n_accepted"])
+                mixed_proof["source_stats"] = validate_completed_image_sources(text,completed) if mixed_image else validate_mixed_sources(text,
+                    generated_tokens=sum(row["timings"].get("draft_n",0) for row in completed),
+                    accepted_tokens=sum(row["timings"].get("draft_n_accepted",0) for row in completed))
             elif mixed_proof is not None:
                 mixed_proof["source_stats"] = speculative_source_stats(text)
                 for source_key, timing_key in (("generated_tokens", "draft_n"), ("accepted_tokens", "draft_n_accepted")):
-                    expected = result["timings"].get(timing_key, 0)+mixed_proof["timings"].get(timing_key, 0)+sum(row["timings"].get(timing_key, 0) for row in vision_result or [])
+                    expected = sum(row["timings"].get(timing_key,0) for row in completed)
                     if sum(row[source_key] for row in mixed_proof["source_stats"].values()) != expected:
                         raise ValueError("copy-path source totals differ from completed request counters")
         except (RuntimeError, ValueError) as error:
@@ -325,7 +405,7 @@ def _runtime_probe(args, candidate):
         "log_sha256":hashlib.sha256(log_path.read_bytes()).hexdigest(),
         "response":str(response_path) if response_path else None,
         "response_sha256":hashlib.sha256(response_path.read_bytes()).hexdigest() if response_path else None,
-        "prompt_ids_sha256":prompt_sha256, "mixed_proof":mixed_proof,
+        "prompt_ids_sha256":prompt_sha256, "mixed_proof":mixed_proof, "completed_requests":completed,
         "probe_mode":args.probe_mode, "timings":result.get("timings"), "error":str(failure) if failure else None,
         "vision_bootstrap":vision_result,"vision_capacity_requested":bool(args.mmproj),
         "limiting_factor":"context" if context_limit else "runtime_capacity" if failure else None}

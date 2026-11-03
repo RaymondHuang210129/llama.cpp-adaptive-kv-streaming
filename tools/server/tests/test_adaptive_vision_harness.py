@@ -17,7 +17,7 @@ import test_adaptive_vision as harness
 
 
 class Launch(unittest.TestCase):
-    def test_finder_admits_complete_pure_dflash_images_but_not_mixed_vision(self):
+    def test_finder_admits_qualified_dflash_images_and_preserves_unsupported_width_guard(self):
         root=Path(__file__).resolve().parents[3]
         spec=importlib.util.spec_from_file_location("vision_arena_finder",root/"benchmarks/find-max-arena.py")
         finder=importlib.util.module_from_spec(spec)
@@ -31,8 +31,10 @@ class Launch(unittest.TestCase):
             self.assertIn("--model-draft",command)
             self.assertNotIn("--spec-draft-type-k",command)
             self.assertEqual(args.image,[Path("image.png")])
+            mixed=finder.arguments(base+["--spec-mode","dflash-k4v","--ngram-m","7"])
+            self.assertEqual(mixed.spec_mode,"dflash-k4v")
             with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
-                finder.arguments(base+["--spec-mode","dflash-k4v"])
+                finder.arguments(base+["--spec-mode","dflash-k4v","--ngram-m","8"])
             process.assert_not_called()
 
     def test_image_state_actions_require_complete_files_and_matching_counts(self):
@@ -230,6 +232,106 @@ class FinderCapacity(unittest.TestCase):
         spec=importlib.util.spec_from_file_location("capacity_finder",root/"benchmarks/find-max-arena.py")
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         return module
+
+    def mixed_args(self,module,directory):
+        args=module.arguments(["--model","model","--model-draft","draft","--spec-mode","dflash-k4v",
+            "--draft-length","3","--ngram-n","2","--ngram-m","7","--ngram-min-hits","1",
+            "--context-size","4096","--decode-tokens","8","--probe-mode","preflight"])
+        args.output=Path(directory);args.mmproj=Path("projector")
+        return args
+
+    def test_mixed_vision_cli_uses_the_same_inherited_cache_and_independent_widths(self):
+        module=self.finder()
+        for images in ([],["--image","photo.png"]):
+            args=module.arguments(["--model","model","--model-draft","draft","--mmproj","projector",
+                "--spec-mode","dflash-k4v","--draft-length","3","--ngram-m","7",*images])
+            command=module.server_command(args,1024)
+            self.assertIn("--mmproj",command);self.assertNotIn("--spec-draft-type-k",command)
+            self.assertEqual(command[command.index("--spec-ngram-map-k4v-size-m")+1],"7")
+
+    def test_image_route_proof_retains_images_and_never_slices_their_prompt(self):
+        module=self.finder()
+        with tempfile.TemporaryDirectory() as directory:
+            args=self.mixed_args(module,directory);calls=[]
+            def response(url,payload,**kwargs):
+                if url.endswith("/tokenize"):
+                    return {"tokens":[17]*(len(payload["content"])//2)}
+                calls.append(payload);count=payload["n_predict"]
+                return {"tokens":[17]*count,"timings":{"predicted_n":count,"prompt_n":96,"draft_n":3,"draft_n_accepted":2,"cache_n":0}}
+            with patch.object(module,"request_json",side_effect=response):
+                proof=module.mixed_image_route_probe(args,"http://fixture",["same-image"],1024)
+            self.assertEqual(len(calls),2)
+            self.assertEqual([r["route"] for r in proof["requests"]],["image-miss","image-copy"])
+            for call in calls:
+                self.assertEqual(call["prompt"]["multimodal_data"],["same-image"])
+                self.assertEqual(call["prompt"]["prompt_string"].count(module.MARKER),1)
+                self.assertEqual(call["logit_bias"],[[17,1000]])
+            self.assertTrue(calls[0]["prompt"]["prompt_string"].startswith(" B"))
+            self.assertTrue(calls[1]["prompt"]["prompt_string"].endswith(" B"))
+
+    def test_image_route_proof_rejects_bad_tokenization_and_insufficient_context_before_completion(self):
+        module=self.finder()
+        with tempfile.TemporaryDirectory() as directory:
+            args=self.mixed_args(module,directory)
+            with patch.object(module,"request_json",return_value={"tokens":[1,2]}) as request:
+                with self.assertRaisesRegex(ValueError,"single ordinary token"):
+                    module.mixed_image_route_probe(args,"http://fixture",["image"],1024)
+                self.assertEqual(request.call_count,1)
+            args.ngram_n=1024
+            with patch.object(module,"request_json",return_value={"tokens":[17]}) as request:
+                with self.assertRaisesRegex(ValueError,"proof history|context"):
+                    args.context_size=512
+                    module.mixed_image_route_probe(args,"http://fixture",["image"],1024)
+                self.assertLessEqual(request.call_count,1)
+
+    @staticmethod
+    def mixed_statistics(ordinal,copied,neural,accepted_copy,accepted_neural,forwards):
+        lines=[]
+        for name,generated,accepted,pred in [("ngram-map-k4v",copied,accepted_copy,0),("draft-dflash",neural,accepted_neural,forwards)]:
+            lines.append(f"statistics {name}: #calls(b,g,a) = {ordinal} {ordinal} {ordinal}, #gen drafts = {ordinal}, #acc drafts = 0, #gen tokens = {generated}, #acc tokens = {accepted}, #prediction forwards = {pred}")
+        return "\n".join(lines)
+
+    def test_mixed_image_accounting_cannot_borrow_copy_or_forward_proof_from_text_prelude(self):
+        module=self.finder();completed=[{"label":"text-prelude","timings":{"draft_n":3,"draft_n_accepted":2}},
+            {"label":"image-copy","timings":{"draft_n":7,"draft_n_accepted":7}},
+            {"label":"image-miss","timings":{"draft_n":3,"draft_n_accepted":0}}]
+        log="\n".join([self.mixed_statistics(1,0,3,0,2,1),self.mixed_statistics(2,7,3,7,2,1),self.mixed_statistics(3,7,6,7,2,2)])
+        result=module.validate_completed_image_sources(log,completed)
+        self.assertEqual(result["ngram-map-k4v"]["generated_tokens"],7)
+        self.assertEqual(completed[1]["source_stats"]["ngram-map-k4v"]["generated_tokens"],7)
+        for bad in (log.replace("#gen tokens = 7","#gen tokens = 0"),
+                log.replace("#prediction forwards = 2","#prediction forwards = 1"),log.splitlines()[2:],log.replace("#gen tokens = 6","#gen tokens = 7")):
+            if isinstance(bad,list):bad="\n".join(bad)
+            with self.subTest(log=bad),self.assertRaises((RuntimeError,ValueError)):
+                module.validate_completed_image_sources(bad,completed)
+
+    def test_mixed_image_runtime_probe_accounts_text_prelude_and_all_encoder_phases(self):
+        from types import SimpleNamespace
+        module,plan=self.plan();shape=plan["ratios"][0]["candidates"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            args=self.mixed_args(module,directory);args.port=0
+            args.image=[args.output/"image.png"];args.image[0].write_bytes(b"image")
+            args.prefill_text=args.output/"corpus";args.prefill_text.write_text("corpus")
+            args._expected_vision_shape=shape;args._vision_validate_text_first=True
+            phase="vision_phase: parent=1073741824 image_width=256 image_height=256 image_tokens=64 weights=100 compute=200 graph=150 operator=25 library=20 padding=5 borrowed_after=0 suspended_after=0 diagnostics=1"
+            stats="\n".join([self.mixed_statistics(1,0,3,0,2,1),self.mixed_statistics(2,0,6,0,4,2),
+                self.mixed_statistics(3,0,9,0,6,3),self.mixed_statistics(4,7,9,7,6,3)])
+            def start(command,**kwargs):
+                kwargs["stdout"].write("\n".join([phase]*3)+"\n"+stats);kwargs["stdout"].flush()
+                return SimpleNamespace(pid=123)
+            calls=[]
+            def response(url,body,**kwargs):
+                if url.endswith("/tokenize"):
+                    return {"tokens":list(range(2048)) if body["content"]=="corpus" else [17]*(len(body["content"])//2)}
+                calls.append(body);count=body["n_predict"];copy=len(calls)==4
+                return {"tokens":[17]*count,"timings":{"prompt_n":2048 if len(calls)==1 else 96,"predicted_n":count,
+                    "cache_n":0,"draft_n":7 if copy else 3,"draft_n_accepted":7 if copy else 2}}
+            with patch.object(module.subprocess,"Popen",side_effect=start),patch.object(module.SWEEP,"wait_ready"),patch.object(module.SWEEP,"stop_process"),patch.object(module.SWEEP,"validate_execution_log"),patch.object(module,"request_json",side_effect=response):
+                result=module._runtime_probe(args,1024)
+            self.assertTrue(result["fits"],result["error"])
+            self.assertEqual(len(calls),4)
+            self.assertEqual([row["label"] for row in result["completed_requests"]],["text-prelude","image","image-miss","image-copy"])
+            self.assertEqual(result["mixed_proof"]["source_stats"]["draft-dflash"]["generated_tokens"],9)
 
     def plan(self):
         module=self.finder()
