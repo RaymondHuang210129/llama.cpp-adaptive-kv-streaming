@@ -4,6 +4,8 @@ Status: complete for the bounded K7 implementation on `feature/adaptive-kv-dflas
 
 The user selected completion of K7 and separate preservation of the unfinished K15/TG16 extension on 2026-10-31. Its exact tracked snapshot is on `wip/dflash2-k4v-k15-20261031` at `e59e929e9`; full native-equivalence qualification remains unfinished there. No K15 source is admitted by this completion. The old 96-point sweep remains intentionally stopped; no completed full-sweep claim is added.
 
+K4V with mmproj is planned separately in the [DV18-DV26 vision extension](DFLASH2_VISION_PHASE_ROADMAP.md#k4v-vision-extension-dv18-dv26). The completed text-only K7 contract below remains unchanged; mixed image admission is still closed.
+
 The stage descriptions below retain historical plans and evidence. This current status and the NK7 ledger govern completion; earlier references to later stages remaining mandatory describe their state at that time.
 
 Source baseline: `bcf1a81d641c478db5690d2f2c048c691801fcb2`. The mechanism investigation originally used `1b7c0f46e`; the relevant common, n-gram, context, rollback and server source files were verified unchanged between that revision and this baseline. Recheck those files before implementation if HEAD changes.

@@ -2,6 +2,8 @@
 
 Status: DV0-DV17 complete, 2026-11-02, for scoped pure DFlash2 shared-arena vision and common Qwen/Gemma controlled CUDA encoder workspace. Projector weights, graph storage, operator temporaries and explicit cuBLAS scratch share the existing phase parent while protected target/draft state stays live. Numerical, safety, performance, functional compilation, final finder examples and documentation checks are complete. K4V vision remains a separate follow-up. Historical stage receipts below retain their measured source/binary identities; they are not all relabelled as fresh passes after later changes.
 
+Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18 baseline and controlled-red evidence are complete; DV19-DV26 remain unchecked. Mixed vision remains rejected in the current runtime. See the [new implementation plan](#k4v-vision-extension-dv18-dv26).
+
 Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
 ## User decisions
@@ -561,35 +563,208 @@ The private memory guide documents preparation/query/bind/release, the retained 
 
 Exit: DV10-DV17 are complete for the declared controlled CUDA vision workspace. Model weights and identified opaque runtime costs remain separately accounted; no global all-process OOM guarantee or K4V-vision qualification is implied.
 
-## Separate follow-up: DFlash2 + K4V + mmproj
+## K4V vision extension: DV18-DV26
 
-This follow-up is planned but is not a dependency for declaring pure DFlash2 vision complete. It must not be enabled implicitly by DV6.
+Status: implementation started; DV18 baseline/readiness is complete and DV19-DV26 are pending. DV0-DV17 stay complete for their qualified scopes. DV18-DV26 add optional K4V to the existing Qwen DFlash2 image path; current common/server/finder guards must continue rejecting mixed vision until the corresponding implementation gates pass. Source inspected: `af2b9cb8f`. Recheck the anchors below before implementation if the source changes. Planning this extension does not establish runtime or performance qualification.
+
+### Scope and release policy
+
+- Start with the already qualified Qwen3.8-27B IQ4_XS target, matching F16 projector and matching Q2_K_S-MIX DFlash2 sidecar. Keep the original Q4 sidecar as a separate text regression control. Pin the exact artifacts again; a different sidecar encoding can change acceptance and memory fit.
+- One serial request on one CUDA GPU, Flash Attention, GPU KV offload, UVM off, an explicit shared arena, fit off and context shifting disabled. Preserve the three full-model KV reference pairs: Q8_0/Q4_0, Q8_0/Q8_0 and Q5_1/Q5_1. Draft formats remain inherited; even identical explicit overrides remain rejected.
+- DFlash maximum F and K4V copied maximum K remain independently configured in 1-7. N remains the lookup-key length, not a table size or verification width. Keep existing positive-hit and N bounds. K15/TG16, K4V-only vision, MTP+K4V vision, Gemma+DFlash, other model pairs, audio/video, LoRA, parallel slots and multi-GPU are outside this extension.
+- Support real still images, multiple images and interleaved text/image requests within measured image/context limits. K4V must actually supply valid post-image drafts in positive controls. Merely loading mmproj, accepting a flag or falling back to pure DFlash for every image request does not meet acceptance.
+- Correct support with reported performance is the release objective; a speedup over pure DFlash or MTP3 is not presumed. Investigate material regressions in existing text/vision modes. Do not retune N/K/hit thresholds, reduce images or change model/KV precision to hide a failure.
+- Reuse the completed bounded writer, source provenance, serial owner, rollback, prefetch/restore scheduling and controlled vision workspace. K4V stays in RAM. No new GPU map, attention kernel, allocator, second physical parent or speculative framework is expected.
+
+### Current mechanisms and concrete gaps
+
+| Source anchor | Current behavior | Extension requirement |
+| --- | --- | --- |
+| `common/common.cpp`: `common_streamed_dflash_config_error` | Explicitly rejects mmproj plus K4V | Open only the qualified mixed set after internal proof; keep pairing, width, format and owner guards |
+| `common/common.cpp`: `common_streamed_dflash_verification_error` | Already derives target capacity from both F and K | Reuse it; do not size target verification from F alone |
+| `tools/server/server-common.cpp`: vision configuration/request guards | The pure-DFlash predicate allows only NONE/DFlash types | Admit the exact configured NONE/DFlash/K4V set and validate its parameters; removing the common guard alone is insufficient |
+| `tools/server/server-common.h/.cpp`: `server_tokens`, `get_text_tokens`, `find_chunk`, `pos_next` | Stores media extents/positions but filters NULL image rows from speculative text history | Derive a safe text suffix and preserve the existing full DFlash text snapshot and true decoder position |
+| `tools/server/server-context.cpp`: draft setup and `common_speculative_begin` | Both currently receive filtered text without a media boundary | Supply a source-specific K4V lookup range at both generation begin and drafting; keep ownership through queue execution |
+| `common/speculative.cpp`: `common_speculative_impl_ngram_map_k` | K4V begin/draft use the entire shared prompt; process is a no-op | Bind only K4V to its safe range; do not change DFlash's history or skip its process callback |
+| `common/ngram-map.cpp/.h` | Map keys, cursors and values refer to positions in one contiguous token history | Preserve current selection/statistics semantics with a checked range view; invalidate indices when that range's identity changes |
+| K4V zero-index sentinels (`key_map`, `value_idx`, `match_pos`) | Zero denotes unused/not found; current searches skip position zero | Define checked range/index encoding so the first real suffix occurrence is not accidentally lost or treated as a sentinel |
+| `common/speculative.cpp`: DFlash process/draft | Validates completed features, skips multirow pinned image groups, injects text features; prediction uses actual `dp.pos0` | Preserve this policy even when K4V supplies proposals; raw image embeddings are not DFlash features |
+| `common_speculative_get_state` / `set_state` | Existing interface handles one saved implementation state; K4V maps rebuild at generation boundaries | Reconstruct lookup metadata/maps from restored authoritative prompt; do not add a combined state format just to save disposable maps |
+| `benchmarks/find-max-arena.py` | Rejects mixed mmproj; its mixed proof constructs an integer-token text prompt and runs before image bootstrap | Add an image-conditioned proof and complete request accounting, not just a parser exception |
+| `tools/server/tests/test_adaptive_vision.py` | Launches pure DFlash/MTP image controls and expects mixed rejection | Extend the existing harness with explicit mixed settings, actual supplying-source observations and negative controls |
+
+The existing text K4V fixes are already implemented: selected continuation emission, one-time statistics accounting, ambiguity/minimum-hit behavior and generation rebuilds have CPU tests. This work must not reintroduce the old bugs or replace the qualified scoring policy with a new heuristic.
 
 ### Mixed-mode contract
 
-- Keep F and copied maximum K independent in 1-7; target verification/rollback capacity remains `max(F,K)+1` rows and `max(F,K)` candidate states respectively.
-- K4V remains a CPU text-token map. Image embeddings and placeholder runs must not become ordinary copied candidates or image lookup keys.
-- The initial conservative design is to prevent lookup keys or copied continuations from crossing a media boundary. Prefer a source-specific lookup view over changing the shared DFlash prompt or global target positions. Determine whether the existing map can enforce this using a post-last-image text segment before adding any new state.
-- `dp.pos0` still comes from the actual target decoder frontier, never the length of filtered text or a K4V segment.
-- Rebuild disposable map/acceptance state on generation replacement and relevant image changes. Preserve valid textual lookup within the admitted segment; no new GPU map or persistent second history is required.
-- DFlash receives required target features after every successful verification even if K4V supplied the proposal. A lookup hit only skips neural prediction, not target verification or feature maintenance.
+#### Source-specific text history
 
-### Mixed-mode TDD and acceptance
+The first release uses the contiguous text suffix after the latest complete image chunk. Text before that image, including earlier otherwise-valid text segments, is intentionally not searched by K4V. This conservative scope prevents both lookup keys and copied values from crossing an image. Searching all older bounded segments is a later optional optimization with separate tests; it is not required to open the first mixed image release.
 
-1. CPU red cases: an apparent n-gram formed only by removing an image, a continuation spanning an image, identical text with a changed image, reset/restore and empty post-image text. A genuine repeated suffix after the image remains a positive case.
-2. Common/request red cases: mixed vision remains closed until all limits, media identity and source-specific history contracts are validated. No forced generic read-only role or shared prompt-length substitution.
-3. Internal controls: force K4V -> DFlash -> K4V, both-empty, rejection and every accepted prefix, including F3/K7 and F7/K3 with images. Verify supplying-source feedback and image-conditioned target/draft state.
-4. Public API/lifecycle: real copied and neural proposals after images, changed-image/cache/save/restore/cancel behavior and exact per-scenario native controls.
-5. Strict memory and ordinary performance: use the same reporting and failure rules as DV8. Copying/resource proofs are explicitly separated from natural image-task timings; no broad K4V gain is assumed.
-6. Open only the matching mixed image pairing after these gates pass, then document its independent scope.
+Prefer a checked non-owning range over the existing slot-owned `spec_prompt` text snapshot. Compute the suffix start while walking validated `server_tokens` media extents; do not guess it from literal marker strings or from the number of NULL rows alone. The default `get_text_tokens()` result and DFlash prompt remain unchanged. Reuse an existing suitable range utility, or add a minimal private contiguous token view with existing vector interfaces preserved as wrappers. Do not require C++20 `std::span`, make a second persistent conversation history, or copy full image-placeholder runs into a new map history.
 
-If boundary-aware lookup cannot be added without changing native shared history semantics, keep mixed vision closed and present the concrete API/design choice rather than weakening correctness checks.
+The existing map uses zero-valued index sentinels. DV18-DV19 must choose and test a consistent range-aware index representation, including a real first suffix occurrence at offset zero. Preserve existing whole-prompt wrappers, use checked encoding or bounds where needed, and never solve an internal sentinel collision by adding a token to the model prompt.
+
+The view describes only committed text, excluding the sampled anchor and any provisional draft. K4V combines its suffix with `id_last` using the existing lookup rule. The anchor is supplied once. Empty or too-short suffixes are legitimate lookup misses and fall through to DFlash; malformed media extents, stale generations or invalid tokens are errors/reset conditions, not ordinary misses. No artificial barrier token ID enters the vocabulary, target prompt or saved state. Native textual wrappers remain at their actual side of the media chunk; their treatment must be characterized by fixtures.
+
+| Quantity | Meaning | Must not be substituted for |
+| --- | --- | --- |
+| Full server token index | Text plus all media storage rows | Model position under M-RoPE |
+| Filtered DFlash prompt index | Existing text snapshot with image rows omitted | A valid K4V cross-image history |
+| K4V lookup index | Checked position in the eligible suffix/view | Target/draft KV position |
+| `server_tokens::pos_next()` / `dp.pos0` | Actual next model position | Text count, suffix length or image row count |
+
+For example, two text tokens, a three-row image occupying two model positions, and three suffix tokens have eight storage rows, five filtered text tokens, a three-token K4V suffix and next model position seven. Use actual chunk metadata for this calculation; real images need not have that illustrative row/position relationship.
+
+A pointer address, unchanged suffix length or identical text is not a sufficient generation identity. Bind the view to the existing request/prompt generation, media boundary and committed-prefix identity. Rebuild map keys/value statistics and retire pending supplier feedback on generation replacement, changed images, rewind, restore or changed suffix origin. Normal committed append within the same suffix must keep incremental statistics; do not clear or rebuild the map on every draft or merely because a snapshot's storage address changes. Keep lookup metadata per sequence even though the admitted server is serial.
+
+#### Drafting, verification and features
+
+```text
+full committed prompt + real media metadata
+    -> existing full DFlash text snapshot + true model frontier
+    -> K4V-only view of text after the latest image
+    -> K4V proposal, or DFlash prediction on a legitimate miss
+    -> target verification at the original model frontier
+    -> DFlash feature processing, regardless of proposal supplier
+    -> native acceptance/correction and target/draft trimming
+    -> next lookup from authoritative committed prompt
+```
+
+Use D = max(F,K): target verification/output capacity is D+1 rows and rollback depth is D; neural prediction remains F+1 rows. Image-input microbatch size does not become proposal width or full-vocabulary output count. Preserve all measured intermediate target widths TG1-TG8 and actual feature-injection capacity when K exceeds F. Short-context clamping may reduce actual proposals, never increase an admitted width or allocate around the quota.
+
+Keep the existing cascade and supplier record. A copied draft skips only DFlash prediction, not target verification or required image-conditioned feature injection. Ambiguity/empty lookup falls through once; rejection does not retry DFlash against the old frontier in the same round. The target correction/bonus token is the next unprocessed anchor. Rebuild the next lookup from the server's final trimmed prompt rather than maintaining an independent manual copy of accepted history. A checkpoint replay must not consume acceptance feedback twice or reset a still-valid pending supplier midway through replay.
+
+#### Recovery, identity and one-parent memory
+
+| Event | Required lookup behavior | Target/draft requirement |
+| --- | --- | --- |
+| New generation, even identical/equal-length input | Reset using the current safe range, as text K4V already resets | Preserve existing common begin and sampler semantics |
+| Successful verification/append | Refresh the borrowed view; preserve incremental prefix indices | Inject features, attribute acceptance and trim both contexts normally |
+| Cached image/prompt or checkpoint restore | Derive boundary from restored whole-chunk metadata; discard stale map/feedback | Respect actual available history and the existing checkpoint selection |
+| Changed, adjacent or later images | Move the suffix origin after the final complete image and reset lookup state | Preserve all image inputs/positions and completed feature provenance |
+| Cancellation, erase, failed restore or source replacement | Drop pending candidates/view state before reuse; rebuild only from authoritative recovery | Drain or close the owner, with no stale output or speculative continuation |
+| Vision loan/retirement failure | The host map cannot authorize target execution | Retain unresolved leases and keep the target closed until cleanup succeeds |
+| Restart / serialized media placeholders | Rebuild from validated restored chunk extents, including placeholders with no pixels | Restore existing target/draft/media state; do not invent missing history |
+| End of context / EOS / both sources empty | Honor actual remaining rows and clear stale supplier state | Keep native target-only fallback and end/cancel behavior |
+
+K4V index, keys, values and view metadata stay in RAM. Measure capacity/growth and avoid a new full-prefix copy per lookup where the existing owned snapshot can be reused. GPU weights remain outside the parent. Target state, bounded DFlash KV, rollback staging and current vision weight/graph/operator/library/padding loans keep their existing owner and fences. Adding host lookup does not create another GPU consumer. F3/K7 can require more target rollback/output/workspace than pure F3, so remeasure rather than assuming mixed image admission is VRAM-neutral. Preserve the flexible prefetch and recurrent-restore overlap fixes and restore their prior hints at teardown.
+
+### Staged implementation and acceptance
+
+Each stage starts with focused red evidence, then a minimal fix and the affected regressions. Keep the public mixed vision barrier until internal policy, lifecycle and exact-model controls pass. A compile red proves a missing seam; geometry/OOM/fixture failures are findings, not the expected behavioral red. One descriptive one-sentence commit closes a whole qualified stage, with no attribution trailers or pushes. Preserve DV0-DV17 and unrelated work; implementation begins on a new feature branch from the qualified base when requested.
+
+#### DV18 - Pin the mixed image contract and reproduce unsafe history joins
+
+Status: complete as a controlled-red stage. The new feature branch preserves the qualified runtime/library hashes and original native image inputs. Three live GPU controls pass: seven pure DFlash native/streamed API scenarios, the real image-conditioned vector oracle (1580 assertions), and mixed-text source switching/all verification widths (4419 assertions). Current CPU speculative/server controls pass 493/386 assertions, and host-ASAN/UBSAN preserves the expected readiness red without memory errors. Original services are restored healthy.
+
+The opt-in `test-server-vision --k4v-vision-readiness` reports exactly seven failures after valid controls: first post-image occurrence at index zero, a cross-image lookup key, a cross-image copied continuation, a pre-image value excluded by the initial suffix policy, and common/server/request mixed-image admission. The separate finder CPU red reports exactly one missing-admission failure. The ordinary released tests remain green and mixed vision remains closed. The first readiness attempt used an incorrect row/position assumption about the cheap CPU fixture; that fixture-only failure is preserved and is not counted as the behavioral red. The real native Qwen fixture has 64 image rows but eight model positions, with all four M-RoPE coordinates retained. Local evidence is under `benchmarks/results/k4v-vision-20261102/`; source/binary/model identities and original failing artifacts are preserved.
+
+- Pin current source/binaries, target/projector/smaller-draft hashes, settings and existing pure-image/text-mixed controls. Confirm the native-compatible Q2 metadata again; use it on both sides of each new comparison.
+- Characterize actual text wrappers, media extents, cached placeholders and all four M-RoPE coordinates. Record the precise safe-suffix extraction and generation lifetime before choosing the minimum private view seam.
+- CPU reds must demonstrate the current filtered-history join: a key split by an image, a continuation split by an image, and a whole pre-image continuation that the initial suffix-only policy must exclude. A genuine repeated post-image suffix is the positive control.
+- Add controlled common/server/finder reds for missing mixed-image support, after valid pure native/image controls. Keep current rejection as the released behavior; no guard-only feature opening.
+
+Exit: source-anchored failure cases distinguish the new lookup policy from pairing, allocation or image-fixture failures; design and baseline artifacts are reviewable.
+
+#### DV19 - Add a checked K4V-only suffix view
+
+Status: pending; depends on DV18.
+
+- Extend the existing server-token/speculative/ngram helpers with the smallest range seam. Borrow the existing owned text snapshot where possible; leave the ordinary shared prompt and position APIs unchanged. With no images and no boundary context, preserve existing text-only native and streamed K4V behavior.
+- Apply the selected range consistently to map begin, key search, occurrence counting, value selection and acceptance indices. Keep indices/cursors in one declared range-aware space, use checked bounds before pointer arithmetic, and handle an empty view without null-pointer arithmetic. Prove first-suffix-token lookup and zero-sentinel handling; do not silently drop that occurrence.
+- CPU TDD covers image-first/last/only, multiple/adjacent images, N=1 and N=1024, K=1 and K=7, suffix shorter than N, exactly sufficient history, collisions, ambiguity, selected values, saturation and zero acceptance. Include genuine copied proposals after images; globally disabling K4V is not a fix.
+- Verify wrapper text behavior and malformed/truncated media-map rejection. Existing text map tests, other n-gram algorithms and CPU ASAN/UBSAN remain green. No map reset on each ordinary append.
+
+Exit: unsafe joins and values are impossible within the declared suffix policy; exact text-only behavior and map accounting are preserved without a second persistent history.
+
+#### DV20 - Wire generation, prompt-cache and checkpoint lifetime
+
+Status: pending; depends on DV19.
+
+- Supply the K4V view at both generation begin and fresh-draft setup. Keep the snapshot alive and immutable through `queue_tasks.yield_to_queue`; DFlash receives its current full text prompt and actual `pos_next()`.
+- Audit prompt clear/load, context checkpoint get/set, sequence removal, partial acceptance/replay, slot-file restore and restart. Reconstruct disposable K4V state from the authoritative prompt instead of serializing indices or extending the one-implementation state container unnecessarily.
+- Reds cover same text/length with changed image, changed suffix origin, restored placeholders, rewind across an image, rejection replay, stale pending acceptance and cancellation followed by reuse. Validate that illegal mid-chunk rewinds and unavailable old history remain rejected.
+- Prove no tentative token enters the next lookup and no supplier feedback survives a generation replacement. Reset only the affected sequence; do not call global begin on every round or disrupt another implementation's state.
+
+Exit: source identity and acceptance lifetime survive every supported recovery path, or fail closed before output; no stale map/view/source pointer remains usable.
+
+#### DV21 - Qualify actual image-conditioned source switching and rollback
+
+Status: pending; depends on DV20; public mixed vision still closed.
+
+- Extend existing `test-speculative.cpp`, `kv-stream-dflash-test.h` and `test-kv-stream-context.cpp` controls; combine the real exported image fixture with the existing mixed-source program rather than adding a replacement inference driver.
+- Force actual K4V -> DFlash -> K4V, misses/ambiguity, both-empty and every accepted prefix 0..L, including F3/K7, F7/K3 and F7/K7. Exercise actual TG1-TG8 and context/window boundaries with real post-image copied candidates and neural prediction forwards.
+- Compare complete target features, logits/hidden rows, image inputs/positions, target/draft KV, recurrent state, correction frontier and source counters. Include one-row image injection and multirow pinned-image skipping. K4V-supplied verification must still invoke the existing DFlash feature processing.
+- Use native attention/model arithmetic with the same new host boundary policy as the reference. Do not bless the old native filtered-history bug as an oracle. If the smaller-sidecar full native server cannot fit, retain its failure and use the approved encoder/native-decoder component reference with exact images, positions and source/decision transcripts. Keep independent CPU policy controls and end-to-end streamed tests.
+
+Exit: mixed vision works internally with exact native/component values, correct supplied-source accounting and all rollback decisions, without a silent pure-DFlash/target-only substitute.
+
+#### DV22 - Open only qualified startup and request admission
+
+Status: pending; depends on DV21.
+
+- Resolve F/K/D, outputs, rollback, image-input feature shapes and all width/workload quotes before child capture. Reuse `common_streamed_dflash_verification_error`, the serial bounded writer and existing image-aware construction; no private workspace fallback or Gemma read-role substitution.
+- Update both common and server configuration/request predicates. Preserve model/projector matching, immutable sidecar, inherited cache formats, F/K bounds, effective microbatch limits and all unsupported-mode guards. Do not mistake a mixed configured set for the old pure-DFlash predicate.
+- Initially freeze N/K/hit policy at server configuration unless per-request changes have explicit bounded/reset qualification. Requests cannot exceed admitted widths, replace models or enable an unconfigured source. Empty valid suffixes may fall through to DFlash; invalid provenance cannot.
+- CPU/argument/server reds cover valid mixed images, both CLI source orders, F3/K7 and F7/K3, and negatives for K=0/8/48, short microbatch, wrong model/format overrides, K4V-only, Gemma, MTP mixing, parallel/audio/video/LoRA and model overrides. Invalid configurations reject before target mutation or inference.
+- Execute exact startup/joint quota boundaries, one-byte/one-MiB rejection as appropriate, phase return and child teardown, with physical parent/persistent target/draft bytes unchanged across vision loans.
+
+Exit: matching mixed image requests reach real source switching; all unrelated configurations retain their previous admission and no late growth occurs.
+
+#### DV23 - Extend image-capacity fitting and real mixed route proofs
+
+Status: pending; depends on DV22.
+
+- Remove the finder's blanket mixed/mmproj rejection only after a correct image-aware proof exists. Never pass an image prompt string/dictionary into the current integer-token slicing proof, and never call a text-only proof evidence of K4V after an image.
+- Build a separate controlled image-plus-repeated-text-suffix resource probe, using the existing target-bias constraint where appropriate. Use a declared sequence of image-conditioned positive-copy and genuine-miss requests when needed; a repetition-only request need not naturally exercise both sources. Require actual copied and neural source activity, successful target verification and exact generated/draft/accept totals. Keep it separate from ordinary timing/quality workloads and respect configured N/K/hit bounds; insufficient proof history is not VRAM OOM.
+- Preserve the user's actual image workload or generated seven-ratio profile. Explicitly track any additional proof encoder phases so strict phase-count checks remain exact. Account for every completed text prelude, image, route proof and common/bootstrap response once in cumulative source statistics.
+- Reuse `vision-memory-v2`, native geometry, complete graph/operator/library/padding quotes, physical max+1 rejection and independent/common settings. Refit mixed mode rather than using a pure DFlash/MTP arena. A fit with copying never exercised is not a mixed resource qualification.
+- Host tests cover supplied images, automatic ratios, no post-image text, common setting different from independent maxima, parser rejection and partial/missing counters. Execute representative Qwen F3/K7 and F7/K3 image fits. Run one full selected workload only when publishing that full-history claim; never silently label bounded preflight as full validation.
+
+Exit: the tool prints executed resolutions and a safe ready-to-run command for the exact mixed configuration, with explicit source coverage and honest failure/validation scope.
+
+#### DV24 - Complete public image, cache and restart lifecycle
+
+Status: pending; depends on DV23.
+
+- Extend the existing vision harness with explicit mixed parameters and source observations. Check all standard API image forms already supported by the feature, first/last/only/portrait/narrow/changed/adjacent/later images, positive copied suffixes and genuine no-copy fallback cases.
+- Cover fresh/cached requests, low/high/low phases, save/erase/restore, malformed/truncated state, process restart, cancellation during encoder work and during either proposal source, error recovery and context end. Preserve complete state-file extent/token counts and native pairs where fitting.
+- Compare corresponding native and streamed scenarios, not fresh versus cached/native cross-layout assumptions. A rebuilt map may have different proposal counts from uninterrupted generation; compare matching reset protocols and document that distinction.
+- Require real copying and real DFlash prediction in positive lifecycle scenarios, correct supplier feedback, no stale image-conditioned features, returned vision loans and valid target continuation. Test held-loan/queued failure/reconstruction with the existing frame/owner checks.
+
+Exit: the public mixed image path is functional and recoverable across the full supported lifecycle, with per-scenario tokens, counters and available state byte comparisons.
+
+#### DV25 - Audit safety, regressions and useful performance
+
+Status: pending; depends on DV24.
+
+- Run affected CPU ASAN/UBSAN, actual graph-enabled owner/capture/lifetime checks and strict mixed encoder/target/draft/source-switching device memcheck. Keep default PDL, API-all reporting, error exit 99 and no filters. A presence-based graph-disable variable set to zero still disables graphs; capture-required gates need the variable absent and actual capture assertions. Eager execution is checker-only where explicitly scoped.
+- Fresh regressions cover pure DFlash vision, mixed text, Qwen target/MTP vision and text, Gemma target/shared-KV vision, all-64 reader guards and three full-model cache pairs where affected. Preserve controlled encoder pool/library coverage, persistent state, source generations, phase errors and the cached-writer destination fix.
+- Compare existing source versus candidate with K4V disabled to detect code regressions, and candidate pure DFlash versus candidate mixed mode to isolate K4V. Keep identical weights, images, prompts, KV types, F/K, batch sizes and fixed arenas within each relevant pair. Independently fitted arenas are a separate capacity comparison. Same-mode code comparisons require exact output/work/source counts and layouts. Pure-versus-mixed proposal counts differ by design; interpret equal-output timing separately and retain any unmatched responses without relaxing numerical checks. Do not mix Q2 image and Q4 text acceptance/timings.
+- Measure ordinary end-to-end image latency, encoder/reload, text prefill/decode, lookup/indexing CPU cost, host reserved map/view capacity, neural prediction forwards, target passes, acceptance and physical decode layout. Controlled repetition proves paths/resources; natural or clearly labelled constructed multimodal workloads assess useful performance. Open-SWE text prefixes with inserted fixtures are not native multimodal dataset traces or agent task-success scores.
+- Use several representative contexts/images first, repeat matched measurements only where a gain/regression needs confirmation, and investigate material existing-feature harm. Do not promise general K4V speedup or infer it from lookup hits, skipped kernels or instrumented timings. Preserve useful correct support even if its scope yields no speedup, with the limitation documented.
+- Audit complete source/model/build/library/profile/probe hashes and every accepted error summary. No CUDA arithmetic/header/generator change is expected; if dependencies actually change, qualify the affected native/legacy objects proportionately without a clean compile-time benchmark or unsupported physical-GPU claim. Own/drain all child processes and restore any temporarily managed services.
+
+Exit: current mixed vision is backed by numerical, memory, failure and ordinary performance evidence with no unresolved material regression or misleading reference/capacity claim.
+
+#### DV26 - Publish and close K4V image support
+
+Status: pending; depends on DV25.
+
+- Update the brief README support/launch examples, focused DFlash/K4V/vision reports, finder examples and this checklist. Document the post-last-image text-only lookup scope, legitimate early misses, rebuild-on-generation/restore policy, independent F/K bounds and native-versus-component references.
+- Publish real measured arena/resolution/source-coverage results with bounded/full-history and performance scopes separated. Do not replace the fully validated earlier examples with an unvalidated larger profile. Keep raw benchmark results/data and server-AB additions local under the existing publication boundary.
+- Verify actual commands/options, Markdown paths/anchors, any changed diagrams and upstream README byte preservation. Recheck code/binary provenance after documentation-only changes; do not relabel old builds as newly compiled commits.
+- Check every completed DV18-DV26 box against its accepted gates, use descriptive one-sentence stage commits, leave unrelated files untouched and end with healthy services and no owned GPU/build/watch resources. No pushes or production model/configuration changes.
+
+Exit: the matching Qwen DFlash2+K4V+mmproj pairing can be advertised with the declared lookup/verification/memory policy and reproducible qualified usage. Unrelated K4V/MTP/Gemma modes remain outside this release.
 
 ## Expected file boundaries and review units
 
 | Area | Prefer extending |
 | --- | --- |
 | Common admission/limits | `common/common.cpp`, existing declarations and speculative parameter helpers |
+| K4V history and media lifetime | `common/ngram-map.cpp/.h`, `common/speculative.cpp/.h`, existing `server_tokens` helpers and speculative call sites in `tools/server/server-context.cpp` |
 | DFlash features and source routing | `common/speculative.cpp`, minimal existing feature/provenance metadata |
 | Context graph sizing and feature capture | `src/llama-context.cpp` and its private declarations |
 | Parent/child phase lifetime | `src/llama-context-memory.cpp/.h`, existing bounded-cache and lease infrastructure |
@@ -636,8 +811,22 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV15: automatic per-ratio/common-resolution fitting requalified against complete controlled scratch and exact published full-profile execution.
 - [x] DV16: fresh numerical, allocation, sanitizer, lifecycle and regression/performance evidence audited.
 - [x] DV17: extended memory/capacity contract documented and local resources restored.
-- [x] Mixed-mode boundary: K4V+mmproj remains explicitly rejected; its optional media-bounded extension is unimplemented and separately scoped.
+- [x] DV0-DV17 release boundary: K4V+mmproj remains explicitly rejected in the qualified baseline; the new extension is separately scoped.
+
+### K4V vision extension checklist
+
+- [x] DV18: current mixed-image artifacts, source contracts and unsafe history joins reproduced with valid controls.
+- [ ] DV19: checked K4V-only post-image text view passes positive, boundary and existing text-map CPU tests.
+- [ ] DV20: generation, media identity, cache/checkpoint and pending acceptance lifetime are integrated safely.
+- [ ] DV21: actual mixed image source switching, every accepted prefix and TG1-TG8 match scoped native/component controls.
+- [ ] DV22: only the qualified mixed startup/request set is admitted, with independent widths, exact quotas and preserved guards.
+- [ ] DV23: image-aware finder/ratio output and real post-image copy/neural resource proofs execute and account correctly.
+- [ ] DV24: public images, cache/state/cancel/restart/window lifecycle pass with real mixed source coverage.
+- [ ] DV25: current numerical/sanitizer/regression/performance and resource/provenance evidence is audited.
+- [ ] DV26: mixed-image support, limits and measured commands are documented, boxes checked and local resources restored.
 
 Pure DFlash2 vision is complete only when DV0-DV9 pass. A helper subgate, successful encoder call, configured projector, target-only fallback, or process exit does not satisfy whole-feature acceptance. Optional K4V vision has its own completion boundary.
 
 The controlled CUDA workspace extension is complete only when DV10-DV17 pass. DV0-DV9 remain complete for their recorded graph-workspace scope; neither the older feature ledger nor the completed automatic finder alone qualifies operator-private allocation coverage.
+
+The K4V vision extension is complete only when DV18-DV26 pass and the matching public guards are opened by those qualified changes. The completed DV0-DV17 and text-only K7 ledgers do not themselves admit mixed image history.

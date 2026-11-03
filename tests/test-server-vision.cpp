@@ -1,5 +1,6 @@
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-task.h"
+#include "ngram-map.h"
 #include "testing.h"
 #include <cstring>
 
@@ -13,8 +14,64 @@ static common_params qualified() {
     return p;
 }
 
-int main() {
+int main(int argc, char ** argv) {
     testing t;
+    const bool k4v_readiness = argc == 2 && !std::strcmp(argv[1], "--k4v-vision-readiness");
+    if (argc > 1 && !k4v_readiness) return 2;
+    if (k4v_readiness) t.set_filter("k4v_vision_readiness");
+    if (k4v_readiness) t.test("k4v_vision_readiness", [](testing & t) {
+        mtmd::input_chunks_ptr chunks(mtmd_test_create_input_chunks());
+        const auto * image = mtmd_input_chunks_get(chunks.get(), 1);
+        if (!t.assert_true(image && mtmd_input_chunk_get_type(image) == MTMD_INPUT_CHUNK_TYPE_IMAGE)) return;
+        const auto rows = mtmd_input_chunk_get_n_tokens(image);
+        const auto positions = mtmd_input_chunk_get_n_pos(image);
+        if (!t.assert_true(rows > 0 && positions > 0)) return;
+        const auto lookup = [&](const llama_tokens & prefix, const llama_tokens & suffix) {
+            server_tokens prompt(prefix, true);
+            prompt.push_back(image);
+            for (auto id : suffix) prompt.push_back(id);
+            const auto text = prompt.get_text_tokens();
+            t.assert_equal(prefix.size() + suffix.size(), text.size());
+            t.assert_equal(llama_pos(prefix.size() + positions + suffix.size()), prompt.pos_next());
+            common_ngram_map map(2, 3, false, 1);
+            common_ngram_map_begin(map, text);
+            llama_tokens copied;
+            common_ngram_map_draft(map, text, 20, copied);
+            t.out << "K4V image lookup rows=" << prompt.size() << " text=" << text.size()
+                  << " model_next=" << prompt.pos_next() << " copied=" << copied.size() << '\n';
+            return copied;
+        };
+        t.assert_true("real post-image repetition remains usable",
+            lookup({99,55}, {99,10,20,30,40,50,98,10}) == llama_tokens({30,40,50}));
+        t.assert_true("first post-image occurrence is a real key, not a zero sentinel",
+            lookup({}, {10,20,30,40,50,98,10}) == llama_tokens({30,40,50}));
+        t.assert_true("lookup key cannot join text across an image",
+            lookup({99,10}, {20,30,40,50,98,10}).empty());
+        t.assert_true("copied continuation cannot cross an image",
+            lookup({99,10,20,30}, {40,50,98,10}).empty());
+        t.assert_true("initial suffix-only policy excludes pre-image values",
+            lookup({99,10,20,30,40,50,98}, {10}).empty());
+        auto p = qualified();
+        p.n_batch = p.n_ubatch = 256;
+        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+        p.speculative.draft.mparams.path = "matching-dflash.gguf";
+        p.speculative.draft.n_max = 3;
+        p.speculative.ngram_map_k4v.size_n = 2;
+        p.speculative.ngram_map_k4v.size_m = 7;
+        p.speculative.ngram_map_k4v.min_hits = 1;
+        t.assert_true(!common_streamed_dflash_config_error(p) && !server_vision_arena_config_error(p));
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.tokens = server_tokens(llama_tokens{1,2,3}, true);
+        task.params.speculative = p.speculative;
+        t.assert_true(!server_vision_arena_request_error(task, false, &p.speculative));
+        p.speculative.types.insert(p.speculative.types.begin(), COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
+        task.params.speculative = p.speculative;
+        uint32_t depth = 0;
+        t.assert_true(!common_streamed_dflash_verification_error(p, depth) && depth == 7);
+        t.assert_true("mixed image common admission", !common_streamed_dflash_config_error(p));
+        t.assert_true("mixed image server admission", !server_vision_arena_config_error(p));
+        t.assert_true("mixed image request admission", !server_vision_arena_request_error(task, false, &p.speculative));
+    });
     t.test("vision_memory_report_requires_a_real_shared_projector_profile",[](testing & t) {
         auto p=qualified();p.vision_memory_report=true;
         t.assert_true(!server_vision_arena_config_error(p));
