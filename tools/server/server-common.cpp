@@ -81,13 +81,32 @@ const char * server_vision_arena_request_error(const server_task & task, bool st
         configured->draft.n_max>=1 && configured->draft.n_max<=7 &&
         std::find(configured->types.begin(),configured->types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)!=configured->types.end() &&
         std::all_of(configured->types.begin(),configured->types.end(),[](auto type) {
-            return type==COMMON_SPECULATIVE_TYPE_NONE || type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            return type==COMMON_SPECULATIVE_TYPE_NONE || type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                type==COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
         });
+    const bool ngram=dflash && std::find(configured->types.begin(),configured->types.end(),
+        COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)!=configured->types.end();
+    if (ngram) {
+        const auto & fixed=configured->ngram_map_k4v;
+        const auto & asked=requested.ngram_map_k4v;
+        if (!fixed.size_n || fixed.size_n>1024 || !fixed.size_m || fixed.size_m>7 || !fixed.min_hits ||
+                fixed.size_n!=asked.size_n || fixed.size_m!=asked.size_m || fixed.min_hits!=asked.min_hits)
+            return "vision arena request cannot change the configured K4V lookup policy";
+        if (requested.draft.n_max<1 || requested.draft.n_max>configured->draft.n_max)
+            return "vision arena request exceeds the configured DFlash prediction width";
+        const bool active=std::any_of(requested.types.begin(),requested.types.end(),[](auto type) {
+            return type!=COMMON_SPECULATIVE_TYPE_NONE;
+        });
+        if (active && (std::find(requested.types.begin(),requested.types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)==requested.types.end() ||
+                std::find(requested.types.begin(),requested.types.end(),COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)==requested.types.end()))
+            return "vision arena request cannot change the configured mixed proposal sources";
+    }
     for (auto type : task.params.speculative.types) if (type != COMMON_SPECULATIVE_TYPE_NONE &&
             !(streamed_mtp && type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && requested.draft.n_max >= 1 && requested.draft.n_max <= 3 &&
                 (!configured || requested.draft.n_max <= configured->draft.n_max)) &&
             !(dflash && type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && requested.draft.n_max>=1 &&
-                requested.draft.n_max<=configured->draft.n_max))
+                requested.draft.n_max<=configured->draft.n_max) &&
+            !(ngram && type==COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V))
         return "vision arena request cannot change the qualified speculation mode";
     try {
         for (size_t i = 0; i < task.tokens.size();) {

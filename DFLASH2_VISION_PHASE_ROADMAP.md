@@ -2,7 +2,7 @@
 
 Status: DV0-DV17 complete, 2026-11-02, for scoped pure DFlash2 shared-arena vision and common Qwen/Gemma controlled CUDA encoder workspace. Projector weights, graph storage, operator temporaries and explicit cuBLAS scratch share the existing phase parent while protected target/draft state stays live. Numerical, safety, performance, functional compilation, final finder examples and documentation checks are complete. K4V vision remains a separate follow-up. Historical stage receipts below retain their measured source/binary identities; they are not all relabelled as fresh passes after later changes.
 
-Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18 baseline/red and DV19 checked lookup ranges are complete; DV20-DV26 remain unchecked. Mixed vision remains rejected in the current runtime. See the [new implementation plan](#k4v-vision-extension-dv18-dv26).
+Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18-DV22 are complete, including checked history lifetime, exact mixed decoder controls and scoped public admission. DV23-DV26 remain unchecked; the finder still rejects mixed vision until its image-aware resource proof is qualified. See the [new implementation plan](#k4v-vision-extension-dv18-dv26).
 
 Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -565,7 +565,7 @@ Exit: DV10-DV17 are complete for the declared controlled CUDA vision workspace. 
 
 ## K4V vision extension: DV18-DV26
 
-Status: implementation started; DV18 baseline/readiness and DV19 checked lookup ranges are complete; DV20-DV26 are pending. DV0-DV17 stay complete for their qualified scopes. DV18-DV26 add optional K4V to the existing Qwen DFlash2 image path; current common/server/finder guards must continue rejecting mixed vision until the corresponding implementation gates pass. Source inspected: `af2b9cb8f`. Recheck the anchors below before implementation if the source changes. Planning this extension does not establish runtime or performance qualification.
+Status: implementation in progress; DV18-DV22 are complete and DV23-DV26 are pending. DV0-DV17 stay complete for their qualified scopes. DV18-DV26 add optional K4V to the existing Qwen DFlash2 image path; current common/server/finder guards must continue rejecting mixed vision until the corresponding implementation gates pass. Source inspected: `af2b9cb8f`. Recheck the anchors below before implementation if the source changes. Planning this extension does not establish runtime or performance qualification.
 
 ### Scope and release policy
 
@@ -708,7 +708,9 @@ Exit: mixed vision works internally with exact native/component values, correct 
 
 #### DV22 - Open only qualified startup and request admission
 
-Status: pending; depends on DV21.
+Status: complete. Common startup now admits the already validated DFlash2/K4V image pairing; the server request predicate accepts only its configured source set, matching draft model, inherited formats and bounded independent widths. K4V N/K/hit settings stay fixed per server, and request changes to either mixed source are rejected. Existing unsupported-mode/format/parallel/LoRA/media guards remain. CPU reds reproduced 12 missing-admission failures in both CLI orders and 12 partial-source-policy failures; the checked implementation passes 569 speculative and 526 server assertions in native and ASAN/UBSAN/leak runs, plus the readiness and argument controls. Old mixed-image rejection tests now distinguish qualified K7 from unsupported K8 instead of retaining the obsolete blanket barrier.
+
+Seven current GPU gates pass: F3/K3, F3/K7, F7/K3 and F7/K7 public image route/resource cases, the pure-image regression, mixed-text TG1-TG8 exact switching, and exact one-byte-short joint quota/teardown. Fresh/cached/changed/later images and a missing text suffix produce the expected complete forced outputs and actual copied/neural counters; all controlled encoder scratch stays in the parent and vision loans return cleanly. F3 full-native pairs match outputs and counts; F7 full-native smaller-Q2 projector OOM is preserved, with DV21 native-decoder component values kept as the numerical reference. The first mixed-text retry ran out of temporary disk while writing its large oracle. Only test temporary stdio backing moved to RAM after read/write/seek/flush/EOF contract red/green checks; device execution, arena and exact comparisons did not change. Accepted artifacts and hashes remain intact and production is restored healthy. Evidence is in `benchmarks/results/k4v-vision-20261102/dv22-*`.
 
 - Resolve F/K/D, outputs, rollback, image-input feature shapes and all width/workload quotes before child capture. Reuse `common_streamed_dflash_verification_error`, the serial bounded writer and existing image-aware construction; no private workspace fallback or Gemma read-role substitution.
 - Update both common and server configuration/request predicates. Preserve model/projector matching, immutable sidecar, inherited cache formats, F/K bounds, effective microbatch limits and all unsupported-mode guards. Do not mistake a mixed configured set for the old pure-DFlash predicate.
@@ -825,7 +827,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV19: checked K4V-only post-image text view passes positive, boundary and existing text-map CPU tests.
 - [x] DV20: generation, media identity, cache/checkpoint and pending acceptance lifetime are integrated safely.
 - [x] DV21: actual mixed image source switching, every accepted prefix and TG1-TG8 match scoped native/component controls.
-- [ ] DV22: only the qualified mixed startup/request set is admitted, with independent widths, exact quotas and preserved guards.
+- [x] DV22: only the qualified mixed startup/request set is admitted, with independent widths, exact quotas and preserved guards.
 - [ ] DV23: image-aware finder/ratio output and real post-image copy/neural resource proofs execute and account correctly.
 - [ ] DV24: public images, cache/state/cancel/restart/window lifecycle pass with real mixed source coverage.
 - [ ] DV25: current numerical/sanitizer/regression/performance and resource/provenance evidence is audited.

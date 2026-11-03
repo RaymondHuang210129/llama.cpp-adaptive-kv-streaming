@@ -553,11 +553,14 @@ int main(int argc, char ** argv) {
         }
     });
 
-    t.test("pure_dflash_image_admission_preserves_the_mixed_vision_barrier",[&](testing & t) {
+    t.test("dflash_image_admission_scopes_mixed_widths_and_preserves_pure_configuration",[&](testing & t) {
         for (int depth : {1,3,7}) {
             auto p=streamed_dflash_params(depth,7);
             p.mmproj.path="projector.gguf";
-            t.assert_true(common_streamed_dflash_config_error(p)!=nullptr);
+            t.assert_true(!common_streamed_dflash_config_error(p));
+            t.assert_equal(uint32_t(7),common_context_params_to_llama(p).n_rs_seq);
+            p.speculative.ngram_map_k4v.size_m=8;
+            t.assert_true("mixed images still reject unsupported K4V widths",common_streamed_dflash_config_error(p)!=nullptr);
             p.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
             t.assert_true("pure DFlash can measure image graphs before child capture",!common_streamed_dflash_config_error(p));
             t.assert_equal(uint32_t(depth),common_context_params_to_llama(p).n_rs_seq);
@@ -578,7 +581,7 @@ int main(int argc, char ** argv) {
                 case 0: params.n_parallel=2; break;
                 case 1: params.kv_stream_auxiliary_layers=1; break;
                 case 2: params.fit_params=true; break;
-                case 3: params.mmproj.path="vision.gguf"; break;
+                case 3: params.mmproj.path="vision.gguf"; params.speculative.ngram_map_k4v.size_m=8; break;
                 case 4: params.n_ubatch=7; break;
                 case 5: params.speculative.draft.cache_type_k_explicit=true; break;
                 case 6: params.speculative.draft.cache_type_v_explicit=true; break;
