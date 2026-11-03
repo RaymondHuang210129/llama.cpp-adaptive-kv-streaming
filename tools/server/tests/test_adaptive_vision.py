@@ -126,6 +126,9 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
                 time.sleep(0.1)
             else:
                 raise TimeoutError(f"{mode} startup timed out: {log_path}")
+            startup=log_path.read_text(errors="replace").lower()
+            if "failed to initialize cuda" in startup or "no usable gpu found" in startup:
+                raise RuntimeError("GPU execution unavailable; refusing a CPU fallback qualification: "+str(log_path))
             yield port
         finally:
             if os.name == "posix":

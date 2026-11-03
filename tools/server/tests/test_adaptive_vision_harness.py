@@ -78,6 +78,13 @@ class Launch(unittest.TestCase):
             with self.subTest(message=message),self.launch(message),patch.object(harness.os,"killpg",create=True):
                 with harness.server(self.args,"arena-reject-dflash",reject=True):pass
 
+    def test_requested_gpu_profile_rejects_a_healthy_cpu_fallback(self):
+        with self.launch("failed to initialize CUDA: out of memory\nno usable GPU found"), \
+                patch.object(harness.os,"killpg",create=True), \
+                patch.object(harness,"request",return_value=(200,{"status":"ok"})):
+            with self.assertRaisesRegex(RuntimeError,"GPU execution unavailable"):
+                with harness.server(self.args,"stock"):pass
+
     def test_a_vision_banner_does_not_turn_device_faults_into_config_rejections(self):
         for error in ("cudaMalloc failed: out of memory","illegal memory access","device-side assert","no kernel image"):
             with self.subTest(error=error),self.launch("vision arena enabled\n"+error),patch.object(harness.os,"killpg",create=True):

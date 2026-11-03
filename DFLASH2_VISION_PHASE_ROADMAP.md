@@ -2,7 +2,7 @@
 
 Status: DV0-DV17 complete, 2026-11-02, for scoped pure DFlash2 shared-arena vision and common Qwen/Gemma controlled CUDA encoder workspace. Projector weights, graph storage, operator temporaries and explicit cuBLAS scratch share the existing phase parent while protected target/draft state stays live. Numerical, safety, performance, functional compilation, final finder examples and documentation checks are complete. K4V vision remains a separate follow-up. Historical stage receipts below retain their measured source/binary identities; they are not all relabelled as fresh passes after later changes.
 
-Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18-DV24 are complete, including checked history lifetime, exact mixed decoder controls, public admission, image-aware fitting and image/cache/state/cancellation/restart lifecycle. DV25-DV26 remain unchecked. See the [new implementation plan](#k4v-vision-extension-dv18-dv26).
+Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18-DV25 are complete, including image-aware lookup, internal/public/lifecycle controls and final safety/performance qualification. DV26 documentation closure remains unchecked. See the [new implementation plan](#k4v-vision-extension-dv18-dv26).
 
 Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -565,7 +565,7 @@ Exit: DV10-DV17 are complete for the declared controlled CUDA vision workspace. 
 
 ## K4V vision extension: DV18-DV26
 
-Status: implementation in progress; DV18-DV24 are complete and DV25-DV26 are pending. DV0-DV17 stay complete for their qualified scopes. DV18-DV26 add optional K4V to the existing Qwen DFlash2 image path; current common/server/finder guards must continue rejecting mixed vision until the corresponding implementation gates pass. Source inspected: `af2b9cb8f`. Recheck the anchors below before implementation if the source changes. Planning this extension does not establish runtime or performance qualification.
+Status: implementation in progress; DV18-DV25 are complete and DV26 is pending. DV0-DV17 stay complete for their qualified scopes. DV18-DV26 add optional K4V to the existing Qwen DFlash2 image path; current common/server/finder guards must continue rejecting mixed vision until the corresponding implementation gates pass. Source inspected: `af2b9cb8f`. Recheck the anchors below before implementation if the source changes. Planning this extension does not establish runtime or performance qualification.
 
 ### Scope and release policy
 
@@ -751,7 +751,13 @@ Exit: the public mixed image path is functional and recoverable across the full 
 
 #### DV25 - Audit safety, regressions and useful performance
 
-Status: pending; depends on DV24.
+Status: complete. The final compiled runtime passes 34 accepted GPU numerical, memory and regression gates, including nine zero-error strict jobs. Device checks retain default PDL, all API errors, exit 99, all relevant child processes and no filters. The graph-owner gate keeps graph-disable variables absent and asserts real captures; eager execution is checker-only. Coverage includes widest target and neural mixed-image paths, MTP full-checkpoint replay, D256/D512 reader/operator matrices, writer/read-only/owner/copy/recurrent controls, Qwen MTP exact vectors, all three mixed native decoder-component transcripts, pure Qwen/Gemma regressions and three full-model cache pairs. Thirteen native and sixteen affected ASAN/UBSAN host suites pass; all 53 vision, 46 Gemma and 182 benchmark host tests pass with one expected benchmark skip.
+
+The real mixed image ASAN lifecycle passes 30 native and 30 streamed records with identical corresponding outputs/work and complete saved states, no host sanitizer errors and confirmed CUDA model buffers. Its first attempt accidentally omitted the previously qualified `protect_shadow_gap=0` CUDA-ASAN setting and fell back to CPU. A no-model/no-arena diagnostic reproduces that default initialization failure in both baseline and current ASAN binaries with free VRAM, and both initialize CUDA using the accepted profile. Leak detection, halt-on-error and UBSAN stay enabled. A controlled host red additionally proved that a healthy CPU fallback could be mistaken for the requested GPU profile; the harness now fails closed before inference. The failed attempt is preserved and is not a GPU pass. Earlier accepted compiled-runtime results are adopted only after explicit review of that fail-fast-only harness delta, unchanged CXX/GPU/model/command identities and confirmed CUDA execution.
+
+Ordinary performance uses a fixed 1-GiB arena, context capacity 8192, Q8/Q4, b/ub256, UVM off, fresh image requests, 128 outputs and three alternating paired trials, with one warmup per process. All 48 timed responses retain 6144 exact generated IDs within their comparisons, and all 12 paired physical decode-layout sequences match. Existing MTP3 and DFlash7 code-comparison median decode changes remain within 0.27%; no material existing-mode regression is observed in these scoped checks. N12/M7/H2 makes no eligible copies on the two ordinary fixtures and shows no meaningful gain. A separate N12/M7/H1 cohort accepts 98 copied code tokens, reduces neural forwards from 17 to 3 with the same 17 target verification passes, and improves the constructed post-image code-copy case by 9.98% paired-median decode (all three pairs +9.43% to +10.99%); request latency decreases about 2.7%. Captioning remains unchanged within noise. This is a deliberately constructed copy task, not an agent/image-quality result or a universal K4V speedup. The measured host index reserve is 1 MiB plus dynamic 88-byte key-statistic entries and existing history capacity on this build; the private lookup descriptor is 16 bytes. No GPU map or new device allocation is introduced.
+
+Complete source/model/library/profile/command/loaded-library and result hashes, all real sanitizer reports, capacity findings and healthy service restoration are audited locally under `benchmarks/results/k4v-vision-20261102/dv25-*`. No CUDA kernel/header/generator changed, so unchanged legacy device objects are not needlessly rebuilt or represented as new physical-GPU qualification. Raw reports and measurement data remain local.
 
 - Run affected CPU ASAN/UBSAN, actual graph-enabled owner/capture/lifetime checks and strict mixed encoder/target/draft/source-switching device memcheck. Keep default PDL, API-all reporting, error exit 99 and no filters. A presence-based graph-disable variable set to zero still disables graphs; capture-required gates need the variable absent and actual capture assertions. Eager execution is checker-only where explicitly scoped.
 - Fresh regressions cover pure DFlash vision, mixed text, Qwen target/MTP vision and text, Gemma target/shared-KV vision, all-64 reader guards and three full-model cache pairs where affected. Preserve controlled encoder pool/library coverage, persistent state, source generations, phase errors and the cached-writer destination fix.
@@ -836,7 +842,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV22: only the qualified mixed startup/request set is admitted, with independent widths, exact quotas and preserved guards.
 - [x] DV23: image-aware finder/ratio output and real post-image copy/neural resource proofs execute and account correctly.
 - [x] DV24: public images, cache/state/cancel/restart/window lifecycle pass with real mixed source coverage.
-- [ ] DV25: current numerical/sanitizer/regression/performance and resource/provenance evidence is audited.
+- [x] DV25: current numerical/sanitizer/regression/performance and resource/provenance evidence is audited.
 - [ ] DV26: mixed-image support, limits and measured commands are documented, boxes checked and local resources restored.
 
 Pure DFlash2 vision is complete only when DV0-DV9 pass. A helper subgate, successful encoder call, configured projector, target-only fallback, or process exit does not satisfy whole-feature acceptance. Optional K4V vision has its own completion boundary.
