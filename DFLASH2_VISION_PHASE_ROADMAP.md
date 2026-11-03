@@ -634,8 +634,8 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV13: explicit cuBLAS workspace has qualified borrowed ownership, stream/capture lifetime and setup/retirement recovery; MTMD hookup remains DV14.
 - [x] DV14: combined vision admission, phase transitions and failure recovery qualified for Qwen/Gemma, with exact native output and controlled CUDA storage inside one parent.
 - [x] DV15: automatic per-ratio/common-resolution fitting requalified against complete controlled scratch and exact published full-profile execution.
-- [ ] DV16: fresh numerical, allocation, sanitizer, lifecycle and regression/performance evidence audited.
-- [ ] DV17: extended memory/capacity contract documented and local resources restored.
+- [x] DV16: fresh numerical, allocation, sanitizer, lifecycle and regression/performance evidence audited.
+- [x] DV17: extended memory/capacity contract documented and local resources restored.
 - [x] Mixed-mode boundary: K4V+mmproj remains explicitly rejected; its optional media-bounded extension is unimplemented and separately scoped.
 
 Pure DFlash2 vision is complete only when DV0-DV9 pass. A helper subgate, successful encoder call, configured projector, target-only fallback, or process exit does not satisfy whole-feature acceptance. Optional K4V vision has its own completion boundary.
