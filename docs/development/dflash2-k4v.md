@@ -4,16 +4,16 @@ The bounded seven-token implementation combines the existing CPU K4V map with th
 
 ## Supported scope
 
-- The pinned Qwen3.8-27B target (`qwen35` metadata) and matching [DFlash2 sidecar](../../benchmarks/data/dflash2-qwen27b-artifacts.json), one serial text request on one CUDA GPU.
+- The pinned Qwen3.8-27B target (`qwen35` metadata) and matching [DFlash2 sidecar](../../benchmarks/data/dflash2-qwen27b-artifacts.json), one serial text or still-image request on one CUDA GPU.
 - Independently configured DFlash proposal maximum F=1-7 and K4V continuation maximum M=1-7. Target verification and recurrent rollback use max(F,M); verification executes TG1-TG8, including intermediate widths. Neural prediction still respects its own trained block size.
 - Full-model qualification covers Q8_0/Q4_0, Q8_0/Q8_0 and Q5_1/Q5_1. Adaptive drafting inherits target cache types; explicit draft-cache overrides are rejected.
-- The mixed K4V mode has no simultaneous MTP, image/projector, parallel-slot, multi-GPU, Gemma+DFlash, DSpark or EAGLE admission. Pure DFlash2 has separate [shared-arena image support](../multimodal/dflash2-vision.md); that does not enable K4V image history. Native non-streaming modes retain their separate contracts.
+- The mixed K4V mode has no simultaneous MTP, parallel-slot, multi-GPU, Gemma+DFlash, DSpark or EAGLE admission. Matching Qwen [shared-arena image support](../multimodal/dflash2-vision.md#optional-k4v-image-conditioned-text) admits lookup only in text after the last complete image; audio/video remain outside this scope. Native non-streaming modes retain their separate contracts.
 
 The unfinished K15/TG16 extension is preserved on `wip/dflash2-k4v-k15-20261031` at `e59e929e9`. It is outside this release. Its source and partial evidence were preserved; they are not labelled qualified.
 
 ## Run it
 
-Build this branch using the [normal fork build instructions](../../README.md#quickstart). Substitute model paths and fit the arena on your own GPU. No existing service is required; these tools start and stop their own server.
+Build the fork using the [normal fork build instructions](../../README.md#quickstart). Substitute model paths and fit the arena on your own GPU. No existing service is required; these tools start and stop their own server.
 
 ```bash
 KV_SERVER=./build-v2/bin/llama-server
@@ -47,13 +47,13 @@ KV_ARENA=$(python3 -c 'import json; print(json.load(open("benchmarks/results/my-
   --spec-ngram-map-k4v-min-hits 2 --offline --no-context-shift
 ```
 
-N is the lookup-key length; M is the proposed continuation length. K4V's four values are alternative continuations, not simultaneous verification branches. The native default M=48 exceeds the bounded limit, so set M explicitly. H2 above is a conservative example; the H1 research measurements below do not establish a universal best setting. CLI order does not change K4V-before-DFlash priority. A miss or empty proposal falls through to DFlash.
+N is the lookup-key length; M is the proposed continuation length. K4V's four values are alternative continuations, not simultaneous verification branches. The native default M=48 exceeds the bounded limit, so set M explicitly. H2 above is a conservative example; the H1 research measurements below do not establish a universal best setting. CLI order does not change K4V-before-DFlash priority. A miss or empty proposal falls through to DFlash. For images, configure the matching `--mmproj` and fit with the same projector. The finder adds real image-conditioned copied and neural-miss resource requests, with exact per-request source/encoder accounting. See the [bounded measured image example](../multimodal/dflash2-vision.md#size-and-launch-mixed-vision); no sample file or existing inference service is required.
 
 ## State, ownership and memory
 
-K4V stores its index, continuation statistics and token-history references in RAM. The hash index is approximately 1 MiB, plus dynamic keys, statistics, history capacity and allocator overhead. Maps and acceptance feedback rebuild at each generation boundary, including equal-length prompt replacement. Restarts/restores may therefore change proposal counts relative to uninterrupted generation.
+K4V stores its index, continuation statistics and token-history references in RAM. The hash index is approximately 1 MiB, plus dynamic keys, statistics, history capacity and allocator overhead. Maps and acceptance feedback rebuild at each generation boundary, including equal-length prompt replacement. With images, the checked view excludes all text before the latest complete image; DFlash still receives the full snapshot and true model position. Cached/restored placeholders rebuild the boundary from validated media metadata, without serializing map indices or inventing a new history. Restarts/restores may therefore change proposal counts relative to uninterrupted generation.
 
-Every successful target verification still supplies DFlash features, even when K4V supplied the proposal. Acceptance trims both target and child provisional suffixes; source-specific acceptance feedback goes to the implementation that supplied the draft. Clear, cancellation, checkpoint/window recovery and reconstruction preserve the existing target safety guards.
+Every successful target verification still supplies DFlash features, even when K4V supplied the proposal. Acceptance trims both target and child provisional suffixes; source-specific acceptance feedback goes to the implementation that supplied the draft. Replay corrections advance the verified neural boundary but are not accepted original proposals; the explicit four-argument common acceptance call keeps those quantities separate, preserving the legacy equal-count wrapper. Clear, cancellation, checkpoint/window recovery and reconstruction preserve the existing target safety guards.
 
 Target/sidecar weights stay outside the arena. Target resident KV/ring, persistent bounded draft KV, phase workspace and staged rollback publication retain the existing owner. Recurrent snapshots remain host-spilled; the selected restore uses the existing publication copy backend. The release adds no GPU map, independent arena, GPU buffer or attention arithmetic.
 

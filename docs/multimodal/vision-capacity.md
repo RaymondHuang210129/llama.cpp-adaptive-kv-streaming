@@ -10,7 +10,7 @@ The finder first searches for the maximum arena that completes its text workload
 
 The matching server emits `vision-memory-v2`: graph, operator, explicit library and alignment bytes sum to its complete compute grant, with projector weights reported separately. The finder rejects older graph-only reports and inconsistent or executed-mismatched totals. Opaque runtime allocations are explicitly excluded. The native planner considers every image budget up to the configured ceiling. Runtime capacity uses a boundary search ordered by processed token count, including the selected boundary and rejected neighbor where one exists. These are executed fits, not a mathematical proof that every larger shape fails: native graph choices and CUDA scratch requirements can vary with shape. Unsupported operations, device faults and incomplete responses stop the search rather than being counted as capacity failures.
 
-One image is tested at a time, with real preprocessing, encoder execution, text decoding and actual drafts when speculation is enabled. The shared setting is also checked with the seven images issued serially in one server after text. Arbitrary other ratios, multiple-image requests, other batch sizes, changed weights and concurrent GPU users are outside these receipts. Use `--image` for a specific image or multi-image workload.
+One image is tested at a time, with real preprocessing, encoder execution, text decoding and actual drafts when speculation is enabled. The shared setting is also checked with the seven images issued serially in one server after text. Arbitrary other ratios, multiple-image requests, other batch sizes, changed weights and concurrent GPU users are outside these receipts. Validate other image or multi-image workloads separately.
 
 ## Run without a sample image
 
@@ -29,7 +29,7 @@ python3 benchmarks/find-max-arena.py \
   --output benchmarks/results/my-qwen-resolution-fit
 ```
 
-For Gemma, substitute the Q3_K_S target, matching external Q8 assistant and Q8 projector, and select `--spec-mode mtp --draft-length 3`. The [README](../../README.md#find-a-usable-arena-size) gives both embedded-Qwen-MTP and external-Gemma-MTP examples. DFlash2+K4V image history remains unsupported.
+For Gemma, substitute the Q3_K_S target, matching external Q8 assistant and Q8 projector, and select `--spec-mode mtp --draft-length 3`. The [README](../../README.md#find-a-usable-arena-size) gives both embedded-Qwen-MTP and external-Gemma-MTP examples. Qwen DFlash2+K4V uses `--spec-mode dflash-k4v` with explicit `--ngram-n`, `--ngram-m` and `--ngram-min-hits`; lookup is restricted to post-last-image text. The finder proves real image-conditioned copy and neural fallback in separate requests, accounts for their additional encoder phases and preserves all text/image response totals. A text-only hit is not image resource qualification. The [measured bounded example](dflash2-vision.md#size-and-launch-mixed-vision) retains its own 4-Ki/256-image-budget scope.
 
 Omitting image-budget flags uses projector metadata. `--image-max-tokens` can set a lower search ceiling; it is not an input resolution. The finder keeps your context, batch sizes, KV types and draft width fixed. Gemma's whole-image microbatch limit can be lower than its native 1120-token image ceiling. Increasing `--ubatch-size` also increases protected SWA storage, so refit rather than changing it after sizing.
 

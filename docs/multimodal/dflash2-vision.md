@@ -1,6 +1,6 @@
 # DFlash2 image support with the shared phase arena
 
-Pure DFlash2 can draft for still-image/text requests using the matching Qwen target and projector. It uses the existing image-request API and the same device parent as text prefill, decode and verification. DFlash2+K4V remains text-only; mixed image history needs a separate boundary-aware lookup policy. Gemma uses its existing target-only/shared-KV MTP vision path and cannot attach this Qwen DFlash sidecar.
+DFlash2 can draft for still-image/text requests using the matching Qwen target and projector. It uses the existing image-request API and the same device parent as text prefill, decode and verification. Optional CPU K4V can copy continuations from contiguous text after the latest complete image, falling through to DFlash on a miss. Gemma uses its existing target-only/shared-KV MTP vision path and cannot attach this Qwen DFlash sidecar.
 
 ## Supported and measured scope
 
@@ -14,7 +14,7 @@ The reference configuration is one serial request on one CUDA RTX 5070 Ti (SM120
 
 The [sidecar publisher](https://huggingface.co/HermiHg/Qwen3.8-27B-DFlash2-Q2_K_S-MIX-GGUF) provides this mixed weight encoding. Its validated DFlash metadata retains block size 8, the 2048-position window, five target input-layer features and RoPE sections `[64,0,0,0]`. Weight encoding is independent of the decoder KV format. The original Q4 sidecar remains a text regression control; changing sidecar precision can change acceptance and memory fit.
 
-Proposal maxima are F=1-7 and verification widths TG1-TG8. Q8_0/Q4_0, Q8_0/Q8_0 and Q5_1/Q5_1 have exact decoder controls; F3 full native/streamed API controls also pass for all three pairs at the fitting short profile; that is not a long-context sweep of every pair. Adaptive execution inherits target cache types. Do not pass draft-cache overrides, even identical ones. LoRA, parallel slots, multi-GPU, audio/video, simultaneous MTP, K15 and K4V image requests remain outside this profile. This work does not qualify DFlash vision on Windows or other physical GPUs.
+Neural proposal maxima are F=1-7; optional copied maxima K=1-7 are independent. Target verification and rollback cover max(F,K), through TG1-TG8; neural prediction still uses F+1 input rows. Q8_0/Q4_0, Q8_0/Q8_0 and Q5_1/Q5_1 have exact decoder controls; F3 full native/streamed API controls also pass for all three pairs at the fitting short profile; that is not a long-context sweep of every pair. Adaptive execution inherits target cache types. Do not pass draft-cache overrides, even identical ones. LoRA, parallel slots, multi-GPU, audio/video, simultaneous MTP+K4V and K15 remain outside this profile. This work does not qualify DFlash vision on Windows or other physical GPUs.
 
 ## One device parent and separate lifetimes
 
@@ -79,7 +79,9 @@ build-v2/bin/llama-server \
 
 Open that server's Web UI and attach an image, or use the existing [HTTP image request](gemma4-vision.md#running-an-image-request-locally). There is no DFlash-specific image wire format. Refit when changing images, cache types, context, batch sizes, proposal limits or weights; a previous text-only budget is not an image fit guarantee.
 
-## Numerical and lifecycle qualification
+## Pure-DFlash foundation qualification
+
+The following records describe the separately qualified DV0-DV17 foundation. The mixed-image extension is documented below; the older metrics are not relabelled as new measurements.
 
 Fresh fitting full native F1-F4 servers and streamed servers at context 2048, b/ub256 and image budget 256 compare corresponding image scenarios with exact tokens and draft/prompt/cache counts. F5-F7 at the recorded complete-workspace control profile reach preserved native physical capacity failures; unchanged smaller Q2 weights are tried first. Native encoder/native-decoder component references and the archived streamed end-to-end reference are explicitly distinguished from full native-server equivalence. F7 full native startup cannot allocate the 927588992-byte projector alongside its decoder state, even with the smaller draft. That capacity failure is preserved. F7 instead has separately qualified native encoder export and native-decoder import of identical embeddings, positions and weights, plus end-to-end streamed API/lifecycle tests. This is native-arithmetic component coverage, not full native-server equivalence.
 
@@ -135,8 +137,62 @@ Image request-latency median changes span -0.292%..+0.423% for Qwen target/MTP a
 
 The [implementation roadmap](../../DFLASH2_VISION_PHASE_ROADMAP.md) records stage completion and scoped failures. Existing reusable tests are `tests/test-mtmd-projector-storage.cpp`, the image oracle in `tests/test-kv-stream-context.cpp`, `tests/test-server-vision.cpp`, and [the public vision harness](../../tools/server/tests/test_adaptive_vision.py). Local raw results and binary/source manifests remain outside the committed report.
 
-K4V vision needs a separate media-boundary-aware text lookup and its own numerical/lifecycle qualification. It is explicitly rejected today. Text DFlash+K4V and existing Qwen/Gemma target-only/MTP vision retain their existing contracts; this work introduces no attention kernel, second arena or projector-weight quantization change.
+The optional K4V image extension below has separate media-boundary, numerical, lifecycle and performance qualification. Existing Qwen/Gemma target-only/MTP vision remains supported; no attention arithmetic, second arena or projector-weight quantization changes are introduced.
 
 ### Finder admission tests
 
-The existing finder rejection test retains the unsupported mixed DFlash+K4V image case; pure DFlash image admission is covered by the server vision host harness. All 31 finder tests complete successfully with one platform skip. The 17 vision-harness tests and nine actual startup rejections plus a native-matching positive request cover the current pure/mixed policy; the remaining tracked benchmark host suites also pass.
+The existing finder negative case now retains unsupported K8 rather than rejecting the qualified mixed-image pairing. No new server-AB harness or raw data is added. The current host suites pass 53 vision, 46 Gemma and 182 benchmark tests, with one expected platform skip.
+
+## Optional K4V image-conditioned text
+
+K4V receives a checked suffix of the existing full text snapshot. It never joins keys or continuations across an image and excludes all pre-image text. DFlash keeps its full existing snapshot and the actual model frontier. Image rows, filtered-text offsets and M-RoPE positions are separate quantities: the real Qwen reference contains 64 image rows across eight model positions.
+
+The map and acceptance feedback rebuild on every real generation, including equal-length image replacement, cache reuse, restore and restart. Restored image placeholders use validated whole-chunk metadata. Successful verification refreshes the next snapshot from committed, trimmed prompt state; tentative tokens do not become lookup history. K4V is disposable host state and adds no serialized model history, GPU map or new arena. A short/empty suffix legitimately uses DFlash.
+
+Copied proposals still require target verification and DFlash feature injection. Source feedback charges only original accepted proposals. `common_speculative_accept(spec, seq, boundary_row, n_accepted)` keeps the verified neural hidden-state row separate from that logical count when a correction is replayed; the three-argument wrapper retains its equal-count behavior. MTP/EAGLE keep their original neural boundary. The private lookup epoch is not a GPU cache generation or lease identity.
+
+### Size and launch mixed vision
+
+Use the same image API and matching artifacts as pure DFlash. Fit the exact mixed configuration; an MTP or pure-DFlash arena is not a mixed fit. This executed bounded example uses the default optional 2240 MiB starting guess:
+
+```bash
+python3 benchmarks/find-max-arena.py \
+  --server build-v2/bin/llama-server \
+  --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --model-draft /path/to/Qwen3.8-27B-DFlash2-Q2_K_S-MIX.gguf \
+  --mmproj /path/to/mmproj-Qwen3.8-27B-F16.gguf \
+  --spec-mode dflash-k4v --draft-length 3 --ngram-n 12 --ngram-m 7 --ngram-min-hits 2 \
+  --context-size 4096 --batch-size 256 --ubatch-size 256 \
+  --cache-type-k q8_0 --cache-type-v q4_0 --decode-tokens 8 \
+  --probe-mode preflight --image-max-tokens 256 --no-webui \
+  --output benchmarks/results/my-mixed-image-fit
+```
+
+The recorded local sizing cohort selects 2110 MiB and rejects 2111 MiB for both F3/K7 and F7/K3. It executes bounded 2048-token text history, eight ordinary outputs, real image-conditioned copy/miss proofs and all seven ratios. The common image budget is 256 under that explicit ceiling. Processed resolutions are 512x512 (1:1), 576x416 (4:3), 416x576 (3:4), 672x384 (16:9), 384x672 (9:16), 704x352 (2:1) and 352x704 (1:2). Source aspect and processed aspect can differ through native alignment. These are bounded, workload-specific measurements, not full-context validation or maximum original-file dimensions.
+
+Launch the generated `command.txt`. It includes the selected arena, projector, independent widths and common image setting. No existing server is required. The finder uses actual images for separate post-image-copy and genuine-miss resource probes; every text prelude, ordinary request, extra encoder phase and source total is accounted once. A text-only copy hit cannot qualify image resources. Insufficient proof history is reported separately from physical OOM. N/K/hit policy is fixed at server configuration; requests cannot replace sources or exceed admitted widths.
+
+### Mixed safety and recovery
+
+F3/K7, F7/K3 and F7/K7 match complete native-decoder component transcripts: image inputs/positions, all target logits/hidden/layer features, selector values, visible target/draft KV, recurrent state and source counters, including every accepted prefix and TG1-TG8. Full native F7 projector-capacity failures remain preserved; component values are not described as full native-server equivalence.
+
+F3/K3 compares 30 corresponding full-native and streamed completion scenarios per mode, with exact output/work/cache counts and identical complete 321082524-byte state files. F3/K7 and an F7/K3 8-Ki window profile add separately labelled streamed recovery controls; the latter preserves a complete 571911928-byte state. New copied and neural cancellation controls wait for real output rather than progress placeholders. Unavailable old prefixes and mid-image rewinds remain rejected.
+
+The final runtime passes 34 accepted GPU regression/numerical/memory gates and nine strict zero-error jobs, plus 13 native and 16 host-ASAN suites. Strict checks retain default PDL, API-all reporting, exit 99 and no filters; eager mode is checker-only. Capture-required ownership tests use actual graphs. GPU ASAN retains its already-qualified `protect_shadow_gap=0` CUDA compatibility setting, leak detection and UBSAN. A baseline/current no-model diagnostic distinguishes the default shadow-gap initialization failure from model/arena OOM; the harness rejects CPU fallback as a GPU qualification. Raw logs, source/model/library hashes and preserved failures remain local.
+
+The corrected replay contract preserves all 1497376 captured bytes of MTP embedding inputs against the established baseline; an unshipped logical-count-only prototype changes those bytes and is rejected. This is a functional input comparison, not instrumented performance evidence.
+
+### Mixed-image performance scope
+
+Ordinary requests use the IQ4_XS/Q2/F16 artifacts, fixed 1-GiB parent, context capacity 8192, Q8/Q4, b/ub256, UVM off, fresh images and 128 outputs. Three alternating pairs per case include one warmup per process. Caption and constructed post-image code-copy prompts contain 213 and 1792 actual input rows respectively. All 6144 timed output IDs match within the comparisons; paired physical decode-layout sequences also match.
+
+| Same-mode code control | Caption paired-median decode change | Constructed code paired-median decode change |
+| --- | ---: | ---: |
+| Existing MTP3 | +0.02% | -0.27% |
+| Existing Q2 DFlash7 | +0.07% | -0.20% |
+
+No material existing-mode regression is observed in these scoped samples. Small-prefill timings vary and are not claimed as a new optimization.
+
+N12/M7/H2 makes no eligible copies on these ordinary fixtures and shows no meaningful gain. A separate N12/M7/H1 cohort leaves captioning effectively unchanged. On the deliberately constructed code-copy task, median decode rises from 181.17 to 199.14 tok/s, with a +9.98% paired-median change (all three pairs +9.43% to +10.99%) and roughly 2.7% lower paired request latency. K4V accepts 98 copied tokens; DFlash prediction forwards fall from 17 to 3, while target verification remains 17 passes and total generated/accepted proposals remain 119/110. Output IDs match exactly. Separate medians and medians of paired ratios need not give identical percentages.
+
+This demonstrates useful copying when the supplied post-image text is reusable. It is not a general image-captioning gain, native multimodal agent trace, quality result or long-context speed guarantee. Do not combine it with the older Q4 text/scheduling measurements. One measured code sample spends about 0.102 ms on all K4V lookup/statistics work plus 0.055 ms on map begin; those are whole-call host scopes, not single-hash latency guarantees. The hash index reserves 1 MiB per map, plus dynamic key statistics (88 bytes per entry on this build), history capacity and allocator overhead; the private view descriptor is 16 bytes. All remain in RAM.

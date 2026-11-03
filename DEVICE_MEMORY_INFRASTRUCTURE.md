@@ -597,7 +597,7 @@ Each change is a separate review unit:
 
 ### Common device-memory arena
 
-The common phase arena is now used by Qwen/Gemma text and vision consumers, including [pure Qwen DFlash vision](docs/multimodal/dflash2-vision.md). Its attached bounded draft writer registers the actual persistent lease; vision loans preserve that region and rollback publication staging while reusing reclaimable text workspace. The target/sidecar weights remain outside the parent. The historical next-step discussion below describes the infrastructure design, not a claim that these consumers are still unimplemented or that every backend supports streaming.
+The common phase arena is now used by Qwen/Gemma text and vision consumers, including [Qwen DFlash vision with optional K4V](docs/multimodal/dflash2-vision.md#optional-k4v-image-conditioned-text). Its attached bounded draft writer registers the actual persistent lease; vision loans preserve that region and rollback publication staging while reusing reclaimable text workspace. The target/sidecar weights remain outside the parent. K4V uses a checked post-image text view in RAM; it is not a GPU consumer or another history. Model verification and DFlash feature injection still run on a copy hit. Replay acceptance separates the verified hidden-state boundary from the count of original proposals accepted. The historical next-step discussion below describes the infrastructure design, not a claim that these consumers are still unimplemented or that every backend supports streaming.
 
 A future arena can own one or more parent allocations and lend views to named components:
 

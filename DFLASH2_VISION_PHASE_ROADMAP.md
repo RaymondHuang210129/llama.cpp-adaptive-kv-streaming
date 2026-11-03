@@ -1,8 +1,8 @@
 # DFlash2 vision phase-arena implementation roadmap
 
-Status: DV0-DV17 complete, 2026-11-02, for scoped pure DFlash2 shared-arena vision and common Qwen/Gemma controlled CUDA encoder workspace. Projector weights, graph storage, operator temporaries and explicit cuBLAS scratch share the existing phase parent while protected target/draft state stays live. Numerical, safety, performance, functional compilation, final finder examples and documentation checks are complete. K4V vision remains a separate follow-up. Historical stage receipts below retain their measured source/binary identities; they are not all relabelled as fresh passes after later changes.
+Status: DV0-DV26 complete, 2026-11-03, for the scoped pure/mixed Qwen DFlash2 still-image paths and common Qwen/Gemma controlled CUDA encoder workspace. Optional CPU K4V uses checked post-last-image text, fixed server policy and independent 1-7 limits. Numerical, device/host safety, lifecycle, sizing, regression/performance and documentation checks are complete. Historical stage receipts retain their measured source/binary identities; they are not relabelled as new passes after later changes.
 
-Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18-DV25 are complete, including image-aware lookup, internal/public/lifecycle controls and final safety/performance qualification. DV26 documentation closure remains unchecked. See the [new implementation plan](#k4v-vision-extension-dv18-dv26).
+Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18-DV26 are complete, including image-aware lookup, internal/public/lifecycle controls, final safety/performance qualification and documented release limits. See the [implementation record](#k4v-vision-extension-dv18-dv26).
 
 Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -565,7 +565,7 @@ Exit: DV10-DV17 are complete for the declared controlled CUDA vision workspace. 
 
 ## K4V vision extension: DV18-DV26
 
-Status: implementation in progress; DV18-DV25 are complete and DV26 is pending. DV0-DV17 stay complete for their qualified scopes. DV18-DV26 add optional K4V to the existing Qwen DFlash2 image path; current common/server/finder guards must continue rejecting mixed vision until the corresponding implementation gates pass. Source inspected: `af2b9cb8f`. Recheck the anchors below before implementation if the source changes. Planning this extension does not establish runtime or performance qualification.
+Status: complete, 2026-11-03. DV18-DV26 qualify optional K4V on the existing Qwen DFlash2 image path; DV0-DV17 retain their separate foundation scopes. The initial implementation inspection used `af2b9cb8f`; current admission, source accounting and limits are described in the [focused report](docs/multimodal/dflash2-vision.md#optional-k4v-image-conditioned-text). Earlier closed-guard and pending-next-stage statements below describe their historical stage, not the current release.
 
 ### Scope and release policy
 
@@ -770,7 +770,9 @@ Exit: current mixed vision is backed by numerical, memory, failure and ordinary 
 
 #### DV26 - Publish and close K4V image support
 
-Status: pending; depends on DV25.
+Status: complete. The README now briefly lists matching mixed-image support and its standard launch flags, with detailed lookup/recovery/API, actual sizing and scoped performance in the focused vision/K4V/capacity reports. Related speculation, memory-consumer and test guides agree on post-last-image text, independent limits, per-generation/restore rebuilding, inherited formats, separate verified-boundary/proposal counts, one parent and unsupported pairings. The real 2110/2111-MiB bounded seven-ratio examples remain distinct from earlier full-context MTP examples. No user sample-image flag or running production service is required by the published automatic finder examples.
+
+Local checks validate changed Markdown paths/anchors, shell syntax, balanced fences and all completed boxes. No local Markdown/Mermaid package is installed; every existing Mermaid block is byte-identical to the accepted baseline. The upstream README body remains exactly 7610 bytes with SHA256 `8e43128b52e5e99fcfd7b65b4d182681566f98f72e7e8f812f71847ef8ec1dbf`. Final host tests, compiled CXX/GPU/library identities and healthy service restoration are verified separately; binaries keep their measured pre-commit source mappings. Raw data and test runtime archives remain local, unrelated files are preserved, no push or production model/configuration change is made, and no owned GPU/build/watch work remains.
 
 - Update the brief README support/launch examples, focused DFlash/K4V/vision reports, finder examples and this checklist. Document the post-last-image text-only lookup scope, legitimate early misses, rebuild-on-generation/restore policy, independent F/K bounds and native-versus-component references.
 - Publish real measured arena/resolution/source-coverage results with bounded/full-history and performance scopes separated. Do not replace the fully validated earlier examples with an unvalidated larger profile. Keep raw benchmark results/data and server-AB additions local under the existing publication boundary.
@@ -819,7 +821,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV3: native-policy feature behavior and exact owned image provenance pass, including one-row injection.
 - [x] DV4: validated bounded-writer state survives complete vision loans and strict memory checks.
 - [x] DV5: real encoder inputs, exact image-conditioned target/draft vectors and forced acceptance/correction match fitting native controls.
-- [x] DV6: pure DFlash common/server/request/finder integration works with actual images; mixed K4V vision remains closed.
+- [x] DV6: pure DFlash common/server/request/finder integration works with actual images; mixed K4V was excluded from that foundation stage.
 - [x] DV7: image/cache/window/cancellation/state/restart and attached-writer encoder failure/retry pass.
 - [x] DV8: scoped numerical/memory/regression/performance evidence audited; approved finder-test correction passes.
 - [x] DV9: pure DFlash2 vision documentation and release scope complete; local resources restored; finder-test maintenance complete.
@@ -831,7 +833,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV15: automatic per-ratio/common-resolution fitting requalified against complete controlled scratch and exact published full-profile execution.
 - [x] DV16: fresh numerical, allocation, sanitizer, lifecycle and regression/performance evidence audited.
 - [x] DV17: extended memory/capacity contract documented and local resources restored.
-- [x] DV0-DV17 release boundary: K4V+mmproj remains explicitly rejected in the qualified baseline; the new extension is separately scoped.
+- [x] DV0-DV17 historical release boundary: that foundation excluded K4V+mmproj; the completed DV18-DV26 extension qualifies it separately.
 
 ### K4V vision extension checklist
 
@@ -843,7 +845,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 - [x] DV23: image-aware finder/ratio output and real post-image copy/neural resource proofs execute and account correctly.
 - [x] DV24: public images, cache/state/cancel/restart/window lifecycle pass with real mixed source coverage.
 - [x] DV25: current numerical/sanitizer/regression/performance and resource/provenance evidence is audited.
-- [ ] DV26: mixed-image support, limits and measured commands are documented, boxes checked and local resources restored.
+- [x] DV26: mixed-image support, limits and measured commands are documented, boxes checked and local resources restored.
 
 Pure DFlash2 vision is complete only when DV0-DV9 pass. A helper subgate, successful encoder call, configured projector, target-only fallback, or process exit does not satisfy whole-feature acceptance. Optional K4V vision has its own completion boundary.
 
