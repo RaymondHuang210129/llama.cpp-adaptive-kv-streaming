@@ -269,6 +269,17 @@ struct server_slot {
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
+    common_speculative_ngram_context spec_ngram_context;
+    uint64_t spec_generation = 0;
+
+    void prepare_speculative_text(bool begin) {
+        auto snapshot = prompt.tokens.get_speculative_text();
+        if (begin && ++spec_generation == 0) ++spec_generation;
+        if (snapshot.has_media && !spec_generation) throw std::invalid_argument("missing speculative generation");
+        spec_ngram_context = snapshot.has_media ? common_speculative_ngram_context{snapshot.ngram_begin, spec_generation} :
+            common_speculative_ngram_context{};
+        spec_prompt = std::move(snapshot.tokens);
+    }
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
@@ -390,6 +401,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_ngram_context = {};
 
         last_nl_pos    = 0;
         generated      = {};
@@ -3347,6 +3359,12 @@ private:
         }
     }
 
+    bool uses_image_ngram() const {
+        const auto & types = params_base.speculative.types;
+        return mctx && std::find(types.begin(),types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)!=types.end() &&
+            std::find(types.begin(),types.end(),COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)!=types.end();
+    }
+
     void pre_decode() {
         // apply context-shift if needed
         // TODO: simplify and improve
@@ -3427,6 +3445,10 @@ private:
                 return;
             }
 
+            if (spec && uses_image_ngram() && slot.can_speculate() && slot.spec_draft.empty() && slot.get_n_draft_max()>0) {
+                slot.prepare_speculative_text(false);
+            }
+
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -3467,7 +3489,10 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        if (!uses_image_ngram()) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                            slot.spec_ngram_context = {};
+                        }
 
                         const bool spec_reject = slot.use_spec_rejection();
 
@@ -3481,6 +3506,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .ngram_context = */ slot.spec_ngram_context,
                         };
 
                         drafting.push_back(&slot);
@@ -4439,7 +4465,12 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    if (uses_image_ngram()) {
+                        slot.prepare_speculative_text(true);
+                        common_speculative_begin(spec.get(), slot.id, slot.spec_prompt, slot.spec_ngram_context);
+                    } else {
+                        common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    }
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;

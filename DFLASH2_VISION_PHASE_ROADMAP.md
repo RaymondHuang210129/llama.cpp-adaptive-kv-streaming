@@ -682,7 +682,9 @@ Exit: unsafe joins and values are impossible within the declared suffix policy; 
 
 #### DV20 - Wire generation, prompt-cache and checkpoint lifetime
 
-Status: pending; depends on DV19.
+Status: complete. The common dispatcher passes a checked per-sequence suffix/generation descriptor only to K4V; DFlash keeps the existing full text snapshot and true model frontier. Fresh rounds refresh the slot-owned snapshot; actual generation begin resets disposable lookup and supplier state. Replay keeps its pending source. Invalid ranges reject before begin mutation, and sequence resets are isolated. Native and ASAN/UBSAN/leak checks pass 563 speculative and 430 server assertions. The three public admission barriers remain closed.
+
+The prior native server reports exactly one excluded-prefix-copy failure after valid real-image controls. Current native fresh/cached/changed-image requests preserve every forced output ID, reject pre-image copying and observe post-image copies plus genuine neural forwards. The initial four-output fixture ended before a second lookup; its failure is preserved separately. The corrected seven-output fixture changes no runtime or numerical check. Current pure-image native pairs, full image-vector import and mixed-text TG1-TG8 regressions also pass: five GPU gates including the expected red. Original services are restored healthy. Source, build and model hashes, logs and the qualified patch are retained locally in `benchmarks/results/k4v-vision-20261102/dv20-*`.
 
 - Supply the K4V view at both generation begin and fresh-draft setup. Keep the snapshot alive and immutable through `queue_tasks.yield_to_queue`; DFlash receives its current full text prompt and actual `pos_next()`.
 - Audit prompt clear/load, context checkpoint get/set, sequence removal, partial acceptance/replay, slot-file restore and restart. Reconstruct disposable K4V state from the authoritative prompt instead of serializing indices or extending the one-implementation state container unnecessarily.
@@ -819,7 +821,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 
 - [x] DV18: current mixed-image artifacts, source contracts and unsafe history joins reproduced with valid controls.
 - [x] DV19: checked K4V-only post-image text view passes positive, boundary and existing text-map CPU tests.
-- [ ] DV20: generation, media identity, cache/checkpoint and pending acceptance lifetime are integrated safely.
+- [x] DV20: generation, media identity, cache/checkpoint and pending acceptance lifetime are integrated safely.
 - [ ] DV21: actual mixed image source switching, every accepted prefix and TG1-TG8 match scoped native/component controls.
 - [ ] DV22: only the qualified mixed startup/request set is admitted, with independent widths, exact quotas and preserved guards.
 - [ ] DV23: image-aware finder/ratio output and real post-image copy/neural resource proofs execute and account correctly.
