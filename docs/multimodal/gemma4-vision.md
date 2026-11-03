@@ -61,6 +61,8 @@ The table's complete compute figures are fresh isolated encoder controls at all 
 
 Complete all-seven-ratio 1120 admission requires 2394857856 bytes: 2284 MiB fits and 2283 MiB rejects. The matching graph-only all-seven-ratio minimum was 2149 MiB. The older two-image fixture's 2143 MiB minimum and independent 2812/2332 MiB maxima predate this migration and are retained as historical evidence, not current sizing recommendations. New automatic finder examples and their exact workload scope are in the [capacity report](vision-capacity.md).
 
+The later native-context-capacity ratio sweep uses b/ub1280 and MTP3, refits the parent to 2444 MiB (2445 rejected), and reaches the native 1120 budget for all seven ratios under one common setting. It executes 2560-token bounded text probes and 256 outputs per request; it does not repeat the full-context text validation. The [larger-image results and command](vision-capacity.md#gemma-1120-budget-profile) distinguish this profile from the fully validated b/ub256 example.
+
 ### Find a fit for your images
 
 No existing server, container or background service is required. Build the [vision-enabled server](../../README.md#build), make sufficient GPU memory available, and choose an unused port. The finder below launches and cleans up its own temporary servers; it neither contacts an existing inference server nor manages other services. Run commands from the repository root, using your own model/image paths and a fresh output directory.

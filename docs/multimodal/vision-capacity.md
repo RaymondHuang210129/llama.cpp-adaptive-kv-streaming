@@ -78,6 +78,39 @@ The fitter records each independent boundary, the common sequence, the actual re
 
 Earlier fixed 2048 MiB controls complete all seven ratios at their configured 4096/256 Qwen/Gemma ceilings. Those are separate equal-parent capacity controls from before the writer metadata fix, not fresh maximum-arena measurements or a full-history native-equivalence claim. The historical 48/143 figures are explained below.
 
+### Gemma 1120-budget profile
+
+A separate follow-up uses the same Q3_K_S target, external Q8 assistant and Q8 projector, MTP3, Q8_0/Q4_0 and native context capacity 262144, with batch/microbatch raised to 1280. The finder selects **2444 MiB**, rejects **2445 MiB**, and validates the common native image budget **1120** across all seven ratios. Both the printed rows and completed encoder phases match the expected native geometry.
+
+This run uses bounded 2560-token text probes and 256 generated tokens per request, including the seven images issued serially in one process. Its `full_workload_validated` field is **false**. It is a larger-image capacity check, separate from the fully validated b/ub256 examples above; it does not certify a full 261873-token prefill with the wider batch.
+
+| Source ratio | Processed resolution at budget 1120 | Actual image tokens |
+| --- | ---: | ---: |
+| 1:1 | 1584x1584 | 1089 |
+| 4:3 | 1824x1344 | 1064 |
+| 3:4 | 1344x1824 | 1064 |
+| 16:9 | 2112x1200 | 1100 |
+| 9:16 | 1200x2112 | 1100 |
+| 2:1 | 2256x1104 | 1081 |
+| 1:2 | 1104x2256 | 1081 |
+
+The token setting is a ceiling; native geometry rounds down to whole patches. Increasing the microbatch also increases protected SWA, so the earlier 2462 MiB b/ub256 result cannot be reused unchanged: that parent fails the wider profile, while the refitted 2444 MiB parent completes it.
+
+To fit this wider configuration with automatic ratio probes:
+
+```sh
+python3 benchmarks/find-max-arena.py \
+  --server build-v2/bin/llama-server --model /path/to/gemma-4-31B-it-Q3_K_S.gguf \
+  --model-draft /path/to/mtp-gemma-4-31B-it-Q8_0.gguf \
+  --mmproj /path/to/mmproj-gemma4-31B-Q8_0-local.gguf \
+  --context-size 262144 --batch-size 1280 --ubatch-size 1280 \
+  --cache-type-k q8_0 --cache-type-v q4_0 --spec-mode mtp --draft-length 3 \
+  --decode-tokens 256 --probe-mode preflight --no-webui --port 1249 \
+  --output benchmarks/results/fit-gemma-native-image-budget
+```
+
+`--initial-arena-mib` remains an optional search guess; the follow-up started from the earlier 2462 MiB result. Add `--validate-selected` for a full requested-text validation after fitting; that additional check was not part of this ratio sweep. All arena numbers are specific to the measured card, weights and configuration.
+
 ## What consumes the vision loan
 
 The active vision phase may reclaim text graph workspace and reusable device KV storage. It preserves registered target recurrent state, bounded draft state and Gemma SWA. Its temporary loans hold projector weights and complete controlled encoder compute: graph tensors, backend operator conversions/outputs/pointer arrays, native-size explicit cuBLAS workspace and placement padding. Main/assistant/DFlash weights remain outside the parent. Host KV, decoded pixels and completed embeddings are host allocations.

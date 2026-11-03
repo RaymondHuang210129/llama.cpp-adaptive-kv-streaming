@@ -162,6 +162,8 @@ Gemma Q3_K_S + external Q8 MTP3 + Q8 projector:
 }
 ```
 
+The Gemma example above uses a 256-row microbatch. A separate [1120-budget image profile](docs/multimodal/vision-capacity.md#gemma-1120-budget-profile) uses b/ub1280 and reaches the native image ceiling; its follow-up sweep validates bounded prefill and images, rather than another full-history request.
+
 Qwen IQ4_XS + embedded MTP3 + F16 projector:
 
 ```json
