@@ -30,11 +30,12 @@ int main(int argc, char ** argv) {
             server_tokens prompt(prefix, true);
             prompt.push_back(image);
             for (auto id : suffix) prompt.push_back(id);
-            const auto text = prompt.get_text_tokens();
+            const auto snapshot = prompt.get_speculative_text();
+            const auto & text = snapshot.tokens;
             t.assert_equal(prefix.size() + suffix.size(), text.size());
             t.assert_equal(llama_pos(prefix.size() + positions + suffix.size()), prompt.pos_next());
             common_ngram_map map(2, 3, false, 1);
-            common_ngram_map_begin(map, text);
+            common_ngram_map_begin(map, text, snapshot.ngram_begin);
             llama_tokens copied;
             common_ngram_map_draft(map, text, 20, copied);
             t.out << "K4V image lookup rows=" << prompt.size() << " text=" << text.size()
@@ -136,6 +137,36 @@ int main(int argc, char ** argv) {
         restored.keep_first(1+rows);
         t.assert_equal(size_t(1)+rows,restored.size());
         t.assert_equal(llama_pos(1+positions),restored.pos_next());
+    });
+    t.test("speculative_text_snapshot_keeps_media_boundaries_and_legacy_text", [](testing & t) {
+        mtmd::input_chunks_ptr chunks(mtmd_test_create_input_chunks());
+        const auto * image = mtmd_input_chunks_get(chunks.get(),1);
+        for (bool placeholder : {false,true}) for (int layout=0;layout<5;++layout) {
+            server_tokens prompt(llama_tokens{},true);
+            if (layout!=0) { prompt.push_back(11); prompt.push_back(12); }
+            if (placeholder) prompt.push_back_placeholder(image); else prompt.push_back(image);
+            if (layout>=2) {
+                if (layout!=3) prompt.push_back(13);
+                if (placeholder) prompt.push_back_placeholder(image); else prompt.push_back(image);
+            }
+            if (layout!=1) { prompt.push_back(14);prompt.push_back(15); }
+            const auto snapshot=prompt.get_speculative_text();
+            t.assert_true(snapshot.tokens==prompt.get_text_tokens());
+            t.assert_true(snapshot.has_media);
+            t.assert_equal(snapshot.tokens.size()-(layout==1 ? 0u : 2u),snapshot.ngram_begin);
+            const auto bytes=prompt.serialize();llama_tokens packed(bytes.size()/sizeof(llama_token));
+            std::memcpy(packed.data(),bytes.data(),bytes.size());
+            const auto restored=server_tokens::deserialize(packed,true).get_speculative_text();
+            t.assert_true(restored.tokens==snapshot.tokens && restored.ngram_begin==snapshot.ngram_begin && restored.has_media);
+        }
+        for (const auto & tokens : {llama_tokens{},llama_tokens{1,2,3}}) {
+            server_tokens prompt(tokens,true);const auto view=prompt.get_speculative_text();
+            t.assert_true(view.tokens==tokens && !view.has_media && view.ngram_begin==0);
+        }
+        server_tokens malformed(llama_tokens{1,LLAMA_TOKEN_NULL,2},true);
+        t.assert_true(malformed.get_text_tokens()==llama_tokens({1,2}));
+        bool rejected=false;try { malformed.get_speculative_text(); } catch (const std::exception &) { rejected=true; }
+        t.assert_true(rejected);
     });
     t.test("eager_multimodal_and_text_only_paths_keep_existing_policy", [](testing & t) {
         auto p = qualified(); p.shared_device_memory_bytes = 0; p.n_parallel = 4;

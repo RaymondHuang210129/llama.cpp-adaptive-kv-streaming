@@ -457,6 +457,45 @@ int main(int argc, char ** argv) {
         }
     });
 
+    t.test("bounded_k4v_history_excludes_prefix_and_keeps_first_occurrence", [&](testing & t) {
+        for (size_t prefix : {0u,1u,17u,1024u}) {
+            llama_tokens tokens(prefix,77);
+            const llama_tokens suffix{10,20,30,40,50,98,10};tokens.insert(tokens.end(),suffix.begin(),suffix.end());
+            common_ngram_map map(2,3,false,1);common_ngram_map_begin(map,tokens,prefix);
+            t.assert_true(lookup(map,tokens)==llama_tokens({30,40,50}));
+            const auto occurrences=map.keys[0].values[0].value_num;
+            t.assert_true(lookup(map,tokens)==llama_tokens({30,40,50}));
+            t.assert_equal(occurrences,map.keys[0].values[0].value_num);
+            for (const auto & key : map.keys) {
+                t.assert_true(key.key_idx>=prefix && key.stat_idx>=prefix);
+                for (const auto & v:key.values) if (v.value_num) t.assert_true(v.value_idx>=prefix);
+            }
+            tokens.insert(tokens.end(),{20,30,40,50,98,10});
+            t.assert_true(lookup(map,tokens)==llama_tokens({30,40,50}));
+            common_ngram_map_accept(map,0);t.assert_true(lookup(map,tokens).empty());
+            bool rejected=false;try { common_ngram_map_begin(map,tokens,SIZE_MAX); } catch (const std::invalid_argument &) { rejected=true; }
+            t.assert_true(rejected);t.assert_true(lookup(map,tokens).empty());
+            common_ngram_map_begin(map,tokens,tokens.size());t.assert_true(lookup(map,tokens).empty());
+        }
+        const auto prefix=history_for({1,1,1});auto tokens=prefix;const auto suffix=history_for({0,0});
+        tokens.insert(tokens.end(),suffix.begin(),suffix.end());common_ngram_map map(2,3,false,1);
+        common_ngram_map_begin(map,tokens,prefix.size());t.assert_true(lookup(map,tokens)==continuation(0));
+        tokens.resize(prefix.size()-1);llama_tokens output{123};bool rejected=false;
+        try { common_ngram_map_draft(map,tokens,20,output); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected && output==llama_tokens({123}));
+    });
+    t.test("bounded_k4v_history_preserves_key_length_and_optional_hash_contracts", [&](testing & t) {
+        for (uint16_t n : {uint16_t(1),uint16_t(2),uint16_t(1024)}) for (uint16_t m : {uint16_t(1),uint16_t(7)}) for (bool hashed : {false,true}) {
+            llama_tokens key;for (uint16_t k=0;k<n;++k) key.push_back(100+k);
+            llama_tokens history=key;const auto value=continuation(0,m);history.insert(history.end(),value.begin(),value.end());
+            history.push_back(9999);history.insert(history.end(),key.begin(),key.end()-1);
+            common_ngram_map map(n,m,false,1);if (!hashed) map.key_map.clear();common_ngram_map_begin(map,history,size_t(0));
+            llama_tokens result;common_ngram_map_draft(map,history,key.back(),result);t.assert_true(result==value);
+        }
+        common_ngram_map keys(2,3,true,1);const auto tokens=history_for({0});bool rejected=false;
+        try { common_ngram_map_begin(keys,tokens,0); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected);
+    });
     t.test("streamed_dflash_rollback_covers_both_independent_proposal_limits", [&](testing & t) {
         for (int predictions = 1; predictions <= 7; ++predictions) {
             for (uint16_t ngram = 1; ngram <= 7; ++ngram) {

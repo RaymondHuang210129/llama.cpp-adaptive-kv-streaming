@@ -758,6 +758,36 @@ llama_tokens server_tokens::get_text_tokens() const {
     return res;
 }
 
+server_speculative_text server_tokens::get_speculative_text() const {
+    if (!has_mtmd && !map_idx_to_media.empty()) throw std::invalid_argument("media in text-only history");
+    server_speculative_text result;
+    result.tokens.reserve(tokens.size());
+    auto media = map_idx_to_media.begin();
+    for (size_t i = 0; i < tokens.size();) {
+        if (media != map_idx_to_media.end() && media->first < i) throw std::invalid_argument("overlapping media history");
+        if (media != map_idx_to_media.end() && media->first == i) {
+            const auto * chunk = media->second.get();
+            if (!chunk || mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                throw std::invalid_argument("invalid media history");
+            }
+            const size_t rows = mtmd_input_chunk_get_n_tokens(chunk);
+            if (!rows || rows > tokens.size() - i) throw std::invalid_argument("invalid media extent");
+            for (size_t row = 0; row < rows; ++row) {
+                if (tokens[i + row] != LLAMA_TOKEN_NULL) throw std::invalid_argument("invalid media placeholder");
+            }
+            result.ngram_begin = result.tokens.size();
+            result.has_media = true;
+            i += rows;
+            ++media;
+        } else {
+            if (tokens[i] == LLAMA_TOKEN_NULL) throw std::invalid_argument("missing media history");
+            result.tokens.push_back(tokens[i++]);
+        }
+    }
+    if (media != map_idx_to_media.end()) throw std::invalid_argument("media outside history");
+    return result;
+}
+
 void server_tokens::set_token(llama_pos pos, llama_token id) {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;

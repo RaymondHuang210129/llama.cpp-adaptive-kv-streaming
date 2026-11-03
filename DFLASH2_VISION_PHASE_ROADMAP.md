@@ -2,7 +2,7 @@
 
 Status: DV0-DV17 complete, 2026-11-02, for scoped pure DFlash2 shared-arena vision and common Qwen/Gemma controlled CUDA encoder workspace. Projector weights, graph storage, operator temporaries and explicit cuBLAS scratch share the existing phase parent while protected target/draft state stays live. Numerical, safety, performance, functional compilation, final finder examples and documentation checks are complete. K4V vision remains a separate follow-up. Historical stage receipts below retain their measured source/binary identities; they are not all relabelled as fresh passes after later changes.
 
-Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18 baseline and controlled-red evidence are complete; DV19-DV26 remain unchecked. Mixed vision remains rejected in the current runtime. See the [new implementation plan](#k4v-vision-extension-dv18-dv26).
+Implementation extension: **DV18-DV26**, Qwen DFlash2 + K4V + mmproj. DV18 baseline/red and DV19 checked lookup ranges are complete; DV20-DV26 remain unchecked. Mixed vision remains rejected in the current runtime. See the [new implementation plan](#k4v-vision-extension-dv18-dv26).
 
 Initial DV0-DV9 source baseline: merged Adaptive KV Streaming V2 at `7425d14c3ae0bc357b2e5f51edff15fabbe17f70`. Recheck the named mechanisms when implementation starts. Historical evidence retains its measured source and binary identities when later Git metadata changes.
 
@@ -565,7 +565,7 @@ Exit: DV10-DV17 are complete for the declared controlled CUDA vision workspace. 
 
 ## K4V vision extension: DV18-DV26
 
-Status: implementation started; DV18 baseline/readiness is complete and DV19-DV26 are pending. DV0-DV17 stay complete for their qualified scopes. DV18-DV26 add optional K4V to the existing Qwen DFlash2 image path; current common/server/finder guards must continue rejecting mixed vision until the corresponding implementation gates pass. Source inspected: `af2b9cb8f`. Recheck the anchors below before implementation if the source changes. Planning this extension does not establish runtime or performance qualification.
+Status: implementation started; DV18 baseline/readiness and DV19 checked lookup ranges are complete; DV20-DV26 are pending. DV0-DV17 stay complete for their qualified scopes. DV18-DV26 add optional K4V to the existing Qwen DFlash2 image path; current common/server/finder guards must continue rejecting mixed vision until the corresponding implementation gates pass. Source inspected: `af2b9cb8f`. Recheck the anchors below before implementation if the source changes. Planning this extension does not establish runtime or performance qualification.
 
 ### Scope and release policy
 
@@ -669,7 +669,9 @@ Exit: source-anchored failure cases distinguish the new lookup policy from pairi
 
 #### DV19 - Add a checked K4V-only suffix view
 
-Status: pending; depends on DV18.
+Status: complete. The bounded map overload borrows a suffix of the existing full text vector with checked absolute indices; it does not allocate a second history. Legacy begin/draft wrappers retain their previous behavior. A separate found flag and explicit first-eligible check handle real index zero without inventing a token. Search/statistics cursors exclude the prefix, bounds are checked before narrowing/access, stale shrink rejects, and ordinary append preserves incremental statistics. The new server snapshot walks validated whole media chunks and returns the same full filtered text plus its last-media offset; the original getter remains unchanged.
+
+The missing getter/bounded-begin API compile red is preserved. Native and host ASAN/UBSAN pass 548 speculative and 430 server assertions, covering first/last/adjacent/multiple images, cached placeholders/serialization, short/empty/invalid ranges, N1/N1024, K1/K7, optional hashes, zero acceptance, prefix exclusion and growth. The readiness probe now has only the three expected admission reds; every history case passes. Three fresh current-library GPU controls pass again: pure native/streamed images, complete native image vectors and mixed-text switching/all widths. CUDA remains byte-identical. Generation/server dispatch integration is DV20; public mixed vision remains closed.
 
 - Extend the existing server-token/speculative/ngram helpers with the smallest range seam. Borrow the existing owned text snapshot where possible; leave the ordinary shared prompt and position APIs unchanged. With no images and no boundary context, preserve existing text-only native and streamed K4V behavior.
 - Apply the selected range consistently to map begin, key search, occurrence counting, value selection and acceptance indices. Keep indices/cursors in one declared range-aware space, use checked bounds before pointer arithmetic, and handle an empty view without null-pointer arithmetic. Prove first-suffix-token lookup and zero-sentinel handling; do not silently drop that occurrence.
@@ -816,7 +818,7 @@ Suggested review boundaries are startup/provenance, persistent owner handoff, in
 ### K4V vision extension checklist
 
 - [x] DV18: current mixed-image artifacts, source contracts and unsafe history joins reproduced with valid controls.
-- [ ] DV19: checked K4V-only post-image text view passes positive, boundary and existing text-map CPU tests.
+- [x] DV19: checked K4V-only post-image text view passes positive, boundary and existing text-map CPU tests.
 - [ ] DV20: generation, media identity, cache/checkpoint and pending acceptance lifetime are integrated safely.
 - [ ] DV21: actual mixed image source switching, every accepted prefix and TG1-TG8 match scoped native/component controls.
 - [ ] DV22: only the qualified mixed startup/request set is admitted, with independent widths, exact quotas and preserved guards.
