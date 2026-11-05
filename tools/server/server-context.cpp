@@ -18,16 +18,19 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "mtmd-session.h"
+#include "mtmd-workspace.h"
 #include "mtmd-projector-storage.h"
 #include "src/llama-context-memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <set>
 #include <utility>
 #include <fstream>
 
@@ -266,6 +269,17 @@ struct server_slot {
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
+    common_speculative_ngram_context spec_ngram_context;
+    uint64_t spec_generation = 0;
+
+    void prepare_speculative_text(bool begin) {
+        auto snapshot = prompt.tokens.get_speculative_text();
+        if (begin && ++spec_generation == 0) ++spec_generation;
+        if (snapshot.has_media && !spec_generation) throw std::invalid_argument("missing speculative generation");
+        spec_ngram_context = snapshot.has_media ? common_speculative_ngram_context{snapshot.ngram_begin, spec_generation} :
+            common_speculative_ngram_context{};
+        spec_prompt = std::move(snapshot.tokens);
+    }
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
@@ -387,6 +401,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_ngram_context = {};
 
         last_nl_pos    = 0;
         generated      = {};
@@ -953,6 +968,7 @@ public:
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     bool vision_arena = false;
+    int vision_image_limit_before_batch = -1;
     const llama_vocab * vocab = nullptr;
 
     server_decision_context decision;
@@ -1214,6 +1230,7 @@ private:
         if (has_mmproj) {
             int64_t t_start = ggml_time_us();
             mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+            vision_image_limit_before_batch=mmproj_usage.image_max_tokens;
             mmproj_usage_t_us = ggml_time_us() - t_start;
         }
 
@@ -1349,7 +1366,7 @@ private:
             if (vision_arena) {
                 auto * owner = llama_context_compute_memory(ctx_tgt);
                 if (!owner || !owner->valid() || !owner->shares_kv_memory() || !owner->can_suspend_for_vision() ||
-                        (streamed_mtp && (!ctx_dft || !llama_context_compute_memory(ctx_dft) ||
+                        ((streamed_mtp || streamed_dflash) && (!ctx_dft || !llama_context_compute_memory(ctx_dft) ||
                             !llama_context_compute_memory(ctx_dft)->valid() ||
                             !llama_context_compute_memory(ctx_dft)->borrows_serial_parent())) ||
                         !mtmd_vision_phase_compatible(mctx,model_tgt)) {
@@ -3342,6 +3359,12 @@ private:
         }
     }
 
+    bool uses_image_ngram() const {
+        const auto & types = params_base.speculative.types;
+        return mctx && std::find(types.begin(),types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)!=types.end() &&
+            std::find(types.begin(),types.end(),COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)!=types.end();
+    }
+
     void pre_decode() {
         // apply context-shift if needed
         // TODO: simplify and improve
@@ -3422,6 +3445,10 @@ private:
                 return;
             }
 
+            if (spec && uses_image_ngram() && slot.can_speculate() && slot.spec_draft.empty() && slot.get_n_draft_max()>0) {
+                slot.prepare_speculative_text(false);
+            }
+
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -3462,7 +3489,10 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        if (!uses_image_ngram()) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                            slot.spec_ngram_context = {};
+                        }
 
                         const bool spec_reject = slot.use_spec_rejection();
 
@@ -3476,6 +3506,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .ngram_context = */ slot.spec_ngram_context,
                         };
 
                         drafting.push_back(&slot);
@@ -4434,7 +4465,12 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    if (uses_image_ngram()) {
+                        slot.prepare_speculative_text(true);
+                        common_speculative_begin(spec.get(), slot.id, slot.spec_prompt, slot.spec_ngram_context);
+                    } else {
+                        common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    }
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4572,8 +4608,6 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
-
                 slot.spec_draft = std::move(accepted);
             }
 
@@ -4583,6 +4617,7 @@ private:
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
+            common_speculative_accept(spec.get(), slot.id, ids.size() - 1, n_accepted);
             slot.spec_is_replay = false;
 
             slot.stats.update_gen_last();
@@ -4787,6 +4822,85 @@ llama_context * server_context::get_llama_context() const {
 
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
+}
+
+json server_context::get_vision_memory_report() const {
+    auto * owner=llama_context_compute_memory(impl->ctx_tgt);
+    mtmd_vision_geometry geometry;
+    if (!impl->vision_arena || !impl->mctx || !owner || !owner->valid() ||
+            !owner->can_suspend_for_vision() || !mtmd_get_vision_geometry(impl->mctx,geometry)) {
+        throw std::runtime_error("vision memory reporting requires an admitted shared-arena Qwen3-VL or Gemma4 projector");
+    }
+    auto * parent=owner->shared_parent();
+    const size_t weights=mtmd_vision_weight_bytes(impl->mctx,ggml_backend_buffer_get_type(parent));
+    if (!weights) throw std::runtime_error("cannot measure projector weight storage");
+    llama_context_memory_create_result lower;
+    const bool lower_fits=owner->quote_suspended_loans({weights,1},lower);
+    if (!lower_fits && lower.status!=llama_context_memory_create_status::insufficient_budget)
+        throw std::runtime_error("vision parent admission is unavailable");
+    json ratios=json::array();
+    const std::array<std::pair<int,int>,7> aspects{{{1,1},{4,3},{3,4},{16,9},{9,16},{2,1},{1,2}}};
+    for (const auto & aspect : aspects) {
+        std::vector<json> admitted;
+        std::map<std::pair<int,int>,int> seen;
+        std::vector<int> budget_shapes(size_t(geometry.max_tokens-geometry.min_tokens+1),-1);
+        size_t rejected_minimum=SIZE_MAX;
+        if (lower_fits) for (int budget=geometry.min_tokens;budget<=geometry.max_tokens;++budget) {
+            mtmd_vision_shape shape;
+            if (!mtmd_vision_shape_for_budget(geometry,budget,aspect.first,aspect.second,shape))
+                throw std::runtime_error("native vision shape calculation failed");
+            const auto key=std::make_pair(shape.width,shape.height);
+            const auto previous=seen.find(key);
+            if (previous!=seen.end()) {
+                budget_shapes[size_t(budget-geometry.min_tokens)]=previous->second;
+                if (previous->second>0) {
+                    auto & value=admitted[size_t(previous->second-1)];
+                    value["image_max_tokens"]=budget;
+                    value["input_width"]=shape.input_width;value["input_height"]=shape.input_height;
+                }
+                continue;
+            }
+            mtmd_vision_phase_requirements plan;
+            if (!mtmd_measure_vision_shape(impl->mctx,parent,shape,plan))
+                throw std::runtime_error("vision graph measurement failed for "+std::to_string(shape.width)+"x"+std::to_string(shape.height));
+            llama_context_memory_create_result admission;
+            if (!owner->quote_suspended_loans({plan.weight_bytes,plan.device_compute_bytes},admission)) {
+                if (admission.status!=llama_context_memory_create_status::insufficient_budget)
+                    throw std::runtime_error("vision shape admission failed without a quota result");
+                rejected_minimum=std::min(rejected_minimum,admission.required_bytes);
+                seen.emplace(key,-1);
+                continue;
+            }
+            const int id=int(admitted.size())+1;
+            seen.emplace(key,id);budget_shapes[size_t(budget-geometry.min_tokens)]=id;
+            admitted.push_back({{"width",shape.width},{"height",shape.height},{"input_width",shape.input_width},
+                {"input_height",shape.input_height},{"image_tokens",shape.tokens},{"image_max_tokens",shape.budget},
+                {"weight_bytes",plan.weight_bytes},{"compute_bytes",plan.device_compute_bytes},
+                {"workspace",{{"graph_bytes",plan.workspace.graph_bytes},{"operator_bytes",plan.workspace.operator_bytes},
+                    {"library_bytes",plan.workspace.library_bytes},{"padding_bytes",plan.workspace.padding_bytes},
+                    {"total_bytes",plan.workspace.total_bytes}}},
+                {"host_compute_bytes",plan.host_compute_bytes},{"required_arena_bytes",admission.required_bytes},{"shape_id",id}});
+        }
+        std::sort(admitted.begin(),admitted.end(),[](const json & a,const json & b) {
+            return a.at("image_tokens").get<size_t>()>b.at("image_tokens").get<size_t>();
+        });
+        json candidates=json::array();
+        for (auto & value : admitted) candidates.push_back(std::move(value));
+        ratios.push_back({{"ratio",std::to_string(aspect.first)+":"+std::to_string(aspect.second)},
+            {"candidates",std::move(candidates)},{"shapes_measured",seen.size()},
+            {"budget_shape_ids",budget_shapes},
+            {"minimum_rejected_bytes",rejected_minimum==SIZE_MAX ? json(nullptr) : json(rejected_minimum)}});
+    }
+    if (!mtmd_release_compute_workspace(impl->mctx)) throw std::runtime_error("cannot retire vision planning metadata");
+    return {{"schema","vision-memory-v2"},{"controlled_workspace",json::array({"graph","operator","library"})},
+        {"opaque_runtime_allocations_included",false},{"family",geometry.family},{"patch_size",geometry.patch_size},
+        {"merge",geometry.merge},{"alignment",geometry.patch_size*geometry.merge},
+        {"min_image_tokens",geometry.min_tokens},{"effective_image_max_tokens",geometry.max_tokens},
+        {"image_limit_before_batch",impl->vision_image_limit_before_batch},
+        {"batch_limited",impl->vision_image_limit_before_batch>geometry.max_tokens},
+        {"microbatch",llama_n_ubatch(impl->ctx_tgt)},{"arena_bytes",ggml_backend_buffer_get_size(parent)},
+        {"weight_bytes",weights},{"minimum_arena_bytes_lower_bound",lower.required_bytes},{"ratios",std::move(ratios)},
+        {"images_per_probe",1},{"runtime_validated",false}};
 }
 
 server_context_meta server_context::get_meta() const {

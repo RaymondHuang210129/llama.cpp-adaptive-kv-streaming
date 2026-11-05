@@ -92,6 +92,9 @@ struct common_ngram_map {
 
     size_t   idx_last_check       = 0; // index of last check in context history
 
+    size_t history_begin = 0;
+    bool history_bounded = false;
+
     // optional map "hash to ngram-index" for faster lookup of n-grams. map is empty if unused.
     //
     // uint32_t instead of size_t (size of current histories is << UINT32_MAX)
@@ -105,6 +108,9 @@ struct common_ngram_map {
 void common_ngram_map_begin(
     common_ngram_map & map,
     const llama_tokens & tokens);
+
+// Restrict K4V to a suffix of the same owned history; indices remain absolute.
+void common_ngram_map_begin(common_ngram_map & map, const llama_tokens & tokens, size_t begin);
 
 // Searches for the n-gram in the history and checks whether a draft sequence should be generated.
 // map:                the ngram map to search in.

@@ -106,10 +106,13 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
     llama_context(model, params, 0) {}
 
+llama_context::llama_context(const llama_model & model, llama_context_params params,
+        uint32_t serial_prediction_rows) : llama_context(model, params, serial_prediction_rows, false) {}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params,
-              uint32_t serial_prediction_rows) :
+              uint32_t serial_prediction_rows, bool serial_image_inputs) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -124,6 +127,10 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    if (serial_image_inputs && !serial_prediction_rows) {
+        throw std::runtime_error("image feature preparation requires an attached serial block drafter");
+    }
 
     if (serial_prediction_rows && (model.arch != LLM_ARCH_DFLASH || !params.ctx_other ||
             !params.ctx_other->get_cparams().kv_streaming())) {
@@ -407,6 +414,10 @@ llama_context::llama_context(
             }
         }
         // Configure every retained feature before a child can capture the target's arena addresses.
+        if (target->serial_feature_images!=serial_image_inputs) {
+            target->serial_feature_images=serial_image_inputs;
+            target->sched_reserve_state.invalidate();
+        }
         target->serial_feature_producer=true;
         target->serial_feature_layers=model.target_layer_ids;
         for (auto id : model.target_layer_ids) target->set_embeddings_layer_inp(uint32_t(id),true);
@@ -966,6 +977,9 @@ bool llama_context::prepare_compute_arenas(
         }
         if (compute_memory && cparams.kv_shared_read && !compute_memory->register_shared_read_consumer())
             throw std::runtime_error("failed to register shared read-only serial consumer");
+        if (compute_memory && cparams.serial_block_rows &&
+                (!serial_cache || !compute_memory->register_bounded_write_consumer(serial_cache->lease())))
+            throw std::runtime_error("failed to register parent-owned bounded draft writer");
         if (compute_memory) compute_memory_graph_revision = compute_memory->graph_binding_revision();
         return compute_memory != nullptr;
     }
@@ -1087,6 +1101,22 @@ void llama_context::sched_reserve() {
             n_seqs, n_seqs, n_seqs, mctx.get(), true,
             measurements.data() + backend_ptrs.size());
         if (!gf_pp || !gf_tg) return false;
+        if (serial_feature_images) {
+            const bool decode_intent=cparams.kv_stream_decode;
+            std::vector<uint32_t> measured;
+            for (uint32_t width : {1u,64u,128u,129u,n_injection ? n_injection-1 : 0,n_injection}) {
+                if (!width || width>n_injection || std::find(measured.begin(),measured.end(),width)!=measured.end()) continue;
+                measured.push_back(width);
+                for (uint32_t outputs : {1u,std::max(1u,std::min(width,cparams.n_outputs_max))}) {
+                    std::vector<size_t> image(backend_ptrs.size());
+                    cparams.kv_stream_decode=false;
+                    if (!graph_reserve(width,1,outputs,mctx.get(),true,image.data(),true)) return false;
+                    for (size_t i=0;i<backend_ptrs.size();++i) measurements[i]=std::max(measurements[i],image[i]);
+                }
+            }
+            cparams.kv_stream_decode=decode_intent;
+            LLAMA_LOG_INFO("%s: measured %zu image input widths before serial draft registration\n",__func__,measured.size());
+        }
         if (model.arch == LLM_ARCH_DFLASH && model.hparams.n_embd_inp_enc() > 0) {
             // Injection and block prediction use different graph inputs but the same workspace.
             std::vector<size_t> injection(backend_ptrs.size());
@@ -1324,15 +1354,35 @@ llama_context_memory * llama_context_compute_memory(llama_context * ctx) noexcep
     return ctx ? const_cast<llama_context_memory *>(ctx->get_compute_memory()) : nullptr;
 }
 
+void llama_context::clear_serial_features() {
+    serial_feature_rows.clear();
+    serial_feature_image_rows.clear();
+    serial_feature_image_values.clear();
+    serial_feature_image_width=0;
+}
+
 bool llama_context::serial_features_match(const llama_batch_ext & batch,const int32_t * ids,uint32_t count) const {
     if (!serial_feature_producer || serial_feature_rows.empty() || serial_feature_rows.size() != batch.tokens.size() ||
             !memory || memory->seq_pos_max(0) != serial_feature_rows.back().second) return false;
     if ((ids || count) && (!ids || count != serial_feature_layers.size() ||
             !std::equal(serial_feature_layers.begin(),serial_feature_layers.end(),ids))) return false;
     for (auto id : serial_feature_layers) if (!cparams.embeddings_layer_inp[uint32_t(id)]) return false;
+    const bool image_frame=!serial_feature_image_rows.empty();
+    if (image_frame) {
+        if (!serial_feature_images || serial_feature_image_rows.size()!=batch.tokens.size() ||
+                serial_feature_image_width!=batch.n_embd || serial_feature_image_values.empty() ||
+                serial_feature_image_values.size()!=batch.embd.size() ||
+                std::memcmp(serial_feature_image_values.data(),batch.embd.data(),batch.embd.size()*sizeof(float))) return false;
+        for (size_t i=0;i<batch.tokens.size();++i) {
+            const auto & token=batch.tokens[i];
+            const auto & saved=serial_feature_image_rows[i];
+            if (token.has_embd!=saved.has_embd || token.pos!=saved.position ||
+                    (token.has_embd && token.embd_off!=saved.offset)) return false;
+        }
+    }
     for (size_t i=0;i<batch.tokens.size();++i) {
         const auto & token=batch.tokens[i];
-        if (token.has_embd || token.seq_ids.size() != 1 || !token.seq_ids.count(0) ||
+        if ((!image_frame && token.has_embd) || token.seq_ids.size() != 1 || !token.seq_ids.count(0) ||
                 token.id != serial_feature_rows[i].first || token.pos[0] != serial_feature_rows[i].second) return false;
     }
     return true;
@@ -2554,7 +2604,7 @@ int llama_decode_mtp_embeddings(llama_context * ctx, const llama_batch_ext & bat
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
-    if (serial_feature_producer) serial_feature_rows.clear();
+    if (serial_feature_producer) clear_serial_features();
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.arch == LLM_ARCH_QWEN35 && !mtp_visual_hidden &&
             std::any_of(batch_inp.tokens.begin(), batch_inp.tokens.end(), [](const auto & token) {
                 return token.id == LLAMA_TOKEN_NULL && token.has_embd;
@@ -3102,6 +3152,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (serial_feature_producer) {
         serial_feature_rows.reserve(batch_inp.tokens.size());
         for (const auto & token : batch_inp.tokens) serial_feature_rows.emplace_back(token.id,token.pos[0]);
+        if (serial_feature_images && !batch_inp.embd.empty()) {
+            serial_feature_image_rows.reserve(batch_inp.tokens.size());
+            for (const auto & token : batch_inp.tokens)
+                serial_feature_image_rows.push_back({token.has_embd,token.embd_off,token.pos});
+            serial_feature_image_values=batch_inp.embd;
+            serial_feature_image_width=batch_inp.n_embd;
+        }
     }
 
     return 0;
@@ -4536,7 +4593,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
-    serial_feature_rows.clear();
+    clear_serial_features();
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -4571,7 +4628,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    serial_feature_rows.clear();
+    clear_serial_features();
 
     if (memory) {
         memory->state_read(io, seq_id, flags);
@@ -4933,7 +4990,7 @@ llama_context_params llama_context_default_params() {
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params,
-                    uint32_t   serial_prediction_rows) {
+                    uint32_t   serial_prediction_rows, bool serial_image_inputs) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -5021,7 +5078,7 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params, serial_prediction_rows);
+        auto * ctx = new llama_context(*model, params, serial_prediction_rows, serial_image_inputs);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -5036,6 +5093,10 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model(llama_model * model, llama_context_params params, uint32_t serial_prediction_rows) {
+    return llama_init_from_model(model, params, serial_prediction_rows, false);
 }
 
 llama_context * llama_init_from_model(llama_model * model, llama_context_params params) {

@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdio>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -151,6 +152,10 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty()
                                && params.model.docker_repo.empty();
+    if (params.vision_memory_report && is_router_server) {
+        SRV_ERR("%s", "vision memory reporting requires a specific model\n");
+        return 1;
+    }
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
@@ -490,6 +495,15 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             ctx_http.join();
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
+        }
+
+        if (params.vision_memory_report) {
+            int status=0;
+            try { std::printf("%s\n",ctx_server.get_vision_memory_report().dump().c_str()); }
+            catch (const std::exception & error) { SRV_ERR("vision memory report: %s\n",error.what()); status=1; }
+            clean_up();
+            ctx_http.join();
+            return status;
         }
 
         routes.update_meta(ctx_server);

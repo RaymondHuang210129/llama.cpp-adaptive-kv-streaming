@@ -227,6 +227,13 @@ GGML_API bool ggml_backend_sched_attach_memory_lease(
         ggml_backend_t backend,
         ggml_backend_memory_lease_t lease);
 
+// Limit graph placement within the retained root loan; completed graph bindings must be rebuilt.
+GGML_API bool ggml_backend_sched_set_memory_lease_limit(
+        ggml_backend_sched_t sched, ggml_backend_t backend, size_t size);
+
+// Internal allocator seam for an existing external range; retains its complete backing.
+bool ggml_gallocr_set_buffer_range_limit(ggml_gallocr_t galloc, int buffer_id, size_t size);
+
 // Synchronize the scheduler, detach its workspace, and release its lease.
 // Existing graph tensor addresses become invalid.
 GGML_API bool ggml_backend_sched_detach_memory_lease(
@@ -242,6 +249,10 @@ GGML_API void ggml_backend_memory_lease_free(
 
 // Return a borrowed buffer valid for the lease lifetime.
 GGML_API ggml_backend_buffer_t ggml_backend_memory_lease_buffer(
+        ggml_backend_memory_lease_t lease);
+
+// Return the arena parent buffer, borrowed for the lease lifetime.
+GGML_API ggml_backend_buffer_t ggml_backend_memory_lease_parent(
         ggml_backend_memory_lease_t lease);
 
 // Return the region metadata captured when the lease was acquired.

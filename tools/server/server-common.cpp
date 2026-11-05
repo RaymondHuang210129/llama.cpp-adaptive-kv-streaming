@@ -39,6 +39,8 @@ bool server_uses_vision_arena(const common_params & params) {
     return !params.mmproj.path.empty() && (params.kv_stream_pool_bytes || params.shared_device_memory_bytes);
 }
 const char * server_vision_arena_config_error(const common_params & params) {
+    if (params.vision_memory_report && (!server_uses_vision_arena(params) || !params.shared_device_memory_bytes))
+        return "vision memory reporting requires --mmproj and a shared device memory arena";
     if (!server_uses_vision_arena(params)) return nullptr;
     if (!params.shared_device_memory_bytes || params.kv_stream_pool_bytes)
         return "vision KV streaming requires a shared device memory arena, not a fixed KV pool";
@@ -48,6 +50,11 @@ const char * server_vision_arena_config_error(const common_params & params) {
     if (const auto * error = common_streamed_kv_config_error(params)) return error;
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED)
         return "vision arena requires -fa on; cache support is checked during context initialization";
+    if (common_params_uses_streamed_dflash(params)) {
+        if (const auto * error=common_streamed_dflash_config_error(params)) return error;
+        if (!params.speculative.has_dft()) return "vision DFlash2 requires a matching separate draft model";
+        return nullptr;
+    }
     const bool mtp = common_params_uses_streamed_mtp(params);
     if ((params.speculative.has_dft() && (!mtp || params.kv_stream_auxiliary_layers)) || (params.kv_stream_auxiliary_layers && !mtp) ||
             params.kv_stream_auxiliary_layers > 1 || (mtp && (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > 3)))
@@ -70,9 +77,36 @@ const char * server_vision_arena_request_error(const server_task & task, bool st
                 source.hf_file!=allowed.hf_file || source.docker_repo!=allowed.docker_repo)
             return "vision arena request cannot change the configured draft model";
     } else if (requested.has_dft()) return "vision arena request cannot enable a draft model";
+    const bool dflash=configured && configured->has_dft() &&
+        configured->draft.n_max>=1 && configured->draft.n_max<=7 &&
+        std::find(configured->types.begin(),configured->types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)!=configured->types.end() &&
+        std::all_of(configured->types.begin(),configured->types.end(),[](auto type) {
+            return type==COMMON_SPECULATIVE_TYPE_NONE || type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                type==COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
+        });
+    const bool ngram=dflash && std::find(configured->types.begin(),configured->types.end(),
+        COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)!=configured->types.end();
+    if (ngram) {
+        const auto & fixed=configured->ngram_map_k4v;
+        const auto & asked=requested.ngram_map_k4v;
+        if (!fixed.size_n || fixed.size_n>1024 || !fixed.size_m || fixed.size_m>7 || !fixed.min_hits ||
+                fixed.size_n!=asked.size_n || fixed.size_m!=asked.size_m || fixed.min_hits!=asked.min_hits)
+            return "vision arena request cannot change the configured K4V lookup policy";
+        if (requested.draft.n_max<1 || requested.draft.n_max>configured->draft.n_max)
+            return "vision arena request exceeds the configured DFlash prediction width";
+        const bool active=std::any_of(requested.types.begin(),requested.types.end(),[](auto type) {
+            return type!=COMMON_SPECULATIVE_TYPE_NONE;
+        });
+        if (active && (std::find(requested.types.begin(),requested.types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)==requested.types.end() ||
+                std::find(requested.types.begin(),requested.types.end(),COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)==requested.types.end()))
+            return "vision arena request cannot change the configured mixed proposal sources";
+    }
     for (auto type : task.params.speculative.types) if (type != COMMON_SPECULATIVE_TYPE_NONE &&
             !(streamed_mtp && type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && requested.draft.n_max >= 1 && requested.draft.n_max <= 3 &&
-                (!configured || requested.draft.n_max <= configured->draft.n_max)))
+                (!configured || requested.draft.n_max <= configured->draft.n_max)) &&
+            !(dflash && type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && requested.draft.n_max>=1 &&
+                requested.draft.n_max<=configured->draft.n_max) &&
+            !(ngram && type==COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V))
         return "vision arena request cannot change the qualified speculation mode";
     try {
         for (size_t i = 0; i < task.tokens.size();) {
@@ -741,6 +775,36 @@ llama_tokens server_tokens::get_text_tokens() const {
         }
     }
     return res;
+}
+
+server_speculative_text server_tokens::get_speculative_text() const {
+    if (!has_mtmd && !map_idx_to_media.empty()) throw std::invalid_argument("media in text-only history");
+    server_speculative_text result;
+    result.tokens.reserve(tokens.size());
+    auto media = map_idx_to_media.begin();
+    for (size_t i = 0; i < tokens.size();) {
+        if (media != map_idx_to_media.end() && media->first < i) throw std::invalid_argument("overlapping media history");
+        if (media != map_idx_to_media.end() && media->first == i) {
+            const auto * chunk = media->second.get();
+            if (!chunk || mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                throw std::invalid_argument("invalid media history");
+            }
+            const size_t rows = mtmd_input_chunk_get_n_tokens(chunk);
+            if (!rows || rows > tokens.size() - i) throw std::invalid_argument("invalid media extent");
+            for (size_t row = 0; row < rows; ++row) {
+                if (tokens[i + row] != LLAMA_TOKEN_NULL) throw std::invalid_argument("invalid media placeholder");
+            }
+            result.ngram_begin = result.tokens.size();
+            result.has_media = true;
+            i += rows;
+            ++media;
+        } else {
+            if (tokens[i] == LLAMA_TOKEN_NULL) throw std::invalid_argument("missing media history");
+            result.tokens.push_back(tokens[i++]);
+        }
+    }
+    if (media != map_idx_to_media.end()) throw std::invalid_argument("media outside history");
+    return result;
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {

@@ -213,3 +213,37 @@ The temporary servers use image-token limits 64-4096 to exercise different encod
 - Sampled peaks are lower bounds on the true instantaneous peak. They include all activity on the selected device and can miss brief allocations. The fixed parent intentionally remains allocated after vision; successful cleanup returns grants, not the entire parent to the driver.
 
 For host-only report tests, run `python3 -B tools/server/tests/test_adaptive_vision_measurements.py`. These tests require neither a model nor a GPU and are registered with CTest when server tests and Python are available.
+
+### DFlash2 vision qualification
+
+The existing vision harness also accepts `--dflash-length 1..7 --model-draft /path/to/matching-sidecar.gguf`, with `--mtp-length 0`. Adaptive drafting inherits the target K/V formats; the native control selects matching independent formats. `--lifecycle` adds complete state-file checks, erase/restore, truncated-state recovery, restart and later/aspect-varied images. Each scenario compares with its corresponding native scenario, including draft and cache counters. The public image wire format is unchanged.
+
+The measured Qwen profile uses the matching Q2 mixed sidecar and F16 projector. Full native F1/F3 controls fit; F7 uses separately pinned native encoder/decoder component references after its full-native projector allocation fails. Long F7 image lifecycle is explicitly streamed self-consistency. Optional K4V image lookup is limited to text after the last complete image; MTP+K4V and Gemma+DFlash remain unsupported. See the [DFlash2 vision report](../../../docs/multimodal/dflash2-vision.md) for artifact hashes, performance, strict-memory scope and finder admission coverage.
+
+```bash
+python3 tools/server/tests/test_adaptive_vision.py \
+  --server build-v2/bin/llama-server --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --mmproj /path/to/mmproj-Qwen3.8-27B-F16.gguf \
+  --model-draft /path/to/Qwen3.8-27B-DFlash2-Q2_K_S-MIX.gguf --dflash-length 3 \
+  --context 2048 --batch-size 256 --ubatch-size 256 --arena-mib 1024 \
+  --background-tokens 128 --decode 64 --cache-ram-mib 2048 \
+  --lifecycle --mode compare --output benchmarks/results/my-dflash-vision-check
+```
+
+This command starts and cleans up its own servers. Make GPU memory available first; it does not manage other services. A failing capacity or numerical check is not an accepted profile.
+
+Optional mixed-image controls add `--ngram-m 1..7 --ngram-n N --ngram-min-hits H` to the same harness. F and M are independent. For a fitting full-native comparison, the measured lifecycle profile uses F3/M3, N2/H1, context 2048, b/ub256, a 1024 MiB parent, 128 background tokens and 32 outputs. Use a fresh output directory; input fixtures are generated internally. `--mode compare` requires identical corresponding native/streamed outputs and work/cache counts. Larger profiles with native capacity failures use separately declared component/self-reference scopes, not a CPU fallback.
+
+The dedicated replay control reproduces rejection of a copied seven-token continuation and checks source feedback without charging its replayed correction:
+
+```bash
+python3 tools/server/tests/test_adaptive_vision.py \
+  --server build-v2/bin/llama-server --model /path/to/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --mmproj /path/to/mmproj-Qwen3.8-27B-F16.gguf \
+  --model-draft /path/to/Qwen3.8-27B-DFlash2-Q2_K_S-MIX.gguf --dflash-length 3 \
+  --ngram-m 7 --ngram-n 2 --ngram-min-hits 1 \
+  --context 2048 --batch-size 256 --ubatch-size 256 --arena-mib 1024 \
+  --check-mixed-replay --mode compare --output benchmarks/results/my-mixed-image-replay
+```
+
+It compares complete forced output IDs and strict per-mode source/response totals. Native RS/F full-checkpoint replay and streamed RS/max(F,M) direct rollback perform different recovery work, so this dedicated control does not require their draft totals to coincide. Ordinary same-protocol controls retain their full counter comparisons. N2/H1 is a controlled route fixture, not a universal tuning recommendation. Cancellation ignores native progress IDs and can wait for multiple real outputs before disconnecting. GPU qualification refuses a healthy CPU fallback; GPU host-ASAN uses the already-qualified `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:protect_shadow_gap=0` CUDA compatibility profile with UBSAN enabled. Device memcheck still uses default PDL, API-all/exit99 and no filters.

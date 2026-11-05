@@ -6,6 +6,7 @@ import base64
 import contextlib
 import http.client
 import json
+import importlib.util
 import os
 import signal
 from pathlib import Path
@@ -42,24 +43,53 @@ def request(port, path, body=None):
         return error.code, json.load(error)
 
 
+def speculative_arguments(args, mode):
+    mtp = getattr(args, "mtp_length", 0)
+    dflash = getattr(args, "dflash_length", 0)
+    draft = getattr(args, "model_draft", None)
+    ngram = getattr(args, "ngram_m", 0)
+    if ngram and (not dflash or not 1<=ngram<=7 or not 1<=getattr(args,"ngram_n",12)<=1024 or
+                  not 1<=getattr(args,"ngram_min_hits",2)<=65535):
+        raise ValueError("mixed vision requires DFlash1-7, K4V1-7, lookup N1-1024 and positive hits")
+    if not 0 <= mtp <= 3 or not 0 <= dflash <= 7 or (mtp and dflash) or bool(draft) != bool(dflash):
+        raise ValueError("choose embedded MTP1-3 or DFlash1-7 with its matching --model-draft")
+    if not (mtp or dflash):
+        return ["--spec-type", "none"]
+    flags = ["--spec-type", "ngram-map-k4v,draft-dflash" if ngram else "draft-dflash" if dflash else "draft-mtp",
+             "--spec-draft-n-max", str(dflash or mtp)]
+    if ngram:
+        flags += ["--spec-ngram-map-k4v-size-n",str(getattr(args,"ngram_n",12)),"--spec-ngram-map-k4v-size-m",str(ngram),
+                  "--spec-ngram-map-k4v-min-hits",str(getattr(args,"ngram_min_hits",2))]
+    if dflash:
+        flags += ["--model-draft", str(draft.resolve()), "--spec-draft-ngl", "999",
+                  "--spec-draft-n-min", "0", "--spec-draft-p-min", "0"]
+    if not mode.startswith("arena"):
+        flags += ["--spec-draft-type-k", getattr(args, "cache_type_k", "q8_0"),
+                  "--spec-draft-type-v", getattr(args, "cache_type_v", "q4_0")]
+    return flags
+
+
 @contextlib.contextmanager
 def server(args, mode, extra=(), reject=False, env_extra=None):
+    speculative = speculative_arguments(args, mode)
     with socket.socket() as available:
         available.bind(("127.0.0.1", 0))
         port = available.getsockname()[1]
+    slot_path=args.output/("arena-slots" if mode.startswith("arena") else "stock-slots")
+    if getattr(args,"lifecycle",False):
+        slot_path.mkdir(parents=True,exist_ok=True)
     log_path = args.output / f"{mode}.log"
     command = [str(args.server.resolve()), "--model", str(args.model.resolve()), "--mmproj", str(args.mmproj.resolve()),
                "--host", "127.0.0.1", "--port", str(port), "--offline", "--fit", "off", "--parallel", "1",
                "--ctx-size", str(args.context), "-b", str(args.batch_size), "-ub", str(args.ubatch_size), "-ngl", "999", "-fa", "on",
-               "-ctk", "q8_0", "-ctv", "q4_0", "--spec-type", "none", "--no-context-shift", "--no-warmup",
+               "-ctk", getattr(args, "cache_type_k", "q8_0"), "-ctv", getattr(args, "cache_type_v", "q4_0"), "--no-context-shift", "--no-warmup",
                "--cache-ram", str(args.cache_ram_mib), "--ctx-checkpoints", "8", "--image-min-tokens", "64",
                "--image-max-tokens", "4096", "--slots", "--no-webui", "--log-verbosity", str(getattr(args, "log_verbosity", 4))]
     if mode.startswith("arena"):
         command += ["--shared-device-memory-mib", str(args.arena_mib)]
-    if getattr(args,"mtp_length",0):
-        command += ["--spec-type","draft-mtp","--spec-draft-n-max",str(args.mtp_length)]
-        if not mode.startswith("arena"):
-            command += ["--spec-draft-type-k","q8_0","--spec-draft-type-v","q4_0"]
+    command += speculative
+    if getattr(args,"lifecycle",False):
+        command += ["--slot-save-path",str(slot_path.resolve())]
     command += list(extra)
     env = dict(os.environ, LLAMA_MEDIA_MARKER="<__media__>")
     env.update(env_extra or {})
@@ -72,9 +102,16 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
         process = subprocess.Popen(command, stdout=log, stderr=log, env=env, start_new_session=os.name == "posix")
         try:
             if reject:
-                assert process.wait(timeout=30) != 0, f"unsupported startup admitted: {extra}"
+                assert process.wait(timeout=30) > 0, f"startup did not reject the configuration cleanly: {extra}"
                 diagnostic = log_path.read_text().lower()
-                assert "vision arena" in diagnostic or "attached mtp kv streaming supports at most 3 draft tokens" in diagnostic, log_path
+                assert not any(error in diagnostic for error in ("out of memory","cudamalloc failed","illegal memory access",
+                    "misaligned address","device-side assert","unspecified launch failure","no kernel image")), log_path
+                causes=("vision arena requires","vision arena supports","vision arena does not support","vision arena rejects",
+                    "vision kv streaming requires","attached mtp kv streaming supports at most 3 draft tokens",
+                    "adaptive dflash2 requires","adaptive dflash2 supports 1-7 draft tokens",
+                    "adaptive dflash2 with mmproj does not support k4v","adaptive dflash2+k4v requires",
+                    "adaptive kv speculation inherits target cache types")
+                assert any(cause in diagnostic for cause in causes), log_path
                 yield None
                 return
             deadline = time.monotonic() + 120
@@ -89,6 +126,9 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
                 time.sleep(0.1)
             else:
                 raise TimeoutError(f"{mode} startup timed out: {log_path}")
+            startup=log_path.read_text(errors="replace").lower()
+            if "failed to initialize cuda" in startup or "no usable gpu found" in startup:
+                raise RuntimeError("GPU execution unavailable; refusing a CPU fallback qualification: "+str(log_path))
             yield port
         finally:
             if os.name == "posix":
@@ -110,10 +150,116 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
                     os.killpg(process.pid, signal.SIGKILL)
 
 
+def wait_vision_idle(port):
+    deadline=time.monotonic()+60
+    while time.monotonic()<deadline:
+        status,slots=request(port,"/slots")
+        if status==200 and all(not slot["is_processing"] for slot in slots):return
+        time.sleep(0.1)
+    raise TimeoutError("cancelled slot did not return to idle")
+
+
+def vision_state_action(port, directory, action, saved=None, filename="vision.bin"):
+    status, result = request(port, "/slots/0?action="+action, {} if action=="erase" else {"filename":filename})
+    if status!=200:
+        raise RuntimeError("vision state action failed: "+action+" "+str(result))
+    path=directory/filename
+    if action=="save":
+        count,size=result.get("n_saved"),result.get("n_written")
+        if type(count) is not int or count<=0 or type(size) is not int or size<=0 or not path.is_file() or path.stat().st_size!=size:
+            raise RuntimeError("incomplete vision state save")
+    elif action=="restore":
+        if not saved or result.get("n_restored")!=saved["n_saved"] or result.get("n_read")!=saved["n_written"] or path.stat().st_size!=saved["n_written"]:
+            raise RuntimeError("incomplete vision state restore")
+    elif type(result.get("n_erased")) is not int or result["n_erased"]<0:
+        raise RuntimeError("invalid vision state erase")
+    return result
+
+
+def vision_observation(result, count, drafting=False, sources=None):
+    tokens=result.get("tokens",[])
+    timing=result.get("timings",{})
+    generated,accepted=timing.get("draft_n",0),timing.get("draft_n_accepted",0)
+    if len(tokens)!=count or any(type(token) is not int or token<0 for token in tokens) or timing.get("predicted_n")!=count:
+        raise RuntimeError("incomplete vision completion")
+    if type(generated) is not int or type(accepted) is not int or accepted<0 or accepted>generated or (drafting and not generated):
+        raise RuntimeError("invalid vision draft counts")
+    reused,processed=timing.get("cache_n"),timing.get("prompt_n")
+    if type(reused) is not int or reused<0 or type(processed) is not int or processed<=0:
+        raise RuntimeError("invalid vision prompt counts")
+    observed={"tokens":tokens,"content":result.get("content"),"cached":result.get("tokens_cached"),"timings":timing}
+    if sources is not None:
+        if set(sources)!={"ngram-map-k4v","draft-dflash"} or any(
+                type(row.get(key)) is not int or row[key]<0 for row in sources.values() for key in ("generated_tokens","accepted_tokens")):
+            raise RuntimeError("invalid mixed image source counters")
+        for source_key,timing_key in (("generated_tokens","draft_n"),("accepted_tokens","draft_n_accepted")):
+            if sum(row[source_key] for row in sources.values())!=timing.get(timing_key,0):
+                raise RuntimeError("mixed image source counters differ from completed response")
+        observed["source_stats"]=sources
+    return observed
+
+
 def completion(prompt, images=(), cache=False, decode=16):
     return {"prompt": {"prompt_string": prompt, "multimodal_data": list(images)} if images else prompt,
             "n_predict": decode, "temperature": 0, "top_k": 1, "seed": 42,
             "ignore_eos": True, "return_tokens": True, "cache_prompt": cache, "id_slot": 0}
+
+
+def vision_source_statistics(text):
+    root=Path(__file__).resolve().parents[3]
+    spec=importlib.util.spec_from_file_location("vision_speculative_controls",root/"benchmarks/run_dflash_controls.py")
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module.speculative_source_stats(text)
+
+
+def mixed_vision_cases(args, tokenize):
+    n,k,hits=getattr(args,"ngram_n",12),args.ngram_m,getattr(args,"ngram_min_hits",2)
+    fragment=" B";token=tokenize(fragment)
+    if len(token)!=1 or type(token[0]) is not int or token[0]<0:
+        raise ValueError("mixed vision fixture requires one ordinary B token")
+    tail=2*n+k+2;count=max(args.decode,32,(args.dflash_length+1)*hits+k+2)
+    if tail+count+15>=args.context or tokenize(fragment*tail)!=token*tail:
+        raise ValueError("mixed vision fixture exceeds context or changes tokenization")
+    image,changed=png(256,256),png(256,256,1);marker="<__media__>"
+    cases=[]
+    for label,prompt,images,cache,outputs in [
+        ("mixed-prefix-miss",fragment*tail+" Describe: "+marker+" Answer:",[image],False,args.dflash_length+2),
+        ("mixed-copy","Describe: "+marker+fragment*tail,[image],False,count),
+        ("mixed-copy-cached","Describe: "+marker+fragment*tail,[image],True,count),
+        ("mixed-changed-copy","Describe: "+marker+fragment*tail,[changed],True,count),
+        ("mixed-later-copy","Compare: "+marker+" Then: "+marker+fragment*tail,[image,changed],False,count)]:
+        body=completion(prompt,images,cache,outputs);body["logit_bias"]=[[token[0],1000]];cases.append((label,body))
+    return cases
+
+
+def run_mixed_replay(args, mode):
+    if not (getattr(args,"ngram_n",12)==2 and getattr(args,"ngram_min_hits",2)==1 and
+            1<=args.dflash_length<args.ngram_m<=7):
+        raise ValueError("copied rejection/replay fixture needs N2, hits1 and K greater than DFlash width")
+    count=args.ngram_m+2
+    with server(args,mode,extra=["--image-max-tokens","256"],env_extra={"LLAMA_TRACE":"1"}) as port:
+        def tokenize(text):
+            status,value=request(port,"/tokenize",{"content":text,"add_special":False})
+            if status!=200:raise RuntimeError("fixture tokenization failed")
+            return value["tokens"]
+        ids=[tokenize(text) for text in (" B"," C"," X")]
+        if any(len(row)!=1 for row in ids) or len({row[0] for row in ids})!=3:
+            raise RuntimeError("copied rejection fixture tokens are not distinct")
+        b,c,x=[row[0] for row in ids];pattern=(" B C"+" B"*args.ngram_m+" X")*2+" B"
+        if tokenize(pattern)!=([b,c]+[b]*args.ngram_m+[x])*2+[b]:
+            raise RuntimeError("copied rejection fixture changed tokenization")
+        body=completion("Describe: <__media__>"+pattern,[png(256,256)],decode=count);body["logit_bias"]=[[c,1000]]
+        status,result=request(port,"/completion",body)
+        (args.output/(mode+"-replay-response.json")).write_text(json.dumps({"payload":body,"status":status,"response":result},indent=2))
+        if status!=200 or result.get("tokens")!=[c]*count:raise RuntimeError("copied rejection target constraint failed")
+    text=(args.output/(mode+".log")).read_text();sources=vision_source_statistics(text)
+    observed=vision_observation(result,count,True,sources)
+    if sources["ngram-map-k4v"]["generated_tokens"]!=args.ngram_m or sources["ngram-map-k4v"]["accepted_tokens"] or sources["draft-dflash"]["prediction_forwards"]<=0:
+        raise RuntimeError("copied rejection lost actual source attribution")
+    replay="(restore checkpoint)" in text
+    if not mode.startswith("arena") and not replay:raise RuntimeError("native copied rejection did not exercise checkpoint replay")
+    return {"observation":observed,"checkpoint_replay":replay,
+            "scope":"Strict per-mode accounting and output IDs; native RS/F and streamed RS/max(F,K) use different recovery work."}
 
 
 def run(args, mode):
@@ -132,20 +278,49 @@ def run(args, mode):
         ("adjacent_images", completion(f"Compare: {marker}{marker} One sentence: ", [image, changed], decode=args.decode)),
         ("after_other_prompt", completion(initial, [image], True, args.decode)),
     ]
+    if getattr(args,"lifecycle",False):
+        cases.extend([
+            ("image_only",completion(marker,[image],decode=args.decode)),
+            ("image_first",completion(marker+" Describe briefly: ",[large],decode=args.decode)),
+            ("image_last",completion("Describe: "+marker,[large],decode=args.decode)),
+            ("portrait",completion(initial,[png(384,512,3)],decode=args.decode)),
+            ("narrow",completion(initial,[png(32,1024,4)],decode=args.decode)),
+        ])
     results = {}
     with server(args, mode) as port:
+        if getattr(args,"ngram_m",0):
+            def tokenize(text):
+                status,value=request(port,"/tokenize",{"content":text,"add_special":False})
+                if status!=200:raise RuntimeError("mixed fixture tokenization failed")
+                return value["tokens"]
+            cases.extend(mixed_vision_cases(args,tokenize))
         for name, body in cases:
             status, result = request(port, "/completion", body)
             assert status == 200, (mode, name, status, result)
-            assert len(result.get("tokens", [])) == args.decode, (name, result)
-            results[name] = {"tokens": result["tokens"], "content": result["content"],
-                             "cached": result.get("tokens_cached"), "timings": result.get("timings")}
+            count=body["n_predict"]
+            assert len(result.get("tokens", [])) == count, (name, result)
+            results[name] = vision_observation(result,count,bool(getattr(args,"dflash_length",0)))
+            if name.startswith("mixed-"):assert result["tokens"]==[body["logit_bias"][0][0]]*count
             (args.output / f"{mode}-partial.json").write_text(json.dumps(results,indent=2))
             print(mode, name, results[name]["cached"], flush=True)
         assert results["image"]["tokens"] == results["image_uncached_control"]["tokens"]
         assert (results["changed_image"]["timings"] or {})["prompt_n"] > (results["same_image_cached"]["timings"] or {})["prompt_n"]
         assert any((results[name]["timings"] or {}).get("prompt_n", args.context) < args.background_tokens
                    for name in ("same_image_cached", "followup_cached")) or args.background_tokens == 0, results
+
+        if getattr(args,"lifecycle",False):
+            from test_adaptive_gemma import vision_after_decode,vision_rejection_cases
+            after=vision_after_decode(completion(initial,[image],decode=args.decode),results["image"],changed)
+            status,result=request(port,"/completion",after)
+            assert status==200,(status,result)
+            results["image_after_decode"]=vision_observation(result,args.decode,bool(getattr(args,"dflash_length",0)))
+            for name,endpoint,body,expected in vision_rejection_cases(completion(initial,[image],decode=args.decode)):
+                status,result=request(port,endpoint,body)
+                assert status>=400 and expected in str(result),(name,status,result)
+                assert request(port,"/health")[0]==200
+            overflow=completion(" green"*(2*args.context)+marker,[image],decode=args.decode)
+            status,result=request(port,"/completion",overflow)
+            assert status>=400 and "context" in str(result).lower(),(status,result)
 
         chat = {"messages": [{"role": "user", "content": [
             {"type": "text", "text": "Describe this pattern briefly."},
@@ -164,23 +339,79 @@ def run(args, mode):
         response.readline()
         response.close()
         connection.close()
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            status, slots = request(port, "/slots")
-            if status == 200 and all(not slot["is_processing"] for slot in slots):
-                break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("cancelled slot did not return to idle")
+        wait_vision_idle(port)
         status, result = request(port, "/completion", completion("The capital of France is", decode=args.decode))
         assert status == 200 and result["tokens"] == results["text"]["tokens"], (status, result)
+        if getattr(args,"ngram_m",0):
+            from test_adaptive_gemma import cancel_after_first_output
+            controlled=dict(cases)
+            for source,label,minimum in (("copy","mixed-copy",args.ngram_m+3),("neural","mixed-prefix-miss",args.dflash_length+3)):
+                cancel_after_first_output("http://127.0.0.1:"+str(port),controlled[label],minimum_tokens=minimum)
+                wait_vision_idle(port)
+                status,value=request(port,"/completion",completion("The capital of France is",decode=args.decode))
+                assert status==200 and value["tokens"]==results["text"]["tokens"],(source,status,value)
+                results[source+"-cancel-recovery"]=vision_observation(value,args.decode,True)
         if mode == "arena" and not args.skip_budget_rejection:
             status, result = request(port, "/completion", completion(f"Describe: {marker} Answer: ", [png(1536, 1536)]))
             assert status >= 400, ("oversized vision workspace was not rejected", result)
             status, result = request(port, "/completion", completion("The capital of France is", decode=args.decode))
             assert status == 200 and result["tokens"] == results["text"]["tokens"], result
         assert request(port, "/health")[0] == 200
-    assert "found better prompt" in (args.output / f"{mode}.log").read_text(), "RAM prompt-cache restoration was not exercised"
+    text=(args.output/f"{mode}.log").read_text()
+    assert "found better prompt" in text, "RAM prompt-cache restoration was not exercised"
+    if getattr(args,"ngram_m",0):
+        sources=vision_source_statistics(text)
+        assert sources["ngram-map-k4v"]["generated_tokens"]>0 and sources["draft-dflash"]["prediction_forwards"]>0,sources
+        (args.output/(mode+"-source-stats.json")).write_text(json.dumps(sources,indent=2))
+    return results
+
+
+def run_lifecycle(args, mode):
+    results=run(args,mode)
+    image=png(256,256)
+    high=completion(" green"*args.background_tokens+" Describe: <__media__> Short answer: ",[image],decode=args.decode)
+    low=completion("The capital of France is",decode=args.decode)
+    directory=args.output/("arena-slots" if mode.startswith("arena") else "stock-slots")
+    actions=[]
+    def action(port, kind, saved=None):
+        result=vision_state_action(port,directory,kind,saved)
+        actions.append({"action":kind,"result":result})
+        (args.output/(mode+"-state-actions.json")).write_text(json.dumps(actions,indent=2))
+        return result
+    def observe(port,label,body,cached=False):
+        status,result=request(port,"/completion",dict(body,cache_prompt=cached))
+        if status!=200:raise RuntimeError("vision lifecycle failed: "+label+" "+str(result))
+        row=vision_observation(result,args.decode,bool(getattr(args,"dflash_length",0)))
+        if cached and row["timings"]["cache_n"]<=0:raise RuntimeError("vision state replay did not reuse a checkpoint")
+        results[label]=row
+        (args.output/(mode+"-lifecycle-partial.json")).write_text(json.dumps(results,indent=2))
+        print(mode,label,row["timings"]["cache_n"],flush=True)
+        return row
+    with server(args,mode+"-state") as port:
+        original=observe(port,"save-image",high)
+        saved=action(port,"save")
+        text=observe(port,"low-after-save",low)
+        assert text["tokens"]==results["text"]["tokens"]
+        action(port,"erase");action(port,"restore",saved)
+        observe(port,"restored-image",high,True)
+        state=directory/"vision.bin"
+        import hashlib
+        with state.open("rb") as source:digest=hashlib.file_digest(source,"sha256").hexdigest()
+        truncated=directory/"truncated.bin"
+        with state.open("rb") as source:truncated.write_bytes(source.read(4096))
+        status,result=request(port,"/slots/0?action=restore",{"filename":truncated.name})
+        assert status>=400 and "restore" in str(result).lower(),result
+        with state.open("rb") as source:assert hashlib.file_digest(source,"sha256").hexdigest()==digest
+        recovered=observe(port,"invalid-state-recovery",high)
+        assert recovered["tokens"]==original["tokens"]
+        from test_adaptive_gemma import cancel_after_first_output
+        cancel_after_first_output("http://127.0.0.1:"+str(port),dict(high,stream=True,n_predict=512))
+        assert observe(port,"draft-cancel-recovery",low)["tokens"]==results["text"]["tokens"]
+    with server(args,mode+"-restart") as port:
+        action(port,"restore",saved)
+        observe(port,"restarted-restored-image",high,True)
+        assert observe(port,"restarted-fresh-image",high)["tokens"]==original["tokens"]
+        assert observe(port,"restarted-text",low)["tokens"]==results["text"]["tokens"]
     return results
 
 
@@ -201,6 +432,14 @@ def main():
     parser.add_argument("--ubatch-size", type=int, default=64)
     parser.add_argument("--decode", type=int, default=16)
     parser.add_argument("--mtp-length", type=int, choices=(0,1,2,3), default=0)
+    parser.add_argument("--dflash-length", type=int, choices=range(8), default=0)
+    parser.add_argument("--model-draft", type=Path)
+    parser.add_argument("--ngram-m", type=int, default=0, help="enable DFlash/K4V image qualification with 1-7 copied proposals")
+    parser.add_argument("--ngram-n", type=int, default=12)
+    parser.add_argument("--ngram-min-hits", type=int, default=2)
+    parser.add_argument("--check-mixed-replay", action="store_true", help="run the N2/hits1/K>F copied rejection and source-accounting control")
+    parser.add_argument("--cache-type-k", choices=("q8_0", "q5_1"), default="q8_0")
+    parser.add_argument("--cache-type-v", choices=("q4_0", "q8_0", "q5_1"), default="q4_0")
     parser.add_argument("--cache-ram-mib", type=int, default=2048)
     parser.add_argument("--background-tokens", type=int, default=128)
     parser.add_argument("--mode", choices=("arena", "stock", "compare"), default="compare")
@@ -209,20 +448,33 @@ def main():
     parser.add_argument("--arena-uvm", action="store_true",
                         help="test managed model weights in the arena run; shared arena storage remains device-local")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--lifecycle", action="store_true", help="check complete image state files, erase/restore and process restart")
     parser.add_argument("--check-rejections", action="store_true")
     parser.add_argument("--skip-budget-rejection", action="store_true",
                         help="skip the oversized-image rejection assertion when testing a larger arena")
     args = parser.parse_args()
+    try:
+        speculative_arguments(args, "stock")
+    except ValueError as error:
+        parser.error(str(error))
     if min(args.arena_mib, args.context, args.decode, args.batch_size, args.ubatch_size) <= 0 or args.background_tokens < 0:
         parser.error("memory/context/batch/decode values must be positive, background must be nonnegative")
     args.output.mkdir(parents=True, exist_ok=True)
     results = {}
+    if args.check_mixed_replay:
+        for mode in (("stock","arena") if args.mode=="compare" else (args.mode,)):
+            results[mode]=run_mixed_replay(args,mode)
+            (args.output/"results.json").write_text(json.dumps(results,indent=2))
+        if args.mode=="compare":assert results["stock"]["observation"]["tokens"]==results["arena"]["observation"]["tokens"]
+        return
     for mode in (("stock", "arena") if args.mode == "compare" else (args.mode,)):
-        results[mode] = run(args, mode)
+        results[mode] = (run_lifecycle if args.lifecycle else run)(args, mode)
         (args.output / "results.json").write_text(json.dumps(results, indent=2))
     if args.mode == "compare":
         for name in results["stock"]:
             assert results["stock"][name]["tokens"] == results["arena"][name]["tokens"], name
+            for field in ("prompt_n","cache_n","predicted_n","draft_n","draft_n_accepted"):
+                assert results["stock"][name]["timings"].get(field)==results["arena"][name]["timings"].get(field),(name,field)
         print("Stock and arena token IDs match for every request.")
     if args.check_rejections:
         for name, extra in vision_startup_rejections():

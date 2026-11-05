@@ -294,7 +294,7 @@ class ArenaFinderTests(unittest.TestCase):
     def test_invalid_combinations_are_rejected_before_starting_a_server(self):
         for options in (("--spec-mode","mtp","--draft-length","4"),
                 ("--spec-mode","none","--draft-length","3"), ("--spec-mode","dflash"),
-                ("--spec-mode","dflash","--model-draft","draft","--mmproj","vision","--image","x"),
+                ("--spec-mode","dflash-k4v","--model-draft","draft","--mmproj","vision","--image","x","--ngram-m","8"),
                 ("--mmproj","vision","--prompt-file","text"), ("--image","x"), ("--prompt-tokens","8192"),
                 ("--batch-size","0"), ("--decode-tokens","0"), ("--initial-arena-mib","0"),
                 ("--request-timeout","nan"), ("--port","70000")):

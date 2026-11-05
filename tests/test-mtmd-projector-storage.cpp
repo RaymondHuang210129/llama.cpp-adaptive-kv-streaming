@@ -4,8 +4,11 @@
 #include "../tools/mtmd/mtmd-workspace.h"
 #include "../tools/mtmd/mtmd-session.h"
 #include "../src/llama-context-memory.h"
+#include "../src/llama-kv-cache-iswa.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-operator-workspace.h"
 #include "testing.h"
+#include "kv-stream-bit-exact-test.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -16,6 +19,84 @@
 #include <thread>
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
+struct scratch_allocation_probe {
+    std::mutex mutex;
+    bool capture = false, installed = false;
+    size_t operations = 0, requests = 0, growth_bytes = 0, pool_capacity = 0, pool_used = 0, blas_workspace = 0;
+    bool quote_mode = false, quoted = false;
+    size_t quotes = 0, quote_errors = 0, mismatches = 0, cursor = 0, quoted_bytes = 0, quoted_library = 0;
+    std::vector<size_t> expected_requests;
+    static size_t field(const char * text,const char * key) {
+        const char * found=std::strstr(text,key);
+        return found ? size_t(std::strtoull(found+std::strlen(key),nullptr,10)) : 0;
+    }
+    static void log(ggml_log_level,const char * text,void * data) {
+        std::fputs(text,stderr);
+        auto & self=*static_cast<scratch_allocation_probe *>(data);
+        std::lock_guard<std::mutex> lock(self.mutex);
+        if (!self.capture || !std::strstr(text,"cuda_scratch:")) return;
+        if (std::strstr(text,"event=quote ")) {
+            ++self.quotes;self.quoted=field(text,"status=")==0;
+            self.quote_errors+=!self.quoted;self.cursor=0;
+            self.quoted_bytes=field(text,"bytes=");self.quoted_library=field(text,"library_bytes=");
+            self.expected_requests.clear();
+            const char * values=std::strstr(text,"requests=");
+            if (values) {
+                values+=9;
+                while (*values>='0' && *values<='9' && self.expected_requests.size()<8) {
+                    char * end=nullptr;self.expected_requests.push_back(size_t(std::strtoull(values,&end,10)));
+                    values=end;if (*values!=',') break;++values;
+                }
+            }
+        }
+        if (self.quote_mode && std::strstr(text,"event=pool_request ")) {
+            const size_t bytes=field(text,"bytes=");
+            if (!self.quoted || self.expected_requests.empty()) ++self.mismatches;
+            else {
+                self.mismatches+=bytes>self.expected_requests[self.cursor];
+                self.cursor=(self.cursor+1)%self.expected_requests.size();
+            }
+        }
+        if (self.quote_mode && std::strstr(text,"event=pool_alloc ") && std::strstr(text,"used_valid=1"))
+            self.mismatches+=!self.quoted || field(text,"used=")>self.quoted_bytes;
+        if (self.quote_mode && std::strstr(text,"event=blas_alloc ")) self.mismatches+=field(text,"bytes=")>self.quoted_library;
+        if (std::strstr(text,"event=operation ")) ++self.operations;
+        if (std::strstr(text,"event=pool_alloc ")) ++self.requests;
+        if (std::strstr(text,"event=pool_grow ")) self.growth_bytes+=field(text,"bytes=");
+        self.pool_capacity=std::max(self.pool_capacity,field(text,"capacity="));
+        self.pool_used=std::max(self.pool_used,field(text,"used="));
+        if (std::strstr(text,"family=cublas_workspace ")) self.blas_workspace=std::max(self.blas_workspace,field(text,"bytes="));
+    }
+    ~scratch_allocation_probe() { if (installed) ggml_log_set(nullptr,nullptr); }
+};
+
+struct library_retirement_failure {
+    using faults_t=void (*)(int,bool,bool);
+    using hits_t=int (*)();
+    faults_t faults=nullptr;
+    hits_t hits=nullptr;
+    bool armed=false;
+    library_retirement_failure() {
+#if defined(__linux__)
+        faults=reinterpret_cast<faults_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_workspace_faults"));
+        hits=reinterpret_cast<hits_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_workspace_hits"));
+#endif
+        if (!faults || !hits) throw std::runtime_error("missing cuBLAS retirement fault library");
+        faults(0,false,false);
+        ggml_log_set([](ggml_log_level,const char * text,void * opaque) {
+            std::fputs(text,stderr);auto & self=*static_cast<library_retirement_failure *>(opaque);
+            if (!self.armed && std::strstr(text,"event=operator_retire ")) {
+                self.armed=true;self.faults(1,false,false);
+            }
+        },this);
+    }
+    ~library_retirement_failure() { ggml_log_set(nullptr,nullptr);faults(0,false,false); }
+};
 
 struct weight_buffer_probe {
     inline static weight_buffer_probe * active = nullptr;
@@ -97,12 +178,13 @@ static std::vector<uint8_t> projector_test_pixels(size_t width,size_t height) {
 }
 
 int main(int argc,char ** argv) {
-    const char * model_path = nullptr, * projector_path = nullptr, * baseline = nullptr, * save = nullptr;
+    const char * model_path = nullptr, * projector_path = nullptr, * baseline = nullptr, * save = nullptr, * save_input = nullptr, * dflash_path = nullptr;
     bool cuda = false;
     bool phase_only = false;
     bool protected_target = false;
-    bool measure_only = false;
-    bool parent_explicit=false,long_vision=false;
+    bool measure_only = false,library_release_faults=false;
+    bool parent_explicit=false,long_vision=false,audit_scratch=false,quote_scratch=false;
+    scratch_allocation_probe scratch;
     size_t image_budget=0,parent_mib=1024,image_count=1;
     size_t image_width=256,image_height=256;
     for (int i = 1; i < argc; ++i) {
@@ -110,6 +192,9 @@ int main(int argc,char ** argv) {
         else if (!std::strcmp(argv[i],"--phase-only")) phase_only = true;
         else if (!std::strcmp(argv[i],"--protected-target")) protected_target = true;
         else if (!std::strcmp(argv[i],"--long-vision")) long_vision = true;
+        else if (!std::strcmp(argv[i],"--library-release-faults")) library_release_faults=true;
+        else if (!std::strcmp(argv[i],"--audit-scratch")) audit_scratch = true;
+        else if (!std::strcmp(argv[i],"--quote-scratch")) { audit_scratch=true;quote_scratch=true; }
         else if (!std::strcmp(argv[i],"--measure-only")) { measure_only=true;phase_only=true; }
         else if ((!std::strcmp(argv[i],"--image-budget") || !std::strcmp(argv[i],"--parent-mib") ||
                 !std::strcmp(argv[i],"--image-count") || !std::strcmp(argv[i],"--image-width") ||
@@ -121,14 +206,31 @@ int main(int argc,char ** argv) {
             char * end=nullptr;value=std::strtoul(argv[++i],&end,10);
             if (!end || *end || !value || value>8192) return 2;
         }
+        else if (!std::strcmp(argv[i],"--dflash-model") && i+1<argc) dflash_path=argv[++i];
         else if (!std::strcmp(argv[i],"--model") && i+1 < argc) model_path = argv[++i];
         else if (!std::strcmp(argv[i],"--mmproj") && i+1 < argc) projector_path = argv[++i];
         else if (!std::strcmp(argv[i],"--baseline") && i+1 < argc) baseline = argv[++i];
         else if (!std::strcmp(argv[i],"--save-baseline") && i+1 < argc) save = argv[++i];
+        else if (!std::strcmp(argv[i],"--save-image-input") && i+1<argc) save_input=argv[++i];
         else return 2;
     }
+    if (dflash_path && !protected_target) return 2;
+    if (library_release_faults) {
+        const char * trace=std::getenv("GGML_CUDA_TRACE_SCRATCH");
+        if (!cuda || !protected_target || !baseline || !trace || std::strcmp(trace,"1")) return 2;
+#if !defined(__linux__)
+        return 2;
+#endif
+    }
+    if (audit_scratch) {
+        const char * trace=std::getenv("GGML_CUDA_TRACE_SCRATCH");
+        if (!cuda || !phase_only || !baseline || !trace || std::strcmp(trace,"1")) return 2;
+        ggml_log_set(scratch_allocation_probe::log,&scratch);scratch.installed=true;
+        scratch.quote_mode=quote_scratch;
+    }
+    if (save_input && (!save || phase_only || !model_path || !projector_path)) return 2;
     testing t;
-    if (image_count>2 || image_budget>1120 ||
+    if (image_count>2 || image_budget>4096 ||
             (image_count!=1 && !phase_only) || (parent_explicit && !phase_only && !protected_target) ||
             (long_vision && !protected_target) ||
             ((image_width!=256 || image_height!=256) && (protected_target || (!phase_only && !save && !baseline))) ||
@@ -148,7 +250,7 @@ int main(int argc,char ** argv) {
     }
     if (protected_target) {
         if (!cuda || phase_only || !model_path || !projector_path || !baseline) return 2;
-        t.set_filter("real_Gemma_target_preserves_KV_around_vision_encoding");
+        t.set_filter(dflash_path ? "real_DFlash_target_and_child_survive_encoder_failures" : "real_Gemma_target_preserves_KV_around_vision_encoding");
     }
     t.test("projector_pixel_fixture_geometry_is_explicit_and_bounded",[](testing & t) {
         const auto small=projector_test_pixels(2,3);
@@ -461,7 +563,7 @@ int main(int argc,char ** argv) {
         const auto pixels=projector_test_pixels(image_width,image_height);
         mtmd::bitmap_ptr image(mtmd_bitmap_init(uint32_t(image_width),uint32_t(image_height),pixels.data()));
         const auto * bitmap = image.get();
-        const std::string prompt = mtmd_get_marker(projector.get());
+        const std::string prompt = save_input ? std::string("Describe the pattern: ")+mtmd_get_marker(projector.get())+" Short answer: " : mtmd_get_marker(projector.get());
         mtmd_input_text input{prompt.c_str(),prompt.size(),true,true};
         mtmd::input_chunks_ptr chunks(mtmd_input_chunks_init());
         if (!t.assert_equal(0,mtmd_tokenize(projector.get(),chunks.get(),&input,&bitmap,1))) return;
@@ -480,6 +582,37 @@ int main(int argc,char ** argv) {
         mtmd_embedding_view output;
         if (!t.assert_true(mtmd_batch_acquire_output_embd(batch.get(),chunk,output))) return;
         const size_t bytes = output.n_tokens()*output.n_embd()*sizeof(float);
+        if (save_input) {
+            if (!t.assert_true(mtmd_decode_use_mrope(projector.get()) && !mtmd_decode_use_non_causal(projector.get(),chunk))) return;
+            kv_stream_image_input fixture;
+            fixture.width=output.n_embd();
+            bool seen_image=false;
+            for (size_t i=0;i<mtmd_input_chunks_size(chunks.get());++i) {
+                const auto * entry=mtmd_input_chunks_get(chunks.get(),i);
+                if (mtmd_input_chunk_get_type(entry)==MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                    if (!t.assert_true(!seen_image && entry==chunk)) return;
+                    seen_image=true;
+                } else {
+                    size_t count=0;const auto * tokens=mtmd_input_chunk_get_tokens_text(entry,&count);
+                    auto & dest=seen_image ? fixture.suffix : fixture.prefix;
+                    if (!t.assert_true(tokens!=nullptr)) return;
+                    dest.insert(dest.end(),tokens,tokens+count);
+                }
+            }
+            const auto * image_tokens=mtmd_input_chunk_get_tokens_image(chunk);
+            if (!t.assert_true(image_tokens && fixture.prefix.size()<=size_t(INT32_MAX))) return;
+            fixture.next_position=llama_pos(fixture.prefix.size())+mtmd_input_chunk_get_n_pos(chunk);
+            fixture.values.assign(output.data(),output.data()+output.n_tokens()*output.n_embd());
+            for (size_t i=0;i<output.n_tokens();++i) {
+                const auto pos=mtmd_image_tokens_get_decoder_pos(image_tokens,llama_pos(fixture.prefix.size()),i);
+                fixture.positions.push_back({pos.t,pos.y,pos.x,pos.z});
+            }
+            std::unique_ptr<FILE,kv_stream_exact_file_free> file(std::fopen(save_input,"wb"));
+            if (!t.assert_true(bool(file))) return;
+            fixture.save(file.get());
+            t.out << "real image input rows=" << fixture.positions.size() << " width=" << fixture.width
+                  << " prefix=" << fixture.prefix.size() << " suffix=" << fixture.suffix.size() << '\n';
+        }
         if (save) {
             std::ofstream file(save,std::ios::binary);
             file.write(reinterpret_cast<const char *>(output.data()),std::streamsize(bytes));
@@ -556,6 +689,15 @@ int main(int argc,char ** argv) {
             projector.reset(mtmd_init_from_file_deferred(projector_path,model.get(),params));
         }
         if (!t.assert_true(bool(projector) && !mtmd_acquire_projector_weights(projector.get()))) return;
+        if (quote_scratch) {
+            auto * backend=mtmd_vision_backend(projector.get());
+            if (!t.assert_true(backend!=nullptr)) return;
+            auto * reg=ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            auto prepare=reinterpret_cast<ggml_backend_operator_workspace_prepare_t>(
+                ggml_backend_reg_get_proc_address(reg,"ggml_backend_operator_workspace_prepare"));
+            if (!t.assert_true(prepare!=nullptr) ||
+                    !t.assert_true(prepare(backend)==ggml_backend_operator_workspace_status::success)) return;
+        }
         auto * type = ggml_backend_cpu_buffer_type();
         if (cuda) {
             auto * dev = ggml_backend_dev_by_name("CUDA0");
@@ -603,16 +745,25 @@ int main(int argc,char ** argv) {
         std::vector<uint8_t> canary_before(64),canary_after(64);
         ggml_backend_tensor_get(canary,canary_before.data(),0,64);
         const auto usage = ggml_backend_buffer_get_usage(parent);
-        if (!t.assert_true(mtmd_batch_measure_vision_phase(batch.get(),parent,plan))) return;
+        const bool measured=measure_only ? mtmd_batch_quote_vision_phase(batch.get(),parent,plan) :
+            mtmd_batch_measure_vision_phase(batch.get(),parent,plan);
+        if (!t.assert_true(measured)) return;
+        t.assert_equal(plan.device_compute_bytes,plan.workspace.total_bytes);
+        t.assert_true(plan.workspace.total_bytes==plan.workspace.graph_bytes+plan.workspace.operator_bytes+
+            plan.workspace.library_bytes+plan.workspace.padding_bytes);
+        if (cuda) t.assert_true(plan.workspace.operator_bytes>0 && plan.workspace.library_bytes>0);
         ggml_backend_tensor_get(canary,canary_after.data(),0,64);
         t.assert_true(canary_before == canary_after && ggml_backend_buffer_get_usage(parent) == usage);
-        t.assert_true(plan.weight_bytes+plan.device_compute_bytes <= parent_bytes);
+        if (!measure_only) t.assert_true(plan.weight_bytes+plan.device_compute_bytes <= parent_bytes);
         t.assert_true(plan.groups.size() == 1 || (plan.groups.size() == 2 && plan.host_compute_bytes > 0));
         auto tiny = ggml_backend_buffer_ptr(ggml_backend_buffer_view(ggml_backend_memory_arena_parent(arena.get()),0,1048576));
         mtmd_vision_phase_requirements unchanged; unchanged.weight_bytes = 123;
         t.assert_true(!mtmd_batch_measure_vision_phase(batch.get(),tiny.get(),unchanged) && unchanged.weight_bytes == 123);
         auto weights_only = ggml_backend_buffer_ptr(ggml_backend_buffer_view(parent,0,plan.weight_bytes));
         t.assert_true(!mtmd_batch_measure_vision_phase(batch.get(),weights_only.get(),unchanged) && unchanged.weight_bytes == 123);
+        mtmd_vision_phase_requirements quoted;
+        t.assert_true(mtmd_batch_quote_vision_phase(batch.get(),weights_only.get(),quoted) &&
+            quoted.weight_bytes==plan.weight_bytes && quoted.device_compute_bytes==plan.device_compute_bytes);
         ggml_backend_tensor_get(canary,canary_after.data(),0,64);
         t.assert_true(canary_after == canary_before && !mtmd_acquire_projector_weights(projector.get()));
         const size_t alignment = ggml_backend_buft_get_alignment(type);
@@ -625,6 +776,8 @@ int main(int argc,char ** argv) {
         t.out << "vision-phase-measured image_budget=" << image_budget << " image_tokens=" << mtmd_input_chunk_get_n_tokens(chunk)
             << " images=" << image_count << " batch_images=" << (split ? 1 : image_count) << " batches=" << (split ? 2 : 1)
             << " weights=" << plan.weight_bytes << " compute=" << plan.device_compute_bytes
+            << " graph=" << plan.workspace.graph_bytes << " operator=" << plan.workspace.operator_bytes
+            << " library=" << plan.workspace.library_bytes << " padding=" << plan.workspace.padding_bytes
             << " host=" << plan.host_compute_bytes << " alignment=" << alignment << " parent=" << parent_bytes << '\n';
         if (measure_only) return;
         GGML_ASSERT(ggml_backend_memory_arena_begin(arena.get(),0));
@@ -648,7 +801,13 @@ int main(int argc,char ** argv) {
                 compute.push_back(host_leases.back().get());
             }
         }
-        if (!t.assert_true(mtmd_attach_compute_workspace(projector.get(),compute)) || !t.assert_equal(0,mtmd_batch_encode(batch.get()))) return;
+        if (!t.assert_true(mtmd_attach_compute_workspace(projector.get(),compute))) return;
+        { std::lock_guard<std::mutex> lock(scratch.mutex); scratch.capture=audit_scratch; }
+        if (audit_scratch) std::fprintf(stderr,"vision_scratch_window: begin_us=%lld\n",(long long)ggml_time_us());
+        const auto encode_result=mtmd_batch_encode(batch.get());
+        if (audit_scratch) std::fprintf(stderr,"vision_scratch_window: end_us=%lld\n",(long long)ggml_time_us());
+        { std::lock_guard<std::mutex> lock(scratch.mutex); scratch.capture=false; }
+        if (!t.assert_equal(0,encode_result)) return;
         mtmd_embedding_view output;
         if (!t.assert_true(mtmd_batch_acquire_output_embd(batch.get(),chunk,output))) return;
         const size_t bytes = output.n_tokens()*output.n_embd()*sizeof(float);
@@ -670,8 +829,20 @@ int main(int argc,char ** argv) {
         ggml_backend_tensor_get(tensor,after.data(),0,sample);
         t.assert_true(after == before && output.data() != nullptr);
         reader.reset(); t.assert_true(!tensor->data && !tensor->buffer);
+        if (audit_scratch) {
+            t.out << "vision-scratch-audit operations=" << scratch.operations << " private_pool_requests=" << scratch.requests
+                << " backing_growth_bytes=" << scratch.growth_bytes << " max_single_pool_capacity=" << scratch.pool_capacity
+                << " max_single_pool_used=" << scratch.pool_used << " max_blas_workspace=" << scratch.blas_workspace << '\n';
+            t.assert_true("CUDA operation trace is present after valid native encoder comparison",scratch.operations>0);
+            if (quote_scratch) {
+                t.out << "vision-scratch-quote quotes=" << scratch.quotes << " unsupported=" << scratch.quote_errors
+                    << " mismatches=" << scratch.mismatches << '\n';
+                t.assert_true(scratch.quotes>0);t.assert_equal(size_t(0),scratch.quote_errors);t.assert_equal(size_t(0),scratch.mismatches);
+            } else t.assert_equal("managed encoder has no unquoted operator-private or cuBLAS workspace",size_t(0),
+                scratch.requests+size_t(scratch.blas_workspace!=0));
+        }
     });
-    if (protected_target) t.test("real_Gemma_target_preserves_KV_around_vision_encoding",[&](testing & t) {
+    if (protected_target) t.test(dflash_path ? "real_DFlash_target_and_child_survive_encoder_failures" : "real_Gemma_target_preserves_KV_around_vision_encoding",[&](testing & t) {
         ggml_backend_load_all();
         auto mp=llama_model_default_params();mp.n_gpu_layers=999;
         llama_model_ptr model(llama_model_load_from_file(model_path,mp));
@@ -680,6 +851,7 @@ int main(int argc,char ** argv) {
         std::vector<llama_token> tokens(1333);
         for (size_t i=0;i<tokens.size();++i) tokens[i]=llama_token(10+i%64);
         std::vector<std::vector<float>> expected;
+        llama_tokens expected_draft;
         for (bool streaming : {false,true}) {
             auto cp=llama_context_default_params();
             cp.n_ctx=4096;cp.n_batch=cp.n_ubatch=image_budget ? uint32_t((image_budget+255)/256*256) : 256;cp.n_seq_max=1;cp.swa_full=false;
@@ -687,11 +859,42 @@ int main(int argc,char ** argv) {
             cp.n_threads=cp.n_threads_batch=8;cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;
             cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
             if (streaming) cp.shared_device_memory_bytes=protected_test_parent_bytes(parent_explicit,parent_mib);
+            if (dflash_path) { cp.n_rs_seq=3; cp.n_outputs_max=cp.n_outputs_max_per_seq=4; }
             llama_context_ptr target(llama_init_from_model(model.get(),cp));
             if (!t.assert_true(bool(target))) return;
+            common_params draft_params;
+            common_speculative_init_result_ptr owned;
+            common_speculative_ptr spec;
+            if (dflash_path) {
+                draft_params.n_ctx=cp.n_ctx; draft_params.n_batch=draft_params.n_ubatch=cp.n_ubatch;
+                draft_params.n_parallel=1; draft_params.n_gpu_layers=999; draft_params.fit_params=false;
+                draft_params.cache_type_k=cp.type_k; draft_params.cache_type_v=cp.type_v;
+                draft_params.shared_device_memory_bytes=cp.shared_device_memory_bytes;
+                draft_params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                draft_params.mmproj.path=projector_path;
+                draft_params.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+                draft_params.speculative.draft.n_max=3; draft_params.speculative.draft.n_min=0; draft_params.speculative.draft.p_min=0;
+                draft_params.speculative.draft.mparams.path=dflash_path; draft_params.speculative.draft.n_gpu_layers=999;
+                draft_params.speculative.draft.cache_type_k=cp.type_k; draft_params.speculative.draft.cache_type_v=cp.type_v;
+                draft_params=common_base_params_to_speculative(draft_params);
+                owned=common_speculative_init_from_params(draft_params,model.get(),target.get());
+                if (!t.assert_true(owned && owned->context())) return;
+                auto * local=dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(owned->context()));
+                if (!t.assert_true(local && local->get_swa()->type_k()==cp.type_k && local->get_swa()->type_v()==cp.type_v)) return;
+                draft_params.speculative.draft.ctx_tgt=target.get(); draft_params.speculative.draft.ctx_dft=owned->context();
+                spec.reset(common_speculative_init(draft_params.speculative,1));
+                if (!t.assert_true(bool(spec))) return;
+            }
+            const auto process=[&](const llama_token * values,size_t first,size_t count) {
+                if (!spec) return llama_decode(target.get(),llama_batch_get_one(const_cast<llama_token *>(values),int32_t(count)));
+                common_batch batch(target.get());
+                for (size_t i=0;i<count;++i) batch.add(values[i],llama_pos(first+i),0,i+1==count);
+                const int status=llama_process(target.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get());
+                return status ? status : common_speculative_process(spec.get(),batch) ? 0 : 1;
+            };
             for (size_t first=0;first<tokens.size();first+=256) {
                 const auto count=int32_t(std::min(size_t(256),tokens.size()-first));
-                if (!t.assert_equal(0,llama_decode(target.get(),llama_batch_get_one(tokens.data()+first,count)))) return;
+                if (!t.assert_equal(0,process(tokens.data()+first,first,size_t(count)))) return;
             }
             if (long_vision) {
                 llama_set_kv_stream_decode(target.get(),true);
@@ -707,10 +910,16 @@ int main(int argc,char ** argv) {
                 auto * retained_owner=llama_context_compute_memory(target.get());
                 llama_context_memory_diagnostics retained_usage;
                 if (!t.assert_true(retained_owner && retained_owner->diagnostics(retained_usage) && retained_usage.persistent_cache_bytes>0)) return;
-                if (!image_budget) t.assert_equal(size_t(425984000),retained_usage.persistent_cache_bytes);
+                if (!image_budget && !dflash_path) t.assert_equal(size_t(425984000),retained_usage.persistent_cache_bytes);
                 auto snapshot=[&] {
                     std::vector<uint8_t> bytes(llama_state_get_size(target.get()));
-                    bytes.resize(llama_state_get_data(target.get(),bytes.data(),bytes.size()));return bytes;
+                    bytes.resize(llama_state_get_data(target.get(),bytes.data(),bytes.size()));
+                    if (owned) {
+                        std::vector<uint8_t> draft(llama_state_get_size(owned->context()));
+                        draft.resize(llama_state_get_data(owned->context(),draft.data(),draft.size()));
+                        bytes.insert(bytes.end(),draft.begin(),draft.end());
+                    }
+                    return bytes;
                 };
                 const auto before=snapshot();
                 auto params=mtmd_context_params_default();params.use_gpu=true;params.warmup=false;
@@ -762,6 +971,21 @@ int main(int argc,char ** argv) {
                     t.assert_true(owner->valid() && !owner->kv_device_suspended() && snapshot()==before);
                     t.assert_true(!mtmd_acquire_projector_weights(projector.get()));
                 }
+                if (library_release_faults) {
+                    {
+                        library_retirement_failure retirement;
+                        t.assert_true(mtmd_batch_encode_arena(projector.get(),batch.get(),target.get())!=0);
+                        t.assert_true(retirement.armed && retirement.hits()==1);
+                    }
+                    llama_context_memory_diagnostics held;
+                    t.assert_true(owner->valid() && owner->kv_device_suspended() && owner->diagnostics(held) && held.borrowed_phase_bytes>0);
+                    mtmd_embedding_view unpublished;
+                    t.assert_true("failed vision retirement publishes no image output",!mtmd_batch_acquire_output_embd(batch.get(),chunk,unpublished));
+                    t.assert_true(mtmd_release_compute_workspace(projector.get()) && mtmd_unload_projector_weights(projector.get()));
+                    t.assert_true(llama_context_resume_kv_device(target.get(),llama_memory_text_phase::prefill));
+                    t.assert_true(owner->valid() && !owner->kv_device_suspended() && snapshot()==before);
+                    t.out << "vision-retirement: retained loans, closed target, explicit recovery exact\n";
+                }
                 fault.abort=true;
                 t.assert_true("queued encoder exception is returned as failure",mtmd_batch_encode_arena(projector.get(),batch.get(),target.get())!=0);
                 t.assert_true("queued exception restores the unchanged target",fault.calls>0 && owner->valid() && !owner->kv_device_suspended() && snapshot()==before);
@@ -784,11 +1008,22 @@ int main(int argc,char ** argv) {
             }
             for (size_t step=0;step<8;++step) {
                 llama_token token=llama_token(80+step);
-                if (!t.assert_equal(0,llama_decode(target.get(),llama_batch_get_one(&token,1)))) return;
+                if (!t.assert_equal(0,process(&token,tokens.size()+(long_vision ? 1024 : 0)+step,1))) return;
                 const auto * logits=llama_get_logits_ith(target.get(),-1);
                 if (!t.assert_true(logits!=nullptr)) return;
                 if (!streaming) expected.emplace_back(logits,logits+vocab);
                 else if (!t.assert_true("native continuation after actual vision phase",std::memcmp(expected[step].data(),logits,vocab*sizeof(float))==0)) return;
+            }
+            if (spec) {
+                llama_tokens history=tokens;
+                for (size_t step=0;step<8;++step) history.push_back(llama_token(80+step));
+                llama_tokens proposed;
+                auto & dp=common_speculative_get_draft_params(spec.get(),0);
+                dp.drafting=true;dp.n_max=3;dp.pos0=llama_pos(history.size());dp.id_last=1000;dp.prompt=&history;dp.result=&proposed;
+                common_speculative_draft(spec.get());llama_synchronize(owned->context());
+                if (!t.assert_equal(size_t(3),proposed.size())) return;
+                if (!streaming) expected_draft=proposed;
+                else t.assert_true("DFlash predicts the native continuation after encoder failure/retry",proposed==expected_draft);
             }
         }
     });

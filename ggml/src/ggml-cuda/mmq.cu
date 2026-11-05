@@ -1,3 +1,4 @@
+#include "scratch-plan.h"
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
@@ -132,6 +133,48 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+bool ggml_cuda_mmq_workspace_plan(const ggml_tensor * a,const ggml_tensor * b,const ggml_tensor * dst,
+        int cc,size_t shared_bytes,int nsm,ggml_backend_operator_workspace & output,int * selected_columns,int * selected_threads) {
+    size_t na,nb,nd;
+    if (!ggml_cuda_operator_elements(a,na) || !ggml_cuda_operator_elements(b,nb) ||
+            !ggml_cuda_operator_elements(dst,nd) || a->type!=GGML_TYPE_Q8_0 || b->type!=GGML_TYPE_F32 ||
+            dst->type!=GGML_TYPE_F32 || a->nb[0]!=ggml_type_size(a->type) || b->nb[0]!=sizeof(float) ||
+            a->ne[0]!=b->ne[0] || dst->ne[0]!=a->ne[1] || dst->ne[1]!=b->ne[1] ||
+            dst->ne[2]!=b->ne[2] || dst->ne[3]!=b->ne[3]) return false;
+    const auto precision=(ggml_prec)ggml_get_op_params_i32(dst,0);
+    if (precision!=GGML_PREC_UNDEFINED && precision!=GGML_PREC_Q8 && precision!=GGML_PREC_Q4) return false;
+    const bool fallback=ggml_cuda_mmq_needs_fallback(a->ne[1]);
+    const auto prec=ggml_cuda_mmq_get_prec_src1(a,dst,cc);
+    int best_columns=0,best_threads=0,best_tiles=INT_MAX;
+    for (int columns=8;columns<=128 && best_tiles>1;columns+=8) {
+        const auto config=ggml_cuda_mmq_get_config(a->type,columns,fallback,cc,prec);
+        if (config.type==GGML_TYPE_COUNT || mmq_get_nbytes_shared(config,cc)>shared_bytes) continue;
+        const int64_t tiles=(b->ne[1]+config.J-1)/config.J;
+        if (tiles<best_tiles) { best_columns=columns;best_threads=config.nthreads;best_tiles=int(tiles); }
+    }
+    if (best_columns<=0 || best_threads<=0) return false;
+    size_t padded;
+    if (!ggml_backend_operator_workspace_align(size_t(b->ne[0]),MATRIX_ROW_PADDING,padded)) return false;
+    size_t bytes=padded;
+    for (int i=1;i<GGML_MAX_DIMS;++i) if (!ggml_cuda_operator_product(bytes,size_t(b->ne[i]))) return false;
+    if (!ggml_cuda_operator_product(bytes,sizeof(block_q8_1_mmq))) return false;
+    bytes/=QK8_1_MMQ;
+    const size_t load=size_t(best_threads)*sizeof(int),raw=size_t(best_columns)*sizeof(block_q8_1_mmq);
+    if (raw>SIZE_MAX-(load-1)) return false;
+    const size_t padding=(raw+load-1)/load*load;
+    if (bytes>SIZE_MAX-padding) return false;
+    ggml_backend_operator_workspace next;
+    if (!ggml_backend_operator_workspace_add(next,bytes+padding)) return false;
+    const auto config=ggml_cuda_mmq_get_config(a->type,best_columns,fallback,cc,prec);
+    size_t fixup;
+    if (!ggml_cuda_mmq_fixup_workspace(a->ne[1],b->ne[1],b->ne[2],b->ne[3],config.I,config.J,nsm,
+            config.stream_k,GGML_CUDA_CC_IS_NVIDIA(cc),fixup) || !ggml_backend_operator_workspace_add(next,fixup)) return false;
+    output=next;
+    if (selected_columns) *selected_columns=best_columns;
+    if (selected_threads) *selected_threads=best_threads;
+    return true;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -189,6 +232,10 @@ void ggml_cuda_mul_mat_q(
 
     int J_best        = 0;
     int nthreads_best = 0;
+    ggml_backend_operator_workspace measured_workspace;
+    const bool measured_q8=!ids && src0->type==GGML_TYPE_Q8_0 &&
+        ggml_cuda_mmq_workspace_plan(src0,src1,dst,cc,smpbo,ggml_cuda_info().devices[id].nsm,measured_workspace,&J_best,&nthreads_best);
+    if (!measured_q8)
     {
         int64_t ncols_opt = ne11;
         if (ids) {
@@ -232,7 +279,8 @@ void ggml_cuda_mul_mat_q(
         * src1_load_chunk_size;
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
+        const size_t nbytes_src1_q8_1 = measured_q8 ? measured_workspace.requests[0] :
+            ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {

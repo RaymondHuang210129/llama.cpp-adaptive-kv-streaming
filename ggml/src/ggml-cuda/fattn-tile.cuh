@@ -1448,3 +1448,7 @@ extern DECL_FATTN_TILE_CASE(256, 256);
 extern DECL_FATTN_TILE_CASE(320, 256);
 extern DECL_FATTN_TILE_CASE(512, 512);
 extern DECL_FATTN_TILE_CASE(576, 512);
+
+#ifdef GGML_CUDA_FATTN72_WORKSPACE_METADATA
+#include "fattn-tile-scratch.cuh"
+#endif

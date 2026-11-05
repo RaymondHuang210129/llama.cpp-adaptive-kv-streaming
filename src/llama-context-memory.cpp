@@ -86,6 +86,7 @@ struct llama_context_memory::implementation : llama_memory_executor_backend {
     bool serial_suspended_borrow = false, invalid = false;
     bool serial_prefill_only = false, serial_busy = false;
     bool serial_shared_read = false;
+    llama_memory_resource_id serial_bounded_resource = 0;
     llama_memory_resource_id kv_pool_resource = 0;
     ggml_backend_buffer_t kv_parent = nullptr;
     size_t kv_parent_capacity = 0;
@@ -1336,7 +1337,7 @@ bool llama_context_memory::has_speculative_consumer() const noexcept {
 }
 bool llama_context_memory::register_shared_read_consumer() noexcept {
     if (!valid() || !impl->serial_borrowed || !impl->serial_parent || impl->serial_suspended_borrow ||
-            impl->serial_prefill_only || impl->serial_busy) return false;
+            impl->serial_prefill_only || impl->serial_busy || impl->serial_bounded_resource) return false;
     auto & parent=*impl->serial_parent->impl;
     if (!impl->serial_parent->valid() || parent.serial_busy || !parent.shared_stream || !parent.bounded_cache ||
             parent.shared_stream->auxiliary_cache() ||
@@ -1344,18 +1345,49 @@ bool llama_context_memory::register_shared_read_consumer() noexcept {
     impl->serial_shared_read=true;
     return true;
 }
+bool llama_context_memory::register_bounded_write_consumer(ggml_backend_memory_lease_t storage) noexcept {
+    if (!storage || !valid() || !impl->serial_borrowed || !impl->serial_parent ||
+            impl->serial_suspended_borrow || impl->serial_prefill_only || impl->serial_busy || impl->serial_shared_read) return false;
+    auto & parent=*impl->serial_parent->impl;
+    if (!impl->serial_parent->valid() || parent.serial_busy || !parent.shared_stream || !parent.bounded_cache ||
+            parent.shared_stream->auxiliary_cache() || !parent.fixed_regions_match() ||
+            std::find(parent.serial_children.begin(),parent.serial_children.end(),this)==parent.serial_children.end()) return false;
+    ggml_backend_memory_region region{};
+    if (!ggml_backend_memory_lease_get_region(storage,&region) || region.id!=parent.bounded_resource.id ||
+            region.offset>parent.kv_parent_capacity || region.size>parent.kv_parent_capacity-region.offset) return false;
+    const auto fixed=std::find_if(parent.phase_target.fixed.begin(),parent.phase_target.fixed.end(),[&](const auto & value) {
+        const auto & expected=value.region;
+        return value.arena==parent.kv_arena && expected.id==region.id && expected.offset==region.offset &&
+            expected.size==region.size && expected.alignment==region.alignment && expected.flags==region.flags;
+    });
+    if (fixed==parent.phase_target.fixed.end() || !(region.flags&GGML_BACKEND_MEMORY_REGION_PERSISTENT)) return false;
+    auto * buffer=ggml_backend_memory_lease_buffer(storage);
+    const auto base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(parent.kv_parent));
+    if (!buffer || !base || region.offset>UINTPTR_MAX-base ||
+            ggml_backend_buffer_get_type(buffer)!=ggml_backend_buffer_get_type(parent.kv_parent) ||
+            ggml_backend_buffer_get_size(buffer)!=region.size ||
+            reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer))!=base+region.offset) return false;
+    impl->serial_bounded_resource=region.id;
+    return true;
+}
+
 bool llama_context_memory::can_suspend_for_vision() const noexcept {
     if (!valid() || !impl->shared_stream || impl->serial_borrowed) return false;
-    size_t drafts = 0, shared_reads = 0;
+    size_t drafts = 0, shared_reads = 0, bounded_writers = 0;
     for (auto * child : impl->serial_children) {
         if (child->impl->serial_prefill_only) continue;
         if (!child->valid() || !child->impl->serial_borrowed || child->impl->serial_suspended_borrow ||
                 child->impl->serial_parent != this) return false;
         ++drafts;
         shared_reads+=child->impl->serial_shared_read ? 1 : 0;
+        if (child->impl->serial_bounded_resource) {
+            if (child->impl->serial_shared_read || !impl->bounded_cache ||
+                    child->impl->serial_bounded_resource!=impl->bounded_resource.id || !impl->fixed_regions_match()) return false;
+            ++bounded_writers;
+        }
     }
-    if (impl->shared_stream->auxiliary_cache()) return drafts==1 && shared_reads==0;
-    return drafts==0 || (drafts==1 && shared_reads==1 && impl->bounded_cache);
+    if (impl->shared_stream->auxiliary_cache()) return drafts==1 && shared_reads==0 && bounded_writers==0;
+    return drafts==0 || (drafts==1 && impl->bounded_cache && shared_reads+bounded_writers==1);
 }
 ggml_backend_buffer_t llama_context_memory::shared_parent() const noexcept { return impl->kv_parent; }
 size_t llama_context_memory::shared_parent_capacity() const noexcept { return impl->kv_parent_capacity; }

@@ -212,7 +212,7 @@ struct common_speculative_impl {
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
-    virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+    virtual void accept(llama_seq_id seq_id, uint16_t boundary_row, bool is_other, uint16_t n_accepted) = 0;
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -475,7 +475,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         // noop
     }
 };
@@ -921,7 +921,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1405,7 +1405,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         // noop
     }
 };
@@ -1877,7 +1877,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1958,14 +1958,25 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         // noop
     }
 };
 
+static void spec_validate_ngram_context(const llama_tokens & prompt, common_speculative_ngram_context context) {
+    if ((!context.generation && context.begin) || context.begin > prompt.size() ||
+            (context.generation && prompt.size() >= size_t(UINT32_MAX))) {
+        throw std::invalid_argument("invalid K4V lookup context");
+    }
+    if (context.generation) for (size_t i = context.begin; i < prompt.size(); ++i) {
+        if (prompt[i] < 0) throw std::invalid_argument("non-text K4V lookup context");
+    }
+}
+
 struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     // n_seq configs
     std::vector<common_ngram_map> config;
+    std::vector<common_speculative_ngram_context> contexts;
 
     common_speculative_impl_ngram_map_k(
             const common_ngram_map & config,
@@ -1976,6 +1987,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         for (uint32_t i = 0; i < n_seq; i++) {
             this->config.push_back(config);
         }
+        contexts.resize(n_seq);
 
         SPC_TRC("adding speculative implementation '%s'\n", common_speculative_type_to_str(this->type).c_str());
         SPC_TRC("- size_key=%d, size_value=%d, key_only=%d, min_hits=%d\n",
@@ -1984,8 +1996,13 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
+        begin(seq_id, prompt, {});
+    }
 
-        common_ngram_map_begin(config[seq_id], prompt);
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt, common_speculative_ngram_context context) {
+        if (context.generation) common_ngram_map_begin(config[seq_id], prompt, context.begin);
+        else common_ngram_map_begin(config[seq_id], prompt);
+        contexts[seq_id] = context;
     }
 
     bool process(const common_batch & /*batch*/) override {
@@ -2002,11 +2019,22 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
                 continue;
             }
 
+            if (type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V) {
+                const auto context = dp.ngram_context;
+                const auto previous = contexts[seq_id];
+                if (!context.generation && previous.generation) {
+                    throw std::invalid_argument("missing bounded K4V lookup context");
+                }
+                if (context.generation != previous.generation || context.begin != previous.begin) {
+                    spec_validate_ngram_context(*dp.prompt, context);
+                    begin(seq_id, *dp.prompt, context);
+                }
+            }
             common_ngram_map_draft(config[seq_id], *dp.prompt, dp.id_last, *dp.result);
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+    void accept(llama_seq_id seq_id, uint16_t /*boundary_row*/, bool is_other, uint16_t n_accepted) override {
         GGML_ASSERT((seq_id < (llama_seq_id) config.size()));
 
         if (is_other) {
@@ -2164,7 +2192,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+    void accept(llama_seq_id seq_id, uint16_t /*boundary_row*/, bool is_other, uint16_t n_accepted) override {
         if (is_other) {
             return;
         }
@@ -2326,7 +2354,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/, uint16_t /*n_proposals*/) override {
         // noop
     }
 };
@@ -2785,7 +2813,7 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         llama_context * ctx_dft = streamed_block ?
-            llama_init_from_model(model_dft, cparams, uint32_t(params.speculative.draft.n_max) + 1) :
+            llama_init_from_model(model_dft, cparams, uint32_t(params.speculative.draft.n_max) + 1, !params.mmproj.path.empty()) :
             llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
@@ -3013,16 +3041,26 @@ common_speculative_draft_params & common_speculative_get_draft_params(
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
-    if (spec == nullptr) {
-        return;
-    }
+    common_speculative_begin(spec, seq_id, prompt, {});
+}
 
+void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt,
+        common_speculative_ngram_context context) {
+    if (spec == nullptr) return;
     GGML_ASSERT(seq_id >= 0 && size_t(seq_id) < spec->impl_last.size());
+    spec_validate_ngram_context(prompt, context);
+    if (context.generation && std::none_of(spec->impls.begin(), spec->impls.end(), [](const auto & impl) {
+            return impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
+        })) throw std::invalid_argument("bounded lookup requires K4V");
     spec->impl_last[seq_id] = nullptr;
-
+    spec->dparams[seq_id].ngram_context = context;
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
-        impl->begin(seq_id, prompt);
+        if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V) {
+            static_cast<common_speculative_impl_ngram_map_k *>(impl.get())->begin(seq_id, prompt, context);
+        } else {
+            impl->begin(seq_id, prompt);
+        }
         impl->n_call_begin++;
     }
 }
@@ -3134,6 +3172,13 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_accept(spec, seq_id, n_accepted, n_accepted);
+}
+
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id,
+        uint16_t boundary_row, uint16_t n_accepted) {
+    GGML_ASSERT(spec && seq_id >= 0 && size_t(seq_id) < spec->impl_last.size());
+    if (n_accepted > boundary_row) throw std::invalid_argument("accepted proposals exceed the verified boundary");
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3157,14 +3202,14 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(seq_id, n_accepted, false);
+        impl->accept(seq_id, boundary_row, false, n_accepted);
         impl->n_call_accept++;
     }
 
     // accept with the rest of the implementations, using is_other == true
     for (auto & impl_other : spec->impls) {
         if (impl_other.get() != impl) {
-            impl_other->accept(seq_id, n_accepted, true);
+            impl_other->accept(seq_id, boundary_row, true, n_accepted);
         }
     }
 }

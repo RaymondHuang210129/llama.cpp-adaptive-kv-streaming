@@ -457,6 +457,104 @@ int main(int argc, char ** argv) {
         }
     });
 
+    t.test("bounded_k4v_history_excludes_prefix_and_keeps_first_occurrence", [&](testing & t) {
+        for (size_t prefix : {0u,1u,17u,1024u}) {
+            llama_tokens tokens(prefix,77);
+            const llama_tokens suffix{10,20,30,40,50,98,10};tokens.insert(tokens.end(),suffix.begin(),suffix.end());
+            common_ngram_map map(2,3,false,1);common_ngram_map_begin(map,tokens,prefix);
+            t.assert_true(lookup(map,tokens)==llama_tokens({30,40,50}));
+            const auto occurrences=map.keys[0].values[0].value_num;
+            t.assert_true(lookup(map,tokens)==llama_tokens({30,40,50}));
+            t.assert_equal(occurrences,map.keys[0].values[0].value_num);
+            for (const auto & key : map.keys) {
+                t.assert_true(key.key_idx>=prefix && key.stat_idx>=prefix);
+                for (const auto & v:key.values) if (v.value_num) t.assert_true(v.value_idx>=prefix);
+            }
+            tokens.insert(tokens.end(),{20,30,40,50,98,10});
+            t.assert_true(lookup(map,tokens)==llama_tokens({30,40,50}));
+            common_ngram_map_accept(map,0);t.assert_true(lookup(map,tokens).empty());
+            bool rejected=false;try { common_ngram_map_begin(map,tokens,SIZE_MAX); } catch (const std::invalid_argument &) { rejected=true; }
+            t.assert_true(rejected);t.assert_true(lookup(map,tokens).empty());
+            common_ngram_map_begin(map,tokens,tokens.size());t.assert_true(lookup(map,tokens).empty());
+        }
+        const auto prefix=history_for({1,1,1});auto tokens=prefix;const auto suffix=history_for({0,0});
+        tokens.insert(tokens.end(),suffix.begin(),suffix.end());common_ngram_map map(2,3,false,1);
+        common_ngram_map_begin(map,tokens,prefix.size());t.assert_true(lookup(map,tokens)==continuation(0));
+        tokens.resize(prefix.size()-1);llama_tokens output{123};bool rejected=false;
+        try { common_ngram_map_draft(map,tokens,20,output); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected && output==llama_tokens({123}));
+    });
+    t.test("bounded_k4v_history_preserves_key_length_and_optional_hash_contracts", [&](testing & t) {
+        for (uint16_t n : {uint16_t(1),uint16_t(2),uint16_t(1024)}) for (uint16_t m : {uint16_t(1),uint16_t(7)}) for (bool hashed : {false,true}) {
+            llama_tokens key;for (uint16_t k=0;k<n;++k) key.push_back(100+k);
+            llama_tokens history=key;const auto value=continuation(0,m);history.insert(history.end(),value.begin(),value.end());
+            history.push_back(9999);history.insert(history.end(),key.begin(),key.end()-1);
+            common_ngram_map map(n,m,false,1);if (!hashed) map.key_map.clear();common_ngram_map_begin(map,history,size_t(0));
+            llama_tokens result;common_ngram_map_draft(map,history,key.back(),result);t.assert_true(result==value);
+        }
+        common_ngram_map keys(2,3,true,1);const auto tokens=history_for({0});bool rejected=false;
+        try { common_ngram_map_begin(keys,tokens,0); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected);
+    });
+    t.test("bounded_ngram_generation_preserves_append_and_resets_replacement", [&](testing & t) {
+        auto params=ngram_params();common_speculative_ptr spec(common_speculative_init(params,1));
+        auto tokens=history_for({1,1});const size_t begin=tokens.size();const auto suffix=history_for({0,0});tokens.insert(tokens.end(),suffix.begin(),suffix.end());
+        common_speculative_ngram_context context{begin,1};
+        common_speculative_begin(spec.get(),0,tokens,context);
+        llama_tokens result;draft(spec.get(),tokens,result);t.assert_true(result==continuation(0));
+        common_speculative_accept(spec.get(),0,0);result.clear();tokens.insert(tokens.end(),{20,30,40,50,98,10});
+        draft(spec.get(),tokens,result);t.assert_true(result.empty());
+        context.generation=2;common_speculative_get_draft_params(spec.get(),0).ngram_context=context;
+        result.clear();draft(spec.get(),tokens,result);t.assert_true(result==continuation(0));
+        t.assert_equal(size_t(1),common_speculative_get_stats(spec.get())[0].n_call_begin);
+        bool rejected=false;try { common_speculative_begin(spec.get(),0,tokens,{1,0}); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected);t.assert_equal(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,common_speculative_get_last_type(spec.get(),0));
+        common_speculative_begin(spec.get(),0,tokens,context);
+        t.assert_equal(COMMON_SPECULATIVE_TYPE_NONE,common_speculative_get_last_type(spec.get(),0));
+        auto & request=common_speculative_get_draft_params(spec.get(),0);request.ngram_context={};result.clear();rejected=false;
+        try { draft(spec.get(),tokens,result); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected && result.empty());request.ngram_context=context;
+        result.clear();draft(spec.get(),tokens,result);t.assert_true(result==continuation(0));
+        auto replacement=history_for({1,1});context={0,3};common_speculative_begin(spec.get(),0,replacement,context);
+        result.clear();draft(spec.get(),replacement,result);t.assert_true(result==continuation(1));
+        common_speculative_begin(spec.get(),0,replacement);
+        t.assert_equal(uint64_t(0),common_speculative_get_draft_params(spec.get(),0).ngram_context.generation);
+        result.clear();draft(spec.get(),replacement,result);t.assert_true(result==continuation(1));
+    });
+    t.test("bounded_ngram_generation_is_per_sequence_and_rejects_bad_ranges", [&](testing & t) {
+        auto params=ngram_params();common_speculative_ptr spec(common_speculative_init(params,2));
+        llama_tokens h[2]={history_for({0}),history_for({1})},result[2];
+        for (int seq=0;seq<2;++seq) {
+            common_speculative_begin(spec.get(),seq,h[seq],{0,uint64_t(seq+1)});
+            auto & r=common_speculative_get_draft_params(spec.get(),seq);r.drafting=true;r.n_max=-1;r.pos0=100;r.id_last=20;r.prompt=&h[seq];r.result=&result[seq];
+        }
+        common_speculative_draft(spec.get());t.assert_true(result[0]==continuation(0) && result[1]==continuation(1));
+        common_speculative_begin(spec.get(),0,h[0],{0,3});
+        t.assert_equal(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,common_speculative_get_last_type(spec.get(),1));
+        common_speculative_accept(spec.get(),1,1);
+        bool rejected=false;try { common_speculative_begin(spec.get(),0,h[0],{SIZE_MAX,4}); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected);
+    });
+    t.test("replay_boundary_keeps_logical_proposal_feedback_separate",[&](testing & t) {
+        auto params=ngram_params();common_speculative_ptr spec(common_speculative_init(params,1));
+        const auto history=history_for({0,0});llama_tokens result;
+        common_speculative_begin(spec.get(),0,history);draft(spec.get(),history,result);
+        t.assert_true(result==continuation(0));
+        common_speculative_accept(spec.get(),0,2,1);
+        t.assert_equal(size_t(1),common_speculative_get_stats(spec.get())[0].n_acc_tokens);
+        result.clear();draft(spec.get(),history,result);t.assert_true(result==continuation(0,1));
+        common_speculative_begin(spec.get(),0,history);result.clear();draft(spec.get(),history,result);
+        const auto before=common_speculative_get_stats(spec.get())[0];
+        bool rejected=false;try { common_speculative_accept(spec.get(),0,1,2); } catch (const std::invalid_argument &) { rejected=true; }
+        t.assert_true(rejected);t.assert_equal(before.n_call_accept,common_speculative_get_stats(spec.get())[0].n_call_accept);
+        common_speculative_accept(spec.get(),0,1,0);
+        const auto after=common_speculative_get_stats(spec.get())[0];
+        t.assert_equal(before.n_acc_tokens,after.n_acc_tokens);t.assert_equal(before.n_call_accept+1,after.n_call_accept);
+        result.clear();draft(spec.get(),history,result);t.assert_true(result.empty());
+        common_speculative_begin(spec.get(),0,history);result.clear();draft(spec.get(),history,result);
+        common_speculative_accept(spec.get(),0,2);result.clear();draft(spec.get(),history,result);
+        t.assert_true(result==continuation(0,2));
+    });
     t.test("streamed_dflash_rollback_covers_both_independent_proposal_limits", [&](testing & t) {
         for (int predictions = 1; predictions <= 7; ++predictions) {
             for (uint16_t ngram = 1; ngram <= 7; ++ngram) {
@@ -475,6 +573,20 @@ int main(int argc, char ** argv) {
         }
     });
 
+    t.test("dflash_image_admission_scopes_mixed_widths_and_preserves_pure_configuration",[&](testing & t) {
+        for (int depth : {1,3,7}) {
+            auto p=streamed_dflash_params(depth,7);
+            p.mmproj.path="projector.gguf";
+            t.assert_true(!common_streamed_dflash_config_error(p));
+            t.assert_equal(uint32_t(7),common_context_params_to_llama(p).n_rs_seq);
+            p.speculative.ngram_map_k4v.size_m=8;
+            t.assert_true("mixed images still reject unsupported K4V widths",common_streamed_dflash_config_error(p)!=nullptr);
+            p.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+            t.assert_true("pure DFlash can measure image graphs before child capture",!common_streamed_dflash_config_error(p));
+            t.assert_equal(uint32_t(depth),common_context_params_to_llama(p).n_rs_seq);
+        }
+    });
+
     t.test("mixed_streaming_admission_preserves_other_source_and_configuration_guards", [&](testing & t) {
         for (int type=0;type<COMMON_SPECULATIVE_TYPE_COUNT;++type) {
             if (type==COMMON_SPECULATIVE_TYPE_NONE || type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
@@ -489,7 +601,7 @@ int main(int argc, char ** argv) {
                 case 0: params.n_parallel=2; break;
                 case 1: params.kv_stream_auxiliary_layers=1; break;
                 case 2: params.fit_params=true; break;
-                case 3: params.mmproj.path="vision.gguf"; break;
+                case 3: params.mmproj.path="vision.gguf"; params.speculative.ngram_map_k4v.size_m=8; break;
                 case 4: params.n_ubatch=7; break;
                 case 5: params.speculative.draft.cache_type_k_explicit=true; break;
                 case 6: params.speculative.draft.cache_type_v_explicit=true; break;
