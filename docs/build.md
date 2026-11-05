@@ -205,6 +205,29 @@ performance matters, try following the split build used in our release workflow
 is built with clang (`cmake/arm64-windows-llvm.cmake`) and the CUDA backend with MSVC
 (`cmake/arm64-windows-msvc-cuda.cmake`), and the artifacts are merged afterwards.
 
+#### Windows MSVC / RTX 3080
+
+Run the following in an x64 Developer PowerShell for Visual Studio 2022 with CUDA 12.9 and Ninja on `PATH`:
+
+```powershell
+cmake -S . -B build-rtx3080 -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_TRY_COMPILE_CONFIGURATION=Release `
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 `
+  -DGGML_CUDA_FA_QUANTS=all -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=ON
+cmake --build build-rtx3080 --target llama-server llama-cli test-cuda-compiled-features test-kv-stream-model test-kv-stream-copy test-kv-stream-vector-spans --parallel 2
+ctest --test-dir build-rtx3080 --output-on-failure -R '^test-msvc-simd-config$'
+.\build-rtx3080\bin\llama-cli.exe --list-devices
+.\build-rtx3080\bin\test-cuda-compiled-features.exe
+.\build-rtx3080\bin\test-kv-stream-model.exe --cuda-native-admission
+.\build-rtx3080\bin\test-kv-stream-copy.exe --cuda
+.\build-rtx3080\bin\test-kv-stream-vector-spans.exe --cuda-sm86
+.\build-rtx3080\bin\test-kv-stream-vector-spans.exe --cuda-quant-matrix
+```
+
+`CMAKE_TRY_COMPILE_CONFIGURATION=Release` also builds CMake's compiler checks in Release mode. This worked around MSVC C1902 ("Program database manager mismatch") during the default Debug compiler check on the tested MSVC 19.35 installation. Native CPU detection selects the host instruction set independently of CUDA SM86. The SIMD checks must execute their intrinsics even with optimization enabled, so an AVX2 host can correctly reject AVX-512. Existing cached results from the earlier probes are refreshed on reconfiguration.
+
+The RTX 3080 check used NVCC 12.9.86, MSVC 19.35.32217.1, CMake 3.31.10 and Ninja 1.13.2. Put the CUDA runtime DLLs on `PATH` when using an isolated toolkit. OpenSSL development libraries enable the optional HTTPS support.
+
 ### Non-Native Builds
 
 By default llama.cpp will be built for the hardware that is connected to the system at that time.
