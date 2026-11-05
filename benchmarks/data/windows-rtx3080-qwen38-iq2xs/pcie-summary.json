@@ -1,0 +1,109 @@
+{
+  "hardware": "NVIDIA RTX 3080 10 GiB; Windows WDDM; driver 610.88; CUDA runtime 12.9",
+  "active_link": "PCIe Gen4 x16 in both steady decode profiles",
+  "pcie_replay_counter_after_calibration": 0,
+  "pcie_gen4_x16_theoretical_encoded_data_gbps_per_direction": 31.50769230769231,
+  "pinned_h2d_reference_gbps": 23.518519,
+  "pinned_d2h_reference_gbps": 23.824524,
+  "pinned_h2d_reference_percent_of_theoretical": 74.64373706054687,
+  "calibration_protocol": "cudaHostAllocMapped, cached (same host-allocation flags as the fork on Windows); cudaMalloc device buffer; nonblocking stream; four warmup copies; five trials of 8 GiB per direction and chunk size. CUDA event and host wall times recorded. Endpoint data checks passed. Allocation and host initialization excluded. Pageable 256 MiB comparison included.",
+  "units": "GB/s decimal; MiB binary. Directions from the GPU viewpoint: RX is host to GPU, TX is GPU to host.",
+  "nvml_counter_calibration": {
+    "valid_as_literal_bandwidth": false,
+    "example_256mib_pinned_h2d": {
+      "memory": "pinned_mapped_cached",
+      "direction": "H2D",
+      "copy_mib": 256.0,
+      "trials": 5,
+      "median_wall_gbps": 23.433707,
+      "minimum_wall_gbps": 23.339696,
+      "maximum_wall_gbps": 23.689653,
+      "median_cuda_event_gbps": 23.435318,
+      "median_nvml_counter_kB_s_UNVALIDATED": 40479626,
+      "nvml_as_gbps_binary_kB_UNVALIDATED": 41.451137024,
+      "nvml_as_gbps_decimal_kB_UNVALIDATED": 40.479626
+    },
+    "reason": "NVML reports more than the Gen4 x16 physical limit during a known-byte timed copy, even using decimal kB. Therefore raw NVML values are diagnostic only; no literal MTP3 bus-utilization percentage is claimed. The reason for this counter discrepancy is unproven.",
+    "nominal_driver_window_ms": 20
+  },
+  "inference_protocol": "Fresh 128K server per mode; same model, fitted arenas 1440 MiB off and 1078 MiB MTP3; 8 CPU threads; batch/ubatch128; Q8_0 K/Q4_0 V; no mmproj; no UVM; existing user-confirmed Prefer No Sysmem Fallback profile; warmup256/4 then130801-token prompt and256 outputs. NVML sampling nominal20ms; report uses steady decode after first token+1s to request end-0.25s.",
+  "profiles": [
+    {
+      "mode": "mtp-off",
+      "arena_mib": 1440,
+      "decode_tokens_per_second": 8.233247714014556,
+      "prefill_tokens_per_second": 469.9054785889637,
+      "largest_bulk_reload": {
+        "mode": "mtp-off",
+        "bytes": 1342701568,
+        "calls": 32,
+        "padded_rows": 131072,
+        "drain_us": 0,
+        "upload_us": 57840,
+        "payload_gbps": 23.214065836791146
+      },
+      "bulk_reload_percent_of_pinned_reference": 98.70547476561404,
+      "logged_h2d_mib_per_evaluation": 2041.43,
+      "logged_h2d_calls_per_evaluation": 452,
+      "estimated_streaming_kv_payload_gbps": 17.624044804055483,
+      "estimated_streaming_kv_percent_of_pinned_reference": 74.9368818846777,
+      "estimation_note": "MTP off: logged bytes/evaluation times measured output rate; one target evaluation per output interval, with small growth/padding approximation. This is KV payload, not an exact counter of all PCIe traffic. MTP3 is left unestimated because evaluations can produce multiple tokens and draft traffic is additional.",
+      "steady_decode_nvml_samples": 475,
+      "sampling_gap_median_ms": 62.52909998875111,
+      "sampling_gap_max_ms": 64.41959994845092,
+      "steady_decode_link_states": [
+        [
+          4,
+          16
+        ]
+      ],
+      "raw_nvml_rx_kB_s_mean_UNVALIDATED": 31145971.021052632,
+      "raw_nvml_rx_kB_s_p95_UNVALIDATED": 34325048,
+      "raw_nvml_tx_kB_s_mean_UNVALIDATED": 3351042.6610526317,
+      "nvml_literal_bandwidth_or_utilization_validated": false
+    },
+    {
+      "mode": "mtp-3",
+      "arena_mib": 1078,
+      "decode_tokens_per_second": 16.466592190315062,
+      "prefill_tokens_per_second": 429.54096680512424,
+      "largest_bulk_reload": {
+        "mode": "mtp-3",
+        "bytes": 702021632,
+        "calls": 32,
+        "padded_rows": 130816,
+        "drain_us": 1548,
+        "upload_us": 30953,
+        "payload_gbps": 22.6802452750945
+      },
+      "bulk_reload_percent_of_pinned_reference": 96.43568659699405,
+      "logged_h2d_mib_per_evaluation": 2652.46,
+      "logged_h2d_calls_per_evaluation": 122,
+      "estimated_streaming_kv_payload_gbps": null,
+      "estimated_streaming_kv_percent_of_pinned_reference": null,
+      "estimation_note": "MTP off: logged bytes/evaluation times measured output rate; one target evaluation per output interval, with small growth/padding approximation. This is KV payload, not an exact counter of all PCIe traffic. MTP3 is left unestimated because evaluations can produce multiple tokens and draft traffic is additional.",
+      "steady_decode_nvml_samples": 228,
+      "sampling_gap_median_ms": 62.66270007472485,
+      "sampling_gap_max_ms": 64.29589993786067,
+      "steady_decode_link_states": [
+        [
+          4,
+          16
+        ]
+      ],
+      "raw_nvml_rx_kB_s_mean_UNVALIDATED": 28380295.842105262,
+      "raw_nvml_rx_kB_s_p95_UNVALIDATED": 32698095,
+      "raw_nvml_tx_kB_s_mean_UNVALIDATED": 7590213.521929825,
+      "nvml_literal_bandwidth_or_utilization_validated": false
+    }
+  ],
+  "source_accounting": "src/llama-kv-stream-resident.cpp refresh(): KV_reload upload_us covers existing synchronous tensor uploads and bookkeeping. accepted KV layout copied reports one sequence/evaluation, not all output tokens. copy_ms is only sampled traffic and must not divide the full sequence byte count.",
+  "interpretation": "Large KV reload bursts reach approximately the standalone pinned-transfer reference. The MTP-off KV-payload average is below that reference; this does not by itself measure every bus transaction or establish the dominant stall cause. No Windows-vs-Linux comparison was performed.",
+  "server_sha256": "a8e274c49ac738bb506e1112eff442cef920eaa652546ceac594d76056246671",
+  "calibration_source_sha256": "574ebfe587a5d59a9dbc02f541b707b419969d1893f1880558fe71888f71c1ed",
+  "sources": [
+    "https://developer.nvidia.com/blog/nvidia-ampere-architecture-in-depth/",
+    "https://docs.nvidia.com/cuda/archive/12.9.1/cuda-c-best-practices-guide/index.html#pinned-memory",
+    "https://docs.nvidia.com/deploy/archive/R510/nvml-api/group__nvmlDeviceQueries.html"
+  ]
+}

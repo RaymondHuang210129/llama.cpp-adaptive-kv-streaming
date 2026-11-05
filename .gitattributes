@@ -1,0 +1,6 @@
+# Preserve the byte hashes of the exported Windows benchmark evidence.
+/benchmarks/data/windows-rtx3080-qwen38-iq2xs/* text eol=lf
+/media/qwen38-rtx3080-windows-iq2xs-throughput.* text eol=lf
+/media/qwen38-rtx3080-windows-iq2xs-throughput.png -text
+# Unified patches contain meaningful single-space blank context lines.
+/benchmarks/data/windows-rtx3080-qwen38-iq2xs/measurement-source.patch -whitespace

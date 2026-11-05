@@ -16,6 +16,8 @@
 #include "common.h"
 
 #include <vector>
+#include <limits>
+#include <stdexcept>
 
 // n-gram simple
 //
@@ -51,7 +53,7 @@ struct common_ngram_map_value {
 // statistics of a n-gram
 struct common_ngram_map_key {
     size_t   key_idx;   // index of key n-gram in token-history
-    size_t   stat_idx;  // index of last token of statistics computation (key_num, values)
+    size_t   stat_idx;  // next history position to examine for continuation statistics
 
     uint16_t key_num;   // number of occurrences of this key n-gram in token-history
     common_ngram_map_value values[COMMON_NGRAM_MAX_VALUES]; // some known values after the key
@@ -73,6 +75,9 @@ struct common_ngram_map {
                      uint16_t min_hits)
         : size_key(sz_key), size_value(sz_value), key_only(only_keys),
           min_hits(min_hits) {
+        if (!sz_key || !sz_value || sz_value > std::numeric_limits<int16_t>::max() || !min_hits) {
+            throw std::invalid_argument("ngram map requires positive lengths/hits and an int16 continuation length");
+        }
         key_map.resize(COMMON_NGRAM_HASH_MAP_SIZE); // 2^18 hash entries, 0 entries if key_map shouldn't be used
     }
 
@@ -87,6 +92,9 @@ struct common_ngram_map {
 
     size_t   idx_last_check       = 0; // index of last check in context history
 
+    size_t history_begin = 0;
+    bool history_bounded = false;
+
     // optional map "hash to ngram-index" for faster lookup of n-grams. map is empty if unused.
     //
     // uint32_t instead of size_t (size of current histories is << UINT32_MAX)
@@ -100,6 +108,9 @@ struct common_ngram_map {
 void common_ngram_map_begin(
     common_ngram_map & map,
     const llama_tokens & tokens);
+
+// Restrict K4V to a suffix of the same owned history; indices remain absolute.
+void common_ngram_map_begin(common_ngram_map & map, const llama_tokens & tokens, size_t begin);
 
 // Searches for the n-gram in the history and checks whether a draft sequence should be generated.
 // map:                the ngram map to search in.

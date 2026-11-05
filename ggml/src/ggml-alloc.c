@@ -1,4 +1,5 @@
 #include "ggml-alloc.h"
+#include "ggml-backend-memory.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -1307,6 +1308,22 @@ bool ggml_gallocr_set_buffer_range(
         }
     }
 
+    galloc->n_nodes = 0;
+    galloc->n_leafs = 0;
+    return true;
+}
+
+bool ggml_gallocr_set_buffer_range_limit(ggml_gallocr_t galloc, int buffer_id, size_t size) {
+    GGML_ASSERT(galloc != NULL && buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    struct vbuffer * buffer = galloc->buffers[buffer_id];
+    if (!buffer || !galloc->buffer_external[buffer_id] || !size || !buffer->chunks[0]) return false;
+    const size_t capacity = ggml_backend_buffer_get_size(buffer->chunks[0]);
+    const size_t offset = galloc->buffer_offsets[buffer_id];
+    if (offset > capacity || size > capacity - offset ||
+            (buffer->chunks[0]->iface.reset && (offset || size != capacity))) return false;
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        if (galloc->buffers[i] == buffer) galloc->buffer_sizes[i] = size;
+    }
     galloc->n_nodes = 0;
     galloc->n_leafs = 0;
     return true;

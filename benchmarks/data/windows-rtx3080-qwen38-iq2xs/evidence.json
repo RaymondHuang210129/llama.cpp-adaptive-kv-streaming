@@ -1,0 +1,75 @@
+{
+  "streaming_boundaries": [
+    {
+      "mtp_length": 3,
+      "context_capacity": 32768,
+      "recorded_log_sha256": "e4df6f827cc007b5fc7b8e44d97e52233c2e401f79d0f6f7489cdbe63427b974",
+      "selected_lines": [
+        "0.04.379.516 W memory_phase: phase=decode parent=1130364928 compute=17269504 kv_pool=1103594880 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=148688256 capture=external transition_us=200 arena_gen=5 kv_revision=5 resident_pages=151 ring_slots=23 active_pages=0 streaming=0 last_h2d_bytes=0 last_h2d_calls=0 copy_ms=0.000 elapsed_ms=0.000",
+        "0.04.390.471 W memory_phase: phase=decode parent=1130364928 compute=17269504 kv_pool=1103594880 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=148688256 capture=external transition_us=200 arena_gen=5 kv_revision=5 resident_pages=151 ring_slots=23 active_pages=0 streaming=0 last_h2d_bytes=0 last_h2d_calls=0 copy_ms=0.000 elapsed_ms=0.000",
+        "0.48.391.305 W memory_phase: phase=decode parent=1130364928 compute=17269504 kv_pool=1103594880 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=148688256 capture=external transition_us=2419 arena_gen=7 kv_revision=7 resident_pages=151 ring_slots=23 active_pages=0 streaming=0 last_h2d_bytes=13232128 last_h2d_calls=64 copy_ms=0.000 elapsed_ms=0.000",
+        "0.48.405.611 W memory_phase: phase=decode parent=1130364928 compute=17269504 kv_pool=1103594880 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=148688256 capture=external transition_us=2419 arena_gen=7 kv_revision=7 resident_pages=151 ring_slots=23 active_pages=0 streaming=0 last_h2d_bytes=13232128 last_h2d_calls=64 copy_ms=0.000 elapsed_ms=0.000"
+      ]
+    },
+    {
+      "mtp_length": 3,
+      "context_capacity": 40960,
+      "recorded_log_sha256": "ad8c2b8276e695f2323d24863491c9ef1d9ec4cacbffdae51174b21eb45d84d0",
+      "selected_lines": [
+        "0.04.321.950 W memory_phase: phase=decode parent=1130364928 compute=17335040 kv_pool=1103529344 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=184274304 capture=external transition_us=196 arena_gen=5 kv_revision=5 resident_pages=151 ring_slots=23 active_pages=0 streaming=0 last_h2d_bytes=0 last_h2d_calls=0 copy_ms=0.000 elapsed_ms=0.000",
+        "0.04.332.582 W memory_phase: phase=decode parent=1130364928 compute=17335040 kv_pool=1103529344 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=184274304 capture=external transition_us=196 arena_gen=5 kv_revision=5 resident_pages=151 ring_slots=23 active_pages=0 streaming=0 last_h2d_bytes=0 last_h2d_calls=0 copy_ms=0.000 elapsed_ms=0.000",
+        "1.02.632.889 W memory_phase: phase=decode parent=1130364928 compute=17335040 kv_pool=1103529344 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=184274304 capture=external transition_us=2460 arena_gen=7 kv_revision=7 resident_pages=151 ring_slots=23 active_pages=159 streaming=1 last_h2d_bytes=279046144 last_h2d_calls=270 copy_ms=0.000 elapsed_ms=0.000",
+        "1.02.690.862 W memory_phase: phase=decode parent=1130364928 compute=17335040 kv_pool=1103529344 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=184274304 capture=external transition_us=2460 arena_gen=7 kv_revision=7 resident_pages=151 ring_slots=23 active_pages=159 streaming=1 last_h2d_bytes=279046144 last_h2d_calls=270 copy_ms=0.000 elapsed_ms=0.000",
+        "1.03.123.791 W attention: accepted KV layout copied 59.35 MiB in 50 H2D calls, peak ring pages 23, sampled copy 0.000 ms over 0.000 ms"
+      ]
+    },
+    {
+      "mtp_length": 0,
+      "context_capacity": 49152,
+      "recorded_log_sha256": "4a8925e2f21099c1c89f9f55de5b58cbe656c0b2b27bc7a2deac50866d5016fc",
+      "selected_lines": [
+        "0.04.268.864 W memory_phase: phase=decode parent=1509949440 compute=7103232 kv_pool=1493345664 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=30407168 capture=external transition_us=1437 arena_gen=2 kv_revision=2 resident_pages=218 ring_slots=17 active_pages=0 streaming=0 last_h2d_bytes=0 last_h2d_calls=0 copy_ms=0.000 elapsed_ms=0.000",
+        "1.14.612.680 W memory_phase: phase=decode parent=1509949440 compute=7103232 kv_pool=1493345664 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=30407168 capture=external transition_us=2804 arena_gen=4 kv_revision=4 resident_pages=218 ring_slots=17 active_pages=0 streaming=0 last_h2d_bytes=0 last_h2d_calls=0 copy_ms=0.000 elapsed_ms=0.000"
+      ]
+    },
+    {
+      "mtp_length": 0,
+      "context_capacity": 57344,
+      "recorded_log_sha256": "7cb24799db7628b518c63a70b69b80d0e307e3f129a9e29eb630971ca53761dc",
+      "selected_lines": [
+        "0.04.489.496 W memory_phase: phase=decode parent=1509949440 compute=7119616 kv_pool=1493329280 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=30390784 capture=external transition_us=1533 arena_gen=2 kv_revision=2 resident_pages=218 ring_slots=17 active_pages=0 streaming=0 last_h2d_bytes=0 last_h2d_calls=0 copy_ms=0.000 elapsed_ms=0.000",
+        "1.30.822.037 W memory_phase: phase=decode parent=1509949440 compute=7119616 kv_pool=1493329280 writer=140288 attention=9360256 persistent_kv=0 publication_stage=0 unused=0 reclaimed_compute=30390784 capture=external transition_us=1661 arena_gen=4 kv_revision=4 resident_pages=218 ring_slots=17 active_pages=223 streaming=1 last_h2d_bytes=81389568 last_h2d_calls=106 copy_ms=0.000 elapsed_ms=0.000",
+        "1.31.508.495 W attention: accepted KV layout copied 36.57 MiB in 54 H2D calls, peak ring pages 17, sampled copy 0.287 ms over 33.773 ms"
+      ]
+    }
+  ],
+  "arena_fits": [
+    {
+      "mode": "MTP off",
+      "selected_log_sha256": "34d204f67abb7a442917bda0075d0ca763c34996c0e1ff9976b3327cd124e026",
+      "rejected_log_sha256": "fd803c4b1a7f9c086e37d73d9dfb940cc48494946d04590035672635bc76dbba",
+      "successful_full_workload_lines": [
+        "0.05.348.211 I slot print_timing: id  0 | task 0 | prompt eval time =     506.90 ms /   256 tokens (    1.98 ms per token,   505.03 tokens per second)",
+        "0.05.348.216 I slot print_timing: id  0 | task 0 |        eval time =      91.80 ms /     4 tokens (   30.60 ms per token,    32.68 tokens per second)",
+        "5.13.393.947 I slot print_timing: id  0 | task 7 | prompt eval time =  278026.71 ms / 130801 tokens (    2.13 ms per token,   470.46 tokens per second)",
+        "5.13.393.951 I slot print_timing: id  0 | task 7 |        eval time =   29902.05 ms /   256 tokens (  117.26 ms per token,     8.53 tokens per second)"
+      ],
+      "rejection_lines": [
+        "0.04.814.231 E CUDA error: out of memory"
+      ]
+    },
+    {
+      "mode": "MTP3",
+      "selected_log_sha256": "53380038ece1b8e1fa95e40385da142b374ceda115fe391a26792470a76b592d",
+      "rejected_log_sha256": "310e89f51afeecc835bcfbad52fa58f1e43a040a0b8559363c45202174d167bb",
+      "successful_full_workload_lines": [
+        "5.22.222.993 I slot print_timing: id  0 | task 0 | prompt eval time =  303598.48 ms / 130801 tokens (    2.32 ms per token,   430.84 tokens per second)",
+        "5.22.222.999 I slot print_timing: id  0 | task 0 |        eval time =   13557.48 ms /   256 tokens (   53.17 ms per token,    18.81 tokens per second)",
+        "5.22.223.004 I slot print_timing: id  0 | task 0 | draft acceptance = 0.74262 (  176 accepted /   237 generated), mean len =  3.23"
+      ],
+      "rejection_lines": [
+        "0.05.311.148 E CUDA error: out of memory"
+      ]
+    }
+  ]
+}

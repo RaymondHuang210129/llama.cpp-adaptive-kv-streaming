@@ -1050,6 +1050,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    ggml_backend_sched_pre_compute_callback callback_pre_compute;
+    void * callback_pre_compute_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1965,6 +1968,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->callback_pre_compute &&
+                !sched->callback_pre_compute(split_backend, &split->graph, sched->callback_pre_compute_user_data)) {
+            return GGML_STATUS_FAILED;
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2234,6 +2242,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_copy_user_data = user_data;
 }
 
+void ggml_backend_sched_set_pre_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_pre_compute_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_pre_compute = callback;
+    sched->callback_pre_compute_user_data = user_data;
+}
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
@@ -2339,6 +2353,19 @@ bool ggml_backend_sched_attach_memory_lease(
             sched->memory_leases[i] = ggml_backend_memory_lease_retain(lease);
         }
     }
+    return true;
+}
+
+bool ggml_backend_sched_set_memory_lease_limit(ggml_backend_sched_t sched, ggml_backend_t backend, size_t size) {
+    GGML_ASSERT(sched);
+    const int index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(index >= 0 && index < sched->n_backends);
+    auto * lease = sched->memory_leases[index];
+    ggml_backend_memory_region region{};
+    if (!size || !ggml_backend_memory_lease_get_region(lease, &region) || region.flags || size > region.size) return false;
+    ggml_backend_sched_synchronize(sched);
+    if (!ggml_gallocr_set_buffer_range_limit(sched->galloc, index, size)) return false;
+    ggml_backend_sched_reset(sched);
     return true;
 }
 

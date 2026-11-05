@@ -8,6 +8,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/vmm-probe.h"
 #include "ggml-cuda/kv-stream-partial.cuh"
+#include "ggml-cuda/scratch-plan.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -436,6 +437,61 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// Opt-in host diagnostics; no allocation, stream or synchronization policy is changed.
+struct ggml_cuda_scratch_trace {
+    ggml_backend_cuda_context & ctx;
+    ggml_cgraph * graph;
+    int & node_index;
+    int first_index;
+    ggml_cuda_scratch_trace * previous = nullptr;
+    void * previous_blas[GGML_CUDA_MAX_STREAMS] = {};
+    inline static thread_local ggml_cuda_scratch_trace * active = nullptr;
+    static bool enabled() {
+        static const bool value=[] { const char * env=getenv("GGML_CUDA_TRACE_SCRATCH"); return env && !strcmp(env,"1"); }();
+        return value;
+    }
+    ggml_cuda_scratch_trace(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int & index) :
+        ctx(ctx),graph(graph),node_index(index),first_index(index) {
+        if (!enabled()) return;
+        previous=active;active=this;
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) previous_blas[i]=ctx.cublas_workspaces[ctx.device][i];
+        tensor(graph->nodes[first_index]);
+    }
+    static void tensor(const ggml_tensor * op) {
+        if (!active || !op) return;
+        auto & ctx=active->ctx;
+        GGML_LOG_INFO("cuda_scratch: event=operation time_us=%lld context=%p device=%d stream=%d op=%s tensor=%s type=%s ne=%lld,%lld,%lld,%lld\n",
+            (long long)ggml_time_us(),(void *)&ctx,ctx.device,ctx.curr_stream_no,ggml_op_name(op->op),op->name,
+            ggml_type_name(op->type),(long long)op->ne[0],(long long)op->ne[1],(long long)op->ne[2],(long long)op->ne[3]);
+        for (int i=0;i<GGML_MAX_SRC;++i) if (const auto * src=op->src[i]) {
+            GGML_LOG_INFO("cuda_scratch: event=source context=%p tensor=%s slot=%d type=%s ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu\n",
+                (void *)&ctx,op->name,i,ggml_type_name(src->type),(long long)src->ne[0],(long long)src->ne[1],
+                (long long)src->ne[2],(long long)src->ne[3],src->nb[0],src->nb[1],src->nb[2],src->nb[3]);
+        }
+    }
+    static void pool(const char * event,const char * family,const void * pool,const void * address,
+            size_t bytes,size_t capacity,size_t used) {
+        if (!active) return;
+        auto & ctx=active->ctx;
+        const auto * op=active->graph->nodes[active->first_index];
+        GGML_LOG_INFO("cuda_scratch: event=%s time_us=%lld context=%p device=%d stream=%d op=%s tensor=%s family=%s pool=%p address=%p bytes=%zu capacity=%zu used=%zu used_valid=%d\n",
+            event,(long long)ggml_time_us(),(void *)&ctx,ctx.device,ctx.curr_stream_no,ggml_op_name(op->op),op->name,
+            family,pool,address,bytes,capacity,used,int(!strcmp(family,"vmm") || !strcmp(family,"bounded")));
+    }
+    ~ggml_cuda_scratch_trace() {
+        if (!enabled()) return;
+        for (int i=first_index+1;i<=node_index && i<graph->n_nodes;++i) tensor(graph->nodes[i]);
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) if (ctx.cublas_workspaces[ctx.device][i]) {
+            GGML_LOG_INFO("cuda_scratch: event=%s time_us=%lld context=%p device=%d stream=%d family=cublas_workspace address=%p bytes=%zu\n",
+                previous_blas[i] ? "blas_retained" : "blas_alloc",(long long)ggml_time_us(),(void *)&ctx,ctx.device,i,
+                ctx.cublas_workspaces[ctx.device][i],ctx.cublas_workspace_sizes[ctx.device]);
+        }
+        GGML_LOG_INFO("cuda_scratch: event=operation_end time_us=%lld context=%p tensor=%s\n",
+            (long long)ggml_time_us(),(void *)&ctx,graph->nodes[first_index]->name);
+        active=previous;
+    }
+};
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -472,6 +528,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        ggml_cuda_scratch_trace::pool("pool_request","legacy",this,nullptr,size,pool_size,0);
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -495,6 +552,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                             *actual_size = b.size;
                             b.ptr = nullptr;
                             b.size = 0;
+                            ggml_cuda_scratch_trace::pool("pool_alloc","legacy",this,ptr,*actual_size,pool_size,0);
                             return ptr;
                         }
                     }
@@ -507,6 +565,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             *actual_size = b.size;
             b.ptr = nullptr;
             b.size = 0;
+            ggml_cuda_scratch_trace::pool("pool_alloc","legacy",this,ptr,*actual_size,pool_size,0);
             return ptr;
         }
         void * ptr;
@@ -529,6 +588,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        ggml_cuda_scratch_trace::pool("pool_grow","legacy",this,ptr,look_ahead_size,pool_size,0);
+        ggml_cuda_scratch_trace::pool("pool_alloc","legacy",this,ptr,*actual_size,pool_size,0);
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -542,6 +603,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
+                ggml_cuda_scratch_trace::pool("pool_free","legacy",this,ptr,size,pool_size,0);
                 return;
             }
         }
@@ -549,6 +611,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+        ggml_cuda_scratch_trace::pool("pool_backing_free","legacy",this,ptr,size,pool_size,0);
     }
 };
 
@@ -588,6 +651,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        ggml_cuda_scratch_trace::pool("pool_request","vmm",this,nullptr,size,pool_size,pool_used);
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
@@ -607,6 +671,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
+            ggml_cuda_scratch_trace::pool("pool_grow_request","vmm",this,nullptr,reserve_size,pool_size,pool_used);
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 
             // reserve virtual address space (if not already reserved)
@@ -671,6 +736,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            ggml_cuda_scratch_trace::pool("pool_grow","vmm",this,nullptr,reserve_size,pool_size,pool_used);
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
@@ -682,6 +748,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         void * ptr = (void *) ((CUdeviceptr)((char *)(pool_addr) + pool_used));
         *actual_size = size;
         pool_used += size;
+        ggml_cuda_scratch_trace::pool("pool_alloc","vmm",this,ptr,size,pool_size,pool_used);
 
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
@@ -699,6 +766,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+        ggml_cuda_scratch_trace::pool("pool_free","vmm",this,ptr,size,pool_size,pool_used);
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -741,6 +809,133 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
     }
 }
+
+
+// Host planning state stays private to backend-owned contexts.
+struct ggml_cuda_pool_bounded : ggml_cuda_pool {
+    char * base;
+    size_t capacity, depth=0;
+    ggml_backend_operator_workspace plan;
+    std::array<size_t,8> sizes{};
+
+    ggml_cuda_pool_bounded(char * base,size_t capacity) : base(base), capacity(capacity) {}
+    void prepare(const ggml_backend_operator_workspace & next) {
+        GGML_ASSERT(depth==0 && next.bytes<=capacity);plan=next;
+    }
+    void * alloc(size_t size,size_t * actual_size) override {
+        GGML_ASSERT(depth<plan.count && size && size<=plan.requests[depth]);
+        size_t rounded=0;GGML_ASSERT(ggml_backend_operator_workspace_align(size,128,rounded));
+        GGML_ASSERT(plan.offsets[depth]<=capacity && rounded<=capacity-plan.offsets[depth]);
+        void * ptr=base+plan.offsets[depth];sizes[depth++]=rounded;*actual_size=rounded;
+        ggml_cuda_scratch_trace::pool("arena_alloc","bounded",this,ptr,size,capacity,plan.offsets[depth-1]+rounded);
+        return ptr;
+    }
+    void free(void * ptr,size_t size) override {
+        GGML_ASSERT(depth && ptr==base+plan.offsets[depth-1] && size==sizes[depth-1]);
+        --depth;const size_t used=depth ? plan.offsets[depth-1]+sizes[depth-1] : 0;
+        ggml_cuda_scratch_trace::pool("arena_free","bounded",this,ptr,size,capacity,used);
+    }
+};
+
+struct ggml_backend_cuda_workspace_context : ggml_backend_cuda_context {
+    ggml_cuda_operator_workspace_caps operator_caps;
+    ggml_backend_operator_workspace_binding operator_binding;
+    bool operator_pending=false, operator_executing=false, operator_library_ready=false;
+    explicit ggml_backend_cuda_workspace_context(int device) : ggml_backend_cuda_context(device) {}
+    bool operator_bound() const { return operator_binding.root!=nullptr; }
+    bool operator_library_handle(int index) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        auto & handle=cublas_handles[device][index];
+        if (!handle) {
+            cublasHandle_t created=nullptr;
+            if (cublasCreate(&created)!=CUBLAS_STATUS_SUCCESS) return false;
+            handle=created;
+        }
+        return cublasSetMathMode(handle,CUBLAS_TF32_TENSOR_OP_MATH)==CUBLAS_STATUS_SUCCESS &&
+            cublasSetStream(handle,stream(device,index))==CUBLAS_STATUS_SUCCESS;
+#else
+        GGML_UNUSED(index);return false;
+#endif
+    }
+    bool operator_library_attach() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        auto scratch=ggml_backend_memory_lease_buffer(operator_binding.scratch);
+        auto * base=scratch ? static_cast<char *>(ggml_backend_buffer_get_base(scratch)) : nullptr;
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) {
+            const auto & part=operator_binding.layout.streams[i];
+            const bool active=size_t(i)<operator_binding.layout.count && part.library_bytes;
+            if (active && !operator_library_handle(i)) return false;
+            auto handle=cublas_handles[device][i];
+            if (!handle) continue;
+            void * address=active ? base+part.library_offset : nullptr;
+            if (cublasSetWorkspace(handle,address,active ? operator_caps.library_bytes : 0)!=CUBLAS_STATUS_SUCCESS) return false;
+            auto & owned=cublas_workspaces[device][i];
+            if (owned) { CUDA_CHECK(cudaFree(owned));owned=nullptr; }
+            if (active && ggml_cuda_scratch_trace::enabled()) GGML_LOG_INFO(
+                "cuda_scratch: event=blas_borrowed context=%p stream=%d address=%p bytes=%zu\n",
+                (void *)this,i,address,operator_caps.library_bytes);
+        }
+        operator_library_ready=true;return true;
+#else
+        return false;
+#endif
+    }
+    bool operator_library_detach() {
+        operator_library_ready=false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) if (cublas_handles[device][i]) {
+            if (cublasSetWorkspace(cublas_handles[device][i],nullptr,0)!=CUBLAS_STATUS_SUCCESS) return false;
+            auto & owned=cublas_workspaces[device][i];
+            if (owned) { CUDA_CHECK(cudaFree(owned));owned=nullptr; }
+        }
+#endif
+        return true;
+    }
+    void operator_library_native() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+        for (int i=0;i<GGML_CUDA_MAX_STREAMS;++i) {
+            auto handle=cublas_handles[device][i];auto & owned=cublas_workspaces[device][i];
+            if (!handle || owned) continue;
+            if (!cublas_workspace_sizes[device]) cublas_workspace_sizes[device]=operator_caps.library_bytes;
+            GGML_ASSERT(cublas_workspace_sizes[device]);
+            CUBLAS_CHECK(cublasSetMathMode(handle,CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetStream(handle,stream(device,i)));
+            CUDA_CHECK(cudaMalloc(&owned,cublas_workspace_sizes[device]));
+            CUBLAS_CHECK(cublasSetWorkspace(handle,owned,cublas_workspace_sizes[device]));
+        }
+#endif
+    }
+    void operator_synchronize() {
+        ggml_cuda_set_device(device);
+        for (auto stream : streams[device]) if (stream) CUDA_CHECK(cudaStreamSynchronize(stream));
+        operator_pending=false;
+    }
+    void operator_clear() {
+#ifdef USE_CUDA_GRAPH
+        cuda_graphs.clear();
+#endif
+        if (ggml_cuda_scratch_trace::enabled()) GGML_LOG_INFO("cuda_scratch: event=operator_release context=%p\n",(void *)this);
+        for (auto & pool : pools[device]) pool.reset();
+        ggml_backend_memory_lease_free(operator_binding.scratch);
+        ggml_backend_memory_lease_free(operator_binding.root);
+        operator_binding={};
+    }
+    ~ggml_backend_cuda_workspace_context() {
+        if (operator_bound()) {
+            operator_synchronize();
+            if (!operator_library_detach()) {
+                for (auto & handle : cublas_handles[device]) if (handle) { CUBLAS_CHECK(cublasDestroy(handle));handle=nullptr; }
+            }
+            operator_clear();
+        }
+    }
+};
+
+static ggml_backend_operator_workspace_status ggml_cuda_operator_workspace_query_context(
+    ggml_backend_cuda_workspace_context &,const ggml_tensor *,ggml_backend_operator_workspace &);
+static ggml_backend_operator_workspace_status ggml_cuda_operator_graph_plan(
+    ggml_backend_cuda_workspace_context &,const ggml_cgraph *,ggml_backend_operator_phase_workspace &,bool);
+static bool ggml_cuda_operator_graph_admitted(ggml_backend_cuda_workspace_context &,const ggml_cgraph *);
 
 
 // cuda buffer
@@ -1624,6 +1819,17 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+static bool ggml_cuda_cublas_f32_output(ggml_type compute_type,int cc) {
+    bool prefer_f32_output = false;
+    if (compute_type == GGML_TYPE_F16) {
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+    } else if (compute_type == GGML_TYPE_BF16) {
+        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+    }
+
+    return prefer_f32_output;
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1726,12 +1932,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * beta = traits::get_beta();
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    bool prefer_f32_output = false;
-    if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
-    } else if (compute_type == GGML_TYPE_BF16) {
-        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
-    }
+    const bool prefer_f32_output=ggml_cuda_cublas_f32_output(compute_type,cc);
 
     if (prefer_f32_output) {
         dst_ptr = (char *) dst_ddf;
@@ -1838,8 +2039,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+static ggml_type ggml_cuda_cublas_compute_type(const ggml_tensor * src0,const ggml_tensor * src1,const ggml_tensor * dst,int cc) {
     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type)) {
@@ -1878,7 +2078,14 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
-    constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
+    return compute_type;
+}
+
+static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_type compute_type=ggml_cuda_cublas_compute_type(src0,src1,dst,cc);
+
+    constexpr size_t max_src0_convert_size = ggml_cuda_operator_conversion_chunk_bytes;
     const size_t src0_f32_size = ggml_nelements(src0) * sizeof(float);
 
     if (compute_type == GGML_TYPE_F32 &&
@@ -2122,59 +2329,38 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
-static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_TENSOR_BINARY_OP_LOCALS
+enum class ggml_cuda_matmul_route { cublas, vector_f, vector_transposed, matrix_f, vector_q, matrix_q };
 
-    if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
-    }
+static ggml_cuda_matmul_route ggml_cuda_matmul_route_for(const ggml_tensor * src0,const ggml_tensor * src1,
+        const ggml_tensor * dst,int cc,int warp_size) {
+    const bool bad_padding=src0->buffer && ggml_backend_buffer_get_usage(src0->buffer)==GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(src0)!=ggml_backend_buffer_get_alloc_size(src0->buffer,src0) && src0->view_src;
+    if (bad_padding || src1->type!=GGML_TYPE_F32 || dst->type!=GGML_TYPE_F32) return ggml_cuda_matmul_route::cublas;
+    if (ggml_cuda_should_use_mmvf(src0->type,cc,warp_size,src0->ne,src0->nb,src1->ne[1])) return ggml_cuda_matmul_route::vector_f;
+    if (src0->ne[1]==1 && src1->ne[1]>MMVF_MAX_BATCH_SIZE && dst->ne[2]==1 && dst->ne[3]==1 &&
+            src0->type==GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+            ggml_cuda_should_use_mmvf(src1->type,cc,warp_size,src1->ne,src1->nb,1)) return ggml_cuda_matmul_route::vector_transposed;
+    if (ggml_cuda_should_use_mmf(src0->type,cc,warp_size,src0->ne,src0->nb,src1->ne[1],false)) return ggml_cuda_matmul_route::matrix_f;
+    if (ggml_cuda_should_use_mmvq(src0->type,cc,src1->ne[1])) return ggml_cuda_matmul_route::vector_q;
+    if (ggml_cuda_should_use_mmq(src0->type,cc,src1->ne[1],0)) return ggml_cuda_matmul_route::matrix_q;
+    return ggml_cuda_matmul_route::cublas;
+}
 
-    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
-    // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
-    // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
+static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx,const ggml_tensor * src0,const ggml_tensor * src1,ggml_tensor * dst) {
+    if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx,src1,dst)) return;
+    const auto & device=ggml_cuda_info().devices[ctx.device];
+    switch (ggml_cuda_matmul_route_for(src0,src1,dst,device.cc,device.warp_size)) {
+        case ggml_cuda_matmul_route::vector_f:ggml_cuda_mul_mat_vec_f(ctx,src0,src1,nullptr,dst);return;
+        case ggml_cuda_matmul_route::vector_transposed: {
+            ggml_tensor view=*dst;view.ne[0]=src1->ne[1];view.ne[1]=1;
+            view.nb[1]=view.nb[0]*src1->ne[1];view.nb[2]=view.nb[1];view.nb[3]=view.nb[1];
+            ggml_cuda_mul_mat_vec_f(ctx,src1,src0,nullptr,&view);return;
+        }
+        case ggml_cuda_matmul_route::matrix_f:ggml_cuda_mul_mat_f(ctx,src0,src1,nullptr,dst);return;
+        case ggml_cuda_matmul_route::vector_q:ggml_cuda_mul_mat_vec_q(ctx,src0,src1,nullptr,dst);return;
+        case ggml_cuda_matmul_route::matrix_q:ggml_cuda_mul_mat_q(ctx,src0,src1,nullptr,dst);return;
+        case ggml_cuda_matmul_route::cublas:ggml_cuda_mul_mat_cublas(ctx,src0,src1,dst);return;
     }
-
-    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
-    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
-        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
-        // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
-    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
-            && src0->type == GGML_TYPE_F32
-            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
-            && ggml_cuda_should_use_mmvf(src1->type, cc, warp_size, src1->ne, src1->nb, /*ne11 =*/ 1)) {
-        ggml_tensor dst_vec = *dst;
-        dst_vec.ne[0] = ne11;
-        dst_vec.ne[1] = 1;
-        dst_vec.nb[1] = dst_vec.nb[0]*ne11;
-        dst_vec.nb[2] = dst_vec.nb[1];
-        dst_vec.nb[3] = dst_vec.nb[1];
-        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
-        return;
-    }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -2743,7 +2929,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    delete cuda_ctx;
+    delete static_cast<ggml_backend_cuda_workspace_context *>(cuda_ctx);
     delete backend;
 }
 
@@ -2849,7 +3035,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    auto & state=static_cast<ggml_backend_cuda_workspace_context &>(*cuda_ctx);
+    if (state.operator_bound()) state.operator_synchronize();
+    else CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
 }
@@ -4756,6 +4944,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                auto & bound_state=static_cast<ggml_backend_cuda_workspace_context &>(*cuda_ctx);
+                if (bound_state.operator_bound()) {
+                    GGML_ASSERT(cuda_ctx->curr_stream_no>=0 && size_t(cuda_ctx->curr_stream_no)<bound_state.operator_binding.layout.count);
+                    ggml_backend_operator_workspace plan;
+                    GGML_ASSERT(ggml_cuda_operator_workspace_query_context(bound_state,node,plan)==ggml_backend_operator_workspace_status::success);
+                    static_cast<ggml_cuda_pool_bounded &>(cuda_ctx->pool()).prepare(plan);
+                }
+                ggml_cuda_scratch_trace scratch_trace(*cuda_ctx,cgraph,i);
+                if (ggml_cuda_scratch_trace::enabled()) {
+                    auto & state=static_cast<ggml_backend_cuda_workspace_context &>(*cuda_ctx);
+                    if (state.operator_caps.ready) {
+                        ggml_backend_operator_workspace plan;
+                        GGML_LOG_INFO("cuda_scratch: event=quote_begin time_us=%lld context=%p tensor=%s\n",(long long)ggml_time_us(),(void *)cuda_ctx,node->name);
+                        const auto status=ggml_cuda_operator_workspace_query_context(state,node,plan);
+                        char requests[256]={};size_t cursor=0;
+                        for (size_t n=0;n<plan.count;++n) {
+                            const int written=snprintf(requests+cursor,sizeof(requests)-cursor,"%s%zu",n ? "," : "",plan.requests[n]);
+                            if (written<0 || size_t(written)>=sizeof(requests)-cursor) break;
+                            cursor+=size_t(written);
+                        }
+                        GGML_LOG_INFO("cuda_scratch: event=quote time_us=%lld context=%p tensor=%s status=%d bytes=%zu library_bytes=%zu count=%zu requests=%s\n",
+                            (long long)ggml_time_us(),(void *)cuda_ctx,node->name,int(status),plan.bytes,plan.library_bytes,plan.count,plan.count ? requests : "-");
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4865,6 +5078,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 __func__, i, cgraph->nodes[i]->name, ggml_op_name(cgraph->nodes[i]->op));
             return GGML_STATUS_FAILED;
         }
+        if (owner && static_cast<ggml_backend_cuda_workspace_context &>(*cuda_ctx).operator_bound()) {
+            GGML_LOG_ERROR("%s: managed storage is outside the native operator workspace contract\n",__func__);
+            return GGML_STATUS_FAILED;
+        }
         managed |= owner != nullptr;
         if (owner && !ggml_backend_execution_supports(owner,ggml_backend_get_device(backend),cgraph->nodes[i])) {
             GGML_LOG_ERROR("%s: unsupported managed node %d %s (%s)\n",
@@ -4903,6 +5120,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
         return GGML_STATUS_SUCCESS;
     }
+
+    auto & bound_state=static_cast<ggml_backend_cuda_workspace_context &>(*cuda_ctx);
+    if (!bound_state.operator_bound()) bound_state.operator_library_native();
+    if (bound_state.operator_executing ||
+            (bound_state.operator_bound() && !ggml_cuda_operator_graph_admitted(bound_state,cgraph))) return GGML_STATUS_FAILED;
+    struct execution_guard {
+        ggml_backend_cuda_workspace_context & state;
+        explicit execution_guard(ggml_backend_cuda_workspace_context & state) : state(state) { state.operator_executing=true; }
+        ~execution_guard() { state.operator_executing=false; }
+    } guard(bound_state);
+    if (bound_state.operator_bound()) bound_state.operator_pending=true;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6314,7 +6542,293 @@ static bool ggml_backend_cuda_graph_is_captured(ggml_backend_t backend, const vo
 }
 #endif
 
+static ggml_backend_operator_workspace_status ggml_cuda_operator_workspace_query_context(
+        ggml_backend_cuda_workspace_context & ctx,const ggml_tensor * op,ggml_backend_operator_workspace & output) {
+    using status=ggml_backend_operator_workspace_status;
+    const auto & caps=ctx.operator_caps;
+    if (!caps.ready) return status::unprepared;
+    if (!op || op->type<0 || op->type>=GGML_TYPE_COUNT) return status::invalid;
+    ggml_backend_operator_workspace next;
+    if (ggml_is_empty(op)) { output=next;return status::success; }
+    size_t elements;
+    if (!ggml_cuda_operator_elements(op,elements)) return status::invalid;
+    if (op->op==GGML_OP_MUL_MAT) {
+        if (!op->src[0] || !op->src[1] || !ggml_cuda_operator_elements(op->src[0],elements) ||
+                !ggml_cuda_operator_elements(op->src[1],elements)) return status::invalid;
+        const auto * a=op->src[0];const auto * b=op->src[1];
+        if (ggml_cuda_op_mul_mat_use_fwht(op)) return status::unsupported;
+        if (a->type!=GGML_TYPE_F16 && a->type!=GGML_TYPE_BF16 && a->type!=GGML_TYPE_F32 && a->type!=GGML_TYPE_Q8_0) return status::unsupported;
+        switch (ggml_cuda_matmul_route_for(a,b,op,caps.cc,caps.warp_size)) {
+            case ggml_cuda_matmul_route::vector_f:
+            case ggml_cuda_matmul_route::vector_transposed:
+            case ggml_cuda_matmul_route::matrix_f:break;
+            case ggml_cuda_matmul_route::vector_q: {
+                size_t bytes;
+                if (!ggml_backend_operator_workspace_align(size_t(b->ne[0]),MATRIX_ROW_PADDING,bytes)) return status::invalid;
+                for (int i=1;i<GGML_MAX_DIMS;++i) if (!ggml_cuda_operator_product(bytes,size_t(b->ne[i]))) return status::invalid;
+                if (!ggml_cuda_operator_product(bytes,sizeof(block_q8_1)) ||
+                        !ggml_backend_operator_workspace_add(next,bytes/QK8_1)) return status::invalid;
+                break;
+            }
+            case ggml_cuda_matmul_route::matrix_q:
+                if (!ggml_cuda_mmq_workspace_plan(a,b,op,caps.cc,caps.shared_bytes_per_block,caps.nsm,next)) return status::unsupported;
+                break;
+            case ggml_cuda_matmul_route::cublas: {
+                const auto type=ggml_cuda_cublas_compute_type(a,b,op,caps.cc);
+                if (!ggml_cuda_cublas_workspace_plan(op,type,ggml_cuda_cublas_f32_output(type,caps.cc),caps.library_bytes,next)) return status::unsupported;
+                break;
+            }
+        }
+    } else if (op->op==GGML_OP_FLASH_ATTN_EXT) {
+        if (!ggml_cuda_attention_workspace_plan(caps,op,next) ||
+                ggml_cuda_flash_attn_ext_kernel_family(ctx.device,op)!=ggml_cuda_kv_stream_kernel_family::tile) return status::unsupported;
+    } else {
+        switch (op->op) {
+            case GGML_OP_NONE:case GGML_OP_VIEW:case GGML_OP_RESHAPE:case GGML_OP_TRANSPOSE:case GGML_OP_PERMUTE:
+            case GGML_OP_SCALE:case GGML_OP_IM2COL:case GGML_OP_CONT:case GGML_OP_ADD:case GGML_OP_UPSCALE:
+            case GGML_OP_NORM:case GGML_OP_RMS_NORM:case GGML_OP_MUL:case GGML_OP_ROPE:case GGML_OP_CPY:
+            case GGML_OP_UNARY:case GGML_OP_CLAMP:case GGML_OP_GET_ROWS:case GGML_OP_GLU:case GGML_OP_POOL_2D:
+            case GGML_OP_SUB:case GGML_OP_PAD:case GGML_OP_CONCAT:break;
+            default:return status::unsupported;
+        }
+    }
+    output=next;return status::success;
+}
+
+static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_prepare(ggml_backend_t backend) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!backend || !ggml_backend_is_cuda(backend)) return status::unsupported;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return status::unsupported;
+#else
+    auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
+    if (ctx.operator_caps.ready) return status::success;
+    ggml_cuda_set_device(ctx.device);
+    const auto & info=ggml_cuda_info().devices[ctx.device];
+    ggml_cuda_operator_workspace_caps next;next.cc=info.cc;next.nsm=info.nsm;
+    next.warp_size=info.warp_size;next.shared_bytes_per_block=info.smpbo;
+    next.library_bytes=ctx.cublas_workspace_sizes[ctx.device];
+    if (!next.library_bytes) next.library_bytes=info.cc>=GGML_CUDA_CC_HOPPER ? 32*1024*1024 : 4*1024*1024;
+    for (int softcap=0;softcap<2;++softcap) for (int index=0,columns=2;index<5;++index,columns*=2) {
+        ggml_cuda_operator_kernel_metadata kernel;
+        if (!ggml_cuda_operator_tile_kernel_metadata(columns,bool(softcap),info.cc,kernel) || !kernel.kernel) return status::unsupported;
+        auto & traits=next.tile[softcap][index];traits.nbatch=kernel.nbatch;traits.threads=kernel.threads;
+        const auto error=cudaOccupancyMaxActiveBlocksPerMultiprocessor(&traits.occupancy,kernel.kernel,kernel.threads,0);
+        if (error!=cudaSuccess) {
+            GGML_LOG_ERROR("CUDA operator workspace kernel preparation failed: %s\n",cudaGetErrorString(error));return status::failed;
+        }
+    }
+    next.ready=true;ctx.operator_caps=next;
+    if (!ctx.cublas_handles[ctx.device][0] && !ctx.operator_library_handle(0)) {
+        ctx.operator_caps.ready=false;return status::failed;
+    }
+    return status::success;
+#endif
+}
+
+static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_query(ggml_backend_t backend,
+        const ggml_tensor * op,ggml_backend_operator_workspace * output) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!backend || !ggml_backend_is_cuda(backend) || !output) return status::invalid;
+    auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
+    ggml_backend_operator_workspace next;
+    const auto result=ggml_cuda_operator_workspace_query_context(ctx,op,next);
+    if (result==status::success) *output=next;
+    return result;
+}
+
+static ggml_backend_operator_workspace_status ggml_cuda_operator_graph_plan(
+        ggml_backend_cuda_workspace_context & ctx,const ggml_cgraph * graph,
+        ggml_backend_operator_phase_workspace & output,bool check_payload) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!ctx.operator_caps.ready) return status::unprepared;
+    if (!graph || graph->n_nodes<0 || (graph->n_nodes && !graph->nodes)) return status::invalid;
+    std::unordered_map<const ggml_tensor *,uint32_t> mapping;
+    for (int i=0;i<graph->n_nodes;++i) {
+        if (!graph->nodes[i]) return status::invalid;
+        mapping.emplace(graph->nodes[i],0);
+    }
+    size_t stream_count=1;
+    for (const auto & entry : ctx.stream_context().concurrent_events) {
+        const auto & event=entry.second;
+        if (!mapping.count(entry.first) || !mapping.count(event.join_node) || event.n_streams<1 ||
+                event.n_streams>=GGML_CUDA_MAX_STREAMS) return status::unsupported;
+        for (const auto & item : event.stream_mapping) {
+            auto found=mapping.find(item.first);
+            if (found==mapping.end() || item.second<1 || item.second>event.n_streams || found->second) return status::unsupported;
+            found->second=uint32_t(item.second);
+        }
+        stream_count=std::max(stream_count,size_t(event.n_streams+1));
+    }
+    std::vector<ggml_backend_operator_workspace> plans;
+    std::vector<uint32_t> streams;
+    for (int i=0;i<graph->n_nodes;++i) {
+        const auto * node=graph->nodes[i];
+        if (ggml_cuda_is_view_or_noop(node) || !(node->flags&GGML_TENSOR_FLAG_COMPUTE)) continue;
+        ggml_backend_operator_workspace plan;
+        const auto result=ggml_cuda_operator_workspace_query_context(ctx,node,plan);
+        if (result!=status::success) return result;
+        plans.push_back(plan);streams.push_back(mapping.at(node));
+        // Invalid concurrent regions fall back to the main stream in the native executor.
+        if (mapping.at(node)) { plans.push_back(plan);streams.push_back(0); }
+    }
+    if (!ggml_backend_operator_workspace_group(plans.data(),streams.data(),plans.size(),stream_count,output)) return status::invalid;
+    if (!check_payload) return status::success;
+    auto scratch=ggml_backend_memory_lease_buffer(ctx.operator_binding.scratch);
+    const uintptr_t begin=scratch ? reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch)) : 0;
+    const size_t size=scratch ? ggml_backend_buffer_get_size(scratch) : 0;
+    if (size>UINTPTR_MAX-begin) return status::invalid;
+    const auto valid_tensor=[&](const ggml_tensor * tensor) {
+        if (!tensor || ggml_is_empty(tensor)) return true;
+        size_t count;
+        if (!ggml_cuda_operator_elements(tensor,count) || !tensor->data || !tensor->buffer) return false;
+        auto type=ggml_backend_buffer_get_type(tensor->buffer);
+        if (type!=ggml_backend_cuda_buffer_type(ctx.device) && type!=ggml_backend_cuda_device_buffer_type(ctx.device)) return false;
+        size_t span=ggml_type_size(tensor->type);
+        for (int d=0;d<GGML_MAX_DIMS;++d) {
+            size_t term=size_t(tensor->ne[d]/(d ? 1 : ggml_blck_size(tensor->type)))-1;
+            if (!ggml_cuda_operator_product(term,tensor->nb[d]) || term>SIZE_MAX-span) return false;
+            span+=term;
+        }
+        const uintptr_t data=reinterpret_cast<uintptr_t>(tensor->data);
+        const uintptr_t base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(tensor->buffer));
+        const size_t capacity=ggml_backend_buffer_get_size(tensor->buffer);
+        if (data<base || data-base>capacity || span>capacity-(data-base) || span>UINTPTR_MAX-data) return false;
+        if (data<begin+size && begin<data+span) return false;
+        if (tensor->op==GGML_OP_FLASH_ATTN_EXT) {
+            const size_t allocation=ggml_backend_buft_get_alloc_size(type,tensor);
+            if (allocation>capacity-(data-base) || allocation>UINTPTR_MAX-data ||
+                    (data<begin+size && begin<data+allocation)) return false;
+        }
+        return true;
+    };
+    for (int i=0;i<graph->n_nodes;++i) {
+        const auto * node=graph->nodes[i];
+        if (!valid_tensor(node)) return status::invalid;
+        for (const auto * source : node->src) if (source && !valid_tensor(source)) return status::invalid;
+    }
+    return status::success;
+}
+
+static bool ggml_cuda_operator_graph_admitted(ggml_backend_cuda_workspace_context & ctx,const ggml_cgraph * graph) {
+    if (!ctx.operator_library_ready) return false;
+    ggml_backend_operator_phase_workspace required;
+    const auto result=ggml_cuda_operator_graph_plan(ctx,graph,required,true);
+    if (result!=ggml_backend_operator_workspace_status::success || required.count>ctx.operator_binding.layout.count) {
+        GGML_LOG_ERROR("CUDA bounded operator graph rejected: status=%d\n",int(result));return false;
+    }
+    for (size_t i=0;i<required.count;++i) {
+        const auto & need=required.streams[i];const auto & have=ctx.operator_binding.layout.streams[i];
+        if (need.scratch_bytes>have.scratch_bytes || need.library_bytes>have.library_bytes) {
+            GGML_LOG_ERROR("CUDA bounded operator graph exceeds stream %zu quota\n",i);return false;
+        }
+    }
+    return true;
+}
+
+static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_graph_query(ggml_backend_t backend,
+        const ggml_cgraph * graph,ggml_backend_operator_phase_workspace * output) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!backend || !ggml_backend_is_cuda(backend) || !output) return status::invalid;
+    auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
+    ggml_backend_operator_phase_workspace next;
+    const auto result=ggml_cuda_operator_graph_plan(ctx,graph,next,false);
+    if (result==status::success) *output=next;
+    return result;
+}
+
+static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_bind(ggml_backend_t backend,
+        const ggml_backend_operator_workspace_binding * binding) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!backend || !ggml_backend_is_cuda(backend) || !binding) return status::invalid;
+    auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
+    if (!ctx.operator_caps.ready) return status::unprepared;
+    if (ctx.operator_executing || ctx.operator_pending) return status::busy;
+    ggml_backend_memory_region root,scratch{};
+    if (!ggml_backend_operator_workspace_phase_valid(binding->layout) || binding->layout.count>GGML_CUDA_MAX_STREAMS ||
+            !binding->parent || !ggml_backend_memory_lease_get_region(binding->root,&root) || root.flags ||
+            root.id!=binding->root_id || !binding->root_generation ||
+            ggml_backend_memory_lease_generation(binding->root)!=binding->root_generation) return status::invalid;
+    if (binding->scratch) {
+        if (!ggml_backend_memory_lease_get_region(binding->scratch,&scratch) || scratch.flags ||
+                scratch.id!=binding->scratch_id || !binding->scratch_generation ||
+                ggml_backend_memory_lease_generation(binding->scratch)!=binding->scratch_generation) return status::invalid;
+    } else if (binding->layout.bytes || binding->scratch_id || binding->scratch_generation) return status::invalid;
+    auto root_buffer=ggml_backend_memory_lease_buffer(binding->root);
+    auto scratch_buffer=ggml_backend_memory_lease_buffer(binding->scratch);
+    const auto type=ggml_backend_cuda_device_buffer_type(ctx.device);
+    if (ggml_backend_buffer_get_type(binding->parent)!=type || ggml_backend_buffer_get_type(root_buffer)!=type ||
+            (scratch_buffer && ggml_backend_buffer_get_type(scratch_buffer)!=type)) return status::invalid;
+    const uintptr_t parent_base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(binding->parent));
+    const uintptr_t root_base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(root_buffer));
+    const uintptr_t scratch_base=scratch_buffer ? reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch_buffer)) : 0;
+    const size_t capacity=ggml_backend_buffer_get_size(binding->parent);
+    if (!parent_base || capacity>UINTPTR_MAX-parent_base || root.offset>capacity || root.size>capacity-root.offset ||
+            root_base!=parent_base+root.offset || ggml_backend_buffer_get_size(root_buffer)!=root.size) return status::invalid;
+    if (scratch_buffer && (scratch_base<root_base || scratch_base-root_base>root.size ||
+            scratch.size>root.size-(scratch_base-root_base) ||
+            ggml_backend_buffer_get_size(scratch_buffer)!=scratch.size || scratch_base%256)) return status::invalid;
+    if (binding->layout.bytes>scratch.size) return status::insufficient;
+    for (size_t i=0;i<binding->layout.count;++i) {
+        const auto bytes=binding->layout.streams[i].library_bytes;
+        if (bytes && bytes<ctx.operator_caps.library_bytes) return status::insufficient;
+    }
+    if (ctx.operator_bound()) return status::busy;
+    for (int d=0;d<GGML_CUDA_MAX_DEVICES;++d) for (int stream=0;stream<GGML_CUDA_MAX_STREAMS;++stream) {
+        if (d!=ctx.device && ctx.pools[d][stream]) return status::unsupported;
+    }
+    ggml_cuda_set_device(ctx.device);
+    for (auto stream : ctx.streams[ctx.device]) if (stream) {
+        const auto result=cudaStreamQuery(stream);
+        if (result==cudaErrorNotReady) return status::busy;
+        if (result!=cudaSuccess) return status::failed;
+    }
+    std::array<std::unique_ptr<ggml_cuda_pool>,GGML_CUDA_MAX_STREAMS> pools;
+    for (size_t i=0;i<pools.size();++i) {
+        const auto & part=binding->layout.streams[i];
+        const size_t offset=i<binding->layout.count ? part.scratch_offset : 0;
+        auto * base=reinterpret_cast<char *>(scratch_base);
+        pools[i]=std::make_unique<ggml_cuda_pool_bounded>(offset ? base+offset : base,
+            i<binding->layout.count ? part.scratch_bytes : 0);
+    }
+    auto next=*binding;
+    next.root=ggml_backend_memory_lease_retain(binding->root);
+    next.scratch=ggml_backend_memory_lease_retain(binding->scratch);
+#ifdef USE_CUDA_GRAPH
+    ctx.cuda_graphs.clear();
+#endif
+    for (size_t i=0;i<pools.size();++i) ctx.pools[ctx.device][i]=std::move(pools[i]);
+    ctx.operator_binding=next;
+    if (ggml_cuda_scratch_trace::enabled()) GGML_LOG_INFO("cuda_scratch: event=operator_bind context=%p address=%p bytes=%zu streams=%zu\n",
+        (void *)&ctx,reinterpret_cast<void *>(scratch_base),scratch.size,binding->layout.count);
+    // Partial library setup retains both loans until release succeeds.
+    if (!ctx.operator_library_attach()) return status::failed;
+    return status::success;
+}
+
+static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_release(ggml_backend_t backend) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!backend || !ggml_backend_is_cuda(backend)) return status::invalid;
+    auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
+    if (ctx.operator_pending || ctx.operator_executing) return status::busy;
+    if (ctx.operator_bound()) {
+        if (ggml_cuda_scratch_trace::enabled()) GGML_LOG_INFO("cuda_scratch: event=operator_retire context=%p\n",(void *)&ctx);
+#ifdef USE_CUDA_GRAPH
+        ctx.cuda_graphs.clear();
+#endif
+        if (!ctx.operator_library_detach()) return status::failed;
+        ctx.operator_clear();
+    }
+    return status::success;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (!strcmp(name,"ggml_backend_operator_workspace_prepare")) return (void *)ggml_backend_cuda_operator_workspace_prepare;
+    if (!strcmp(name,"ggml_backend_operator_workspace_query")) return (void *)ggml_backend_cuda_operator_workspace_query;
+    if (!strcmp(name,"ggml_backend_operator_workspace_graph_query")) return (void *)ggml_backend_cuda_operator_workspace_graph_query;
+    if (!strcmp(name,"ggml_backend_operator_workspace_bind")) return (void *)ggml_backend_cuda_operator_workspace_bind;
+    if (!strcmp(name,"ggml_backend_operator_workspace_release")) return (void *)ggml_backend_cuda_operator_workspace_release;
+
     GGML_UNUSED(reg);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name,"ggml_backend_cuda_graph_is_capturing") == 0) return (void *)ggml_backend_cuda_graph_is_capturing;
@@ -6430,7 +6944,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
 
-    ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
+    ggml_backend_cuda_context * ctx = new ggml_backend_cuda_workspace_context(device);
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;

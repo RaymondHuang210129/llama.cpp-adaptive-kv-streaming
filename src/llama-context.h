@@ -49,6 +49,14 @@ struct llama_context {
     llama_context(
             const llama_model & model,
                   llama_context_params params);
+    llama_context(
+            const llama_model & model,
+                  llama_context_params params,
+                  uint32_t serial_prediction_rows);
+    llama_context(
+            const llama_model & model,
+                  llama_context_params params,
+                  uint32_t serial_prediction_rows, bool serial_image_inputs);
 
     ~llama_context();
 
@@ -407,8 +415,18 @@ private:
     llama_context * serial_target_ctx = nullptr;
     bool kv_read_frame_active = false;
     bool serial_feature_producer = false;
+    bool serial_feature_images = false;
     std::vector<int32_t> serial_feature_layers;
     std::vector<std::pair<llama_token,llama_pos>> serial_feature_rows;
+    struct serial_feature_image_row {
+        bool has_embd;
+        size_t offset;
+        std::array<llama_pos,GGML_MROPE_SECTIONS> position;
+    };
+    std::vector<serial_feature_image_row> serial_feature_image_rows;
+    std::vector<float> serial_feature_image_values;
+    size_t serial_feature_image_width = 0;
+    void clear_serial_features();
 
     llama_compute_reserve_state sched_reserve_state;
 

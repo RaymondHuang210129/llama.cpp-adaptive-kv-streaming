@@ -197,9 +197,14 @@ def server(args, streamed, depth, phase=None):
                 process.wait(timeout=20)
 
 
-def cancel_after_first_output(base, payload):
-    body = json.dumps(dict(payload, stream=True, n_predict=256)).encode()
+def cancel_after_first_output(base, payload, minimum_tokens=1):
+    if type(minimum_tokens) is not int or not 1<=minimum_tokens<256:
+        raise ValueError("cancellation needs 1-255 generated tokens")
+    options=dict(payload,stream=True,n_predict=256)
+    if minimum_tokens>1:options["return_tokens"]=True
+    body = json.dumps(options).encode()
     request = urllib.request.Request(base + "/completion", data=body, headers={"Content-Type": "application/json"})
+    generated=0
     with urllib.request.urlopen(request, timeout=600) as response:
         for line in response:
             if not line.startswith(b"data: "):
@@ -207,9 +212,13 @@ def cancel_after_first_output(base, payload):
             event = json.loads(line[6:])
             if event.get("error"):
                 raise RuntimeError("cancelled generation failed: " + str(event))
-            if event.get("tokens") or event.get("content"):
+            if event.get("stop"):
+                break
+            tokens=event.get("tokens",[])
+            generated+=sum(type(token) is int and token>=0 for token in tokens)
+            if generated>=minimum_tokens or minimum_tokens==1 and not tokens and event.get("content"):
                 return
-    raise RuntimeError("cancellation did not observe any generated output")
+    raise RuntimeError("cancellation did not observe the required generated output")
 
 
 def run(args):

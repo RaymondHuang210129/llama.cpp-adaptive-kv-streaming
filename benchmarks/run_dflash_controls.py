@@ -31,6 +31,66 @@ SPEC.loader.exec_module(SWEEP)
 KV_TYPES = SWEEP.KV_TYPES
 
 
+def control_modes(args):
+    profile = getattr(args, "cpu_profile", False)
+    if profile:
+        if not args.trace_library or args.nsys or args.compare_to or getattr(args, "lifecycle", False) or args.spec_mode not in ("dflash", "dflash-k4v"):
+            raise ValueError("--cpu-profile needs --trace-library and DFlash/mixed mode; omit --nsys, --compare-to and --lifecycle")
+        return ["timing", "cpu-profile"]
+    if args.spec_mode != "dflash" and (args.trace_library or args.compare_to or args.nsys):
+        raise ValueError("native capture comparisons require --spec-mode dflash; mixed CPU diagnostics need --cpu-profile")
+    return ["timing"] + (["capture"] if args.trace_library else []) + (["nsight"] if args.nsys else [])
+
+
+def ngram_settings(args):
+    names = ("ngram_n", "ngram_m", "ngram_min_hits")
+    if getattr(args, "spec_mode", "dflash") != "dflash-k4v":
+        if any(getattr(args, name, None) is not None for name in names):
+            raise ValueError("ngram options require --spec-mode dflash-k4v")
+        return None
+    values = [getattr(args, name, None) for name in names]
+    values = [default if value is None else value for value, default in zip(values, (12, 7, 2))]
+    if any(type(value) is not int or not 1 <= value <= maximum for value, maximum in zip(values, (65535, 7, 65535))):
+        raise ValueError("mixed K4V requires lookup N=1..65535, proposals M=1..7 and minimum hits=1..65535")
+    return dict(zip(names, values))
+
+
+def ngram_command(args):
+    settings = ngram_settings(args)
+    if settings is None:
+        return []
+    return [item for name, flag in (("ngram_n", "size-n"), ("ngram_m", "size-m"), ("ngram_min_hits", "min-hits"))
+            for item in ("--spec-ngram-map-k4v-"+flag, str(settings[name]))]
+
+
+def speculative_source_stats(text):
+    pattern = (r"statistics\s+(\S+):\s+#calls\(b,g,a\)\s*=\s*(\d+)\s+(\d+)\s+(\d+),\s*"
+        r"#gen drafts\s*=\s*(\d+),\s*#acc drafts\s*=\s*(\d+),\s*#gen tokens\s*=\s*(\d+),\s*"
+        r"#acc tokens\s*=\s*(\d+),\s*#prediction forwards\s*=\s*(\d+)")
+    fields = ("begin_calls", "draft_calls", "accept_calls", "generated_drafts", "accepted_drafts",
+              "generated_tokens", "accepted_tokens", "prediction_forwards")
+    result = {}
+    for match in re.finditer(pattern, text):
+        row = dict(zip(fields, map(int, match.groups()[1:])))
+        if row["accepted_drafts"] > row["generated_drafts"] or row["accepted_tokens"] > row["generated_tokens"]:
+            raise ValueError("invalid source-specific draft/acceptance counters")
+        result[match[1]] = row
+    return result
+
+
+def validate_mixed_sources(text, require_both=True, generated_tokens=None, accepted_tokens=None):
+    stats = speculative_source_stats(text)
+    if not all(name in stats for name in ("ngram-map-k4v", "draft-dflash")):
+        raise ValueError("mixed execution omitted source statistics")
+    if require_both and (any(stats[name]["generated_tokens"] <= 0 or stats[name]["accept_calls"] <= 0 for name in ("ngram-map-k4v", "draft-dflash"))
+            or stats["draft-dflash"]["prediction_forwards"] <= 0):
+        raise ValueError("mixed sizing must exercise both K4V and DFlash prediction/verification")
+    for field, expected in (("generated_tokens", generated_tokens), ("accepted_tokens", accepted_tokens)):
+        if expected is not None and (type(expected) is not int or expected < 0 or sum(row[field] for row in stats.values()) != expected):
+            raise ValueError("mixed source totals differ from completed request counters: "+field)
+    return stats
+
+
 def effective_microbatch(args, context):
     batch=getattr(args,"batch_size",256)
     ubatch=getattr(args,"ubatch_size",256)
@@ -41,6 +101,9 @@ def effective_microbatch(args, context):
 
 def prompt_count(args, context, depth):
     maximum=getattr(args,"max_depth",depth)
+    settings=ngram_settings(args)
+    if settings is not None:
+        maximum=max(maximum,settings["ngram_m"])
     headroom=getattr(args,"prompt_headroom",None)
     headroom=maximum+8 if headroom is None else headroom
     if type(headroom) is not int or headroom < maximum+1:
@@ -97,7 +160,7 @@ def auto_arena_for_point(args, context, depth, token_cache):
 
 def server_command(args, context, depth):
     spec_mode = getattr(args, "spec_mode", "dflash")
-    admitted = {"dflash": (1, 3, 7), "none": (0,), "mtp": (1, 2, 3)}
+    admitted = {"dflash": (1, 3, 7), "dflash-k4v": range(1, 8), "none": (0,), "mtp": (1, 2, 3)}
     if spec_mode not in admitted or depth not in admitted[spec_mode] or not 512 <= context <= 262144:
         raise ValueError("unsupported speculation mode/depth or context")
     batch = getattr(args,"batch_size",256)
@@ -112,15 +175,17 @@ def server_command(args, context, depth):
             "--parallel", "1", "--n-gpu-layers", "999",
             "--flash-attn", "on", "--cache-type-k", key, "--cache-type-v", value,
             "--fit", "off", "--no-mmproj", "--host", "127.0.0.1", "--port", str(args.port),
-            "--threads", "8", "--threads-batch", "8", "-lv", str(getattr(args,"verbosity",3))]
+            "--threads", "8", "--threads-batch", "8", "-lv",
+            str(max(getattr(args,"verbosity",3),4 if spec_mode == "dflash-k4v" else 0))]
     if spec_mode != "none":
-        command += ["--spec-type", "draft-dflash" if spec_mode == "dflash" else "draft-mtp",
+        command += ["--spec-type", {"dflash":"draft-dflash", "dflash-k4v":"ngram-map-k4v,draft-dflash", "mtp":"draft-mtp"}[spec_mode],
                     "--spec-draft-n-max", str(depth), "--spec-draft-n-min", "0", "--spec-draft-p-min", "0",
                     "--spec-draft-ngl", "999"]
         if not getattr(args, "arena_mib", 0):
             command += ["--spec-draft-type-k", args.draft_k, "--spec-draft-type-v", args.draft_v]
-    if spec_mode == "dflash":
+    if spec_mode in ("dflash", "dflash-k4v"):
         command += ["--model-draft", str(args.draft)]
+    command += ngram_command(args)
     arena = getattr(args, "arena_mib", 0)
     if arena < 0:
         raise ValueError("negative arena size")
@@ -149,6 +214,38 @@ def validate_recovery(result, expected):
         raise ValueError("incomplete lifecycle recovery response")
 
 
+def validate_lifecycle_pair(native, streamed):
+    """Compare the same greedy request/checkpoint protocol, not fresh versus cached runs."""
+    fields=("predicted_n","draft_n","draft_n_accepted","cache_n","prompt_n")
+    timings=[]
+    for result in (native,streamed):
+        tokens=result.get("tokens")
+        timing=result.get("timings",{})
+        if not isinstance(timing,dict) or ("draft_n" in timing)!=("draft_n_accepted" in timing):
+            raise ValueError("incomplete lifecycle draft counters")
+        timing=dict(timing)
+        if "draft_n" not in timing:
+            timing.update(draft_n=0,draft_n_accepted=0)
+        if (not isinstance(tokens,list) or not tokens or any(type(token) is not int or token<0 for token in tokens)
+                or any(type(timing.get(key)) is not int or timing[key]<0 for key in fields)
+                or timing["predicted_n"]!=len(tokens) or timing["draft_n_accepted"]>timing["draft_n"]
+                or result.get("stop_type") not in ("limit","eos","word")):
+            raise ValueError("invalid or incomplete lifecycle comparison record")
+        timings.append(timing)
+    if (native["tokens"]!=streamed["tokens"] or any(timings[0][key]!=timings[1][key] for key in fields)
+            or native["stop_type"]!=streamed["stop_type"] or native.get("stopping_word","")!=streamed.get("stopping_word","")):
+        raise ValueError("paired lifecycle outputs, draft counts, cache use or termination differ")
+
+
+def validate_lifecycle_state(action, result, file_bytes, expected_tokens):
+    if action not in ("save","restore") or type(file_bytes) is not int or file_bytes<=0 or type(expected_tokens) is not int or expected_tokens<0:
+        raise ValueError("invalid lifecycle state expectation")
+    tokens,extent=("n_saved","n_written") if action=="save" else ("n_restored","n_read")
+    if (type(result.get(tokens)) is not int or type(result.get(extent)) is not int or
+            result[tokens]!=expected_tokens or result[extent]!=file_bytes):
+        raise ValueError("lifecycle state token frontier or complete file extent differs")
+
+
 def validate_context_end(result, prompt_tokens, context, requested):
     count = result.get("timings", {}).get("predicted_n")
     if (type(count) is not int or not 1 <= count <= min(requested, context-prompt_tokens)
@@ -168,13 +265,19 @@ def lifecycle_checks(args, url, tokens, evidence):
         memory = [int(line.split(",")[1].strip()) for line in sample.splitlines()
                   if line.split(",")[0].strip() == str(args.lifecycle_pid)]
         evidence.append({"case": label, "result": result, "process_gpu_mib": memory})
+        return result
     recovery("cold", tokens[:512])
-    recovery("cached_append", tokens[:640], True)
+    cached=recovery("cached_append", tokens[:640], True)
     saved = request_json(url+"/slots/0?action=save", {"filename": "lifecycle.bin"}, timeout=args.request_timeout)
+    state_dir=getattr(args,"lifecycle_state_dir",None)
+    if state_dir is not None:
+        validate_lifecycle_state("save",saved,(Path(state_dir)/"lifecycle.bin").stat().st_size,cached["tokens_cached"])
     evidence.append({"case": "slot_save", "result": saved})
     recovery("changed_prompt", tokens[1024:1536])
     recovery("shorter_prompt", tokens[:256])
     restored = request_json(url+"/slots/0?action=restore", {"filename": "lifecycle.bin"}, timeout=args.request_timeout)
+    if state_dir is not None:
+        validate_lifecycle_state("restore",restored,(Path(state_dir)/"lifecycle.bin").stat().st_size,saved["n_saved"])
     evidence.append({"case": "slot_restore", "result": restored})
     recovery("after_slot_restore", tokens[:640], True)
     body = json.dumps({**payload, "prompt": tokens[:args.lifecycle_context+1], "n_predict": 16}).encode()
@@ -471,15 +574,18 @@ def run_point(args, context, depth, token_cache, mode):
                    "--cuda-memory-usage=true", "--output", str(directory / "native"), *command]
     row = {"status": "failed", "context": context, "depth": depth, "mode": mode,"arena_mib":args.arena_mib,
            "spec_mode": getattr(args, "spec_mode", "dflash"),
+           "ngram": ngram_settings(args),
            "command": command, "uvm": getattr(args,"uvm",False),
            "numerical_control_only":getattr(args,"uvm",False),"log": str(log_path), "directory": str(directory)}
     process = None
     url = f"http://127.0.0.1:{args.port}"
     with log_path.open("x") as log:
         try:
+            startup = time.monotonic()
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env,
                                        start_new_session=True)
             wait_for_health(url, 180, process)
+            row["startup_seconds"] = time.monotonic()-startup
             if "tokens" not in token_cache:
                 token_cache["tokens"] = request_json(url+"/tokenize", {
                     "content": args.prefill_text.read_text(), "add_special": False}, timeout=180)["tokens"]
@@ -495,6 +601,7 @@ def run_point(args, context, depth, token_cache, mode):
                 config = copy.copy(args)
                 config.lifecycle_context = context
                 config.lifecycle_pid = process.pid
+                config.lifecycle_state_dir = directory
                 row["lifecycle"] = []
                 lifecycle_checks(config, url, token_cache["tokens"], row["lifecycle"])
         except Exception as error:
@@ -507,7 +614,8 @@ def run_point(args, context, depth, token_cache, mode):
     if row["status"] == "ok":
         try:
             validate_control_log(log_text, row.get("lifecycle", []))
-        except RuntimeError as error:
+            row["source_stats"] = validate_mixed_sources(log_text, require_both=False) if row["spec_mode"] == "dflash-k4v" else speculative_source_stats(log_text)
+        except (RuntimeError, ValueError) as error:
             row.update(status="failed",error=str(error))
     if row["status"] != "ok":
         row["status"] = failure_kind(log_text)
@@ -531,8 +639,11 @@ def main():
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--contexts", default="4096")
     parser.add_argument("--depths", default="1,3,7")
-    parser.add_argument("--spec-mode", choices=("dflash", "none", "mtp"), default="dflash",
+    parser.add_argument("--spec-mode", choices=("dflash", "dflash-k4v", "none", "mtp"), default="dflash",
                         help="matched comparison mode; none needs --depths 0, MTP supports depths 1-3")
+    parser.add_argument("--ngram-n", type=int, help="mixed K4V lookup length (default: 12)")
+    parser.add_argument("--ngram-m", type=int, help="mixed K4V maximum proposals (default: 7; supported: 1-7)")
+    parser.add_argument("--ngram-min-hits", type=int, help="mixed K4V minimum hits (default: 2)")
     parser.add_argument("--prompt-tokens", type=int, default=2304)
     parser.add_argument("--decode-tokens", type=int, default=64)
     parser.add_argument("--prompt-headroom",type=int,
@@ -547,6 +658,8 @@ def main():
     parser.add_argument("--draft-v", choices=KV_TYPES, help="native controls only; streamed drafts inherit target V")
     parser.add_argument("--prefill-text", type=Path, default=ROOT/"benchmarks/data/online-articles-262144-words.txt")
     parser.add_argument("--trace-library", type=Path)
+    parser.add_argument("--cpu-profile", action="store_true",
+                        help="after ordinary timing, collect test-side host-call costs and require identical outputs/counters; not speed evidence")
     parser.add_argument("--nsys", type=Path)
     parser.add_argument("--compare-to", type=Path,
                         help="require byte-exact captured data against matching independent native controls")
@@ -580,8 +693,10 @@ def main():
         parser.error("UVM is only allowed for independent native numerical controls")
     if args.compare_numerical_only and not args.compare_to:
         parser.error("--compare-numerical-only needs --compare-to")
-    if args.spec_mode != "dflash" and (args.trace_library or args.compare_to or args.nsys):
-        parser.error("DFlash-specific capture/trace comparisons require --spec-mode dflash")
+    try:
+        modes = control_modes(args)
+    except ValueError as error:
+        parser.error(str(error))
     if not 0 <= args.lifecycle_cache_mib <= 2**31-1 or (args.lifecycle_cache_mib and not args.lifecycle):
         parser.error("--lifecycle-cache-mib needs --lifecycle and a nonnegative int32 size")
     if (args.arena_mib < 0 or args.decode_tokens < 8 or args.prompt_tokens < 256 or not 1 <= args.port <= 65535
@@ -611,7 +726,6 @@ def main():
     manifest = read_json(ROOT/"benchmarks/data/dflash2-qwen27b-artifacts.json")
     report = inspect_artifacts({"target": args.target, "draft": args.draft, "draft_config": args.draft_config}, manifest)
     (args.output / "artifacts.json").write_text(json.dumps(report, indent=2)+"\n")
-    modes = ["timing"] + (["capture"] if args.trace_library else []) + (["nsight"] if args.nsys else [])
     token_cache = {}
     controls = []
     control_artifacts = {}
@@ -623,9 +737,29 @@ def main():
             for depth in depths:
                 arena,qualified=auto_arena_for_point(args,context,depth,token_cache)
                 args.arena_mib=arena
+                ordinary = None
                 for mode in modes:
                     started = time.monotonic()
                     row = qualified if qualified is not None and mode == "timing" else run_point(args, context, depth, token_cache, mode)
+                    if mode == "timing" and row["status"] == "ok":
+                        ordinary = row
+                    if mode == "cpu-profile" and row["status"] == "ok":
+                        try:
+                            from analyze_dflash_profile import summarize_cpu_trace
+                            if ordinary is None:
+                                raise ValueError("CPU profile omitted its ordinary control")
+                            validate_lifecycle_pair(ordinary["result"], row["result"])
+                            if ordinary["source_stats"] != row["source_stats"]:
+                                raise ValueError("profile changed source-specific prediction/draft/acceptance counters")
+                            trace = [json.loads(line) for line in (Path(row["directory"])/"trace.jsonl").read_text().splitlines()]
+                            if not any(r.get("event") == "generation_begin" for r in trace):
+                                raise ValueError("CPU profile omitted generation boundaries")
+                            row["cpu"] = summarize_cpu_trace(trace)
+                            if args.spec_mode == "dflash-k4v" and not row["cpu"]["lookup"]["all"]["count"]:
+                                raise ValueError("CPU profile did not observe the actual K4V lookup")
+                            row["diagnostic_only"] = True
+                        except (ValueError, OSError) as error:
+                            row.update(status="failed", error=str(error))
                     if args.compare_to and row["status"] == "ok" and mode == "capture":
                         try:
                             matches = [r for r in controls if r.get("context") == context and r.get("depth") == depth

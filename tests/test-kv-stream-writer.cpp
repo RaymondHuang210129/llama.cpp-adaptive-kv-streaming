@@ -157,7 +157,7 @@ struct release_probe {
     inline static release_probe * active = nullptr;
     explicit release_probe(ggml_backend_buffer_t buffer) : buffer(buffer), original(buffer->iface.free_buffer) {
         GGML_ASSERT(!active); active = this;
-        buffer->iface.free_buffer = [](ggml_backend_buffer_t b) { ++active->frees; active->original(b); };
+        buffer->iface.free_buffer = [](ggml_backend_buffer_t b) { ++active->frees; if (active->original) active->original(b); };
     }
     ~release_probe() { if (!frees) buffer->iface.free_buffer = original; active = nullptr; }
 };
@@ -442,6 +442,38 @@ int main(int argc, char ** argv) {
         llama_kv_stream_host_layer host; f.host->layer(0, host);
         t.assert_equal(value, *static_cast<uint8_t *>(host.k));
         t.assert_equal(uint8_t(0), *static_cast<uint8_t *>(host.v));
+    });
+    t.test("cached_writer_retains_destination_scope_through_final_completion", [&](testing & t) {
+        for (size_t maximum : {3u,256u}) for (bool value : {false,true}) {
+            writer_fixture f(backend.get(),cuda);
+            encoder control(f,3,value ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0);
+            control.run();
+            std::vector<uint8_t> expected(control.rows*control.row_bytes),actual(expected.size());
+            ggml_backend_tensor_get(control.output,expected.data(),0,expected.size());
+            auto * type=ggml_backend_get_default_buffer_type(backend.get());
+            size_t bytes=0;
+            if (!t.assert_true(llama_kv_stream_writer::requirements(type,f.host->config().shape,maximum,bytes))) return;
+            ggml_backend_buffer_ptr parent(ggml_backend_buft_alloc_buffer(type,bytes+256));
+            if (!t.assert_true(bool(parent))) return;
+            ggml_backend_buffer_ptr scratch(ggml_backend_buffer_view(parent.get(),128,bytes));
+            if (!t.assert_true(bool(scratch))) return;
+            auto * identity=scratch.get();
+            release_probe probe(identity);
+            auto writer=llama_kv_stream_writer::create(backend.get(),identity,bytes,f.host->config().shape,maximum);
+            if (!t.assert_true(bool(writer)) || !t.assert_true(writer->generate(control.source,value,actual.data(),{}))) return;
+            if (!t.assert_true(actual==expected)) return;
+            scratch.reset();
+            if (!t.assert_equal("cached writer keeps destination metadata alive after the caller releases it",0,probe.frees)) return;
+            ggml_backend_buffer_ptr replacement(ggml_backend_buffer_view(parent.get(),128,bytes));
+            if (!t.assert_true(replacement && replacement.get()!=identity)) return;
+            std::fill(actual.begin(),actual.end(),uint8_t(0xcd));
+            llama_kv_stream_writer_completion completion;
+            if (!t.assert_true(writer->generate_async(control.source,value,actual.data(),{},completion))) return;
+            writer.reset();
+            t.assert_equal(1,probe.frees);
+            if (!t.assert_true(completion.host && completion.host->synchronize())) return;
+            t.assert_true(actual==expected);
+        }
     });
     t.test("release_writer_drops_cached_source_before_phase_reclaim", [&](testing & t) {
         writer_fixture f(backend.get(), cuda);

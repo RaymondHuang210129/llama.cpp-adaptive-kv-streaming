@@ -2684,6 +2684,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--vision-memory-report"},
+        "load a shared-arena vision configuration, print its shape-admission report as JSON, and exit",
+        [](common_params & params) { params.vision_memory_report = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--image-min-tokens"}, "N",
         "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)",
         [](common_params & params, int value) {

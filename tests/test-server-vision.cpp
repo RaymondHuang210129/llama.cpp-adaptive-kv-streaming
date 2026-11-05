@@ -1,5 +1,6 @@
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-task.h"
+#include "ngram-map.h"
 #include "testing.h"
 #include <cstring>
 
@@ -13,8 +14,72 @@ static common_params qualified() {
     return p;
 }
 
-int main() {
+int main(int argc, char ** argv) {
     testing t;
+    const bool k4v_readiness = argc == 2 && !std::strcmp(argv[1], "--k4v-vision-readiness");
+    if (argc > 1 && !k4v_readiness) return 2;
+    if (k4v_readiness) t.set_filter("k4v_vision_readiness");
+    if (k4v_readiness) t.test("k4v_vision_readiness", [](testing & t) {
+        mtmd::input_chunks_ptr chunks(mtmd_test_create_input_chunks());
+        const auto * image = mtmd_input_chunks_get(chunks.get(), 1);
+        if (!t.assert_true(image && mtmd_input_chunk_get_type(image) == MTMD_INPUT_CHUNK_TYPE_IMAGE)) return;
+        const auto rows = mtmd_input_chunk_get_n_tokens(image);
+        const auto positions = mtmd_input_chunk_get_n_pos(image);
+        if (!t.assert_true(rows > 0 && positions > 0)) return;
+        const auto lookup = [&](const llama_tokens & prefix, const llama_tokens & suffix) {
+            server_tokens prompt(prefix, true);
+            prompt.push_back(image);
+            for (auto id : suffix) prompt.push_back(id);
+            const auto snapshot = prompt.get_speculative_text();
+            const auto & text = snapshot.tokens;
+            t.assert_equal(prefix.size() + suffix.size(), text.size());
+            t.assert_equal(llama_pos(prefix.size() + positions + suffix.size()), prompt.pos_next());
+            common_ngram_map map(2, 3, false, 1);
+            common_ngram_map_begin(map, text, snapshot.ngram_begin);
+            llama_tokens copied;
+            common_ngram_map_draft(map, text, 20, copied);
+            t.out << "K4V image lookup rows=" << prompt.size() << " text=" << text.size()
+                  << " model_next=" << prompt.pos_next() << " copied=" << copied.size() << '\n';
+            return copied;
+        };
+        t.assert_true("real post-image repetition remains usable",
+            lookup({99,55}, {99,10,20,30,40,50,98,10}) == llama_tokens({30,40,50}));
+        t.assert_true("first post-image occurrence is a real key, not a zero sentinel",
+            lookup({}, {10,20,30,40,50,98,10}) == llama_tokens({30,40,50}));
+        t.assert_true("lookup key cannot join text across an image",
+            lookup({99,10}, {20,30,40,50,98,10}).empty());
+        t.assert_true("copied continuation cannot cross an image",
+            lookup({99,10,20,30}, {40,50,98,10}).empty());
+        t.assert_true("initial suffix-only policy excludes pre-image values",
+            lookup({99,10,20,30,40,50,98}, {10}).empty());
+        auto p = qualified();
+        p.n_batch = p.n_ubatch = 256;
+        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+        p.speculative.draft.mparams.path = "matching-dflash.gguf";
+        p.speculative.draft.n_max = 3;
+        p.speculative.ngram_map_k4v.size_n = 2;
+        p.speculative.ngram_map_k4v.size_m = 7;
+        p.speculative.ngram_map_k4v.min_hits = 1;
+        t.assert_true(!common_streamed_dflash_config_error(p) && !server_vision_arena_config_error(p));
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.tokens = server_tokens(llama_tokens{1,2,3}, true);
+        task.params.speculative = p.speculative;
+        t.assert_true(!server_vision_arena_request_error(task, false, &p.speculative));
+        p.speculative.types.insert(p.speculative.types.begin(), COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
+        task.params.speculative = p.speculative;
+        uint32_t depth = 0;
+        t.assert_true(!common_streamed_dflash_verification_error(p, depth) && depth == 7);
+        t.assert_true("mixed image common admission", !common_streamed_dflash_config_error(p));
+        t.assert_true("mixed image server admission", !server_vision_arena_config_error(p));
+        t.assert_true("mixed image request admission", !server_vision_arena_request_error(task, false, &p.speculative));
+    });
+    t.test("vision_memory_report_requires_a_real_shared_projector_profile",[](testing & t) {
+        auto p=qualified();p.vision_memory_report=true;
+        t.assert_true(!server_vision_arena_config_error(p));
+        p.mmproj.path.clear();t.assert_true(server_vision_arena_config_error(p));
+        p=qualified();p.vision_memory_report=true;p.shared_device_memory_bytes=0;
+        t.assert_true(server_vision_arena_config_error(p));
+    });
     t.test("vision_cache_formats_are_validated_by_capabilities_not_one_pair", [](testing & t) {
         const ggml_type types[] = {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0,
             GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL};
@@ -72,6 +137,36 @@ int main() {
         restored.keep_first(1+rows);
         t.assert_equal(size_t(1)+rows,restored.size());
         t.assert_equal(llama_pos(1+positions),restored.pos_next());
+    });
+    t.test("speculative_text_snapshot_keeps_media_boundaries_and_legacy_text", [](testing & t) {
+        mtmd::input_chunks_ptr chunks(mtmd_test_create_input_chunks());
+        const auto * image = mtmd_input_chunks_get(chunks.get(),1);
+        for (bool placeholder : {false,true}) for (int layout=0;layout<5;++layout) {
+            server_tokens prompt(llama_tokens{},true);
+            if (layout!=0) { prompt.push_back(11); prompt.push_back(12); }
+            if (placeholder) prompt.push_back_placeholder(image); else prompt.push_back(image);
+            if (layout>=2) {
+                if (layout!=3) prompt.push_back(13);
+                if (placeholder) prompt.push_back_placeholder(image); else prompt.push_back(image);
+            }
+            if (layout!=1) { prompt.push_back(14);prompt.push_back(15); }
+            const auto snapshot=prompt.get_speculative_text();
+            t.assert_true(snapshot.tokens==prompt.get_text_tokens());
+            t.assert_true(snapshot.has_media);
+            t.assert_equal(snapshot.tokens.size()-(layout==1 ? 0u : 2u),snapshot.ngram_begin);
+            const auto bytes=prompt.serialize();llama_tokens packed(bytes.size()/sizeof(llama_token));
+            std::memcpy(packed.data(),bytes.data(),bytes.size());
+            const auto restored=server_tokens::deserialize(packed,true).get_speculative_text();
+            t.assert_true(restored.tokens==snapshot.tokens && restored.ngram_begin==snapshot.ngram_begin && restored.has_media);
+        }
+        for (const auto & tokens : {llama_tokens{},llama_tokens{1,2,3}}) {
+            server_tokens prompt(tokens,true);const auto view=prompt.get_speculative_text();
+            t.assert_true(view.tokens==tokens && !view.has_media && view.ngram_begin==0);
+        }
+        server_tokens malformed(llama_tokens{1,LLAMA_TOKEN_NULL,2},true);
+        t.assert_true(malformed.get_text_tokens()==llama_tokens({1,2}));
+        bool rejected=false;try { malformed.get_speculative_text(); } catch (const std::exception &) { rejected=true; }
+        t.assert_true(rejected);
     });
     t.test("eager_multimodal_and_text_only_paths_keep_existing_policy", [](testing & t) {
         auto p = qualified(); p.shared_device_memory_bytes = 0; p.n_parallel = 4;
@@ -140,6 +235,100 @@ int main() {
         t.assert_true(server_vision_arena_request_error(task,true,&p.speculative)!=nullptr);
         task.params.speculative.draft.n_max=1;
         t.assert_true(!server_vision_arena_request_error(task,true,&p.speculative));
+    });
+    t.test("mixed_dflash_image_admission_preserves_independent_widths_and_fixed_lookup",[](testing & t) {
+        for (auto limits : {std::pair{3,7},std::pair{7,3}}) for (bool reverse : {false,true}) {
+            auto p=qualified();p.n_batch=p.n_ubatch=256;
+            p.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V};
+            if (reverse) std::reverse(p.speculative.types.begin(),p.speculative.types.end());
+            p.speculative.draft.n_max=limits.first;p.speculative.draft.mparams.path="matching-dflash.gguf";
+            p.speculative.ngram_map_k4v.size_n=2;p.speculative.ngram_map_k4v.size_m=uint16_t(limits.second);p.speculative.ngram_map_k4v.min_hits=1;
+            t.assert_true("common mixed image admission",!common_streamed_dflash_config_error(p));
+            t.assert_true("server mixed image admission",!server_vision_arena_config_error(p));
+            t.assert_equal(uint32_t(7),common_context_params_to_llama(p).n_rs_seq);
+            server_task task(SERVER_TASK_TYPE_COMPLETION);task.params.speculative=p.speculative;
+            task.tokens=server_tokens(llama_tokens{1,2,3},true);
+            t.assert_true("configured mixed request admission",!server_vision_arena_request_error(task,false,&p.speculative));
+            for (int change=0;change<10;++change) {
+                auto bad=p;
+                switch (change) {
+                    case 0: bad.speculative.ngram_map_k4v.size_m=0;break;
+                    case 1: bad.speculative.ngram_map_k4v.size_m=8;break;
+                    case 2: bad.speculative.ngram_map_k4v.size_m=48;break;
+                    case 3: bad.speculative.ngram_map_k4v.size_n=0;break;
+                    case 4: bad.speculative.ngram_map_k4v.size_n=1025;break;
+                    case 5: bad.speculative.ngram_map_k4v.min_hits=0;break;
+                    case 6: bad.n_ubatch=7;break;
+                    case 7: bad.speculative.types={COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V};break;
+                    case 8: bad.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);break;
+                    case 9: bad.speculative.draft.cache_type_k_explicit=true;break;
+                }
+                t.assert_true(server_vision_arena_config_error(bad));
+            }
+            for (int change=0;change<10;++change) {
+                server_task bad(SERVER_TASK_TYPE_COMPLETION);bad.params=task.params;bad.tokens=task.tokens.clone();
+                auto & spec=bad.params.speculative;
+                switch (change) {
+                    case 0: ++spec.ngram_map_k4v.size_m;break;
+                    case 1: ++spec.ngram_map_k4v.size_n;break;
+                    case 2: ++spec.ngram_map_k4v.min_hits;break;
+                    case 3: spec.draft.n_max=8;break;
+                    case 4: spec.draft.mparams.path="changed.gguf";break;
+                    case 5: spec.draft.cache_type_v_explicit=true;break;
+                    case 6: spec.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);break;
+                    case 7: spec.types={COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V};spec.draft.n_max=8;break;
+                    case 8: spec.types={COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V};break;
+                    case 9: spec.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};break;
+                }
+                t.assert_true(server_vision_arena_request_error(bad,false,&p.speculative));
+            }
+        }
+    });
+    t.test("pure_dflash_vision_uses_declared_serial_width_and_inherited_formats",[](testing & t) {
+        for (int depth : {1,3,7}) for (auto value : {GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_Q5_1}) {
+            auto p=qualified(); p.n_batch=p.n_ubatch=256;
+            p.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+            p.speculative.draft.n_max=depth; p.speculative.draft.mparams.path="matching-dflash.gguf";
+            p.cache_type_k=value==GGML_TYPE_Q5_1 ? GGML_TYPE_Q5_1 : GGML_TYPE_Q8_0;
+            p.cache_type_v=value;
+            t.assert_true("pure DFlash reaches loaded-model validation",!server_vision_arena_config_error(p));
+            server_task task(SERVER_TASK_TYPE_COMPLETION); task.tokens=server_tokens(llama_tokens{1,2,3},true);
+            task.params.speculative=p.speculative;
+            t.assert_true("configured DFlash image requests are admitted",!server_vision_arena_request_error(task,false,&p.speculative));
+            for (int change=0;change<9;++change) {
+                auto bad=p;
+                switch (change) {
+                    case 0: bad.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V); break;
+                    case 1: bad.speculative.draft.n_max=8; break;
+                    case 2: bad.speculative.draft.mparams.path.clear(); break;
+                    case 3: bad.kv_stream_auxiliary_layers=1; break;
+                    case 4: bad.speculative.draft.cache_type_k_explicit=true; break;
+                    case 5: bad.n_ubatch=depth; break;
+                    case 6: bad.n_parallel=2; break;
+                    case 7: bad.fit_params=true; break;
+                    case 8: bad.mmproj_use_gpu=false; break;
+                }
+                t.assert_true(server_vision_arena_config_error(bad));
+            }
+            for (int change=0;change<6;++change) {
+                auto bad=task.params.speculative;
+                switch (change) {
+                    case 0: bad.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V); break;
+                    case 1: bad.draft.n_max=depth+1; break;
+                    case 2: bad.draft.n_max=0; break;
+                    case 3: bad.draft.mparams.path="foreign.gguf"; break;
+                    case 4: bad.draft.cache_type_v_explicit=true; break;
+                    case 5: bad.types={COMMON_SPECULATIVE_TYPE_DRAFT_MTP}; break;
+                }
+                task.params.speculative=bad;
+                t.assert_true(server_vision_arena_request_error(task,false,&p.speculative));
+                task.params.speculative=p.speculative;
+            }
+            task.params.speculative.types={COMMON_SPECULATIVE_TYPE_NONE};
+            t.assert_true(!server_vision_arena_request_error(task,false,&p.speculative));
+            task.params.speculative=p.speculative;
+            t.assert_true(server_vision_arena_request_error(task));
+        }
     });
     return t.summary();
 }

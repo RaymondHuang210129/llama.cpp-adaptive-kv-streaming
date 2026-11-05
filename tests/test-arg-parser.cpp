@@ -92,6 +92,10 @@ static void test(void) {
             }
             assert(common_streamed_dflash_config_error(invalid));
         }
+        auto image=dflash;
+        image.mmproj.path="vision.gguf";
+        assert(!common_streamed_dflash_config_error(image));
+        assert(common_base_params_to_speculative(image).mmproj.path==image.mmproj.path);
         assert(common_context_params_to_llama(dflash).n_rs_seq == 7);
         assert(common_kv_stream_auxiliary_layers(dflash,1) == 0);
         const auto draft=common_base_params_to_speculative(dflash);
@@ -104,7 +108,7 @@ static void test(void) {
                 case 1: invalid.speculative.draft.n_max=8; break;
                 case 2: invalid.kv_stream_auxiliary_layers=1; break;
                 case 3: invalid.fit_params=true; break;
-                case 4: invalid.mmproj.path="vision.gguf"; break;
+                case 4: invalid.mmproj.path="vision.gguf"; invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V); break;
                 case 5: invalid.n_ubatch=4; break;
                 case 6: invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP); break;
             }
@@ -393,9 +397,13 @@ static void test(void) {
     std::vector<std::string> argv;
 
     {
-        for (const auto & mode : {"draft-mtp", "draft-dflash"}) {
+        for (const auto & mode : {"draft-mtp", "draft-dflash", "ngram-map-k4v,draft-dflash"}) {
             std::vector<std::string> base = {"binary_name", "--kv-stream-arena-mib", "2240", "--spec-type", mode,
                 "--fit", "off", "--parallel", "1", "--flash-attn", "on", "--cache-type-k", "q5_1", "--cache-type-v", "q8_0"};
+            const bool mixed = std::string(mode) == "ngram-map-k4v,draft-dflash";
+            if (mixed) {
+                base.insert(base.end(), {"--spec-ngram-map-k4v-size-m", "7", "--spec-draft-n-max", "3"});
+            }
             for (const auto & option : {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft",
                     "--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"}) for (bool before : {false, true}) {
                 auto overridden = base;
@@ -408,6 +416,10 @@ static void test(void) {
             assert(common_params_parse(base.size(), list_str_to_char(base).data(), automatic, LLAMA_EXAMPLE_SERVER));
             const auto draft = common_base_params_to_speculative(automatic);
             assert(draft.cache_type_k == GGML_TYPE_Q5_1 && draft.cache_type_v == GGML_TYPE_Q8_0);
+            if (mixed) {
+                assert(common_context_params_to_llama(automatic).n_rs_seq == 7);
+                assert(draft.n_outputs_max == 4);
+            }
 #ifndef _WIN32
             for (const auto & name : {"LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K", "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"}) {
                 const std::string saved = common_get_env(name);
@@ -417,6 +429,13 @@ static void test(void) {
                 common_set_env(name, saved);
             }
 #endif
+        }
+        {
+            common_params report;
+            std::vector<std::string> options={"binary_name","--vision-memory-report"};
+            assert(!report.vision_memory_report);
+            assert(common_params_parse(options.size(),list_str_to_char(options).data(),report,LLAMA_EXAMPLE_SERVER));
+            assert(report.vision_memory_report);
         }
         argv = {"binary_name", "--spec-type", "draft-mtp", "-ctkd", "q5_1", "-ctvd", "q4_1"};
         common_params native;

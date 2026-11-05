@@ -141,7 +141,9 @@ public:
     LLAMA_API bool has_speculative_consumer() const noexcept;
     // Declare an existing serial child that only reads its parent's committed cache.
     LLAMA_API bool register_shared_read_consumer() noexcept;
-    // Suspend only known auxiliary-cache writers or declared shared-cache readers.
+    // Declare a serial writer of the parent's existing persistent bounded-cache region.
+    LLAMA_API bool register_bounded_write_consumer(ggml_backend_memory_lease_t storage) noexcept;
+    // Suspend only registered auxiliary, bounded-writer or shared-reader arrangements.
     LLAMA_API bool can_suspend_for_vision() const noexcept;
     LLAMA_API bool borrows_serial_parent() const noexcept;
     LLAMA_API ggml_backend_buffer_t shared_parent() const noexcept;

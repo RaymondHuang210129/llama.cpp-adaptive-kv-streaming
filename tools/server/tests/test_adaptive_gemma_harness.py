@@ -17,6 +17,19 @@ import test_adaptive_gemma as harness
 
 
 class Commands(unittest.TestCase):
+    def test_cancellation_ignores_progress_ids_and_counts_real_outputs(self):
+        events=[b'data: {"tokens": [-1], "content": ""}\n',b'data: {"tokens": [11]}\n',
+                b'data: {"tokens": [12, 13]}\n',b'data: {"tokens": [14]}\n',b'data: {"tokens": [15]}\n']
+        for minimum,expected in [(1,2),(4,4)]:
+            seen=[]
+            def stream():
+                for item in events:seen.append(item);yield item
+            with patch.object(harness.urllib.request,"urlopen",return_value=contextlib.nullcontext(stream())):
+                harness.cancel_after_first_output("http://fixture",{"return_tokens":True},minimum_tokens=minimum)
+            self.assertEqual(len(seen),expected)
+        with patch.object(harness.urllib.request,"urlopen",return_value=contextlib.nullcontext(iter(events[:1]))):
+            with self.assertRaises(RuntimeError):harness.cancel_after_first_output("http://fixture",{})
+
     def test_vision_command_uses_declared_projector_and_image_budget(self):
         args=argparse.Namespace(server=Path("server"),model=Path("model"),assistant=Path("assistant"),
             mmproj=Path("projector"),image_min_tokens=70,image_max_tokens=140,context=4096,

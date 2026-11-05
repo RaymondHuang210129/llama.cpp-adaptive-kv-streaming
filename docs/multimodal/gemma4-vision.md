@@ -24,14 +24,14 @@ Vision reuses the same device parent as text prefill, decode and drafting. It pr
 | Optional matching Q8 assistant | 475.81 MiB | Outside the parent; remain on GPU, no assistant execution |
 | Local Q8 projector weights | 807,838,208 bytes / 770.41 MiB | Temporary weight grant inside the parent |
 | Local/SWA KV | Depends on image microbatch; table below | Protected persistent suffix inside the same parent |
-| Encoder attention and other activations | Measured for the actual image batch | Temporary compute grant inside the parent; no decoder KV history |
+| Encoder graph tensors, CUDA operator scratch and explicit cuBLAS workspace | Measured together for the actual image batch, including alignment | One retained temporary compute grant inside the parent; no decoder KV history |
 | Full-attention KV and completed image embeddings | Host allocations | Authoritative host history and owned outputs survive the handoff |
 
-The device parent bounds only its participating allocations. It does not bound decoded host images, pinned full KV, output embeddings, driver executables or every future request. Model weights also need memory outside the parent.
+The compute grant includes backend conversion/output/pointer temporaries and native-size explicit cuBLAS workspace. These no longer grow a separate native CUDA pool during managed image encoding. The device parent bounds only its participating allocations. It does not bound decoded host images, pinned full KV, output embeddings, driver executables or every future request. Model weights also need memory outside the parent.
 
 ## Projector artifacts and precision
 
-The selected Q8 file is 807,772,384 bytes, not a pure eight-bit encoding of every tensor. Shape-incompatible and sensitive tensors retain F16/F32. A smaller local Q4_0 candidate (599,140,576 file bytes) passed component/native-bit checks and the current synthetic fixture/F16-reference comparison, but is not the selected deployment artifact. These fixtures are not a general OCR, chart or visual-detail quality certificate. Native-versus-arena equality uses the same projector artifact; cross-precision outputs need not be identical.
+The selected Q8 file is 807,772,384 bytes, not a pure eight-bit encoding of every tensor. Shape-incompatible and sensitive tensors retain F16/F32. A smaller local Q4_0 candidate (599,140,576 file bytes) passed earlier component/native-bit and synthetic-fixture/F16-reference checks. It is neither the selected deployment artifact nor part of the current controlled-workspace CUDA qualification. These fixtures are not a general OCR, chart or visual-detail quality certificate. Native-versus-arena equality uses the same projector artifact; cross-precision outputs need not be identical.
 
 The recorded Q8 artifact was made directly from the pinned matching F16 projector with the existing quantizer, without overriding its sensitive-tensor exclusions or shape fallbacks. From the repository root:
 
@@ -45,25 +45,29 @@ Verify the reference and resulting artifact hashes against the [qualification ma
 
 ## Image budgets and measured fit
 
-| Requested per-image budget | Square output rows | Tested b/ub | Protected SWA MiB | One-image encoder workspace MiB | Normal parent MiB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 70 | 64 | 256/256 | 406.25 | 37.66 | 2048 |
-| 140 | 121 | 256/256 | 406.25 | 71.20 | 2048 |
-| 280 | 256 | 512/512 | 487.50 | 150.63 | 2048 |
-| 560 | 529 | 768/768 | 568.75 | 311.26 | 2048 |
-| 1120 | 1089 | 1280/1280 | 731.25 | 640.75 | 2143 |
+| Requested per-image budget | Square output rows | Tested b/ub | Protected SWA MiB | Graph MiB | Complete one-image compute MiB | Joint reference parent MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 70 | 64 | 256/256 | 406.25 | 37.66 | 87.87 | 2048 |
+| 140 | 121 | 256/256 | 406.25 | 71.20 | 114.53 | 2048 |
+| 280 | 256 | 512/512 | 487.50 | 150.63 | 206.60 | 2048 |
+| 560 | 529 | 768/768 | 568.75 | 311.26 | 392.80 | 2048 |
+| 1120 | 1089 | 1280/1280 | 731.25 | 640.75 | 774.75 | 2284 |
 
 Budgets are limits, not guaranteed row counts. The Gemma4V preprocessor uses floor-aligned aspect-ratio geometry; at budget 1120 the portrait/landscape fixtures produce 1064 rows and the narrow fixture 945. Qwen retains its separate preprocessing. The image chunk must fit in one admitted microbatch. Wider image batches enlarge local rollback/headroom storage, so a text-only `--ubatch-size 256` fit does not qualify every image budget. Compatible images can share an encoder batch; the larger two-image fixtures split through the existing batch limits and retain prompt order.
 
-At ctx 4096, prefix 1333 and 16 outputs, modes 0-3 have exact per-scenario native API controls through budget 560; target-only also has them at 1120. Eager native MTP1-3 at 1120 runs out of VRAM allocating the 640.75 MiB encoder workspace after valid text controls. The arena's 1120 MTP profiles pass using staged native encoder/logit/hidden-vector oracles plus separate lifecycle self-consistency; **that is not full native API equivalence at 1120 MTP**.
+In the earlier graph-only cohort at ctx 4096, prefix 1333 and 16 outputs, modes 0-3 have exact per-scenario native API controls through budget 560; target-only also has them at 1120. Eager native MTP1-3 at 1120 runs out of VRAM allocating the 640.75 MiB encoder workspace after valid text controls. The arena's 1120 MTP profiles pass using staged native encoder/logit/hidden-vector oracles plus separate lifecycle self-consistency; **that is not full native API equivalence at 1120 MTP**.
 
-The recorded two-image 1120 workload has a 2143 MiB whole-MiB phase minimum and independent maximum-fit parents of 2812 MiB target-only / 2332 MiB MTP1-3, each with an actual rejected +1 MiB neighbor. These are measured configurations on one card, not portable minima/maxima or arbitrary-image guarantees.
+The table's complete compute figures are fresh isolated encoder controls at all five budgets, with original native F32 output equality and no native-pool growth or retained external explicit cuBLAS workspace. They use a 2048 MiB encoder-only parent without loaded decoder weights or protected SWA. Fresh joint public controls cover the normal 256-budget profile and all four modes at 1120; the latter use 2284 MiB, b/ub1280 and all seven source ratios. MTP at budget 1120 retains its explicitly scoped encoder/native-decoder component reference because the full native server cannot fit. Lower-budget earlier full-model controls are a separate source cohort, not freshly relabelled results.
+
+Complete all-seven-ratio 1120 admission requires 2394857856 bytes: 2284 MiB fits and 2283 MiB rejects. The matching graph-only all-seven-ratio minimum was 2149 MiB. The older two-image fixture's 2143 MiB minimum and independent 2812/2332 MiB maxima predate this migration and are retained as historical evidence, not current sizing recommendations. New automatic finder examples and their exact workload scope are in the [capacity report](vision-capacity.md).
+
+The later native-context-capacity ratio sweep uses b/ub1280 and MTP3, refits the parent to 2444 MiB (2445 rejected), and reaches the native 1120 budget for all seven ratios under one common setting. It executes 2560-token bounded text probes and 256 outputs per request; it does not repeat the full-context text validation. The [larger-image results and command](vision-capacity.md#gemma-1120-budget-profile) distinguish this profile from the fully validated b/ub256 example.
 
 ### Find a fit for your images
 
 No existing server, container or background service is required. Build the [vision-enabled server](../../README.md#build), make sufficient GPU memory available, and choose an unused port. The finder below launches and cleans up its own temporary servers; it neither contacts an existing inference server nor manages other services. Run commands from the repository root, using your own model/image paths and a fresh output directory.
 
-For text sizing with a configured projector, the [README's two native-context examples](../../README.md#find-a-usable-arena-size) use `--probe-mode preflight --validate-selected`: short real prefill/decode probes find the candidate limit, then the complete requested text workload runs once at the selected arena. The report separates probe history, requested history and full-workload validation. A configured projector without an image is not encoder validation. Supplying an image retains the complete image request even in preflight mode; it is never shortened into a causal text surrogate.
+For text sizing with a configured projector, the [README's two native-context examples](../../README.md#find-a-usable-arena-size) use `--probe-mode preflight --validate-selected`: short real prefill/decode probes find the candidate limit, then the complete requested text workload runs once at the selected arena. The report separates probe history, requested history and full-workload validation. With a projector and no supplied image, the finder now runs the [automatic resolution-capacity checks](vision-capacity.md), including real encoder execution for landscape and portrait shapes. Supplying an image retains the complete image request even in preflight mode; it is never shortened into a causal text surrogate.
 
 ```sh
 python3 benchmarks/find-max-arena.py \
@@ -77,7 +81,7 @@ python3 benchmarks/find-max-arena.py \
   --decode-tokens 16 --output benchmarks/results/fit-gemma-images
 ```
 
-The prompt file needs one `<__media__>` marker per image. In the recorded two-pattern run, selected fields were `arena_mib=2332`, `next_mib_rejected=2333`, `vision_execution_validated=true`, `draft_length=3`, and `decode_tokens=16`. These are real measured values for those pinned fixtures, not predicted results for the example's arbitrary photos. `--initial-arena-mib` is optional and is not a required arena input. A `--mmproj` run without `--image` remains only a configured-projector text fit.
+The prompt file needs one `<__media__>` marker per image. In the historical graph-only two-pattern run, selected fields were `arena_mib=2332`, `next_mib_rejected=2333`, `vision_execution_validated=true`, `draft_length=3`, and `decode_tokens=16`. Those are historical measured values for those pinned fixtures, not current fits or predicted results for the example's arbitrary photos. `--initial-arena-mib` is optional and is not a required arena input. A `--mmproj` run without `--image` now reports [validated per-ratio processed resolutions](vision-capacity.md); it does not reuse these two-image measurements.
 
 ## Running an image request locally
 
@@ -115,6 +119,8 @@ Stop the server with Ctrl-C when finished. Run the finder separately, not alongs
 
 ## Phase measurements
 
+The following figures and CSV/JSON describe the earlier graph-only source cohort. Its compute curve excludes the operator/library storage now shown in the table above; it must not be read as the current complete-workspace requirement.
+
 ![Gemma image phase memory inside the one device parent](../../media/gemma4-vision-phase-memory.png)
 ![Gemma first-image latency and phase handoff measurements](../../media/gemma4-vision-phase-latency.png)
 
@@ -122,11 +128,19 @@ Stop the server with Ctrl-C when finished. Run the finder separately, not alongs
 
 ## Numerical, lifecycle and memory qualification
 
-Long image lifecycle coverage is separately scoped to budget 70, capacity 131072 and a 98304-token text prefix at all four modes, including actual ring use, later images, save/restore and process restart. It is streamed-only self-consistency, not long native equivalence or full 256 Ki image-prefill qualification. The 4 Ki image tests also cover 1024-output generations and another image after decode. Failed requests use validated recovery or an explicit uncached reset; malformed state-file rejection does not promise that the prior in-memory cache survived unchanged.
+The current complete-workspace audit includes ordinary/native embedding controls, all-64 D512 reader guards, protected SWA/target continuation through failures, public target/MTP1-3 image scenarios, and explicit component scopes where full native capacity fails. All thirteen shared extension strict gates report zero errors; sixteen host ASAN/UBSAN suites pass. Three affected CUDA adapter files compile to actual SM61/70/75/86 code images using native flags; that is compile-only coverage, not vision runtime on older physical GPUs.
 
-The joint public-vision and image-conditioned full-vector memory gates use the explicitly approved 1536 MiB sanitizer-only parent, unchanged model/projector/KV types and exact vector/API checks. Ordinary 2048/2143 MiB profiles remain unchanged. Encoder/component controls retain their separately recorded budgets; a largest-budget component pass is not a full joint 1120 MTP sanitizer run. Driver executables, host preprocessing and host KV are not bounded by the device arena.
+Earlier long image lifecycle coverage is separately scoped to budget 70, capacity 131072 and a 98304-token text prefix at all four modes, including actual ring use, later images, save/restore and process restart. It is streamed-only self-consistency, not long native equivalence or full 256 Ki image-prefill qualification. The 4 Ki image tests also cover 1024-output generations and another image after decode. Failed requests use validated recovery or an explicit uncached reset; malformed state-file rejection does not promise that the prior in-memory cache survived unchanged.
+
+The original joint memory gates used a 1536 MiB sanitizer-only parent. Complete scratch correctly rejects that size for two compatible 256-budget images: 807838208 weight bytes + 399706240 compute bytes + 425984000 protected SWA bytes = 1633528448 bytes. The fresh strict public replay therefore uses the smallest whole-MiB fit, 1558 MiB, with unchanged pixels, models, KV types and exact checks. Normal profiles retain 2048 MiB; the expanded all-seven-ratio 1120 profile uses the separately measured 2284 MiB. Encoder/component controls retain their separately recorded budgets; a largest-budget component pass is not a full joint 1120 MTP sanitizer run. Driver executables, host preprocessing and host KV are not bounded by the device arena.
 
 The [server test guide](../../tools/server/tests/README.md#gemma-4-vision-and-shared-kv-mtp-qualification) gives standalone numerical, recovery and long-ring harness commands. Those harnesses create their own local servers and require no running service. Full native controls must fit on the device; an allocation failure is a capacity finding, not a numerical pass. Exact artifacts, rejected profiles and accepted partial results remain recorded in the manifest and roadmap.
+
+## Current ordinary regression controls
+
+At fixed 2048 MiB, three warmed uncached samples for each of three source sizes compare the earlier graph-only implementation with the current complete-workspace path. Gemma preprocessing maps those sources to two distinct processed geometries. Generated IDs and prompt/cache/draft/accept counts match. Target-only median request-latency changes range from +0.095% to +0.594%; MTP3 from +0.062% to +0.180%. Encoder phases add about 1.3-1.6 ms to the roughly 95-106 ms baseline; this required admission/ownership work is reported rather than called zero overhead. No material end-to-end regression is observed on these fixtures.
+
+Sampled 50 ms device peaks change from 15451.62 to 15389.62 MiB target-only and 15931.62 to 15869.62 MiB MTP3, with identical parents and weights. They can miss short transients. Separate three-pair Open-SWE text controls retain exact same-mode outputs and layouts; target-only/MTP3 median decode changes are -0.014%/+0.001%. These are scoped regression checks, not a model-quality certificate or a new speedup claim.
 
 ## Internal API and lifetime contracts
 
@@ -152,7 +166,7 @@ For direct C API callers, select `swa_full=false` for bounded Gemma: the C API d
 
 ### Vision lending and completion
 
-Use the existing MTMD session path rather than duplicating a server state machine. `mtmd_vision_phase_compatible` validates the loaded projector/target capabilities; it does not prove arbitrary artifacts are a matching or qualified pair. `mtmd_batch_measure_vision_phase` describes actual weight and device/host compute requirements. `llama_context_memory::quote_suspended_loans` performs a metadata-only aligned quota check before target suspension; report its required/available/additional bytes, not GGUF file-size estimates.
+Use the existing MTMD session path rather than duplicating a server state machine. `mtmd_vision_phase_compatible` validates the loaded projector/target capabilities; it does not prove arbitrary artifacts are a matching or qualified pair. `mtmd_batch_quote_vision_phase` describes actual weight and complete device/host compute requirements before full quota admission; `mtmd_batch_measure_vision_phase` retains its strict-fit contract. Compute details separate graph, operator, explicit library and padding bytes. A graph-placement limit protects the operator banks inside the same retained root loan; see the [private workspace API](../../DEVICE_MEMORY_INFRASTRUCTURE.md#private-phase-and-operator-workspace). `llama_context_memory::quote_suspended_loans` performs a metadata-only aligned quota check before target suspension; report its required/available/additional bytes, not GGUF file-size estimates.
 
 `llama_context_suspend_kv_device` synchronizes the target and completes any recurrent publication when present. Gemma instead preserves the bounded native SWA lease and committed full-attention host history. `lend_suspended` uses the existing `PRESERVE_PERSISTENT` arena plan and materializes only disjoint temporary grants. Unknown regions, retained temporary loans or active serial work still reject unsafe transitions. Protected bytes are not counted again as borrowed vision bytes in diagnostics.
 

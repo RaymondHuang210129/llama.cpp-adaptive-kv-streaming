@@ -53,6 +53,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+struct common_speculative_ngram_context {
+    size_t begin = 0;
+    uint64_t generation = 0; // Zero keeps the original whole-prompt policy.
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -79,12 +84,16 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    common_speculative_ngram_context ngram_context;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
+void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt,
+        common_speculative_ngram_context context);
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
@@ -94,6 +103,9 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+// A replayed correction advances the neural boundary without accepting an original proposal.
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id,
+        uint16_t boundary_row, uint16_t n_accepted);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
@@ -101,6 +113,22 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+struct common_speculative_stats {
+    common_speculative_type type;
+    size_t n_call_begin;
+    size_t n_call_draft;
+    size_t n_call_accept;
+    size_t n_gen_drafts;
+    size_t n_acc_drafts;
+    size_t n_gen_tokens;
+    size_t n_acc_tokens;
+    size_t n_predict; // Successful DFlash/DSpark prediction forwards, not dispatcher calls.
+};
+
+// Snapshot host counters without synchronizing a backend.
+std::vector<common_speculative_stats> common_speculative_get_stats(const common_speculative * spec);
+common_speculative_type common_speculative_get_last_type(const common_speculative * spec, llama_seq_id seq_id);
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }

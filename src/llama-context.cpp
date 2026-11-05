@@ -103,9 +103,16 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+llama_context::llama_context(const llama_model & model, llama_context_params params) :
+    llama_context(model, params, 0) {}
+
+llama_context::llama_context(const llama_model & model, llama_context_params params,
+        uint32_t serial_prediction_rows) : llama_context(model, params, serial_prediction_rows, false) {}
+
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+              uint32_t serial_prediction_rows, bool serial_image_inputs) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -120,6 +127,15 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    if (serial_image_inputs && !serial_prediction_rows) {
+        throw std::runtime_error("image feature preparation requires an attached serial block drafter");
+    }
+
+    if (serial_prediction_rows && (model.arch != LLM_ARCH_DFLASH || !params.ctx_other ||
+            !params.ctx_other->get_cparams().kv_streaming())) {
+        throw std::runtime_error("explicit serial prediction rows require an attached streamed block drafter");
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -375,12 +391,14 @@ llama_context::llama_context(
 
     if (model.arch == LLM_ARCH_DFLASH && params.ctx_other && params.ctx_other->get_cparams().kv_streaming()) {
         auto * target=params.ctx_other;
-        const uint32_t block_rows=target->get_cparams().kv_stream_decode_rows();
+        const uint32_t target_rows=target->get_cparams().kv_stream_decode_rows();
+        const uint32_t block_rows=serial_prediction_rows ? serial_prediction_rows : target_rows;
         if (target->get_model().arch != LLM_ARCH_QWEN35 || target->get_cparams().kv_stream_auxiliary_layers ||
                 !target->get_model().hparams.n_embd ||
                 !target->compute_memory || params.swa_full || !hparams.n_swa || !hparams.dflash_selector_rank ||
                 hparams.dflash_block_size < 2 || hparams.dflash_block_size > 8 ||
-                block_rows < 2 || block_rows > hparams.dflash_block_size || block_rows > cparams.n_ubatch ||
+                target_rows < 2 || target_rows > 8 || block_rows < 2 || block_rows > target_rows ||
+                block_rows > hparams.dflash_block_size || block_rows > cparams.n_ubatch ||
                 cparams.n_seq_max != 1 || cparams.n_rs_seq ||
                 cparams.n_ctx != target->n_ctx() || !cparams.offload_kqv || !cparams.flash_attn ||
                 model.devices.size() != 1 || model.devices.front().dev != target->get_model().devices.front().dev ||
@@ -396,6 +414,10 @@ llama_context::llama_context(
             }
         }
         // Configure every retained feature before a child can capture the target's arena addresses.
+        if (target->serial_feature_images!=serial_image_inputs) {
+            target->serial_feature_images=serial_image_inputs;
+            target->sched_reserve_state.invalidate();
+        }
         target->serial_feature_producer=true;
         target->serial_feature_layers=model.target_layer_ids;
         for (auto id : model.target_layer_ids) target->set_embeddings_layer_inp(uint32_t(id),true);
@@ -586,8 +608,12 @@ llama_context::llama_context(
                 serial_target_ctx->sched_reserve_state.invalidate();
                 serial_target_ctx->sched_reserve();
             }
-            if (!(serial_cache=parent->reserve_bounded_cache(layout))) {
-                throw std::runtime_error("bounded draft KV does not fit the declared serial arena");
+            llama_context_memory_create_result cache_admission;
+            if (!(serial_cache=parent->reserve_bounded_cache(layout,&cache_admission))) {
+                throw std::runtime_error(std::string("bounded draft KV does not fit the declared serial arena: ")+
+                    llama_context_memory_create_status_name(cache_admission.status)+"; required="+std::to_string(cache_admission.required_bytes)+
+                    ", available="+std::to_string(cache_admission.available_bytes)+", additional="+std::to_string(cache_admission.additional_bytes)+
+                    " bytes; phase="+std::to_string(cache_admission.stage)+", resource="+std::to_string(cache_admission.resource));
             }
             params_mem.bounded_cache_lease=serial_cache->lease();
         }
@@ -907,7 +933,7 @@ bool llama_context::prepare_compute_arenas(
         if (!compute_memory && serial_parent && !cparams.serial_block_rows && !cparams.kv_shared_read &&
                 admission.status == llama_context_memory_create_status::insufficient_budget) {
             // Keep separate scratch if the shared budget cannot hold the draft graph and live KV scratch.
-            LLAMA_LOG_INFO("%s: MTP graph exceeds shared arena quota: available=%zu required=%zu additional=%zu bytes; trying a separate workspace\n",
+            LLAMA_LOG_WARN("%s: MTP graph exceeds shared arena quota: available=%zu required=%zu additional=%zu bytes; trying a separate workspace\n",
                 __func__,admission.available_bytes,admission.required_bytes,admission.additional_bytes);
             llama_context_memory_create_result fallback;
             compute_memory = llama_context_memory::create(
@@ -951,6 +977,9 @@ bool llama_context::prepare_compute_arenas(
         }
         if (compute_memory && cparams.kv_shared_read && !compute_memory->register_shared_read_consumer())
             throw std::runtime_error("failed to register shared read-only serial consumer");
+        if (compute_memory && cparams.serial_block_rows &&
+                (!serial_cache || !compute_memory->register_bounded_write_consumer(serial_cache->lease())))
+            throw std::runtime_error("failed to register parent-owned bounded draft writer");
         if (compute_memory) compute_memory_graph_revision = compute_memory->graph_binding_revision();
         return compute_memory != nullptr;
     }
@@ -1072,6 +1101,22 @@ void llama_context::sched_reserve() {
             n_seqs, n_seqs, n_seqs, mctx.get(), true,
             measurements.data() + backend_ptrs.size());
         if (!gf_pp || !gf_tg) return false;
+        if (serial_feature_images) {
+            const bool decode_intent=cparams.kv_stream_decode;
+            std::vector<uint32_t> measured;
+            for (uint32_t width : {1u,64u,128u,129u,n_injection ? n_injection-1 : 0,n_injection}) {
+                if (!width || width>n_injection || std::find(measured.begin(),measured.end(),width)!=measured.end()) continue;
+                measured.push_back(width);
+                for (uint32_t outputs : {1u,std::max(1u,std::min(width,cparams.n_outputs_max))}) {
+                    std::vector<size_t> image(backend_ptrs.size());
+                    cparams.kv_stream_decode=false;
+                    if (!graph_reserve(width,1,outputs,mctx.get(),true,image.data(),true)) return false;
+                    for (size_t i=0;i<backend_ptrs.size();++i) measurements[i]=std::max(measurements[i],image[i]);
+                }
+            }
+            cparams.kv_stream_decode=decode_intent;
+            LLAMA_LOG_INFO("%s: measured %zu image input widths before serial draft registration\n",__func__,measured.size());
+        }
         if (model.arch == LLM_ARCH_DFLASH && model.hparams.n_embd_inp_enc() > 0) {
             // Injection and block prediction use different graph inputs but the same workspace.
             std::vector<size_t> injection(backend_ptrs.size());
@@ -1309,15 +1354,35 @@ llama_context_memory * llama_context_compute_memory(llama_context * ctx) noexcep
     return ctx ? const_cast<llama_context_memory *>(ctx->get_compute_memory()) : nullptr;
 }
 
+void llama_context::clear_serial_features() {
+    serial_feature_rows.clear();
+    serial_feature_image_rows.clear();
+    serial_feature_image_values.clear();
+    serial_feature_image_width=0;
+}
+
 bool llama_context::serial_features_match(const llama_batch_ext & batch,const int32_t * ids,uint32_t count) const {
     if (!serial_feature_producer || serial_feature_rows.empty() || serial_feature_rows.size() != batch.tokens.size() ||
             !memory || memory->seq_pos_max(0) != serial_feature_rows.back().second) return false;
     if ((ids || count) && (!ids || count != serial_feature_layers.size() ||
             !std::equal(serial_feature_layers.begin(),serial_feature_layers.end(),ids))) return false;
     for (auto id : serial_feature_layers) if (!cparams.embeddings_layer_inp[uint32_t(id)]) return false;
+    const bool image_frame=!serial_feature_image_rows.empty();
+    if (image_frame) {
+        if (!serial_feature_images || serial_feature_image_rows.size()!=batch.tokens.size() ||
+                serial_feature_image_width!=batch.n_embd || serial_feature_image_values.empty() ||
+                serial_feature_image_values.size()!=batch.embd.size() ||
+                std::memcmp(serial_feature_image_values.data(),batch.embd.data(),batch.embd.size()*sizeof(float))) return false;
+        for (size_t i=0;i<batch.tokens.size();++i) {
+            const auto & token=batch.tokens[i];
+            const auto & saved=serial_feature_image_rows[i];
+            if (token.has_embd!=saved.has_embd || token.pos!=saved.position ||
+                    (token.has_embd && token.embd_off!=saved.offset)) return false;
+        }
+    }
     for (size_t i=0;i<batch.tokens.size();++i) {
         const auto & token=batch.tokens[i];
-        if (token.has_embd || token.seq_ids.size() != 1 || !token.seq_ids.count(0) ||
+        if ((!image_frame && token.has_embd) || token.seq_ids.size() != 1 || !token.seq_ids.count(0) ||
                 token.id != serial_feature_rows[i].first || token.pos[0] != serial_feature_rows[i].second) return false;
     }
     return true;
@@ -2076,6 +2141,40 @@ llm_graph_result * llama_context::process_ubatch(
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    auto * restore_target=serial_target_ctx ? serial_target_ctx : cparams.mtp_publish_host ? mtp_target_ctx : nullptr;
+    auto * restore=restore_target && restore_target->get_cparams().kv_streaming() ? restore_target->kv_resources.recurrent : nullptr;
+    llama_memory_recurrent * deferred_restore=nullptr;
+    if (restore && restore->staged_publication_enabled() && !restore->rs_idx.empty() && restore->rs_idx[0]) {
+        const auto disjoint=[&](ggml_backend_buffer_t scratch) {
+            if (!scratch) return false;
+            const size_t bytes=ggml_backend_buffer_get_size(scratch);
+            if (!bytes) return true;
+            const auto start=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch));
+            if (!start || bytes>UINTPTR_MAX-start) return false;
+            for (size_t layer=0;layer<restore->r_l.size();++layer) {
+                if (!restore->r_l[layer]) continue;
+                for (auto * state : {restore->r_l[layer],restore->s_l[layer]}) {
+                    if (!state || !state->buffer) return false;
+                    const auto data=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(state->buffer));
+                    const size_t size=ggml_backend_buffer_get_size(state->buffer);
+                    if (!data || size>UINTPTR_MAX-data || (start<data+size && data<start+bytes)) return false;
+                }
+            }
+            return true;
+        };
+        bool isolated=compute_memory && restore_target->compute_memory &&
+            disjoint(restore_target->compute_memory->shared_parent());
+        if (compute_memory) for (auto * lease : compute_memory->workspace_leases())
+            isolated=isolated && lease && disjoint(ggml_backend_memory_lease_buffer(lease));
+        // Live recurrent state is outside the serial arena used by the draft.
+        if (isolated) restore_target->synchronize();
+        if (!isolated) {
+            LLAMA_LOG_ERROR("%s: target recurrent restore overlaps draft storage\n",__func__);
+            ret=GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        deferred_restore=restore;
+    }
     if (cparams.kv_shared_read && !prepare_shared_kv_read()) {
         LLAMA_LOG_ERROR("%s: failed to acquire shared target KV sources\n",__func__);
         ret=GGML_STATUS_FAILED; return nullptr;
@@ -2177,6 +2276,21 @@ llm_graph_result * llama_context::process_ubatch(
         return nullptr;
     }
 
+    struct restore_submission_guard {
+        ggml_backend_sched_t scheduler;
+        ~restore_submission_guard() { if (scheduler) ggml_backend_sched_set_pre_compute_callback(scheduler,nullptr,nullptr); }
+    } restore_submission{deferred_restore ? sched.get() : nullptr};
+    if (deferred_restore) {
+        ggml_backend_sched_set_pre_compute_callback(sched.get(),[](ggml_backend_t backend,ggml_cgraph *,void * opaque) {
+            auto * memory=static_cast<llama_memory_recurrent *>(opaque);
+            if (memory->rs_idx.empty() || !memory->rs_idx[0]) return true;
+            for (auto * state : memory->r_l) if (state) {
+                if (ggml_backend_get_device(backend) != ggml_backend_buft_get_device(ggml_backend_buffer_get_type(state->buffer))) return true;
+                return memory->restore_spill_async(nullptr);
+            }
+            return false;
+        },deferred_restore);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (rs_spill && !rs_spill->complete_restore_spill()) {
         LLAMA_LOG_ERROR("%s: failed to complete recurrent restore\n",__func__);
@@ -2490,7 +2604,7 @@ int llama_decode_mtp_embeddings(llama_context * ctx, const llama_batch_ext & bat
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
-    if (serial_feature_producer) serial_feature_rows.clear();
+    if (serial_feature_producer) clear_serial_features();
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.arch == LLM_ARCH_QWEN35 && !mtp_visual_hidden &&
             std::any_of(batch_inp.tokens.begin(), batch_inp.tokens.end(), [](const auto & token) {
                 return token.id == LLAMA_TOKEN_NULL && token.has_embd;
@@ -2597,7 +2711,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const auto text_phase = cparams.kv_streaming() ?
         (cparams.kv_stream_decode ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) :
         (cparams.kv_shared_read ? llama_memory_text_phase::decode : cparams.serial_block_rows ?
-            (n_tokens_all <= cparams.serial_block_rows ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) : cparams.mtp_publish_host ?
+            (balloc->get_batch().token || serial_target_ctx->get_cparams().kv_stream_decode ?
+                llama_memory_text_phase::decode : llama_memory_text_phase::prefill) : cparams.mtp_publish_host ?
             (n_tokens_all <= 4 ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) :
             llama_memory_text_phase::unspecified);
 
@@ -2629,6 +2744,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    if (kv_resources.recurrent && !kv_resources.recurrent->complete_restore_spill()) {
+        LLAMA_LOG_ERROR("%s: failed to complete recurrent restore before target handoff\n",__func__);
+        return -2;
+    }
     const bool reservation_was_pending = sched_reserve_state.begin();
     const uint64_t serial_transitions = compute_memory ? compute_memory->phase_transition_count() : 0;
     // Drain the other scheduler before reservation can discard or rewrite shared scratch.
@@ -3033,6 +3152,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (serial_feature_producer) {
         serial_feature_rows.reserve(batch_inp.tokens.size());
         for (const auto & token : batch_inp.tokens) serial_feature_rows.emplace_back(token.id,token.pos[0]);
+        if (serial_feature_images && !batch_inp.embd.empty()) {
+            serial_feature_image_rows.reserve(batch_inp.tokens.size());
+            for (const auto & token : batch_inp.tokens)
+                serial_feature_image_rows.push_back({token.has_embd,token.embd_off,token.pos});
+            serial_feature_image_values=batch_inp.embd;
+            serial_feature_image_width=batch_inp.n_embd;
+        }
     }
 
     return 0;
@@ -4467,7 +4593,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
-    serial_feature_rows.clear();
+    clear_serial_features();
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -4502,7 +4628,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    serial_feature_rows.clear();
+    clear_serial_features();
 
     if (memory) {
         memory->state_read(io, seq_id, flags);
@@ -4863,7 +4989,8 @@ llama_context_params llama_context_default_params() {
 
 llama_context * llama_init_from_model(
                  llama_model * model,
-        llama_context_params   params) {
+        llama_context_params   params,
+                    uint32_t   serial_prediction_rows, bool serial_image_inputs) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -4951,7 +5078,7 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, serial_prediction_rows, serial_image_inputs);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -4966,6 +5093,14 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model(llama_model * model, llama_context_params params, uint32_t serial_prediction_rows) {
+    return llama_init_from_model(model, params, serial_prediction_rows, false);
+}
+
+llama_context * llama_init_from_model(llama_model * model, llama_context_params params) {
+    return llama_init_from_model(model, params, 0);
 }
 
 // deprecated
