@@ -22,7 +22,7 @@ struct llama_kv_stream_session_config {
     size_t span_workspace_bytes = 0;
     llama_memory_stage_id suspend_stage = 0;
     // Context-owned backend resources contain no KV views and survive serial layout replacement.
-    std::shared_ptr<void> prepared_copies;
+    std::shared_ptr<void> prepared_copies = {};
     // Admitted target verification width, independent of prefill microbatch and embedded-MTP plans.
     uint32_t max_decode_rows = 4;
     size_t prefill_span_bytes = 0;

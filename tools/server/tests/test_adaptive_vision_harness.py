@@ -11,6 +11,7 @@ import signal
 import subprocess
 import tempfile
 import unittest
+from typing import Any
 from unittest.mock import patch
 
 import test_adaptive_vision as harness
@@ -20,6 +21,7 @@ class Launch(unittest.TestCase):
     def test_finder_admits_qualified_dflash_images_and_preserves_unsupported_width_guard(self):
         root=Path(__file__).resolve().parents[3]
         spec=importlib.util.spec_from_file_location("vision_arena_finder",root/"benchmarks/find-max-arena.py")
+        assert spec is not None and spec.loader is not None
         finder=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(finder)
         base=["--model","target.gguf","--model-draft","draft.gguf","--mmproj","projector.gguf",
@@ -52,7 +54,7 @@ class Launch(unittest.TestCase):
             harness.vision_state_action(1,directory,"save")
 
     def test_image_completion_requires_real_drafts_and_exact_output_accounting(self):
-        result={"tokens":[2,3],"timings":{"predicted_n":2,"draft_n":3,"draft_n_accepted":1,"cache_n":0,"prompt_n":64}}
+        result: dict[str, Any] = {"tokens":[2,3],"timings":{"predicted_n":2,"draft_n":3,"draft_n_accepted":1,"cache_n":0,"prompt_n":64}}
         self.assertEqual(harness.vision_observation(result,2,True)["tokens"],[2,3])
         import copy
         for field,value in (("predicted_n",1),("draft_n",0),("draft_n_accepted",4),("cache_n",-1),("prompt_n",0)):
@@ -264,6 +266,7 @@ class FinderCapacity(unittest.TestCase):
     def finder(self):
         root=Path(__file__).resolve().parents[3]
         spec=importlib.util.spec_from_file_location("capacity_finder",root/"benchmarks/find-max-arena.py")
+        assert spec is not None and spec.loader is not None
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         return module
 
@@ -326,7 +329,7 @@ class FinderCapacity(unittest.TestCase):
         return "\n".join(lines)
 
     def test_mixed_image_accounting_cannot_borrow_copy_or_forward_proof_from_text_prelude(self):
-        module=self.finder();completed=[{"label":"text-prelude","timings":{"draft_n":3,"draft_n_accepted":2}},
+        module=self.finder();completed: list[dict[str, Any]] = [{"label":"text-prelude","timings":{"draft_n":3,"draft_n_accepted":2}},
             {"label":"image-copy","timings":{"draft_n":7,"draft_n_accepted":7}},
             {"label":"image-miss","timings":{"draft_n":3,"draft_n_accepted":0}}]
         log="\n".join([self.mixed_statistics(1,0,3,0,2,1),self.mixed_statistics(2,7,3,7,2,1),self.mixed_statistics(3,7,6,7,2,2)])

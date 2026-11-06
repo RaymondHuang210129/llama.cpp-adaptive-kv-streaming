@@ -51,6 +51,7 @@
 #define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaError_t musaError_t
+#define cudaErrorNotReady musaErrorNotReady
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
@@ -94,6 +95,7 @@
 #define cudaStreamFireAndForget musaStreamFireAndForget
 #define cudaStreamNonBlocking musaStreamNonBlocking
 #define cudaStreamPerThread musaStreamPerThread
+#define cudaStreamQuery musaStreamQuery
 #define cudaStreamSynchronize musaStreamSynchronize
 #define cudaStreamWaitEvent musaStreamWaitEvent
 #define cudaStream_t musaStream_t

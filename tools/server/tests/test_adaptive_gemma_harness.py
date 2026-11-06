@@ -241,6 +241,7 @@ class VisionLifecycles(unittest.TestCase):
             args=argparse.Namespace(output=directory,corpus=corpus,depths=[0],prefill=98304,predict=1,lifecycle=False)
             def request(url,payload=None,**kwargs):
                 self.assertTrue(url.endswith('/tokenize'))
+                assert payload is not None
                 self.assertEqual(payload['content'],text)
                 raise RuntimeError('full corpus observed')
             with patch.object(harness,'server',return_value=contextlib.nullcontext('http://unused')), \

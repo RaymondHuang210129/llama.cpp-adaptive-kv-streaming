@@ -65,7 +65,7 @@ inline std::vector<float> stock_attention(fixture & f, block_inputs & input, uin
     auto * key=ggml_view_3d(ctx.get(),k,dk,input.padded,kv_heads,ggml_row_size(k->type,dk*kv_heads),ggml_row_size(k->type,dk),0);
     auto * value=ggml_view_3d(ctx.get(),v,dv,input.padded,kv_heads,ggml_row_size(v->type,dv*kv_heads),ggml_row_size(v->type,dv),0);
     auto * out=ggml_flash_attn_ext(ctx.get(),input.q,key,value,input.mask,scale,0,0);
-    ggml_flash_attn_ext_set_prec(out,GGML_PREC_F32);
+    ggml_prec_set_acc(out,GGML_PREC_F32);
     auto * graph=ggml_new_graph_custom(ctx.get(),64,false); ggml_build_forward_expand(graph,out);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),f.backend)); GGML_ASSERT(buffer);
     llama_kv_stream_host_layer host; GGML_ASSERT(f.host->layer(layer,host));

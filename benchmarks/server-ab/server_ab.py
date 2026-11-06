@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 class ConfigError(ValueError):
@@ -20,7 +20,7 @@ class ConfigError(ValueError):
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def expand_env(value: Any, env: dict[str, str] | None = None) -> Any:
+def expand_env(value: Any, env: Mapping[str, str] | None = None) -> Any:
     values = os.environ if env is None else env
     if isinstance(value, str):
         def replace(match: re.Match[str]) -> str:

@@ -208,6 +208,7 @@ def completion(prompt, images=(), cache=False, decode=16):
 def vision_source_statistics(text):
     root=Path(__file__).resolve().parents[3]
     spec=importlib.util.spec_from_file_location("vision_speculative_controls",root/"benchmarks/run_dflash_controls.py")
+    assert spec is not None and spec.loader is not None
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     return module.speculative_source_stats(text)
 

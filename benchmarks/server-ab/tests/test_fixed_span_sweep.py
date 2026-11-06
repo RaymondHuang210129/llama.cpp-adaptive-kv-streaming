@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 SCRIPT = Path(__file__).resolve().parents[2] / "run-fixed-span-sweep.py"
 SPEC = importlib.util.spec_from_file_location("fixed_span_sweep", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
 SWEEP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SWEEP)
 

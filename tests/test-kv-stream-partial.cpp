@@ -242,7 +242,7 @@ int main() {
         auto * v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, width, tokens, heads);
         auto * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, tokens, queries);
         auto * output = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 1.0f/8, 0, 0);
-        ggml_flash_attn_ext_set_prec(output, GGML_PREC_F32);
+        ggml_prec_set_acc(output, GGML_PREC_F32);
         auto * graph = ggml_new_graph_custom(ctx.get(), 16, false);
         ggml_build_forward_expand(graph, output);
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));

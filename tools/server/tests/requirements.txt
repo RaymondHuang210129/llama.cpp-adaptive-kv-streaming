@@ -1,6 +1,7 @@
 aiohttp~=3.9.3
 pytest~=8.3.3
 pytest-xdist~=3.6
+PyYAML~=6.0
 filelock~=3.16
 numpy~=2.2.6
 openai~=2.14.0

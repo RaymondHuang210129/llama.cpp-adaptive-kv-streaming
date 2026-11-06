@@ -255,7 +255,7 @@ int main() {
         auto * vt = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, dim, tokens, kv_heads);
         auto * mt = ggml_new_tensor_2d(context.get(), GGML_TYPE_F16, tokens, queries);
         auto * result = ggml_flash_attn_ext(context.get(), qt, kt, vt, mt, 0.2f, 0, 0);
-        ggml_flash_attn_ext_set_prec(result, GGML_PREC_F32);
+        ggml_prec_set_acc(result, GGML_PREC_F32);
         auto * graph = ggml_new_graph_custom(context.get(), 16, false);
         ggml_build_forward_expand(graph, result);
         ggml_backend_buffer_ptr tensors(ggml_backend_alloc_ctx_tensors(context.get(), backend.get()));

@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "benchmarks/server-ab"))
 from server_ab import request_json, stream_completion, wait_for_health
 
 SPEC = importlib.util.spec_from_file_location("sweep", ROOT / "benchmarks/run-fixed-span-sweep.py")
+assert SPEC is not None and SPEC.loader is not None
 SWEEP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SWEEP)
 

@@ -605,7 +605,8 @@ int main(int argc,char ** argv) {
             fixture.values.assign(output.data(),output.data()+output.n_tokens()*output.n_embd());
             for (size_t i=0;i<output.n_tokens();++i) {
                 const auto pos=mtmd_image_tokens_get_decoder_pos(image_tokens,llama_pos(fixture.prefix.size()),i);
-                fixture.positions.push_back({pos.t,pos.y,pos.x,pos.z});
+                if (!t.assert_true(pos.t<=INT32_MAX && pos.y<=INT32_MAX && pos.x<=INT32_MAX && pos.z<=INT32_MAX)) return;
+                fixture.positions.push_back({llama_pos(pos.t),llama_pos(pos.y),llama_pos(pos.x),llama_pos(pos.z)});
             }
             std::unique_ptr<FILE,kv_stream_exact_file_free> file(std::fopen(save_input,"wb"));
             if (!t.assert_true(bool(file))) return;

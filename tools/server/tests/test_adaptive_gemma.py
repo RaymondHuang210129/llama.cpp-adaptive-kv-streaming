@@ -17,6 +17,7 @@ import struct
 import sys
 import urllib.request
 import zlib
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benchmarks/server-ab"))
@@ -236,9 +237,9 @@ def run(args):
                 if len(tokens) < args.prefill + 64:
                     raise RuntimeError("qualification corpus is too short")
                 prompt = tokens[:args.prefill]
-                payload = {"prompt": prompt, "n_predict": args.predict, "temperature": 0, "seed": 123,
+                payload: dict[str, Any] = {"prompt": prompt, "n_predict": args.predict, "temperature": 0, "seed": 123,
                            "ignore_eos": True, "cache_prompt": False, "return_tokens": True, "stream": True}
-                cases = [("fresh", payload), ("cached", dict(payload, cache_prompt=True)),
+                cases: list[tuple[str, dict[str, Any]]] = [("fresh", payload), ("cached", dict(payload, cache_prompt=True)),
                          ("changed", dict(payload, prompt=tokens[args.prefill:args.prefill+64]))]
                 for label, body in cases:
                     result = stream_completion(base + "/completion", body, timeout=600)
@@ -427,10 +428,11 @@ def run_vision(args):
                 response=request_json(base+"/slots/0?action="+action,
                     None if action=="erase" else {"filename":path.name},timeout=600,method="POST")
                 if action=="save":
-                    saved_tokens=response.get("n_saved");saved_bytes=response.get("n_written")
-                    if (type(saved_tokens) is not int or not 0<saved_tokens<=args.context or
-                            type(saved_bytes) is not int or saved_bytes<=0 or not path.is_file() or path.stat().st_size!=saved_bytes):
+                    n_saved=response.get("n_saved");n_written=response.get("n_written")
+                    if (type(n_saved) is not int or not 0<n_saved<=args.context or
+                            type(n_written) is not int or n_written<=0 or not path.is_file() or path.stat().st_size!=n_written):
                         raise RuntimeError("incomplete Gemma vision state save")
+                    saved_tokens,saved_bytes=n_saved,n_written
                 elif action=="restore":
                     if response.get("n_restored")!=saved_tokens or response.get("n_read")!=saved_bytes or path.stat().st_size!=saved_bytes:
                         raise RuntimeError("incomplete Gemma vision state restore")

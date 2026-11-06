@@ -19,6 +19,7 @@ import shlex
 import socket
 import subprocess
 import sys
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmarks/server-ab"))
@@ -145,14 +146,10 @@ def environment():
     return env
 
 
-def shell_commands(command, removed):
-    launch = ["env"] + [item for name in removed for item in ("-u", name)] + ["LLAMA_MEDIA_MARKER="+MARKER] + command
+def shell_commands(command):
     def quote(value):
         return "'"+value.replace("'", "''")+"'"
-    powershell = ["[Environment]::SetEnvironmentVariable("+quote(name)+", $null, 'Process')" for name in removed]
-    powershell.append("$env:LLAMA_MEDIA_MARKER = "+quote(MARKER))
-    powershell.append("& "+" ".join(quote(value) for value in command))
-    return {"posix":shlex.join(launch), "powershell":"\n".join(powershell)}
+    return {"posix":shlex.join(command), "powershell":"& "+" ".join(quote(value) for value in command)}
 
 
 def bounded_bytes(path, maximum=64*1048576):
@@ -242,7 +239,7 @@ def mixed_image_route_probe(args, url, images, candidate):
     if repeated != tokenized*tail:
         raise ValueError("mixed image proof history does not preserve the repeated token")
     media = " ".join([MARKER]*len(images))
-    requests = []
+    requests: list[dict[str, Any]] = []
     for route, prompt, outputs in (("image-miss", fragment*tail+" Describe: "+media+" Answer:", args.draft_length+2),
                                     ("image-copy", "Describe: "+media+fragment*tail, count)):
         config = argparse.Namespace(**vars(args));config.decode_tokens=outputs
@@ -303,7 +300,7 @@ def _runtime_probe(args, candidate):
     vision_result = None
     response_path = None
     prompt_sha256 = None
-    completed = []
+    completed: list[dict[str, Any]] = []
     mixed_image = bool(args.mmproj and args.spec_mode=="dflash-k4v")
     expected_phases = []
     with log_path.open("x", encoding="utf-8") as log:
@@ -363,7 +360,11 @@ def _runtime_probe(args, candidate):
                 proof_images=images if args.image else [base64.b64encode(bounded_bytes(Path(bootstrap[0]["image"]))).decode("ascii")] if bootstrap else []
                 mixed_proof=mixed_image_route_probe(args,url,proof_images,candidate)
                 for row in mixed_proof["requests"]:completed.append({"label":row["route"],"timings":row["timings"]})
-                shape=getattr(args,"_expected_vision_shape",None) if args.image else bootstrap[0]["shape"]
+                if args.image:
+                    shape=getattr(args,"_expected_vision_shape",None)
+                else:
+                    assert bootstrap
+                    shape=bootstrap[0]["shape"]
                 if shape:expected_phases.extend([shape]*(2*len(proof_images)))
         except Exception as error:
             failure = error
@@ -747,6 +748,7 @@ def fit(args, report_vision=False):
         raise RuntimeError("no common image setting completed all listed ratios; no launch command published; see vision-capacity/results.json")
     command_args=argparse.Namespace(**vars(args))
     if capacity and capacity["common_image_max_tokens"] is not None:
+        assert plan is not None
         command_args.image_min_tokens=plan["min_image_tokens"]
         command_args.image_max_tokens=capacity["common_image_max_tokens"]
     if args.validate_selected or (capacity and args.probe_mode == "full"):
@@ -789,7 +791,7 @@ def fit(args, report_vision=False):
     removed = sorted(set(REMOVED_ENV) | {name for name in os.environ if name.startswith("LLAMA_ARG_")})
     report["environment"] = {name:None for name in removed}
     report["environment"]["LLAMA_MEDIA_MARKER"] = MARKER
-    commands = shell_commands(report["command"], removed)
+    commands = shell_commands(report["command"])
     report["shell"] = "powershell" if os.name == "nt" else "posix"
     report["shell_command"] = commands[report["shell"]]
     report["posix_shell_command"] = commands["posix"]

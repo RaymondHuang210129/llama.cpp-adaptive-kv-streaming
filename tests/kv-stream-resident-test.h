@@ -146,7 +146,7 @@ static bool evaluate(testing & t, fixture & f, bool resident, uint32_t layer, si
         out = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 1.0f/16, 0, 0);
     }
     if (!t.assert_true(out != nullptr)) return false;
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     if (!t.assert_true(ggml_backend_supports_op(f.backend, out))) return false;
     auto * graph = ggml_new_graph_custom(ctx.get(), 64, false);
     ggml_build_forward_expand(graph, out);

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any
 
 from test_adaptive_vision import completion, png, request, server
 
@@ -68,8 +69,10 @@ def gpu_samples(gpu, interval_ms):
                "--loop-ms", str(interval_ms)]
     samples = []
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+        stdout, stderr = process.stdout, process.stderr
+        assert stdout is not None and stderr is not None
         def read():
-            for line in process.stdout:
+            for line in stdout:
                 try:
                     samples.append((time.monotonic_ns() // 1000, int(line.strip())))
                 except ValueError:
@@ -82,7 +85,7 @@ def gpu_samples(gpu, interval_ms):
                 time.sleep(0.05)
             if not samples:
                 process.terminate()
-                raise RuntimeError("nvidia-smi supplied no memory samples: " + process.stderr.read())
+                raise RuntimeError("nvidia-smi supplied no memory samples: " + stderr.read())
             yield samples
         finally:
             process.terminate()
@@ -98,7 +101,7 @@ def run(args, batch):
     args.batch_size = args.ubatch_size = batch
     args.output = args.root_output / f"batch-{batch}"
     args.output.mkdir(parents=True, exist_ok=True)
-    rows = []
+    rows: list[dict[str, Any]] = []
     images = [png(args.image_size, args.image_size, i) for i in range(args.images)]
     prompt = " green" * args.background_tokens + " Describe these patterns: " + "<__media__> " * args.images + "One sentence: "
     with gpu_samples(args.gpu, args.sample_ms) as samples, server(args, "arena", env_extra={"CUDA_VISIBLE_DEVICES": str(args.gpu)}) as port:
