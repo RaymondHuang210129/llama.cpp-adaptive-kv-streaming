@@ -1,16 +1,7 @@
 name: Check Pre-Tokenizer Hashes
 
 on:
-    push:
-        paths:
-            - 'conversion/base.py'
-            - 'convert_hf_to_gguf_update.py'
-    pull_request:
-        paths:
-            - 'conversion/base.py'
-            - 'convert_hf_to_gguf_update.py'
-
-cache-mode: none
+  workflow_call:
 permissions:
   contents: read
 
@@ -20,10 +11,10 @@ jobs:
 
         steps:
         - name: Checkout repository
-          uses: actions/checkout@v6
+          uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
         - name: Set up Python
-          uses: actions/setup-python@v6
+          uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
           with:
               python-version: '3.11'
 

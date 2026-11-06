@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmarks/server-ab"))
-from server_ab import request_json, stream_completion, wait_for_health
+from server_ab import request_json, stream_completion, wait_for_health  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location("sweep", ROOT / "benchmarks/run-fixed-span-sweep.py")
 assert SPEC is not None and SPEC.loader is not None
@@ -23,7 +23,7 @@ def command(args, context, mtp, arena, stock=False):
     result = SWEEP.server_command(args, context, mtp, arena)
     if stock:
         index = result.index("--kv-stream-arena-mib")
-        del result[index:index+2]
+        del result[index:index +2]
     if mtp:
         result += ["--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q4_0"]
     return result
@@ -63,18 +63,18 @@ def run_point(args, context, mtp, arena, token_cache):
             wait_for_health(url, 180, process)
             if "tokens" not in token_cache:
                 token_cache["tokens"] = request_json(url + "/tokenize",
-                    {"content": args.prefill_text.read_text(), "add_special": False}, timeout=180)["tokens"]
-            count = context-args.decode_tokens-4
+                                                     {"content": args.prefill_text.read_text(), "add_special": False}, timeout=180)["tokens"]
+            count = context -args.decode_tokens -4
             if count < 256 or len(token_cache["tokens"]) < count:
                 raise ValueError("invalid context or insufficient corpus")
             common = {"temperature": 0, "seed": 123, "ignore_eos": True,
                       "cache_prompt": False, "stream": True, "return_tokens": True}
             warm = stream_completion(url + "/completion", dict(common, prompt=token_cache["tokens"][:256],
-                                      n_predict=4), timeout=120)
+                                                               n_predict=4), timeout=120)
             if len(warm["tokens"]) != 4:
                 raise RuntimeError("incomplete warmup")
             result = stream_completion(url + "/completion", dict(common, prompt=token_cache["tokens"][:count],
-                                        n_predict=args.decode_tokens), timeout=1800)
+                                                                 n_predict=args.decode_tokens), timeout=1800)
             timing = result["timings"]
             if timing.get("prompt_n") != count or timing.get("predicted_n") != args.decode_tokens or len(result["tokens"]) != args.decode_tokens:
                 raise RuntimeError("incomplete measured response")
@@ -88,11 +88,11 @@ def run_point(args, context, mtp, arena, token_cache):
                 row.update(decode_kv_pool_mib=pool, resident_pages=resident, ring_slots=ring,
                            active_pages=active, h2d_mib_per_eval=copies, h2d_calls_per_eval=calls)
             if getattr(args, "verify_reuse", False):
-                prefix = token_cache["tokens"][:count]+result["tokens"][:8]
+                prefix = token_cache["tokens"][:count] +result["tokens"][:8]
                 reused = stream_completion(url + "/completion", dict(common, prompt=prefix,
-                                          n_predict=32, cache_prompt=True), timeout=1800)
+                                                                     n_predict=32, cache_prompt=True), timeout=1800)
                 fresh = stream_completion(url + "/completion", dict(common, prompt=prefix,
-                                         n_predict=32), timeout=1800)
+                                                                    n_predict=32), timeout=1800)
                 row.update(reuse_token_ids=reused["tokens"], fresh_token_ids=fresh["tokens"],
                            reuse_cache_tokens=reused["timings"].get("cache_n", 0),
                            reuse_timings=reused["timings"], fresh_timings=fresh["timings"],
@@ -113,7 +113,7 @@ def run_point(args, context, mtp, arena, token_cache):
     timing = row.get("timings", {})
     accepted = timing.get("draft_n_accepted", accepted)
     generated = timing.get("draft_n", generated)
-    row.update(draft_accepted=accepted, draft_generated=generated, wall_seconds=time.monotonic()-started,
+    row.update(draft_accepted=accepted, draft_generated=generated, wall_seconds=time.monotonic() -started,
                finished_unix=time.time())
     return row
 
@@ -127,13 +127,13 @@ def run_max_point(args, context, mtp, token_cache):
     text = args.prefill_text.read_text()
     url = f"http://127.0.0.1:{args.port}"
     fast_max = SWEEP.find_max_arena_mib(args.arena_mib,
-        lambda arena: SWEEP.probe_arena(probe_args, context, mtp, arena, args.output, url, text, token_cache))
+                                        lambda arena: SWEEP.probe_arena(probe_args, context, mtp, arena, args.output, url, text, token_cache))
     rows = {}
-    with (args.output/"arena-probes.jsonl").open("a") as output:
+    with (args.output /"arena-probes.jsonl").open("a") as output:
         def fits(arena):
             if arena not in rows:
                 row = run_point(args, context, mtp, arena, token_cache)
-                output.write(json.dumps(row)+"\n")
+                output.write(json.dumps(row) +"\n")
                 output.flush()
                 if row["status"] == "failed":
                     minimum = SWEEP.arena_minimum_mib(Path(row["log"]).read_text(errors="replace"))
@@ -169,7 +169,7 @@ def main():
     args.batch_size = args.ubatch_size = 256
     args.model, args.server, args.output = args.model.resolve(), args.server.resolve(), args.output.resolve()
     contexts = [int(value) for value in args.contexts.split(",")]
-    if args.decode_tokens < 16 or args.arena_mib < 1 or any(c < args.decode_tokens+260 or c > 262144 for c in contexts):
+    if args.decode_tokens < 16 or args.arena_mib < 1 or any(c < args.decode_tokens +260 or c > 262144 for c in contexts):
         parser.error("invalid decode/context/arena limits")
     args.output.mkdir(parents=True, exist_ok=True)
     results_path = args.output / "results.jsonl"
@@ -180,9 +180,10 @@ def main():
         for context in contexts:
             for mtp in args.mtp_lengths:
                 row = run_max_point(args, context, mtp, token_cache) if args.auto_max_arena else run_point(args, context, mtp, args.arena_mib, token_cache)
-                output.write(json.dumps(row)+"\n")
+                output.write(json.dumps(row) +"\n")
                 output.flush()
-                print(json.dumps({k:v for k,v in row.items() if k not in ("token_ids","content")}), flush=True)
+                sys.stdout.write(str(json.dumps({k:v for k,v in row.items() if k not in ("token_ids","content")})) + "\n")
+                sys.stdout.flush()
                 if row["status"] == "failed":
                     raise RuntimeError(f"qualification failure; see {row['log']}")
 

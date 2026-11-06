@@ -21,8 +21,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmarks/server-ab"))
 sys.path.insert(0, str(ROOT / "benchmarks"))
-from server_ab import request_json, stream_completion, wait_for_health
-from inspect_dflash_artifacts import inspect_artifacts, read_json, verify_file
+from server_ab import request_json, stream_completion, wait_for_health  # noqa: E402
+from inspect_dflash_artifacts import inspect_artifacts, read_json, verify_file  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location("dflash_sweep", ROOT / "benchmarks/run-fixed-span-sweep.py")
 assert SPEC is not None and SPEC.loader is not None
@@ -60,13 +60,13 @@ def ngram_command(args):
     if settings is None:
         return []
     return [item for name, flag in (("ngram_n", "size-n"), ("ngram_m", "size-m"), ("ngram_min_hits", "min-hits"))
-            for item in ("--spec-ngram-map-k4v-"+flag, str(settings[name]))]
+            for item in ("--spec-ngram-map-k4v-" +flag, str(settings[name]))]
 
 
 def speculative_source_stats(text):
     pattern = (r"statistics\s+(\S+):\s+#calls\(b,g,a\)\s*=\s*(\d+)\s+(\d+)\s+(\d+),\s*"
-        r"#gen drafts\s*=\s*(\d+),\s*#acc drafts\s*=\s*(\d+),\s*#gen tokens\s*=\s*(\d+),\s*"
-        r"#acc tokens\s*=\s*(\d+),\s*#prediction forwards\s*=\s*(\d+)")
+               r"#gen drafts\s*=\s*(\d+),\s*#acc drafts\s*=\s*(\d+),\s*#gen tokens\s*=\s*(\d+),\s*"
+               r"#acc tokens\s*=\s*(\d+),\s*#prediction forwards\s*=\s*(\d+)")
     fields = ("begin_calls", "draft_calls", "accept_calls", "generated_drafts", "accepted_drafts",
               "generated_tokens", "accepted_tokens", "prediction_forwards")
     result = {}
@@ -83,18 +83,18 @@ def validate_mixed_sources(text, require_both=True, generated_tokens=None, accep
     if not all(name in stats for name in ("ngram-map-k4v", "draft-dflash")):
         raise ValueError("mixed execution omitted source statistics")
     if require_both and (any(stats[name]["generated_tokens"] <= 0 or stats[name]["accept_calls"] <= 0 for name in ("ngram-map-k4v", "draft-dflash"))
-            or stats["draft-dflash"]["prediction_forwards"] <= 0):
+                         or stats["draft-dflash"]["prediction_forwards"] <= 0):
         raise ValueError("mixed sizing must exercise both K4V and DFlash prediction/verification")
     for field, expected in (("generated_tokens", generated_tokens), ("accepted_tokens", accepted_tokens)):
         if expected is not None and (type(expected) is not int or expected < 0 or sum(row[field] for row in stats.values()) != expected):
-            raise ValueError("mixed source totals differ from completed request counters: "+field)
+            raise ValueError("mixed source totals differ from completed request counters: " +field)
     return stats
 
 
 def effective_microbatch(args, context):
     batch=getattr(args,"batch_size",256)
     ubatch=getattr(args,"ubatch_size",256)
-    if type(batch) is not int or not 1 <= batch <= 2**32-1 or type(ubatch) is not int or not 0 <= ubatch <= 2**32-1:
+    if type(batch) is not int or not 1 <= batch <= 2**32 -1 or type(ubatch) is not int or not 0 <= ubatch <= 2**32 -1:
         raise ValueError("batch must be positive uint32; microbatch may be zero to inherit")
     return min(batch,context,ubatch or batch)
 
@@ -105,10 +105,10 @@ def prompt_count(args, context, depth):
     if settings is not None:
         maximum=max(maximum,settings["ngram_m"])
     headroom=getattr(args,"prompt_headroom",None)
-    headroom=maximum+8 if headroom is None else headroom
-    if type(headroom) is not int or headroom < maximum+1:
+    headroom=maximum +8 if headroom is None else headroom
+    if type(headroom) is not int or headroom < maximum +1:
         raise ValueError("prompt headroom must cover the configured verification width")
-    count=min(args.prompt_tokens,context-args.decode_tokens-headroom)
+    count=min(args.prompt_tokens,context -args.decode_tokens -headroom)
     if count < 256:
         raise ValueError("context does not leave room for the prompt")
     return count
@@ -118,30 +118,33 @@ def auto_arena_for_point(args, context, depth, token_cache):
     if not getattr(args,"auto_max_arena",False):
         return args.arena_mib,None
     cache={}
-    probe_root=args.output/"fit-probes"
+    probe_root=args.output /"fit-probes"
     probe_root.mkdir(parents=True,exist_ok=True)
+
     def run(candidate,full):
         config=copy.copy(args)
         config.arena_mib=candidate
-        config.output=probe_root/f"context-{context}-d-{depth}-arena-{candidate}-{'full' if full else 'fast'}"
+        config.output=probe_root /f"context-{context}-d-{depth}-arena-{candidate}-{'full' if full else 'fast'}"
         config.output.mkdir()
         if not full:
             config.prompt_tokens=min(args.prompt_tokens,2560)
             config.decode_tokens=min(args.decode_tokens,32)
         started=time.monotonic()
         row=run_point(config,context,depth,token_cache,"timing")
-        row["wall_seconds"]=time.monotonic()-started
+        row["wall_seconds"]=time.monotonic() -started
         row["arena_mib"]=candidate
         row["full_workload"]=full
-        with (probe_root/"results.jsonl").open("a") as output:
-            output.write(json.dumps(row)+"\n")
-        print(json.dumps({"arena_probe":candidate,"context":context,"depth":depth,"full":full,"status":row["status"]}),flush=True)
+        with (probe_root /"results.jsonl").open("a") as output:
+            output.write(json.dumps(row) +"\n")
+        sys.stdout.write(str(json.dumps({"arena_probe":candidate,"context":context,"depth":depth,"full":full,"status":row["status"]})) + "\n")
+        sys.stdout.flush()
         if row["status"] == "quota_failure":
             minimum=SWEEP.arena_minimum_mib(Path(row["log"]).read_text(errors="replace"))
             raise SWEEP.ArenaTooSmallError(minimum or 0)
         if row["status"] not in ("ok","capacity_failure"):
             raise RuntimeError(f"arena probe failed: {row.get('error',row)}")
         return row
+
     def probe(candidate):
         if candidate not in cache:
             cache[candidate]=run(candidate,False)
@@ -153,7 +156,7 @@ def auto_arena_for_point(args, context, depth, token_cache):
         row=run(candidate,True)
         if row["status"] == "ok":
             return candidate,row
-        upper=candidate-1
+        upper=candidate -1
         start=min(start,upper)
     raise RuntimeError("no arena fits the full workload")
 
@@ -171,12 +174,12 @@ def server_command(args, context, depth):
     if any(t not in KV_TYPES for t in (key,value,args.draft_k,args.draft_v)):
         raise ValueError("unknown KV type")
     command = [str(args.server), "--model", str(args.target),
-            "--ctx-size", str(context), "--batch-size", str(batch), "--ubatch-size", str(ubatch),
-            "--parallel", "1", "--n-gpu-layers", "999",
-            "--flash-attn", "on", "--cache-type-k", key, "--cache-type-v", value,
-            "--fit", "off", "--no-mmproj", "--host", "127.0.0.1", "--port", str(args.port),
-            "--threads", "8", "--threads-batch", "8", "-lv",
-            str(max(getattr(args,"verbosity",3),4 if spec_mode == "dflash-k4v" else 0))]
+               "--ctx-size", str(context), "--batch-size", str(batch), "--ubatch-size", str(ubatch),
+               "--parallel", "1", "--n-gpu-layers", "999",
+               "--flash-attn", "on", "--cache-type-k", key, "--cache-type-v", value,
+               "--fit", "off", "--no-mmproj", "--host", "127.0.0.1", "--port", str(args.port),
+               "--threads", "8", "--threads-batch", "8", "-lv",
+               str(max(getattr(args,"verbosity",3),4 if spec_mode == "dflash-k4v" else 0))]
     if spec_mode != "none":
         command += ["--spec-type", {"dflash":"draft-dflash", "dflash-k4v":"ngram-map-k4v,draft-dflash", "mtp":"draft-mtp"}[spec_mode],
                     "--spec-draft-n-max", str(depth), "--spec-draft-n-min", "0", "--spec-draft-p-min", "0",
@@ -241,14 +244,14 @@ def validate_lifecycle_state(action, result, file_bytes, expected_tokens):
     if action not in ("save","restore") or type(file_bytes) is not int or file_bytes<=0 or type(expected_tokens) is not int or expected_tokens<0:
         raise ValueError("invalid lifecycle state expectation")
     tokens,extent=("n_saved","n_written") if action=="save" else ("n_restored","n_read")
-    if (type(result.get(tokens)) is not int or type(result.get(extent)) is not int or
-            result[tokens]!=expected_tokens or result[extent]!=file_bytes):
+    if (type(result.get(tokens)) is not int or type(result.get(extent)) is not int
+            or result[tokens]!=expected_tokens or result[extent]!=file_bytes):
         raise ValueError("lifecycle state token frontier or complete file extent differs")
 
 
 def validate_context_end(result, prompt_tokens, context, requested):
     count = result.get("timings", {}).get("predicted_n")
-    if (type(count) is not int or not 1 <= count <= min(requested, context-prompt_tokens)
+    if (type(count) is not int or not 1 <= count <= min(requested, context -prompt_tokens)
             or len(result.get("tokens", [])) != count or result.get("stop_type") != "limit"):
         raise ValueError("invalid context-end completion")
 
@@ -256,32 +259,33 @@ def validate_context_end(result, prompt_tokens, context, requested):
 def lifecycle_checks(args, url, tokens, evidence):
     payload = {"temperature": 0, "seed": 123, "ignore_eos": True, "cache_prompt": False,
                "stream": True, "return_tokens": True, "id_slot": 0}
+
     def recovery(label, prompt, cached=False):
-        result = stream_completion(url+"/completion", {**payload, "prompt": prompt,
-            "cache_prompt": cached, "n_predict": 16}, timeout=args.request_timeout)
+        result = stream_completion(url +"/completion", {**payload, "prompt": prompt,
+                                                        "cache_prompt": cached, "n_predict": 16}, timeout=args.request_timeout)
         validate_recovery(result, 16)
         sample = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid,used_memory",
-            "--format=csv,noheader,nounits"], text=True)
+                                          "--format=csv,noheader,nounits"], text=True)
         memory = [int(line.split(",")[1].strip()) for line in sample.splitlines()
                   if line.split(",")[0].strip() == str(args.lifecycle_pid)]
         evidence.append({"case": label, "result": result, "process_gpu_mib": memory})
         return result
     recovery("cold", tokens[:512])
     cached=recovery("cached_append", tokens[:640], True)
-    saved = request_json(url+"/slots/0?action=save", {"filename": "lifecycle.bin"}, timeout=args.request_timeout)
+    saved = request_json(url +"/slots/0?action=save", {"filename": "lifecycle.bin"}, timeout=args.request_timeout)
     state_dir=getattr(args,"lifecycle_state_dir",None)
     if state_dir is not None:
-        validate_lifecycle_state("save",saved,(Path(state_dir)/"lifecycle.bin").stat().st_size,cached["tokens_cached"])
+        validate_lifecycle_state("save",saved,(Path(state_dir) /"lifecycle.bin").stat().st_size,cached["tokens_cached"])
     evidence.append({"case": "slot_save", "result": saved})
     recovery("changed_prompt", tokens[1024:1536])
     recovery("shorter_prompt", tokens[:256])
-    restored = request_json(url+"/slots/0?action=restore", {"filename": "lifecycle.bin"}, timeout=args.request_timeout)
+    restored = request_json(url +"/slots/0?action=restore", {"filename": "lifecycle.bin"}, timeout=args.request_timeout)
     if state_dir is not None:
-        validate_lifecycle_state("restore",restored,(Path(state_dir)/"lifecycle.bin").stat().st_size,saved["n_saved"])
+        validate_lifecycle_state("restore",restored,(Path(state_dir) /"lifecycle.bin").stat().st_size,saved["n_saved"])
     evidence.append({"case": "slot_restore", "result": restored})
     recovery("after_slot_restore", tokens[:640], True)
-    body = json.dumps({**payload, "prompt": tokens[:args.lifecycle_context+1], "n_predict": 16}).encode()
-    request = urllib.request.Request(url+"/completion", data=body, headers={"Content-Type": "application/json"})
+    body = json.dumps({**payload, "prompt": tokens[:args.lifecycle_context +1], "n_predict": 16}).encode()
+    request = urllib.request.Request(url +"/completion", data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=args.request_timeout) as response:
             raise ValueError(f"oversized prompt was accepted: HTTP {response.status}")
@@ -292,7 +296,7 @@ def lifecycle_checks(args, url, tokens, evidence):
                          "response": error.read().decode(errors="replace")})
     recovery("after_oversized_prompt", tokens[:256])
     body = json.dumps({**payload, "prompt": tokens[:512], "n_predict": 512}).encode()
-    request = urllib.request.Request(url+"/completion", data=body, headers={"Content-Type": "application/json"})
+    request = urllib.request.Request(url +"/completion", data=body, headers={"Content-Type": "application/json"})
     received = False
     with urllib.request.urlopen(request, timeout=args.request_timeout) as response:
         for raw in response:
@@ -308,16 +312,16 @@ def lifecycle_checks(args, url, tokens, evidence):
         raise ValueError("cancellation request returned no tokens")
     evidence.append({"case": "disconnect_after_token", "received": received})
     recovery("after_disconnect", tokens[:256])
-    near_end = args.lifecycle_context-10
-    result = stream_completion(url+"/completion", {**payload, "prompt": tokens[:near_end],
-        "n_predict": 16}, timeout=args.request_timeout)
+    near_end = args.lifecycle_context -10
+    result = stream_completion(url +"/completion", {**payload, "prompt": tokens[:near_end],
+                                                    "n_predict": 16}, timeout=args.request_timeout)
     validate_context_end(result, near_end, args.lifecycle_context, 16)
     evidence.append({"case": "context_end", "result": result})
     recovery("after_context_end", tokens[:256])
-    request_json(url+"/slots/0?action=erase", {}, timeout=args.request_timeout)
+    request_json(url +"/slots/0?action=erase", {}, timeout=args.request_timeout)
     recovery("after_erase", tokens[:256])
     for repeat in range(4):
-        recovery(f"settled_repeat_{repeat}", tokens[:512] if repeat%2 else tokens[1024:1280])
+        recovery(f"settled_repeat_{repeat}", tokens[:512] if repeat %2 else tokens[1024:1280])
     return evidence
 
 
@@ -358,11 +362,11 @@ def summarize_trace(rows, depth, max_injection_rows=256):
         raise ValueError("trace does not cover injection, prediction, verification, lattice and SWA masks")
     if any(r.get("feature_width") != 25600 or not 1 <= r.get("rows", 0) <= max_injection_rows for r in injection):
         raise ValueError("invalid feature injection geometry")
-    if any(r.get("rows") != depth+1 for r in draft):
+    if any(r.get("rows") != depth +1 for r in draft):
         raise ValueError("draft block width differs from configured control")
-    if depth+1 not in {r.get("rows") for r in target}:
+    if depth +1 not in {r.get("rows") for r in target}:
         raise ValueError("target verification block was not observed")
-    if any(r.get("query_rows") != depth+1 or not r.get("visible_rows") or not r.get("mask_file") for r in attention):
+    if any(r.get("query_rows") != depth +1 or not r.get("visible_rows") or not r.get("mask_file") for r in attention):
         raise ValueError("incomplete draft mask evidence")
     return {"injection_rows": sorted({r["rows"] for r in injection}),
             "draft_widths": sorted({r["rows"] for r in draft}),
@@ -373,6 +377,7 @@ def summarize_trace(rows, depth, max_injection_rows=256):
 
 def validate_payloads(directory, rows):
     files = {}
+
     def visit(value):
         if isinstance(value, dict):
             if "file" in value:
@@ -382,7 +387,7 @@ def validate_payloads(directory, rows):
                 path = directory / name
                 if path.is_symlink() or not path.is_file():
                     raise ValueError("missing or redirected trace payload")
-                if not 0 < value.get("bytes", 0) <= 128*1024*1024:
+                if not 0 < value.get("bytes", 0) <= 128 *1024 *1024:
                     raise ValueError("invalid trace payload size")
                 pin = {"size": value["bytes"], "sha256": value["sha256"]}
                 if name in files and files[name] != pin:
@@ -394,7 +399,7 @@ def validate_payloads(directory, rows):
             for child in value:
                 visit(child)
     visit(rows)
-    if sum(pin["size"] for pin in files.values()) > 1024*1024*1024:
+    if sum(pin["size"] for pin in files.values()) > 1024 *1024 *1024:
         raise ValueError("trace exceeds payload budget")
     for name, pin in files.items():
         verify_file(directory / name, pin)
@@ -418,20 +423,21 @@ def compare_control_rows(actual, control, artifacts_actual, artifacts_control, t
         for row in (actual, control):
             command = row["command"]
             if option.startswith("--spec-draft-type-") and option not in command and "--kv-stream-arena-mib" in command:
-                inherited = "--cache-type-"+option[-1]
-                if command.count(inherited) != 1 or command.index(inherited)+1 == len(command):
+                inherited = "--cache-type-" +option[-1]
+                if command.count(inherited) != 1 or command.index(inherited) +1 == len(command):
                     raise ValueError(f"missing/ambiguous control option: {inherited}")
-                values.append(command[command.index(inherited)+1])
+                values.append(command[command.index(inherited) +1])
                 continue
-            if command.count(option) != 1 or command.index(option)+1 == len(command):
+            if command.count(option) != 1 or command.index(option) +1 == len(command):
                 raise ValueError(f"missing/ambiguous control option: {option}")
-            values.append(command[command.index(option)+1])
+            values.append(command[command.index(option) +1])
         if values[0] != values[1]:
             raise ValueError(f"nonmatching control option: {option}")
     if not artifacts_actual.get("sha256") or artifacts_actual["sha256"] != artifacts_control.get("sha256"):
         raise ValueError("nonmatching control artifacts")
     if actual["result"]["tokens"] != control["result"]["tokens"]:
         raise ValueError("matching control generated different token IDs")
+
     def signature(value):
         if isinstance(value, dict):
             excluded = {"file", "mask_file"}
@@ -453,31 +459,31 @@ def compare_control_rows(actual, control, artifacts_actual, artifacts_control, t
 
 
 def canonical_lattice(data, rows, width, top_k=16, vocab=248320):
-    if (not 2 <= rows <= 8 or not 1 <= top_k <= 16 or not top_k+top_k*top_k <= width <= 5120
-            or len(data) != rows*width*4):
+    if (not 2 <= rows <= 8 or not 1 <= top_k <= 16 or not top_k +top_k *top_k <= width <= 5120
+            or len(data) != rows *width *4):
         raise ValueError("invalid selector lattice geometry")
-    if any(data[:width*4]):
+    if any(data[:width *4]):
         raise ValueError("selector anchor row is not zero")
     result = []
     previous = []
     for index in range(1, rows):
-        raw = data[index*width*4:(index+1)*width*4]
-        if any(raw[(top_k+top_k*top_k)*4:]):
+        raw = data[index *width *4:(index +1) *width *4]
+        if any(raw[(top_k +top_k *top_k) *4:]):
             raise ValueError("selector padding is not zero")
-        values = struct.unpack("<"+"f"*width, raw)
+        values = struct.unpack("<" +"f" *width, raw)
         ids = list(values[:top_k])
         if any(not math.isfinite(v) or int(v) != v or not 0 <= v < vocab for v in ids) or len(set(ids)) != top_k:
             raise ValueError("invalid or duplicate selector candidate ID")
-        scores = values[top_k:top_k+top_k*top_k]
+        scores = values[top_k:top_k +top_k *top_k]
         if any(not math.isfinite(value) for value in scores):
             raise ValueError("invalid selector score")
         if index == 1:
-            if any(raw[top_k*4:(top_k+top_k)*4] != raw[(top_k+k*top_k)*4:(top_k+(k+1)*top_k)*4]
+            if any(raw[top_k *4:(top_k +top_k) *4] != raw[(top_k +k *top_k) *4:(top_k +(k +1) *top_k) *4]
                    for k in range(1, top_k)):
                 raise ValueError("anchor scores are not repeated")
             entries = [(int(ids[j]), struct.pack("<f", scores[j]).hex()) for j in range(top_k)]
         else:
-            entries = [(int(previous[k]), int(ids[j]), struct.pack("<f", scores[k*top_k+j]).hex())
+            entries = [(int(previous[k]), int(ids[j]), struct.pack("<f", scores[k *top_k +j]).hex())
                        for k in range(top_k) for j in range(top_k)]
         result.append(sorted(entries))
         previous = ids
@@ -509,26 +515,28 @@ def fit_ledger(row, trace, native_context=262144):
         raise ValueError("fit ledger requires the single-device control profile")
     device = target["devices"][0]
     name, total = device["name"], device["total"]
+
     def buffer_bytes(snapshot, field):
         return sum(entry[field] for entry in snapshot["buffers"] if entry["buffer"] == name)
+
     def component_bytes(component):
         return sum(entry["bytes"] for entry in target["components"]
                    if entry["buffer"] == name and entry["name"] == component)
-    weights = buffer_bytes(target, "model")+buffer_bytes(draft, "model")
+    weights = buffer_bytes(target, "model") +buffer_bytes(draft, "model")
     kv = component_bytes("target_kv")
     recurrent = component_bytes("target_recurrent")
     draft_kv = buffer_bytes(draft, "context")
-    if (not kv or kv % context or not recurrent or recurrent % (depth+1)
+    if (not kv or kv % context or not recurrent or recurrent % (depth +1)
             or not draft_kv or not weights or not total):
         raise ValueError("invalid measured cache/weight ledger")
-    full_kv = (kv//context)*native_context
-    lower = weights+full_kv+recurrent+draft_kv
-    current_recurrent = recurrent//(depth+1)
+    full_kv = (kv //context) *native_context
+    lower = weights +full_kv +recurrent +draft_kv
+    current_recurrent = recurrent //(depth +1)
     return {"native_context": native_context, "device_total_bytes": total,
             "ordinary_lower_bound_bytes": lower, "target_full_history_kv_bytes": full_kv,
             "ordinary_full_context_fits": False if lower > total else None,
-            "streamed_parent_upper_bound_before_scratch_bytes": max(0, total-weights-current_recurrent),
-            "target_elastic_upper_bound_before_scratch_bytes": max(0, total-weights-current_recurrent-draft_kv),
+            "streamed_parent_upper_bound_before_scratch_bytes": max(0, total -weights -current_recurrent),
+            "target_elastic_upper_bound_before_scratch_bytes": max(0, total -weights -current_recurrent -draft_kv),
             "streamed_fit_qualified": False,
             "excluded": ["compute", "output/features", "rollback staging", "native/library resources"]}
 
@@ -585,16 +593,16 @@ def run_point(args, context, depth, token_cache, mode):
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env,
                                        start_new_session=True)
             wait_for_health(url, 180, process)
-            row["startup_seconds"] = time.monotonic()-startup
+            row["startup_seconds"] = time.monotonic() -startup
             if "tokens" not in token_cache:
-                token_cache["tokens"] = request_json(url+"/tokenize", {
+                token_cache["tokens"] = request_json(url +"/tokenize", {
                     "content": args.prefill_text.read_text(), "add_special": False}, timeout=180)["tokens"]
             count = prompt_count(args,context,depth)
             if count < 256 or len(token_cache["tokens"]) < count:
                 raise ValueError("insufficient context/corpus for ordinary control")
-            result = stream_completion(url+"/completion", {"prompt": token_cache["tokens"][:count],
-                "n_predict": args.decode_tokens, "temperature": 0, "seed": 123, "ignore_eos": True,
-                "cache_prompt": False, "stream": True, "return_tokens": True}, timeout=args.request_timeout)
+            result = stream_completion(url +"/completion", {"prompt": token_cache["tokens"][:count],
+                                                            "n_predict": args.decode_tokens, "temperature": 0, "seed": 123, "ignore_eos": True,
+                                                            "cache_prompt": False, "stream": True, "return_tokens": True}, timeout=args.request_timeout)
             validate_result(result, count, args.decode_tokens, row["spec_mode"] != "none")
             row.update(status="ok", prompt_tokens=count, decode_tokens=args.decode_tokens, result=result)
             if getattr(args, "lifecycle", False):
@@ -627,7 +635,7 @@ def run_point(args, context, depth, token_cache, mode):
             if context >= 2304 and not args.arena_mib and not args.rs_host_spill:
                 row["fit_ledger"] = fit_ledger(row, trace)
             if args.arena_mib:
-                row["declared_arena_bytes"] = args.arena_mib*1024*1024
+                row["declared_arena_bytes"] = args.arena_mib *1024 *1024
         except Exception as error:
             row.update(status="failed", error=str(error))
     return row
@@ -636,7 +644,7 @@ def run_point(args, context, depth, token_cache, mode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("target", "draft", "draft-config", "server", "output"):
-        parser.add_argument("--"+name, type=Path, required=True)
+        parser.add_argument("--" +name, type=Path, required=True)
     parser.add_argument("--contexts", default="4096")
     parser.add_argument("--depths", default="1,3,7")
     parser.add_argument("--spec-mode", choices=("dflash", "dflash-k4v", "none", "mtp"), default="dflash",
@@ -656,7 +664,7 @@ def main():
     parser.add_argument("--target-v",choices=KV_TYPES,default="q4_0")
     parser.add_argument("--draft-k", choices=KV_TYPES, help="native controls only; streamed drafts inherit target K")
     parser.add_argument("--draft-v", choices=KV_TYPES, help="native controls only; streamed drafts inherit target V")
-    parser.add_argument("--prefill-text", type=Path, default=ROOT/"benchmarks/data/online-articles-262144-words.txt")
+    parser.add_argument("--prefill-text", type=Path, default=ROOT /"benchmarks/data/online-articles-262144-words.txt")
     parser.add_argument("--trace-library", type=Path)
     parser.add_argument("--cpu-profile", action="store_true",
                         help="after ordinary timing, collect test-side host-call costs and require identical outputs/counters; not speed evidence")
@@ -697,7 +705,7 @@ def main():
         modes = control_modes(args)
     except ValueError as error:
         parser.error(str(error))
-    if not 0 <= args.lifecycle_cache_mib <= 2**31-1 or (args.lifecycle_cache_mib and not args.lifecycle):
+    if not 0 <= args.lifecycle_cache_mib <= 2**31 -1 or (args.lifecycle_cache_mib and not args.lifecycle):
         parser.error("--lifecycle-cache-mib needs --lifecycle and a nonnegative int32 size")
     if (args.arena_mib < 0 or args.decode_tokens < 8 or args.prompt_tokens < 256 or not 1 <= args.port <= 65535
             or not math.isfinite(args.request_timeout) or not 1 <= args.request_timeout <= 43200):
@@ -723,15 +731,15 @@ def main():
     path = args.output / "results.jsonl"
     if path.exists():
         parser.error("results already exist; choose another output directory")
-    manifest = read_json(ROOT/"benchmarks/data/dflash2-qwen27b-artifacts.json")
+    manifest = read_json(ROOT /"benchmarks/data/dflash2-qwen27b-artifacts.json")
     report = inspect_artifacts({"target": args.target, "draft": args.draft, "draft_config": args.draft_config}, manifest)
-    (args.output / "artifacts.json").write_text(json.dumps(report, indent=2)+"\n")
+    (args.output / "artifacts.json").write_text(json.dumps(report, indent=2) +"\n")
     token_cache = {}
     controls = []
     control_artifacts = {}
     if args.compare_to:
-        controls = [json.loads(line) for line in (args.compare_to/"results.jsonl").read_text().splitlines()]
-        control_artifacts = read_json(args.compare_to/"artifacts.json")
+        controls = [json.loads(line) for line in (args.compare_to /"results.jsonl").read_text().splitlines()]
+        control_artifacts = read_json(args.compare_to /"artifacts.json")
     with path.open("x") as output:
         for context in contexts:
             for depth in depths:
@@ -751,7 +759,7 @@ def main():
                             validate_lifecycle_pair(ordinary["result"], row["result"])
                             if ordinary["source_stats"] != row["source_stats"]:
                                 raise ValueError("profile changed source-specific prediction/draft/acceptance counters")
-                            trace = [json.loads(line) for line in (Path(row["directory"])/"trace.jsonl").read_text().splitlines()]
+                            trace = [json.loads(line) for line in (Path(row["directory"]) /"trace.jsonl").read_text().splitlines()]
                             if not any(r.get("event") == "generation_begin" for r in trace):
                                 raise ValueError("CPU profile omitted generation boundaries")
                             row["cpu"] = summarize_cpu_trace(trace)
@@ -768,15 +776,16 @@ def main():
                                 raise ValueError("missing or ambiguous independent control")
                             control = matches[0]
                             row["comparison"] = compare_control_rows(row, control, report, control_artifacts,
-                                load_control_trace(Path(row["directory"])), load_control_trace(Path(control["directory"])),
-                                allow_uvm_difference=args.compare_numerical_only)
+                                                                     load_control_trace(Path(row["directory"])), load_control_trace(Path(control["directory"])),
+                                                                     allow_uvm_difference=args.compare_numerical_only)
                         except Exception as error:
                             row.update(status="failed", error=str(error))
                     if qualified is None or mode != "timing":
-                        row["wall_seconds"] = time.monotonic()-started
-                    output.write(json.dumps(row)+"\n")
+                        row["wall_seconds"] = time.monotonic() -started
+                    output.write(json.dumps(row) +"\n")
                     output.flush()
-                    print(json.dumps({key: value for key, value in row.items() if key != "result"}), flush=True)
+                    sys.stdout.write(str(json.dumps({key: value for key, value in row.items() if key != "result"})) + "\n")
+                    sys.stdout.flush()
                     if row["status"] == "capacity_failure":
                         break  # Do not repeat a known physical-fit failure under instrumentation.
                     if row["status"] != "ok":

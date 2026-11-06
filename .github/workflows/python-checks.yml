@@ -1,0 +1,38 @@
+name: Python checks
+on:
+  workflow_call:
+    inputs:
+      requirements:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  typing:
+    uses: ./.github/workflows/python-type-check.yml
+  lint:
+    uses: ./.github/workflows/python-lint.yml
+  requirements:
+    if: inputs.requirements
+    uses: ./.github/workflows/python-check-requirements.yml
+  host-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r tools/server/tests/requirements.txt ./gguf-py
+      - run: python -m unittest discover -s .github/scripts/tests -v
+      - run: python -m unittest discover -s benchmarks/server-ab/tests
+        env:
+          PYTHONPATH: benchmarks/server-ab:gguf-py
+      - run: python -m unittest discover -s tools/server/tests -p 'test_adaptive_*harness.py'
+        env:
+          PYTHONPATH: benchmarks/server-ab:gguf-py:tools/server/tests
+      - run: python -m unittest discover -s tools/server/tests -p test_adaptive_vision_measurements.py
+        env:
+          PYTHONPATH: benchmarks/server-ab:gguf-py:tools/server/tests

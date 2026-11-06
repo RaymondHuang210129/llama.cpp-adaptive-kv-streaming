@@ -1,110 +1,59 @@
-name: CI (sanitize)
-
+name: Hosted sanitizers
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-sanitize.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-sanitize.yml'
-    ]
-
-cache-mode: none
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      thread:
+        type: boolean
+        description: Include ThreadSanitizer validation
+        default: false
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
-  cancel-in-progress: true
-
-env:
-  GGML_NLOOP: 3
-  GGML_N_THREADS: 1
-  LLAMA_ARG_LOG_COLORS: 1
-  LLAMA_ARG_LOG_PREFIX: 1
-  LLAMA_ARG_LOG_TIMESTAMPS: 1
-
 jobs:
-  ctest:
-    continue-on-error: true
-
+  sanitize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     strategy:
+      fail-fast: false
       matrix:
-        include:
-        # thread and address doesn't run properly on some self hosted machines, so run it on Github instead
-        - sanitizer: ADDRESS
-          machine: ubuntu-24.04
-        - sanitizer: THREAD
-          machine: ubuntu-24.04
-        - sanitizer: UNDEFINED
-          machine: [self-hosted, X64, Linux]
-
-    runs-on: ${{ matrix.machine }}
-
+        sanitizer: [ADDRESS, UNDEFINED]
     steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      # - name: ccache
-      #   uses: ggml-org/ccache-action@v1.2.24
-      #   if: ${{ matrix.sanitizer != 'UNDEFINED' }}
-      #   with:
-      #     key: ctest-${{ matrix.sanitizer }}-ubuntu-24.04
-      #     variant: ccache
-      #     evict-old-files: 1d
-      #     save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-
-      # with UNDEFINED sanitizer, we have to build in Debug to avoid GCC 13 false-positive warnings
-      - name: Build (undefined)
-        id: cmake_build_undefined
-        if: ${{ matrix.sanitizer == 'UNDEFINED' }}
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DLLAMA_FATAL_WARNINGS=ON \
-            -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
-
-          cmake --build build --config Debug -j $(nproc)
-
-      - name: Build
-        id: cmake_build
-        if: ${{ matrix.sanitizer == 'ADDRESS' }}
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
-
-          cmake --build build --config RelWithDebInfo -j $(nproc)
-
-      - name: Build (no OpenMP)
-        id: cmake_build_no_openmp
-        if: ${{ matrix.sanitizer == 'THREAD' }}
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DGGML_OPENMP=OFF
-
-          cmake --build build --config RelWithDebInfo -j $(nproc)
-
-      - name: Test
-        id: cmake_test
-        run: |
-          cd build
-          ctest -L main -E tokenizer --verbose --timeout 900
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - run: python -m pip install cmake==3.31.8 ninja==1.13.0
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build gcc-13 g++-13 libssl-dev
+      - run: python .github/scripts/build.py --sanitizer "$SANITIZER"
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+      - name: Portable memory, streaming and vision lifecycle tests
+        run: ctest --test-dir build --output-on-failure --parallel 2 --timeout 300 -R '^(test-(kv-stream|memory-|context-memory|backend-memory|speculative|arg-parser|server-vision|mtmd-projector-storage|cuda-fattn))'
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      - run: python -m pip install -r tools/server/tests/requirements.txt ./gguf-py
+      - name: Sanitized basic server API tests
+        working-directory: tools/server/tests
+        run: bash tests.sh unit/test_basic.py
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+  thread:
+    if: github.event_name == 'workflow_dispatch' && inputs.thread
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - run: python -m pip install cmake==3.31.8 ninja==1.13.0
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build gcc-13 g++-13 libssl-dev
+      - run: python3 .github/scripts/build.py --sanitizer THREAD
+      - run: ctest --test-dir build --output-on-failure --timeout 300 -R '^test-memory-'

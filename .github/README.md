@@ -1,0 +1,51 @@
+# Fork CI and binary releases
+
+`workflows/ci.yml` checks pull requests targeting `feature/adaptive-kv-stream-v2`, pushes to that branch, and manual runs. It combines the results in the `required` job. Configure branch protection against that job after its actual check name has appeared in a successful GitHub run.
+
+## Required checks
+
+| Configuration | Purpose | Release package |
+|---|---|---|
+| Linux CPU, shared and static | Compile, link and run portable tests | None |
+| Windows CPU, shared | Compile, link DLLs and run portable tests | None |
+| Linux CUDA, shared | Compile and link CUDA/server/tools; check packaged startup and dependencies | `.tar.gz` |
+| Windows CUDA, shared | Compile and link CUDA/server/tools; check packaged startup and dependencies | `.zip` |
+
+Python typing, lint and host tests run on every event. Source consistency checks remain enabled. Server API, ASan/UBSan and UI tests run for relevant paths; CI or CMake changes request all suites. A manual run requests the full set. Draft PRs run lightweight checks; marking a PR ready triggers compilation and the applicable suites.
+
+The aggregate rejects failed, cancelled, missing or unexpectedly skipped required jobs. Superseded PR runs are cancelled; different branch commits retain separate runs. Internal `cpu-test-*` archives transfer binaries to server tests and expire after one day. They are excluded from releases.
+
+UI assets are built from the same checkout and passed to the C++ builds. Packages do not download upstream `latest` UI assets. The Linux compiler is GCC 13 on Ubuntu 24.04; Windows uses the MSVC environment on `windows-2022`. CMake 3.31.8 and Ninja 1.13.0 are pinned. CUDA compilation is serial; Linux adds swap on the ephemeral runner for heavy compiler processes. Actual hosted build resource requirements still need validation.
+
+## CUDA coverage
+
+The default toolkit is NVIDIA CUDA 13.0.1, installed from checksum-pinned redistributables without a driver. One package contains multiple GPU targets; separate downloads per GPU generation are not required. The configured architecture list is `75-virtual;80-virtual;86-real;89-real;90-virtual;120`. Existing CUDA CMake logic normalizes SM120 to SM120a for the native Blackwell path. Build manifests record the compiler and CMake architecture configuration.
+
+These hosted jobs compile CUDA and check executable startup, not GPU execution. They do not establish numerical correctness or performance on physical GPUs. Paid hosted GPU validation remains a separate decision. `build-cuda-compat.yml` provides manual CUDA 12.9.1 compilation for legacy SM61/SM70; those targets are not included in the initial CUDA 13 release packages.
+
+Other retained platform workflows are manual. HIP/MUSA compilation is in `build-gpu-alternatives.yml`. Apple, Android, Vulkan, SYCL, OpenCL and other manual builds are not prerequisites for the two published CUDA packages. No workflow waits for an upstream or self-hosted runner.
+
+## Commit-SHA releases
+
+A successful v2 push publishes a GitHub prerelease tagged `sha-<full-40-character-sha>` containing:
+
+- `llama-kv-stream-<sha>-linux-x64-cuda.tar.gz`
+- `llama-kv-stream-<sha>-windows-x64-cuda.zip`
+- `SHA256SUMS`
+- `build-info.json`
+
+The archives contain `llama-server`, `llama-cli`, `llama-bench`, the backend/shared libraries, required CUDA redistributables and dependency licenses. Models and GPU drivers are not bundled. Linux packages are built on Ubuntu 24.04; compatibility with older glibc distributions is not implied.
+
+The manifest identifies the exact commit, run/attempt, build configuration, compiler versions and file/archive checksums. Both OS archives must pass validation before publication. Pull requests and manual runs cannot publish. The publisher stages assets in an owned draft and publishes only after checking their sizes and SHA-256 digests. A rerun verifies an existing complete release and preserves its original bytes; it never replaces a published SHA release. An interrupted draft may be resumed by the same Actions run ID. A draft owned by another run is retained for review rather than overwritten.
+
+## Local checks and remaining rollout
+
+```sh
+python -m pip install PyYAML
+python -m unittest discover -s .github/scripts/tests -v
+actionlint
+```
+
+The migration has local Linux CPU, Python, package-startup and workflow-policy checks. Windows and CUDA builds, real release uploads and the final branch-protection check name require actual GitHub Actions runs. No GPU runtime result is implied by a local policy or packaging test. See the [migration ledger](../docs/development/ci-workflow-migration.md) for acceptance gates.
+
+The vocabulary corpus is pinned to the last fixture revision before this fork's upstream tokenizer baseline. Update `LLAMA_TEST_VOCABS_REVISION` when rebasing tokenizer code, and qualify the complete new corpus. The shell driver propagates any fixture failure and rejects an empty corpus.

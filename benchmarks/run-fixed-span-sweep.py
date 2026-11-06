@@ -114,7 +114,7 @@ def server_command(args: argparse.Namespace, context: int, mtp_length: int, aren
         ]
         if getattr(args,"model_draft",None) is not None:
             command += ["--model-draft",str(args.model_draft),"--spec-draft-ngl","999",
-                "--spec-draft-n-min","0","--spec-draft-p-min","0"]
+                        "--spec-draft-n-min","0","--spec-draft-p-min","0"]
         if getattr(args, "no_kv_stream_rs_rollback", False):
             command.append("--no-kv-stream-rs-rollback")
     return command
@@ -147,10 +147,10 @@ def validate_execution_log(log_text: str) -> None:
         # Disabling graph capture preserves the admitted kernel and is not a draft failure.
         if "CUDA graph instantiation" in line and "using eager execution" in line:
             continue
-        if (is_arena_capacity_failure(line) or
-                re.search(r"^\s*\d+(?:\.\d+)+\s+E\s", line) or
-                "llama_process() failed" in line or "CUDA error:" in line or
-                re.search(r"failed to rebuild .*graph after shared scratch handoff", line)):
+        if (is_arena_capacity_failure(line)
+                or re.search(r"^\s*\d+(?:\.\d+)+\s+E\s", line)
+                or "llama_process() failed" in line or "CUDA error:" in line
+                or re.search(r"failed to rebuild .*graph after shared scratch handoff", line)):
             raise RuntimeError(f"benchmark execution failed: {line.strip()}")
 
 
@@ -166,7 +166,7 @@ def arena_minimum_mib(log_text: str, *, include_mtp_fallback_hint: bool = True) 
                    r"|shared MTP arena quota requires")
     if include_mtp_fallback_hint:
         diagnostics += r"|MTP graph exceeds shared arena quota:"
-    lines = re.findall(r"(?:"+diagnostics+r")[^\r\n]*", log_text, re.IGNORECASE)
+    lines = re.findall(r"(?:" +diagnostics +r")[^\r\n]*", log_text, re.IGNORECASE)
     if not lines:
         return None
     required = [int(value) for line in lines for value in
@@ -232,14 +232,14 @@ def context_points(args: argparse.Namespace) -> list[int]:
             points=[int(value) for value in explicit.split(",")]
         except ValueError as error:
             raise ValueError("contexts must be comma-separated positive integers") from error
-        if not points or len(points) > 4096 or any(not 0 < point <= 2**31-1 for point in points) or len(set(points)) != len(points):
+        if not points or len(points) > 4096 or any(not 0 < point <= 2**31 -1 for point in points) or len(set(points)) != len(points):
             raise ValueError("contexts must be unique positive int32 values, at most 4096 points")
         return sorted(points)
-    if not 0 < args.min_context <= args.max_context <= 2**31-1 or args.context_step <= 0:
+    if not 0 < args.min_context <= args.max_context <= 2**31 -1 or args.context_step <= 0:
         raise ValueError("invalid context range")
-    if (args.max_context-args.min_context)//args.context_step+1 > 4096:
+    if (args.max_context -args.min_context) //args.context_step +1 > 4096:
         raise ValueError("context range exceeds 4096 points; increase the step")
-    return list(range(args.min_context,args.max_context+1,args.context_step))
+    return list(range(args.min_context,args.max_context +1,args.context_step))
 
 
 def prompt_tokens_for_context(context: int, decode_tokens: int, mtp_lengths: tuple[int, ...], headroom: int | None = None) -> int:
@@ -291,7 +291,7 @@ def probe_prompt_prefix(url: str, prompt: list[int], decode_tokens: int, process
         "return_progress": True,
     }).encode("utf-8")
     request = urllib.request.Request(url + "/completion", data=payload,
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
+                                     headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
     processed = 0
     with urllib.request.urlopen(request, timeout=180) as response:
         for raw_line in response:
@@ -335,7 +335,7 @@ def probe_arena(args: argparse.Namespace, context: int, mtp_length: int, arena_m
                     raise ValueError("token cache is required for a full-length arena probe")
                 if token_cache.get("tokens") is None:
                     token_cache["tokens"] = request_json(url + "/tokenize",
-                        {"content": article_text, "add_special": False}, timeout=180)["tokens"]
+                                                         {"content": article_text, "add_special": False}, timeout=180)["tokens"]
                 source_tokens = token_cache["tokens"]
                 prompt_count = prompt_tokens_for_context(context, args.decode_tokens, args.mtp_lengths,getattr(args,"prompt_headroom",None))
                 if source_tokens is None or len(source_tokens) < prompt_count:
@@ -388,10 +388,12 @@ def probe_arena(args: argparse.Namespace, context: int, mtp_length: int, arena_m
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
         minimum = arena_minimum_mib(log_text, include_mtp_fallback_hint=is_arena_capacity_failure(log_text))
         if minimum is not None:
-            print(f"arena probe ({label}): context={context} mtp={mtp_length} arena={arena_mib} MiB -> too small (reported minimum={minimum} MiB)", flush=True)
+            sys.stdout.write(str(f"arena probe ({label}): context={context} mtp={mtp_length} arena={arena_mib} MiB -> too small (reported minimum={minimum} MiB)") + "\n")
+            sys.stdout.flush()
             raise ArenaTooSmallError(minimum) from failure
         if is_arena_capacity_failure(log_text):
-            print(f"arena probe ({label}): context={context} mtp={mtp_length} arena={arena_mib} MiB -> capacity failure", flush=True)
+            sys.stdout.write(str(f"arena probe ({label}): context={context} mtp={mtp_length} arena={arena_mib} MiB -> capacity failure") + "\n")
+            sys.stdout.flush()
             return False
         raise RuntimeError(f"arena probe failed at context={context}, mtp={mtp_length}, arena={arena_mib} MiB; see {log_path}: {failure}") from failure
     if full_workload and result_cache is not None:
@@ -402,7 +404,8 @@ def probe_arena(args: argparse.Namespace, context: int, mtp_length: int, arena_m
             "log_path": log_path,
             "wall_seconds": time.monotonic() - started,
         }
-    print(f"arena probe ({label}): context={context} mtp={mtp_length} arena={arena_mib} MiB -> fits", flush=True)
+    sys.stdout.write(str(f"arena probe ({label}): context={context} mtp={mtp_length} arena={arena_mib} MiB -> fits") + "\n")
+    sys.stdout.flush()
     return True
 
 
@@ -412,16 +415,17 @@ def arena_for_point(args: argparse.Namespace, context: int, mtp_length: int, log
     if not args.auto_max_arena:
         return args.arena_mib
     fast_max = find_max_arena_mib(args.arena_mib,
-        lambda candidate: probe_arena(args, context, mtp_length, candidate, logs, url, article_text, token_cache))
+                                  lambda candidate: probe_arena(args, context, mtp_length, candidate, logs, url, article_text, token_cache))
     if article_text is None:
         return fast_max
     checked: dict[int, bool] = {}
+
     def full_fits(candidate: int) -> bool:
         if candidate > fast_max:
             return False
         if candidate not in checked:
             checked[candidate] = probe_arena(args, context, mtp_length, candidate, logs, url,
-                article_text, token_cache, full_workload=True, result_cache=result_cache)
+                                             article_text, token_cache, full_workload=True, result_cache=result_cache)
         return checked[candidate]
     return find_max_arena_mib(fast_max, full_fits, upper_limit=fast_max)
 
@@ -551,7 +555,8 @@ def main() -> int:
     if not args.prefill_text.is_file():
         raise SystemExit(f"prefill text does not exist: {args.prefill_text}")
     if os.name == "nt":
-        print("Windows: disabling UVM does not disable driver system-memory fallback. Configure this server's NVIDIA profile to Prefer No Sysmem Fallback for dedicated-VRAM fitting; the script does not verify that policy.", flush=True)
+        sys.stdout.write(str("Windows: disabling UVM does not disable driver system-memory fallback. Configure this server's NVIDIA profile to Prefer No Sysmem Fallback for dedicated-VRAM fitting; the script does not verify that policy.") + "\n")
+        sys.stdout.flush()
     try:
         contexts=context_points(args)
         args.min_context, args.max_context=min(contexts),max(contexts)
@@ -716,20 +721,21 @@ def main() -> int:
             }
             rows.append(row)
             write_outputs(rows, args.output)
-            print(json.dumps(row, sort_keys=True), flush=True)
+            sys.stdout.write(str(json.dumps(row, sort_keys=True)) + "\n")
+            sys.stdout.flush()
         try:
             plot(rows, args.output, args)
         except ModuleNotFoundError as error:
             if error.name != "matplotlib":
                 raise
-            print("matplotlib is unavailable; CSV/JSONL/log results were preserved without a plot", file=sys.stderr)
+            sys.stderr.write(str("matplotlib is unavailable; CSV/JSONL/log results were preserved without a plot") + "\n")
     finally:
         if managed:
             subprocess.run(["podman", "start", args.production_container], check=False)
 
-    print(args.output / "results.csv")
+    sys.stdout.write(str(args.output / "results.csv") + "\n")
     if (args.output / "fixed-span-sweep.png").exists():
-        print(args.output / "fixed-span-sweep.png")
+        sys.stdout.write(str(args.output / "fixed-span-sweep.png") + "\n")
     return 0
 
 
