@@ -353,8 +353,9 @@ class ArenaFinderTests(unittest.TestCase):
             self.assertEqual(report["next_mib_rejected"], 1067)
             self.assertTrue((args.output/"result.json").is_file())
             launch = shlex.split(report["posix_shell_command"])
-            self.assertEqual(launch[0], "env")
-            self.assertIn("GGML_CUDA_ENABLE_UNIFIED_MEMORY", launch)
+            self.assertEqual(launch, report["command"])
+            self.assertNotIn("SetEnvironmentVariable", report["powershell_command"])
+            self.assertNotIn("$env:", report["powershell_command"])
             self.assertEqual(report["shell"], "powershell" if os.name == "nt" else "posix")
             self.assertEqual((args.output/"command.ps1").read_text(encoding="utf-8-sig").strip(), report["powershell_command"])
             self.assertFalse(report["vision_execution_validated"])
@@ -367,19 +368,19 @@ class ArenaFinderTests(unittest.TestCase):
         self.assertEqual(self.args().server.name, "llama-server.exe" if os.name == "nt" else "llama-server")
 
     @unittest.skipUnless(os.name == "nt", "Windows PowerShell launcher")
-    def test_powershell_launcher_preserves_arguments_and_cleans_child_environment(self):
+    def test_powershell_launcher_preserves_arguments_and_inherits_environment(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)/"arguments.json"
             script = Path(temporary)/"command.ps1"
             values = [r"C:\models\O'Brien $draft\model.gguf", "space argument", "Unicode \u6a21\u578b"]
             code = "import json,os,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps([sys.argv[2:],os.getenv('LLAMA_ARG_MODEL'),os.getenv('LLAMA_MEDIA_MARKER')]), encoding='utf-8')"
             command = [sys.executable, "-c", code, str(output), *values]
-            launch = FINDER.shell_commands(command, ["LLAMA_ARG_MODEL"])["powershell"]
+            launch = FINDER.shell_commands(command)["powershell"]
             script.write_text(launch+"\n", encoding="utf-8-sig")
-            with patch.dict(os.environ, {"LLAMA_ARG_MODEL":"inherited wrong model"}):
+            with patch.dict(os.environ, {"LLAMA_ARG_MODEL":"inherited model", "LLAMA_MEDIA_MARKER":"inherited marker"}):
                 subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
                                check=True, capture_output=True, timeout=30)
-            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), [values, None, FINDER.MARKER])
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), [values, "inherited model", "inherited marker"])
 
     def test_probe_stops_only_its_child_and_does_not_hide_non_oom_errors(self):
         args = self.args("--decode-tokens", "8", "--prompt-tokens", "4")

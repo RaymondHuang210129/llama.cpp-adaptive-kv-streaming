@@ -14,18 +14,24 @@ int main() {
     ggml_cuda_fattn_tile_resume_layout h;
     assert(ggml_cuda_fattn_tile_resume_layout_make(half,529,h));
     assert(h.thread_bytes == 24 && h.state_bytes == 36864);
+    auto wide = geometry; wide.queries = 9;
+    ggml_cuda_fattn_tile_resume_layout w;
+    assert(ggml_cuda_fattn_tile_resume_layout_make(wide,529,w));
+    assert(w.state_bytes == 5*plan.state_bytes);
     const auto saved = plan;
-    for (int kind = 0; kind < 9; ++kind) {
+    for (int kind = 0; kind < 11; ++kind) {
         auto bad = geometry;
         if (kind == 0) bad.nthreads = 96;
         if (kind == 1) bad.ncols1 = 3;
         if (kind == 2) bad.acc_bytes = 2;
         if (kind == 3) bad.query_heads = 3;
         if (kind == 4) bad.nbatch_fa = 31;
-        if (kind == 5) bad.queries = 9;
+        if (kind == 5) bad.queries = 0;
         if (kind == 6) bad.splits = UINT32_MAX;
         if (kind == 7) bad.width = 0;
         if (kind == 8) bad.kv_heads = 0;
+        if (kind == 9) bad.queries = 530;
+        if (kind == 10) bad.queries = uint32_t(INT32_MAX)+1;
         assert(!ggml_cuda_fattn_tile_resume_layout_make(bad,529,plan));
         assert(std::memcmp(&saved,&plan,sizeof(plan)) == 0);
     }

@@ -38,7 +38,7 @@ struct llama_memory_cache_requirement {
     uint32_t row_padding = 1;
     size_t row_bytes = 0;
     uint32_t source_first_layer = 0;
-    llama_memory_cache_format format;
+    llama_memory_cache_format format = {};
 };
 
 struct llama_memory_cache_bound {

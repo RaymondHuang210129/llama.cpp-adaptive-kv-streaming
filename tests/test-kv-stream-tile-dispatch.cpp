@@ -126,7 +126,7 @@ int main(int argc, char ** argv) {
             }
             op.op=GGML_OP_FLASH_ATTN_EXT; op.src[0]=input.q; op.src[1]=&k; op.src[2]=&v; op.src[3]=input.mask;
             const float scale=1.0f/16; std::memcpy(op.op_params,&scale,sizeof(scale));
-            ggml_flash_attn_ext_set_prec(&op,GGML_PREC_F32);
+            ggml_prec_set_acc(&op,GGML_PREC_F32);
             size_t bytes=0;
             if (!t.assert_true(get()->spans_workspace(backend.get(),&op,raw,bytes))) return;
             block_workspace exact(f,bytes,81), tiny(f,bytes-1,82);

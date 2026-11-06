@@ -78,8 +78,8 @@ public:
     // Cache identity selects the next reader; no model layer count is encoded in the schedule.
     bool schedule_next_cache(uint64_t cache_id, uint32_t future_tokens);
     // The same cache can be an append producer or an immutable reader; each declares its own successor.
-    bool schedule_next_consumer(llama_kv_stream_access_role producer, const llama_kv_stream_next_consumer & next);
-    llama_kv_stream_next_consumer next_consumer(llama_kv_stream_access_role producer) const noexcept;
+    LLAMA_API bool schedule_next_consumer(llama_kv_stream_access_role producer, const llama_kv_stream_next_consumer & next);
+    LLAMA_API llama_kv_stream_next_consumer next_consumer(llama_kv_stream_access_role producer) const noexcept;
     // Completed-role statistics do not include an upcoming successor's prefetch.
     llama_kv_stream_prefetch_stats sequence_stats(llama_kv_stream_access_role producer) const noexcept;
     // Finish a read phase, including confidence cutoff, and restore target append lookahead.

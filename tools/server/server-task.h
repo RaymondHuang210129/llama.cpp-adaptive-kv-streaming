@@ -613,7 +613,7 @@ struct server_prompt {
     server_tokens tokens;
 
     std::list<common_prompt_checkpoint> checkpoints;
-    std::vector<uint8_t> speculative_state;
+    std::vector<uint8_t> speculative_state = {};
 
     void clear() {
         tokens.clear();

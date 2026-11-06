@@ -478,7 +478,7 @@ int main(int argc,char ** argv) {
             auto * v=ggml_view_3d(ctx.get(),reader->value(),512,input.padded,4,
                 reader->value()->nb[1],ggml_row_size(pair.second,512),0);
             auto * out=ggml_flash_attn_ext(ctx.get(),q,k,v,input.mask,1.0f/16,0,0);
-            ggml_flash_attn_ext_set_prec(out,GGML_PREC_F32);
+            ggml_prec_set_acc(out,GGML_PREC_F32);
             ggml_backend_execution_set_external_workspace(out,true);
             auto * graph=ggml_new_graph_custom(ctx.get(),64,false); ggml_build_forward_expand(graph,out);
             ggml_backend_buffer_ptr storage(ggml_backend_alloc_ctx_tensors(ctx.get(),child.get()));
@@ -1662,7 +1662,7 @@ int main(int argc,char ** argv) {
             auto * key = ggml_view_3d(ctx.get(),k,width,attn.padded,heads,f.host->layout().k_token_bytes,f.host->layout().k_row_bytes,0);
             auto * value = ggml_view_3d(ctx.get(),v,width,attn.padded,heads,f.host->layout().v_token_bytes,f.host->layout().v_row_bytes,0);
             auto * output = ggml_flash_attn_ext(ctx.get(),attn.q,key,value,attn.mask,1.0f/16,0,0);
-            ggml_flash_attn_ext_set_prec(output,GGML_PREC_F32);
+            ggml_prec_set_acc(output,GGML_PREC_F32);
             ggml_build_forward_expand(graph,output);
             ggml_backend_t backends[]{backend.get(),cpu.get()};
             ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends,nullptr,2,128,false,true));
@@ -1832,7 +1832,7 @@ int main(int argc,char ** argv) {
             auto * node = ggml_flash_attn_ext(ctx.get(), input.q, key, value,
                 input.mask, 1.0f/16, 0, 0);
             if (!t.assert_true(node != nullptr)) return;
-            ggml_flash_attn_ext_set_prec(node, GGML_PREC_F32);
+            ggml_prec_set_acc(node, GGML_PREC_F32);
             ggml_tensor op = *node;
             op.buffer = input.output->buffer;
             op.data = input.output->data;
@@ -2171,7 +2171,7 @@ int main(int argc,char ** argv) {
             auto * v = ggml_view_3d(ctx.get(), vs, 256, input.padded, 2,
                 ggml_row_size(GGML_TYPE_Q4_0, 512), ggml_row_size(GGML_TYPE_Q4_0, 256), 0);
             auto * node = ggml_flash_attn_ext(ctx.get(), input.q, k, v, input.mask, 1.0f/16, 0, 0);
-            ggml_flash_attn_ext_set_prec(node, GGML_PREC_F32);
+            ggml_prec_set_acc(node, GGML_PREC_F32);
             ggml_tensor op = *node;
             op.buffer = input.output->buffer;
             op.data = input.output->data;

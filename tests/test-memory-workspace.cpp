@@ -218,7 +218,7 @@ int main(int argc, char ** argv) {
         ggml_context_ptr ctx(ggml_init({16384,nullptr,true}));
         ggml_cuda_operator_workspace_caps caps;caps.ready=true;caps.nsm=70;
         for (auto & row : caps.tile) for (auto & config : row) { config.occupancy=2;config.nbatch=64; }
-        for (const auto pair : {std::pair<int64_t,size_t>{256,2424832},{576,19095552},{16,0}}) {
+        for (const auto & pair : {std::pair<int64_t,size_t>{256,2424832},{576,19095552},{16,0}}) {
             auto * q=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,72,pair.first,16);
             auto * k=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,72,pair.first,16);
             auto * v=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,72,pair.first,16);

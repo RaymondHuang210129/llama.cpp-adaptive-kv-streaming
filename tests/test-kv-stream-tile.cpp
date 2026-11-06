@@ -26,11 +26,11 @@ static void fill_tensor(ggml_tensor * tensor, float phase) {
 int main(int argc, char ** argv) {
     if (argc < 3) { std::puts("SKIP: use --record or --compare with a snapshot directory, optionally --pascal"); return 77; }
     const bool record = !std::strcmp(argv[1],"--record"), compare = !std::strcmp(argv[1],"--compare");
-    const bool pascal = argc == 4 && !std::strcmp(argv[3],"--pascal");
     if ((!record && !compare) || argc > 4) return 2;
 #ifndef KV_STREAM_TILE_NATIVE_TEST
     std::puts("SKIP: CUDA native adapter is not compiled"); return 77;
 #else
+    const bool pascal = argc == 4 && !std::strcmp(argv[3],"--pascal");
     if (pascal && !kv_stream_test_is_sm61_only()) { std::puts("SKIP: Pascal requires an SM61-only build"); return 77; }
     ggml_backend_load_all();
     auto * dev = ggml_backend_dev_by_name("CUDA0");
@@ -66,7 +66,7 @@ int main(int argc, char ** argv) {
                 auto * v = ggml_view_3d(ctx.get(),vs,dim,tokens,2,ggml_row_size(pair.second,dim*2),ggml_row_size(pair.second,dim),0);
                 auto * mask = masked ? ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,(tokens+31)/32*32,queries) : nullptr;
                 auto * output = ggml_flash_attn_ext(ctx.get(),q,k,v,mask,1.0f/std::sqrt(float(dim)),0,0);
-                ggml_flash_attn_ext_set_prec(output,GGML_PREC_F32);
+                ggml_prec_set_acc(output,GGML_PREC_F32);
                 auto * graph = ggml_new_graph_custom(ctx.get(),32,false);
                 ggml_build_forward_expand(graph,output);
                 ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend.get()));

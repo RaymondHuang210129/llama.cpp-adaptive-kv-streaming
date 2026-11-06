@@ -549,7 +549,7 @@ int main(int argc, char ** argv) {
                 tensor->nb[3] = input.padded*tensor->nb[1];
             }
             auto * output = ggml_flash_attn_ext(input.context.get(),input.q,key,value,input.mask,1.0f/16,0,0);
-            ggml_flash_attn_ext_set_prec(output,GGML_PREC_F32);
+            ggml_prec_set_acc(output,GGML_PREC_F32);
             auto * type = ggml_backend_buffer_get_type(input.buffer.get());
             ggml_backend_buffer_ptr output_buffer(ggml_backend_buft_alloc_buffer(type,ggml_backend_buft_get_alloc_size(type,output)));
             if (!t.assert_true(bool(output_buffer))) return;

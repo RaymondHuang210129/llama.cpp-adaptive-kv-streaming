@@ -145,14 +145,10 @@ def environment():
     return env
 
 
-def shell_commands(command, removed):
-    launch = ["env"] + [item for name in removed for item in ("-u", name)] + ["LLAMA_MEDIA_MARKER="+MARKER] + command
+def shell_commands(command):
     def quote(value):
         return "'"+value.replace("'", "''")+"'"
-    powershell = ["[Environment]::SetEnvironmentVariable("+quote(name)+", $null, 'Process')" for name in removed]
-    powershell.append("$env:LLAMA_MEDIA_MARKER = "+quote(MARKER))
-    powershell.append("& "+" ".join(quote(value) for value in command))
-    return {"posix":shlex.join(launch), "powershell":"\n".join(powershell)}
+    return {"posix":shlex.join(command), "powershell":"& "+" ".join(quote(value) for value in command)}
 
 
 def bounded_bytes(path, maximum=64*1048576):
@@ -789,7 +785,7 @@ def fit(args, report_vision=False):
     removed = sorted(set(REMOVED_ENV) | {name for name in os.environ if name.startswith("LLAMA_ARG_")})
     report["environment"] = {name:None for name in removed}
     report["environment"]["LLAMA_MEDIA_MARKER"] = MARKER
-    commands = shell_commands(report["command"], removed)
+    commands = shell_commands(report["command"])
     report["shell"] = "powershell" if os.name == "nt" else "posix"
     report["shell_command"] = commands[report["shell"]]
     report["posix_shell_command"] = commands["posix"]

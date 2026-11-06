@@ -49,7 +49,7 @@ static bool native_attention_available(const llama_kv_stream_model_config & conf
         }
         op.op = GGML_OP_FLASH_ATTN_EXT;
         op.src[0] = &q; op.src[1] = &k; op.src[2] = &v; op.src[3] = &mask;
-        ggml_flash_attn_ext_set_prec(&op,GGML_PREC_F32);
+        ggml_prec_set_acc(&op,GGML_PREC_F32);
         if (!ggml_backend_supports_op(config.backend,&op)) { unavailable = rows; return false; }
     }
     return true;
