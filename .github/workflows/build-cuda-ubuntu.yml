@@ -5,57 +5,8 @@ permissions:
   contents: read
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 330
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        with:
-          python-version: '3.11'
-      - run: python -m pip install cmake==3.31.10 ninja==1.13.0
-      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
-        if: runner.os == 'Windows'
-        with:
-          arch: x64
-      - name: Linux dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build gcc-13 g++-13 libssl-dev
-      - name: Prepare hosted runner capacity for serial CUDA compilation
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo fallocate -l 8G "$RUNNER_TEMP/cuda-build.swap"
-          sudo chmod 600 "$RUNNER_TEMP/cuda-build.swap"
-          sudo mkswap "$RUNNER_TEMP/cuda-build.swap"
-          sudo swapon "$RUNNER_TEMP/cuda-build.swap"
-          free -h
-          df -h .
-      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
-        with:
-          path: ${{ runner.temp }}/cuda
-          key: cuda-redist-13.0.1-${{ runner.os }}-v2
-      - name: Install pinned CUDA toolkit without a driver
-        run: python .github/scripts/setup_cuda.py "$RUNNER_TEMP/cuda"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-        with:
-          name: ui-dist
-          path: tools/ui/dist
-      - name: Compile and link (no GPU execution)
-        run: python .github/scripts/build.py --backend cuda
-      - name: Package CUDA backend and redistributables
-        run: python .github/scripts/fork_ci.py package --build build --output packages --variant linux-x64-cuda --cuda-root "$CUDA_PATH"
-      - name: Packaged executable startup (no GPU qualification)
-        run: python .github/scripts/smoke_package.py packages
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/adaptive-kv-stream-v2'
-        with:
-          name: package-linux-x64-cuda
-          path: packages/*
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 1
+    uses: ./.github/workflows/build-cuda-sharded.yml
+    with:
+      os: ubuntu-24.04
+      variant: linux-x64-cuda
+      fatal_warnings: 'ON'

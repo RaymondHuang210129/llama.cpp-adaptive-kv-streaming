@@ -293,7 +293,7 @@ class Workflows(unittest.TestCase):
         self.workflows = {path.name: yaml.load(path.read_text(), Loader=yaml.BaseLoader)
                           for path in self.root.glob("*.yml")}
 
-    def build_commands(self, platform, backend, fatal=None):
+    def build_commands(self, platform, backend, fatal=None, configure_only=False):
         spec = importlib.util.spec_from_file_location("ci_build", SCRIPT.parent / "build.py")
         assert spec is not None and spec.loader is not None
         build = importlib.util.module_from_spec(spec)
@@ -301,11 +301,18 @@ class Workflows(unittest.TestCase):
         args = ["build.py", "--backend", backend]
         if fatal is not None:
             args += ["--fatal-warnings", fatal]
+        if configure_only:
+            args += ["--configure-only"]
         with patch.object(sys, "argv", args), patch.object(sys, "platform", platform), \
                 patch.dict(build.os.environ, {"CUDA_PATH": "/sdk"}), patch.object(build.subprocess, "run") as run:
             build.main()
         self.assertTrue(all(call.kwargs.get("check") for call in run.call_args_list))
+        self.assertEqual(len(run.call_args_list), 1 if configure_only else 2)
         return run.call_args_list[0].args[0]
+
+    def test_configure_only_jobs_do_not_start_compilation(self):
+        for platform in ("linux", "win32"):
+            self.build_commands(platform, "cuda", configure_only=True)
 
     def test_build_helper_defaults_to_fatal_warnings_on_both_platforms(self):
         for platform in ("linux", "win32"):
@@ -329,9 +336,9 @@ class Workflows(unittest.TestCase):
         build = next(step for step in cpu["steps"] if step.get("name") == "Build")
         self.assertIn('--fatal-warnings "$FATAL_WARNINGS"', build["run"])
         self.assertEqual(build["env"]["FATAL_WARNINGS"], "${{ matrix.fatal_warnings }}")
-        for name in ("build-cuda-windows.yml", "build-cuda-ubuntu.yml", "build-cuda-compat.yml"):
-            text = (self.root / name).read_text()
-            self.assertEqual("--fatal-warnings OFF" in text, name == "build-cuda-windows.yml")
+        for name, expected in (("build-cuda-windows.yml", "OFF"), ("build-cuda-ubuntu.yml", "ON")):
+            self.assertEqual(self.workflows[name]["jobs"]["build"]["with"]["fatal_warnings"], expected)
+        self.assertNotIn("--fatal-warnings OFF", (self.root / "build-cuda-compat.yml").read_text())
 
     def test_no_empty_jobs_special_runner_services_or_upstream_secrets(self):
         for name, data in self.workflows.items():

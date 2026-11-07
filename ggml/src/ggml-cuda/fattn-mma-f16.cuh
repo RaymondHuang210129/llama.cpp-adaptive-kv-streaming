@@ -1506,7 +1506,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     if constexpr (KV::resumable) {
         if (kb0_stop < native_stop) {
             // Resolve only at each copy; do not keep the checkpoint address across the MMA loop.
-            constexpr size_t thread_bytes=sizeof(VKQ_C)+sizeof(KQ_max)+sizeof(KQ_rowsum);
+            [[maybe_unused]] constexpr size_t thread_bytes=sizeof(VKQ_C)+sizeof(KQ_max)+sizeof(KQ_rowsum);
             char * destination=checkpoint;
             if constexpr (feature_pipeline)
                 destination=ggml_cuda_fattn_mma_checkpoint_thread<thread_bytes>(kv.control,kv.slice,native_block);

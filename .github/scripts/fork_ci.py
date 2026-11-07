@@ -152,6 +152,8 @@ def package(build, output, sha, variant, cuda_root=None):
                     "files": {name: digest(path) for name, path in sorted(files.items())}}
         if cuda_root:
             metadata["cuda_redistributables"] = json.loads((cuda_root / "redistributables.json").read_text())
+        if (build / "cuda-shards.json").is_file():
+            metadata["cuda_shards"] = json.loads((build / "cuda-shards.json").read_text())
         (stage / "build-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
         if windows:
             with zipfile.ZipFile(target, "x", compression=zipfile.ZIP_DEFLATED) as archive:

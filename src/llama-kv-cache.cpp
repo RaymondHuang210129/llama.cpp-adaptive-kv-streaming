@@ -1724,14 +1724,6 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
-ggml_type llama_kv_cache::type_k() const {
-    return layers[0].k->type;
-}
-
-ggml_type llama_kv_cache::type_v() const {
-    return layers[0].v->type;
-}
-
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
     std::vector<uint32_t> res;
     res.reserve(layers.size());

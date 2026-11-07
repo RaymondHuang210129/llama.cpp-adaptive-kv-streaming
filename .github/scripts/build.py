@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--fatal-warnings", choices=("ON", "OFF"), default="ON")
     parser.add_argument("--sanitizer", choices=("ADDRESS", "UNDEFINED", "THREAD"))
     parser.add_argument("--cuda-architectures", default=ARCHITECTURES)
+    parser.add_argument("--configure-only", action="store_true")
     args = parser.parse_args()
     cuda = args.backend == "cuda"
     options = ["cmake", "-S", ".", "-B", str(args.build), "-G", "Ninja",
@@ -44,7 +45,8 @@ def main():
     if args.sanitizer:
         options += ["-DLLAMA_SANITIZE_" + args.sanitizer + "=ON", "-DGGML_SANITIZE_" + args.sanitizer + "=ON"]
     subprocess.run(options, check=True)
-    subprocess.run(["cmake", "--build", str(args.build), "--parallel", "1" if cuda else "2"], check=True)
+    if not args.configure_only:
+        subprocess.run(["cmake", "--build", str(args.build), "--parallel", "1" if cuda else "2"], check=True)
 
 
 if __name__ == "__main__":

@@ -134,7 +134,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
-    float VKQ_scale[ncols];
+    [[maybe_unused]] float VKQ_scale[ncols];
 #pragma unroll
     for (int j = 0; j < ncols; ++j) {
         KQ_max[j] = -FLT_MAX/2.0f;
@@ -143,8 +143,8 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
 
     static_assert(!resumable || ncols <= 2, "resumed vector attention supports TG1/TG2");
     constexpr int query_state_stride = 2 + 2*(D/2)/nthreads_V;
-    constexpr int state_stride = ncols*query_state_stride;
-    float * saved = nullptr;
+    [[maybe_unused]] constexpr int state_stride = ncols*query_state_stride;
+    [[maybe_unused]] float * saved = nullptr;
 
     // Convert Q to float2 (f16 K) or q8_1 (quantized K) and store in registers:
 #ifdef V_DOT2_F32_F16_AVAILABLE

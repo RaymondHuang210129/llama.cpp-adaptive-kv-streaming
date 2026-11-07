@@ -17,7 +17,17 @@ Python typing, lint and host tests run on every event. Source consistency checks
 
 The aggregate rejects failed, cancelled, missing or unexpectedly skipped required jobs. Superseded PR runs are cancelled; different branch commits retain separate runs. Internal `cpu-test-*` archives transfer binaries to server tests and expire after one day. They are excluded from releases.
 
-UI assets are built from the same checkout and passed to the C++ builds. Packages do not download upstream `latest` UI assets. The Linux compiler is GCC 13 on Ubuntu 24.04; Windows uses the MSVC environment on `windows-2022`. CMake 3.31.10 and Ninja 1.13.0 are pinned. CUDA compilation is serial; Linux adds swap on the ephemeral runner for heavy compiler processes. Actual hosted build resource requirements still need validation.
+UI assets are built from the same checkout and passed to the C++ builds. Packages do not download upstream `latest` UI assets. The Linux compiler is GCC 13 on Ubuntu 24.04; Windows uses the MSVC environment on `windows-2022`. CMake 3.31.10 and Ninja 1.13.0 are pinned. Each CUDA shard uses one compiler process; Linux adds swap on the ephemeral runner for heavy compiler processes. Actual hosted build resource requirements still need validation.
+
+### Parallel CUDA compilation
+
+The Linux and Windows components call `build-cuda-sharded.yml`. A planning job reads Ninja's complete compilation database. Each private `kv-stream-*` translation unit gets its own shard; the remaining CUDA files are distributed across eight groups. Up to eight shards run concurrently per OS, using free standard hosted runners. No architecture, format specialization or translation unit is dropped or regrouped.
+
+Each shard returns compressed compiler objects and their source/command/dependency checksums. The final job rejects missing or duplicate objects, changed headers, mixed source/toolchain cohorts and invalid archives. A private CMake hook substitutes validated objects in the original source/link order. The final job compiles host code, links the complete CUDA backend, checks packaged startup and records shard provenance in the package manifest. It refuses to rebuild CUDA sources serially during final linking.
+
+GitHub-hosted jobs have a [six-hour execution limit](https://docs.github.com/en/actions/reference/limits), so setting a single job to 24 hours does not extend it. Shards and final linking use at most 360 minutes per job, with a shared 24-hour deadline measured from plan creation and checked before and during compilation/linking. Setup and artifact/publication steps do not enforce that deadline, so it is not a strict workflow-wide wall-clock limit. An expired plan requires a new workflow run.
+
+Temporary object archives use Actions artifact storage and expire after one day. Their compressed sizes are reported; free public-runner compute does not make [artifact storage unlimited](https://docs.github.com/en/billing/concepts/product-billing/github-actions). The native handoff self-test runs on each selected OS before the expensive CUDA compilation. Local C++ tests and a real NVCC SM75/SM120 object-handoff/link fixture pass; the complete hosted CUDA and Windows builds remain required. No GPU execution is implied by the fixture.
 
 ## CUDA coverage
 

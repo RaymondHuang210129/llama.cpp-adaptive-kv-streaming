@@ -95,8 +95,8 @@ public:
     // llama_kv_cache_iswa specific API
     //
 
-    llama_kv_cache * get_base() const;
-    llama_kv_cache * get_swa () const;
+    llama_kv_cache * get_base() const { return kv_base.get(); }
+    llama_kv_cache * get_swa () const { return kv_swa.get(); }
 
 private:
     const bool unified;

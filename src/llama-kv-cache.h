@@ -199,8 +199,8 @@ public:
 
     bool get_has_shift() const;
 
-    ggml_type type_k() const;
-    ggml_type type_v() const;
+    ggml_type type_k() const { return layers[0].k->type; }
+    ggml_type type_v() const { return layers[0].v->type; }
 
     std::vector<uint32_t> get_layer_ids() const;
     // First streamed source follows this cache's actual graph-layer order, not the target's layer count.

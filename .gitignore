@@ -141,6 +141,7 @@ flake.lock
 /run-chat.sh
 /run-spec.sh
 /.ccache/
+/.ci-cuda/
 
 # IDE
 
