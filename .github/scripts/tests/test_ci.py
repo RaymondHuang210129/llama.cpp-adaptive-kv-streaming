@@ -293,6 +293,46 @@ class Workflows(unittest.TestCase):
         self.workflows = {path.name: yaml.load(path.read_text(), Loader=yaml.BaseLoader)
                           for path in self.root.glob("*.yml")}
 
+    def build_commands(self, platform, backend, fatal=None):
+        spec = importlib.util.spec_from_file_location("ci_build", SCRIPT.parent / "build.py")
+        assert spec is not None and spec.loader is not None
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        args = ["build.py", "--backend", backend]
+        if fatal is not None:
+            args += ["--fatal-warnings", fatal]
+        with patch.object(sys, "argv", args), patch.object(sys, "platform", platform), \
+                patch.dict(build.os.environ, {"CUDA_PATH": "/sdk"}), patch.object(build.subprocess, "run") as run:
+            build.main()
+        self.assertTrue(all(call.kwargs.get("check") for call in run.call_args_list))
+        return run.call_args_list[0].args[0]
+
+    def test_build_helper_defaults_to_fatal_warnings_on_both_platforms(self):
+        for platform in ("linux", "win32"):
+            for backend in ("cpu", "cuda"):
+                with self.subTest(platform=platform, backend=backend):
+                    command = self.build_commands(platform, backend)
+                    self.assertIn("-DLLAMA_FATAL_WARNINGS=ON", command)
+                    self.assertIn("-DGGML_FATAL_WARNINGS=ON", command)
+
+    def test_windows_warning_collection_disables_only_warning_promotion(self):
+        for backend in ("cpu", "cuda"):
+            with self.subTest(backend=backend):
+                command = self.build_commands("win32", backend, fatal="OFF")
+                self.assertIn("-DLLAMA_FATAL_WARNINGS=OFF", command)
+                self.assertIn("-DGGML_FATAL_WARNINGS=OFF", command)
+
+    def test_temporary_warning_policy_is_scoped_to_main_windows_jobs(self):
+        cpu = self.workflows["build-cpu.yml"]["jobs"]["build"]
+        for row in cpu["strategy"]["matrix"]["include"]:
+            self.assertEqual(row["fatal_warnings"], "OFF" if row["os"] == "windows-2022" else "ON")
+        build = next(step for step in cpu["steps"] if step.get("name") == "Build")
+        self.assertIn('--fatal-warnings "$FATAL_WARNINGS"', build["run"])
+        self.assertEqual(build["env"]["FATAL_WARNINGS"], "${{ matrix.fatal_warnings }}")
+        for name in ("build-cuda-windows.yml", "build-cuda-ubuntu.yml", "build-cuda-compat.yml"):
+            text = (self.root / name).read_text()
+            self.assertEqual("--fatal-warnings OFF" in text, name == "build-cuda-windows.yml")
+
     def test_no_empty_jobs_special_runner_services_or_upstream_secrets(self):
         for name, data in self.workflows.items():
             with self.subTest(workflow=name):

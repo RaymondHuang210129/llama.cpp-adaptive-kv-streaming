@@ -11,6 +11,8 @@
 | Linux CUDA, shared | Compile and link CUDA/server/tools; check packaged startup and dependencies | `.tar.gz` |
 | Windows CUDA, shared | Compile and link CUDA/server/tools; check packaged startup and dependencies | `.zip` |
 
+Temporarily, the main Windows CPU and CUDA jobs use `--fatal-warnings OFF` to collect the complete warning inventory. Warnings remain visible; compiler errors and test failures still fail CI. Linux builds and the build helper's default remain strict. Restore Windows warning promotion after the inventory is fixed.
+
 Python typing, lint and host tests run on every event. Source consistency checks remain enabled. Server API, ASan/UBSan and UI tests run for relevant paths; CI or CMake changes request all suites. A manual run requests the full set. Draft PRs run lightweight checks; marking a PR ready triggers compilation and the applicable suites.
 
 The aggregate rejects failed, cancelled, missing or unexpectedly skipped required jobs. Superseded PR runs are cancelled; different branch commits retain separate runs. Internal `cpu-test-*` archives transfer binaries to server tests and expire after one day. They are excluded from releases.

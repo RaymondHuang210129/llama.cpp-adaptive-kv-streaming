@@ -1346,7 +1346,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         KQ_max[col] = -FLT_MAX/2.0f;
     }
 
-    char * checkpoint=nullptr;
+    [[maybe_unused]] char * checkpoint=nullptr;
     if constexpr (KV::resumable) {
         static_assert((DKQ == 256 || DKQ == 512) && DKQ == DV, "unsupported resumed head geometry");
         constexpr size_t thread_bytes=sizeof(VKQ_C)+sizeof(KQ_max)+sizeof(KQ_rowsum);

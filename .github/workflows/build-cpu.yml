@@ -15,12 +15,16 @@ jobs:
           - os: ubuntu-24.04
             variant: linux-x64-cpu
             shared: 'ON'
+            fatal_warnings: 'ON'
           - os: windows-2022
             variant: windows-x64-cpu
             shared: 'ON'
+            # Temporary diagnostic pass to inventory all Windows warnings.
+            fatal_warnings: 'OFF'
           - os: ubuntu-24.04
             variant: linux-static
             shared: 'OFF'
+            fatal_warnings: 'ON'
     defaults:
       run:
         shell: bash
@@ -45,9 +49,10 @@ jobs:
           name: ui-dist
           path: tools/ui/dist
       - name: Build
-        run: python .github/scripts/build.py --shared "$SHARED"
+        run: python .github/scripts/build.py --shared "$SHARED" --fatal-warnings "$FATAL_WARNINGS"
         env:
           SHARED: ${{ matrix.shared }}
+          FATAL_WARNINGS: ${{ matrix.fatal_warnings }}
       - run: python -m pip install ./gguf-py jinja2==3.1.6
       - name: Configure vocabulary fixture downloads
         if: runner.os == 'Linux'

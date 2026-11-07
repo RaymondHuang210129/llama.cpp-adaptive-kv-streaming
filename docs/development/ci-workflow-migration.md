@@ -6,6 +6,8 @@ Baseline: `2f63f96e3b8e0c249e3385fe378233b2ffceb528` on `feature/adaptive-kv-str
 
 Confirmed release policy: use the full commit SHA as the package version and publish Linux and Windows CUDA binaries. CPU-only builds are retained for CI testing, not release downloads. Semantic versioning is not required for this pipeline.
 
+Temporary diagnostic exception: the main Windows CPU/CUDA jobs collect warnings with warning promotion disabled, as requested. Linux and default helper invocations retain fatal warnings. Restore Windows fatal warnings after the complete inventory is fixed; strict Windows acceptance remains pending.
+
 ## 1. Requirements
 
 - Require Linux and Windows compilation on pull requests targeting the v2 branch.
