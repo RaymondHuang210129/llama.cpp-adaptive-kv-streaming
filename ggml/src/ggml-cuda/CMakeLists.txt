@@ -247,6 +247,9 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_FATAL_WARNINGS)
         list(APPEND CUDA_FLAGS -Werror all-warnings)
+        if (MSVC)
+            list(APPEND CUDA_CXX_FLAGS /WX)
+        endif()
     endif()
 
     if (GGML_ALL_WARNINGS AND NOT MSVC)
