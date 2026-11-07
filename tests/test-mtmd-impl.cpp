@@ -103,9 +103,9 @@ MAKE_TEST(test_image_preprocessor_gemma4_budget) {
     hparams.custom_image_min_tokens = 1;
     hparams.custom_image_max_tokens = 280;
     hparams.set_limit_image_tokens(70, 1120);
-    const auto small = mtmd_image_preprocessor_gemma4::target_size(hparams, { 16, 16 });
-    t.assert_equal(768, small.width);
-    t.assert_equal(768, small.height);
+    const auto small_image = mtmd_image_preprocessor_gemma4::target_size(hparams, { 16, 16 });
+    t.assert_equal(768, small_image.width);
+    t.assert_equal(768, small_image.height);
     for (int budget : {70,140,280,560,1120}) {
         hparams.custom_image_min_tokens = budget;
         hparams.custom_image_max_tokens = budget;

@@ -615,7 +615,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
     constexpr int DVp = (DV + 2*warp_size - 1) & ~(2*warp_size - 1); // DV padded to multiple of 2*warp_size.
 #ifdef FAST_FP16_AVAILABLE
-    constexpr bool fuse_half_rescale = !oob_check && (DVp == DV ||
+    [[maybe_unused]] constexpr bool fuse_half_rescale = !oob_check && (DVp == DV ||
         (ncols == 2 && (np == 1 || DVp == 64)) || (np == 1 && nbatch_fa >= 128));
 #endif
 
@@ -632,7 +632,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     float KQ_max_new[cpw];
 #ifdef FAST_FP16_AVAILABLE
     // Keep stock's half rescale rounding when span loads change compiler contraction.
-    float VKQ_scale[cpw];
+    [[maybe_unused]] float VKQ_scale[cpw];
 #endif
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {

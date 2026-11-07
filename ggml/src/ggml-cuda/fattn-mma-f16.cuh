@@ -1294,7 +1294,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse);
-    constexpr bool feature_pipeline = KV::feature_pipelined && DKQ == 512 && DV == 512 && ncols1 == 8 && ncols2 == 8 && !use_sparse && !V_is_K_view;
+    [[maybe_unused]] constexpr bool feature_pipeline = KV::feature_pipelined && DKQ == 512 && DV == 512 && ncols1 == 8 && ncols2 == 8 && !use_sparse && !V_is_K_view;
     const uint32_t native_block=kv.block_index(), native_blocks=kv.block_count();
 
     int kb0_start=native_start, kb0_stop=native_stop;
