@@ -21,6 +21,10 @@ indent_style = tab
 [prompts/*.txt]
 insert_final_newline = unset
 
+# Preserve the exact bytes of the measured benchmark corpus.
+[benchmarks/data/online-articles-262144-words.txt]
+insert_final_newline = unset
+
 [tools/server/deps_*]
 trim_trailing_whitespace = unset
 indent_style = unset

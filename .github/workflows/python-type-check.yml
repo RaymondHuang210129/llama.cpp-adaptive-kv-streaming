@@ -18,5 +18,15 @@ jobs:
           cache-dependency-path: |
             requirements/*.txt
             tools/**/requirements*.txt
-      - run: python -m pip install -r requirements/requirements-all.txt ty==0.0.84
+      - name: Install typing dependencies
+        run: |
+          for attempt in 1 2 3; do
+            if python -m pip install --retries 5 --timeout 120 -r requirements/requirements-all.txt ty==0.0.84; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
       - run: ty check --exit-zero-on-warning --output-format=github

@@ -15,7 +15,7 @@ Python typing, lint and host tests run on every event. Source consistency checks
 
 The aggregate rejects failed, cancelled, missing or unexpectedly skipped required jobs. Superseded PR runs are cancelled; different branch commits retain separate runs. Internal `cpu-test-*` archives transfer binaries to server tests and expire after one day. They are excluded from releases.
 
-UI assets are built from the same checkout and passed to the C++ builds. Packages do not download upstream `latest` UI assets. The Linux compiler is GCC 13 on Ubuntu 24.04; Windows uses the MSVC environment on `windows-2022`. CMake 3.31.8 and Ninja 1.13.0 are pinned. CUDA compilation is serial; Linux adds swap on the ephemeral runner for heavy compiler processes. Actual hosted build resource requirements still need validation.
+UI assets are built from the same checkout and passed to the C++ builds. Packages do not download upstream `latest` UI assets. The Linux compiler is GCC 13 on Ubuntu 24.04; Windows uses the MSVC environment on `windows-2022`. CMake 3.31.10 and Ninja 1.13.0 are pinned. CUDA compilation is serial; Linux adds swap on the ephemeral runner for heavy compiler processes. Actual hosted build resource requirements still need validation.
 
 ## CUDA coverage
 

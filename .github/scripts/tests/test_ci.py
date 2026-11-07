@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from typing import Any
@@ -302,6 +303,23 @@ class Workflows(unittest.TestCase):
         uploads = [step["with"] for step in cpu["steps"]
                    if step.get("uses", "").startswith("actions/upload-artifact@")]
         self.assertEqual([step["name"] for step in uploads], ["cpu-test-${{ matrix.variant }}"])
+
+    def run_typing_install(self, failures):
+        steps = self.workflows["python-type-check.yml"]["jobs"]["typing"]["steps"]
+        script = next(step["run"] for step in steps if "requirements-all.txt" in step.get("run", ""))
+        stub = ('calls=0\npython() { calls=$((calls + 1)); printf "pip-attempt\\n"; '
+                f'[ "$calls" -gt {failures} ]; }}\nsleep() {{ :; }}\n')
+        return subprocess.run(["bash", "-e", "-c", stub + script], capture_output=True, text=True, timeout=10)
+
+    def test_typing_install_recovers_from_a_transient_download_failure(self):
+        result = self.run_typing_install(failures=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("pip-attempt\n"), 2)
+
+    def test_typing_install_stops_after_three_failed_attempts(self):
+        result = self.run_typing_install(failures=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.count("pip-attempt\n"), 3)
 
 
 if __name__ == "__main__":
