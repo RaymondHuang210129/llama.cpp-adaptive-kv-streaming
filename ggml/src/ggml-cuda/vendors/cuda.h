@@ -26,3 +26,15 @@
 #define CUBLAS_COMPUTE_32F CUDA_R_32F
 #define cublasComputeType_t cudaDataType_t
 #endif // CUDART_VERSION < 11020
+
+#if defined(_MSC_VER)
+#include <limits>
+#include <math_constants.h>
+// MSVC's INFINITY macro narrows an overflowing double constant.
+#undef INFINITY
+#if defined(__CUDA_ARCH__)
+#define INFINITY CUDART_INF_F
+#else
+#define INFINITY (std::numeric_limits<float>::infinity())
+#endif
+#endif
