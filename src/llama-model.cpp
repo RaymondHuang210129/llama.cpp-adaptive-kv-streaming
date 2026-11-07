@@ -632,8 +632,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
-            const int64_t n_k_heads  = hparams.ssm_n_group;
-            const int64_t n_v_heads  = hparams.ssm_dt_rank;
+            const uint32_t n_k_heads = hparams.ssm_n_group;
+            const uint32_t n_v_heads = hparams.ssm_dt_rank;
             const int64_t key_dim    = head_k_dim * n_k_heads;
             const int64_t value_dim  = head_v_dim * n_v_heads;
 
@@ -649,7 +649,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {{key_dim * (hparams.ssm_d_conv - 1), 2}, {value_dim * (hparams.ssm_d_conv - 1), 1}};
                 }
             } else {
-                const int64_t head_ratio = n_v_heads / n_k_heads;
+                if (n_k_heads == 0 || n_v_heads / n_k_heads > UINT32_MAX - 2) {
+                    throw std::runtime_error("invalid recurrent head ratio for tensor splitting");
+                }
+                const uint32_t head_ratio = n_v_heads / n_k_heads;
                 if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_ssm_conv1d)) {
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2 + head_ratio}};

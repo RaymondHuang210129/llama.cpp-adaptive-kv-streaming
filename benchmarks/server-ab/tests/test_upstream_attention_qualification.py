@@ -18,15 +18,15 @@ class Commands(unittest.TestCase):
                                ubatch_size=256, arena_mib=2240, port=12351)
         command = QUALIFY.command(args, 8192, 3, 2240, stock=True)
         self.assertNotIn("--kv-stream-arena-mib", command)
-        self.assertEqual(command[command.index("--spec-draft-type-k")+1], "q8_0")
-        self.assertEqual(command[command.index("--spec-draft-type-v")+1], "q4_0")
+        self.assertEqual(command[command.index("--spec-draft-type-k") +1], "q8_0")
+        self.assertEqual(command[command.index("--spec-draft-type-v") +1], "q4_0")
         self.assertIn("--spec-draft-n-max", command)
 
     def test_adaptive_retains_arena_and_no_mtp_control(self):
         args = SimpleNamespace(server=Path("server"), model=Path("model"), batch_size=256,
                                ubatch_size=256, arena_mib=2240, port=12351)
         command = QUALIFY.command(args, 131072, 0, 2100)
-        self.assertEqual(command[command.index("--kv-stream-arena-mib")+1], "2100")
+        self.assertEqual(command[command.index("--kv-stream-arena-mib") +1], "2100")
         self.assertNotIn("--spec-type", command)
 
 
@@ -37,22 +37,23 @@ class Collection(unittest.TestCase):
                                    model=Path("model"), batch_size=256, ubatch_size=256, arena_mib=2240,
                                    variant="fixture", stock=stock, decode_tokens=256)
             args.verify_reuse = reuse is not None
+
             def launch(*unused, **kwargs):
                 kwargs["stdout"].write(text)
                 kwargs["stdout"].flush()
                 return object()
             with patch.object(QUALIFY.subprocess, "Popen", side_effect=launch), \
                     patch.object(QUALIFY, "wait_for_health"), \
-                    patch.object(QUALIFY, "stream_completion", side_effect=[{"tokens": [1]*4}, measured]+(reuse or [])), \
+                    patch.object(QUALIFY, "stream_completion", side_effect=[{"tokens": [1] *4}, measured] +(reuse or [])), \
                     patch.object(QUALIFY.SWEEP, "stop_process") as stop:
-                result = QUALIFY.run_point(args,8192,0,2240,{"tokens": [1]*8192})
+                result = QUALIFY.run_point(args,8192,0,2240,{"tokens": [1] *8192})
                 stop.assert_called_once()
                 return result
 
     def measured(self):
         return {"tokens": list(range(256)), "content": "text", "timings": {"prompt_n":7932,
                 "predicted_n":256, "prompt_per_second":1000, "predicted_per_second":40,
-                "prompt_ms":7932, "predicted_ms":6400}}
+                                                                           "prompt_ms":7932, "predicted_ms":6400}}
 
     def test_complete_response_keeps_token_ids_and_exact_layout(self):
         text = "memory_phase: phase=decode kv_pool=104857600 resident_pages=20 ring_slots=8 active_pages=31\n"
@@ -93,7 +94,7 @@ class Collection(unittest.TestCase):
 
     def test_serial_reuse_difference_is_retained_for_matching_stock_comparison(self):
         cached = {"tokens": list(range(32)), "timings": {"predicted_n":32, "cache_n":7936}}
-        fresh = {"tokens": [2]*32, "timings": {"predicted_n":32}}
+        fresh = {"tokens": [2] *32, "timings": {"predicted_n":32}}
         result = self.run_fixture(self.measured(), "", stock=True, reuse=[cached,fresh])
         self.assertEqual(result["status"], "ok")
         self.assertFalse(result["reuse_matches_fresh"])
@@ -116,9 +117,10 @@ class MaximumArena(unittest.TestCase):
     def test_maximum_requires_full_workload_and_reuses_accepted_result(self):
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(output=Path(directory), arena_mib=1000, port=12351,
-                                   prefill_text=Path(directory)/"corpus")
+                                   prefill_text=Path(directory) /"corpus")
             args.prefill_text.write_text("corpus")
             seen = []
+
             def measured(unused, context, mtp, arena, cache):
                 seen.append(arena)
                 return {"status":"ok" if arena <= 999 else "capacity_failure", "arena_mib":arena}
@@ -127,14 +129,14 @@ class MaximumArena(unittest.TestCase):
                 result = QUALIFY.run_max_point(args, 8192, 3, {})
             self.assertEqual(result["arena_mib"], 999)
             self.assertEqual(len(seen), len(set(seen)))
-            self.assertTrue((args.output/"arena-probes.jsonl").exists())
+            self.assertTrue((args.output /"arena-probes.jsonl").exists())
 
     def test_execution_failure_is_not_treated_as_capacity(self):
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(output=Path(directory), arena_mib=1000, port=12351,
-                                   prefill_text=Path(directory)/"corpus")
+                                   prefill_text=Path(directory) /"corpus")
             args.prefill_text.write_text("corpus")
-            log = Path(directory)/"failed.log"
+            log = Path(directory) /"failed.log"
             log.write_text("kernel assertion")
             with patch.object(QUALIFY.SWEEP, "probe_arena", side_effect=lambda *a, **k:a[3] <= 1000), \
                     patch.object(QUALIFY, "run_point", return_value={"status":"failed", "log":str(log)}):
@@ -146,7 +148,7 @@ class MatchingControl(unittest.TestCase):
     def row(self):
         return {"context":8192, "mtp":3, "prompt_tokens":7932, "decode_tokens":256,
                 "token_ids":list(range(256)), "reuse_token_ids":list(range(32)),
-                "fresh_token_ids":[2]*32, "reuse_cache_tokens":7936}
+                "fresh_token_ids":[2] *32, "reuse_cache_tokens":7936}
 
     def test_matching_stock_modes_pass_even_when_cached_and_fresh_differ(self):
         self.assertTrue(all(QUALIFY.compare_matching_rows(self.row(),self.row()).values()))

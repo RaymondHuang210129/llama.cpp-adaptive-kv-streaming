@@ -27,8 +27,8 @@ class MtpSweepTests(unittest.TestCase):
             self.assertIn("--offline",command)
             self.assertIn("--no-context-shift",command)
             if depth:
-                self.assertEqual(command[command.index("--model-draft")+1],"assistant.gguf")
-                self.assertEqual(command[command.index("--spec-draft-ngl")+1],"999")
+                self.assertEqual(command[command.index("--model-draft") +1],"assistant.gguf")
+                self.assertEqual(command[command.index("--spec-draft-ngl") +1],"999")
             else:
                 self.assertNotIn("--model-draft",command)
                 self.assertNotIn("--spec-draft-ngl",command)
@@ -39,9 +39,9 @@ class MtpSweepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             directory=Path(temp)
             for name in ("target","server","corpus"):
-                (directory/name).write_text("fixture")
-            argv=[str(SCRIPT),"--model",str(directory/"target"),"--server",str(directory/"server"),
-                "--prefill-text",str(directory/"corpus"),"--model-draft",str(directory/"missing"),"--mtp-lengths","3"]
+                (directory /name).write_text("fixture")
+            argv=[str(SCRIPT),"--model",str(directory /"target"),"--server",str(directory /"server"),
+                  "--prefill-text",str(directory /"corpus"),"--model-draft",str(directory /"missing"),"--mtp-lengths","3"]
             with patch("sys.argv",argv),patch.object(SWEEP.subprocess,"run") as manage, \
                     self.assertRaisesRegex(SystemExit,"draft"):
                 SWEEP.main()
@@ -69,15 +69,16 @@ class MtpSweepTests(unittest.TestCase):
 
     def test_full_workload_probe_uses_the_configured_deadline(self):
         args=SimpleNamespace(server=Path("server"),model=Path("model"),batch_size=256,ubatch_size=256,
-            arena_mib=1024,port=1246,uvm=False,decode_tokens=8,mtp_lengths=(3,),request_timeout=3600)
+                             arena_mib=1024,port=1246,uvm=False,decode_tokens=8,mtp_lengths=(3,),request_timeout=3600)
+
         def completion(_url,payload,**kwargs):
             return {"timings":{"prompt_n":len(payload["prompt"]),"predicted_n":payload["n_predict"]},
-                "tokens":list(range(payload["n_predict"]))}
+                    "tokens":list(range(payload["n_predict"]))}
         with tempfile.TemporaryDirectory() as temp,patch.object(SWEEP.subprocess,"Popen") as launch, \
                 patch.object(SWEEP,"wait_ready"),patch.object(SWEEP,"stop_process"), \
                 patch.object(SWEEP,"stream_completion",side_effect=completion) as complete:
             self.assertTrue(SWEEP.probe_arena(args,8192,3,1024,Path(temp),"http://localhost","article",
-                {"tokens":list(range(8192))},full_workload=True))
+                                              {"tokens":list(range(8192))},full_workload=True))
         self.assertEqual(complete.call_args_list[-1].kwargs["timeout"],3600)
         self.assertEqual(launch.call_args.kwargs["creationflags"], SWEEP.subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
@@ -88,11 +89,11 @@ class MtpSweepTests(unittest.TestCase):
 
     def test_cache_types_are_configurable_and_draft_types_are_not_overridden(self):
         args = SimpleNamespace(server=Path("server"), model=Path("model"), batch_size=256, ubatch_size=256,
-            arena_mib=2240, port=1246, cache_type_k="q5_1", cache_type_v="q8_0")
+                               arena_mib=2240, port=1246, cache_type_k="q5_1", cache_type_v="q8_0")
         for depth in (0, 3):
             command = SWEEP.server_command(args, 8192, depth)
-            self.assertEqual(command[command.index("--cache-type-k")+1], "q5_1")
-            self.assertEqual(command[command.index("--cache-type-v")+1], "q8_0")
+            self.assertEqual(command[command.index("--cache-type-k") +1], "q5_1")
+            self.assertEqual(command[command.index("--cache-type-v") +1], "q8_0")
             self.assertNotIn("--spec-draft-type-k", command)
             self.assertNotIn("--spec-draft-type-v", command)
 
@@ -170,6 +171,7 @@ class MtpSweepTests(unittest.TestCase):
     def test_auto_max_search_finds_exact_mib_from_below_and_above(self):
         for seed in (1024, 4096):
             tried = []
+
             def probe(arena_mib):
                 tried.append(arena_mib)
                 return arena_mib <= 2273
@@ -180,6 +182,7 @@ class MtpSweepTests(unittest.TestCase):
     def test_auto_max_search_reports_no_viable_arena_and_propagates_errors(self):
         with self.assertRaisesRegex(RuntimeError, "no allocatable arena"):
             SWEEP.find_max_arena_mib(1024, lambda arena_mib: False)
+
         def broken_probe(arena_mib):
             raise ValueError("not an OOM")
         with self.assertRaisesRegex(ValueError, "not an OOM"):
@@ -188,6 +191,7 @@ class MtpSweepTests(unittest.TestCase):
     def test_auto_max_search_handles_a_bounded_feasible_interval(self):
         for seed in (1, 979, 1024, 1200, 4096):
             tried = []
+
             def probe(arena_mib):
                 tried.append(arena_mib)
                 if arena_mib < 979:
@@ -217,10 +221,11 @@ class MtpSweepTests(unittest.TestCase):
 
     def test_bounded_search_matches_small_interval_oracle_with_optional_hints(self):
         for minimum in range(1, 24):
-            for maximum in (minimum, minimum+1, minimum+9):
+            for maximum in (minimum, minimum +1, minimum +9):
                 for seed in (1, minimum, maximum, 64):
                     for hint in (0, minimum):
                         tried = []
+
                         def probe(arena_mib):
                             tried.append(arena_mib)
                             if arena_mib < minimum:
@@ -240,6 +245,7 @@ class MtpSweepTests(unittest.TestCase):
 
     def test_auto_max_refinement_handles_a_higher_full_workload_minimum(self):
         args = SimpleNamespace(arena_mib=128, auto_max_arena=True)
+
         def fits(_args, _context, _mode, arena_mib, _logs, _url, _article, _cache, full_workload=False, result_cache=None):
             minimum, maximum = (110, 113) if full_workload else (90, 120)
             if arena_mib < minimum:
@@ -251,6 +257,7 @@ class MtpSweepTests(unittest.TestCase):
     def test_auto_max_refinement_does_not_search_above_fast_limit(self):
         args = SimpleNamespace(arena_mib=128, auto_max_arena=True)
         full_candidates = []
+
         def fits(_args, _context, _mode, arena_mib, _logs, _url, _article, _cache, full_workload=False, result_cache=None):
             if full_workload:
                 full_candidates.append(arena_mib)
@@ -264,6 +271,7 @@ class MtpSweepTests(unittest.TestCase):
     def test_probe_reports_required_arena_as_a_lower_bound(self):
         args = SimpleNamespace(server=Path("/build/llama-server"), model=Path("/models/model.gguf"),
                                batch_size=256, ubatch_size=256, arena_mib=960, port=1246, uvm=False)
+
         class FakeProcess:
             def poll(self):
                 return 1
@@ -273,8 +281,8 @@ class MtpSweepTests(unittest.TestCase):
                 stdout.flush()
                 return FakeProcess()
             with patch.object(SWEEP.subprocess, "Popen", side_effect=popen), \
-                 patch.object(SWEEP, "wait_ready", side_effect=RuntimeError("server exited")), \
-                 patch.object(SWEEP, "stop_process") as stop:
+                    patch.object(SWEEP, "wait_ready", side_effect=RuntimeError("server exited")), \
+                    patch.object(SWEEP, "stop_process") as stop:
                 with self.assertRaises(SWEEP.ArenaTooSmallError) as error:
                     SWEEP.probe_arena(args, 155648, 3, 960, Path(temp), "http://localhost")
                 self.assertEqual(error.exception.minimum_mib, 979)
@@ -296,6 +304,7 @@ class MtpSweepTests(unittest.TestCase):
         args = SimpleNamespace(server=Path("/build/llama-server"), model=Path("/models/model.gguf"),
                                batch_size=256, ubatch_size=256, arena_mib=100, port=1246,
                                uvm=False, decode_tokens=4)
+
         class FakeProcess:
             def poll(self):
                 return None
@@ -305,13 +314,14 @@ class MtpSweepTests(unittest.TestCase):
                 stdout.flush()
                 return FakeProcess()
             with patch.object(SWEEP.subprocess, "Popen", side_effect=popen), \
-                 patch.object(SWEEP, "wait_ready"), \
-                 patch.object(SWEEP, "stop_process"), \
-                 patch.object(SWEEP, "stream_completion", return_value={"timings": {"predicted_n": 4}}):
+                    patch.object(SWEEP, "wait_ready"), \
+                    patch.object(SWEEP, "stop_process"), \
+                    patch.object(SWEEP, "stream_completion", return_value={"timings": {"predicted_n": 4}}):
                 self.assertTrue(SWEEP.probe_arena(args, 8192, 0, 100, Path(temp), "http://localhost"))
 
     def test_auto_max_searches_each_mtp_mode_independently(self):
         args = SimpleNamespace(arena_mib=100, auto_max_arena=True)
+
         def fits(_args, _context, mtp_length, arena_mib, _logs, _url, *_extra):
             return arena_mib <= (120 if mtp_length == 0 else 110)
         with patch.object(SWEEP, "probe_arena", side_effect=fits):
@@ -324,22 +334,24 @@ class MtpSweepTests(unittest.TestCase):
     def test_probe_classifies_oom_but_not_other_startup_errors(self):
         args = SimpleNamespace(server=Path("/build/llama-server"), model=Path("/models/model.gguf"),
                                batch_size=256, ubatch_size=256, arena_mib=100, port=1246, uvm=False)
+
         class FakeProcess:
             def poll(self):
                 return None
         with tempfile.TemporaryDirectory() as temp:
             logs = Path(temp)
+
             def oom_popen(_command, *, stdout, **_kwargs):
                 stdout.write("CUDA error: out of memory\n")
                 stdout.flush()
                 return FakeProcess()
             with patch.object(SWEEP.subprocess, "Popen", side_effect=oom_popen), \
-                 patch.object(SWEEP, "wait_ready", side_effect=RuntimeError("server exited")), \
-                 patch.object(SWEEP, "stop_process"):
+                    patch.object(SWEEP, "wait_ready", side_effect=RuntimeError("server exited")), \
+                    patch.object(SWEEP, "stop_process"):
                 self.assertFalse(SWEEP.probe_arena(args, 8192, 0, 2500, logs, "http://localhost"))
             with patch.object(SWEEP.subprocess, "Popen", return_value=FakeProcess()), \
-                 patch.object(SWEEP, "wait_ready", side_effect=RuntimeError("bad model")), \
-                 patch.object(SWEEP, "stop_process"):
+                    patch.object(SWEEP, "wait_ready", side_effect=RuntimeError("bad model")), \
+                    patch.object(SWEEP, "stop_process"):
                 with self.assertRaisesRegex(RuntimeError, "bad model"):
                     SWEEP.probe_arena(args, 8192, 0, 2500, logs, "http://localhost")
 
@@ -347,8 +359,10 @@ class MtpSweepTests(unittest.TestCase):
         class FakeResponse:
             def __enter__(self):
                 return self
+
             def __exit__(self, *_args):
                 return False
+
             def __iter__(self):
                 for processed in (0, 256, 2048):
                     yield f'data: {{"prompt_progress": {{"processed": {processed}}}}}\n'.encode()
@@ -366,8 +380,10 @@ class MtpSweepTests(unittest.TestCase):
         class FakeResponse:
             def __enter__(self):
                 return self
+
             def __exit__(self, *_args):
                 return False
+
             def __iter__(self):
                 yield b'data: {"prompt_progress": {"processed": 256}}\n'
         with patch.object(SWEEP.urllib.request, "urlopen", return_value=FakeResponse()):
@@ -378,6 +394,7 @@ class MtpSweepTests(unittest.TestCase):
         args = SimpleNamespace(server=Path("/build/llama-server"), model=Path("/models/model.gguf"),
                                batch_size=256, ubatch_size=256, arena_mib=100, port=1246, uvm=False,
                                decode_tokens=256, mtp_lengths=(0, 3))
+
         class FakeProcess:
             def poll(self):
                 return None
@@ -401,12 +418,15 @@ class MtpSweepTests(unittest.TestCase):
         args = SimpleNamespace(server=Path("/build/llama-server"), model=Path("/models/model.gguf"),
                                batch_size=256, ubatch_size=256, arena_mib=100, port=1246, uvm=False,
                                decode_tokens=256, mtp_lengths=(3,))
+
         class FakeProcess:
             def poll(self):
                 return None
+
         def completion_result(_url, payload, **_kwargs):
             return {"timings": {"prompt_n": len(payload["prompt"]), "predicted_n": payload["n_predict"]},
                     "tokens": list(range(payload["n_predict"]))}
+
         def request_result(url, *_args, **_kwargs):
             return {"tokens": list(range(9000))} if url.endswith("/tokenize") else {"content": "text"}
         saved = {}
@@ -428,6 +448,7 @@ class MtpSweepTests(unittest.TestCase):
 
     def test_auto_max_refines_fast_bound_with_full_workload(self):
         args = SimpleNamespace(arena_mib=100, auto_max_arena=True)
+
         def fits(_args, _context, _mode, arena_mib, _logs, _url, _article, _cache, full_workload=False, result_cache=None):
             return arena_mib <= (113 if full_workload else 120)
         with patch.object(SWEEP, "probe_arena", side_effect=fits) as probe:
@@ -439,9 +460,11 @@ class MtpSweepTests(unittest.TestCase):
         args = SimpleNamespace(server=Path("/build/llama-server"), model=Path("/models/model.gguf"),
                                batch_size=256, ubatch_size=256, arena_mib=100, port=1246, uvm=False,
                                decode_tokens=256)
+
         class FakeProcess:
             def poll(self):
                 return None
+
         def completion_result(_url, payload, **_kwargs):
             return {"timings": {"predicted_n": payload["n_predict"]}}
         with tempfile.TemporaryDirectory() as temp:
@@ -484,7 +507,7 @@ class MtpSweepTests(unittest.TestCase):
         with patch("sys.argv", [str(SCRIPT), "--model", "model.gguf", "--h2d-reference-gbps", "23.52"]):
             self.assertEqual(SWEEP.arguments().h2d_reference_gbps, 23.52)
         for value in ("0", "-1", "nan", "inf", "-inf"):
-            with self.subTest(value=value), patch("sys.argv", [str(SCRIPT), "--model", "model.gguf", "--h2d-reference-gbps="+value]), self.assertRaises(SystemExit):
+            with self.subTest(value=value), patch("sys.argv", [str(SCRIPT), "--model", "model.gguf", "--h2d-reference-gbps=" +value]), self.assertRaises(SystemExit):
                 SWEEP.arguments()
 
     def test_h2d_payload_rate_requires_a_reference_for_percentages(self):
@@ -505,10 +528,10 @@ class MtpSweepTests(unittest.TestCase):
     def test_missing_transfer_telemetry_is_unknown_not_zero(self):
         layout = "memory_phase: phase=decode kv_pool=1048576 resident_pages=1 ring_slots=2 active_pages=3\n"
         with tempfile.TemporaryDirectory() as temp:
-            log = Path(temp)/"server.log"
+            log = Path(temp) /"server.log"
             log.write_text(layout, encoding="utf-8")
             self.assertEqual(SWEEP.decode_layout(log)[-2:], (None, None))
-            log.write_text(layout+"attention: accepted KV layout copied 0.00 MiB in 0 H2D calls\n", encoding="utf-8")
+            log.write_text(layout +"attention: accepted KV layout copied 0.00 MiB in 0 H2D calls\n", encoding="utf-8")
             self.assertEqual(SWEEP.decode_layout(log)[-2:], (0, 0))
 
     def test_result_files_preserve_unicode(self):
@@ -516,9 +539,9 @@ class MtpSweepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
             SWEEP.write_outputs([row], output)
-            with (output/"results.csv").open(encoding="utf-8", newline="") as handle:
+            with (output /"results.csv").open(encoding="utf-8", newline="") as handle:
                 self.assertEqual(next(csv.DictReader(handle))["decoded_first_10_text"], row["decoded_first_10_text"])
-            self.assertEqual(json.loads((output/"results.jsonl").read_text(encoding="utf-8")), row)
+            self.assertEqual(json.loads((output /"results.jsonl").read_text(encoding="utf-8")), row)
 
     def test_plot_recalibrates_legacy_percentages_and_never_assumes_a_reference(self):
         row = {"context_capacity":8192, "mtp_length":0, "decode_tps":10, "prefill_tps":100,

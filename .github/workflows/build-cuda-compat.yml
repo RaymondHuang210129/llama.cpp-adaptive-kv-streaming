@@ -1,0 +1,47 @@
+name: Manual legacy CUDA compilation
+on:
+  workflow_dispatch:
+    inputs:
+      architectures:
+        description: CUDA 12.9 compilation targets; no GPU execution
+        type: string
+        default: '61-real;70-real'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - run: python -m pip install cmake==3.31.10 ninja==1.13.0
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build gcc-13 g++-13 libssl-dev
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ runner.temp }}/cuda
+          key: cuda-redist-12.9.1-${{ runner.os }}-v2
+      - name: Install pinned CUDA toolkit without a driver
+        run: python .github/scripts/setup_cuda.py "$RUNNER_TEMP/cuda" --version 12.9.1
+      - name: Compile and link (no GPU execution)
+        run: python .github/scripts/build.py --backend cuda --cuda-architectures "$ARCHITECTURES"
+        env:
+          ARCHITECTURES: ${{ inputs.architectures }}

@@ -83,6 +83,8 @@ if (WIN32)
 endif()
 
 if (MSVC)
+    # Backend C entry points can propagate exceptions from C++ callbacks.
+    string(REGEX REPLACE "(^|[ \t])/EHsc($|[ \t])" "\\1/EHs\\2" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/bigobj>")

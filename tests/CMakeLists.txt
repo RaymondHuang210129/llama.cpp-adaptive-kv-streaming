@@ -136,12 +136,16 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact            ARGS ${PROJE
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
 if (NOT WIN32)
+    set(LLAMA_TEST_VOCABS_REVISION "2c9db6cf7f8f6f80ec1c13e0cd5016c5a96de1c6" CACHE STRING
+        "Vocabulary fixtures matching this fork's upstream tokenizer baseline")
     llama_test_cmd(
         ${CMAKE_CURRENT_SOURCE_DIR}/test-tokenizers-repo.sh
         NAME test-tokenizers-ggml-vocabs
         WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
         ARGS https://huggingface.co/ggml-org/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
     )
+    set_property(TEST test-tokenizers-ggml-vocabs PROPERTY ENVIRONMENT
+        "LLAMA_TEST_VOCABS_REVISION=${LLAMA_TEST_VOCABS_REVISION}")
 endif()
 
 if (LLAMA_LLGUIDANCE)

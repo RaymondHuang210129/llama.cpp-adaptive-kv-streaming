@@ -12,10 +12,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "gguf-py"))
-from gguf import GGML_QUANT_SIZES, GGMLQuantizationType, GGUFReader
+from gguf import GGML_QUANT_SIZES, GGMLQuantizationType, GGUFReader  # noqa: E402
 
-INT_MAX = 2**31-1
-SIZE_MAX = 2**63-1
+INT_MAX = 2**31 -1
+SIZE_MAX = 2**63 -1
 INTEGER_TYPES = {"INT32", "UINT32", "INT64", "UINT64"}
 
 
@@ -29,7 +29,7 @@ def product(values, name, maximum=SIZE_MAX):
     result = 1
     for value in values:
         value = integer(value, name, maximum=maximum)
-        if result > maximum//value:
+        if result > maximum //value:
             raise ValueError(f"{name}: size overflow")
         result *= value
     return result
@@ -71,7 +71,7 @@ def check_tensor(document, name, expected):
     elements = product(shape, name)
     if shape[0] % block:
         raise ValueError(f"invalid quant block alignment: {name}")
-    expected_bytes = product([elements//block, size], name)
+    expected_bytes = product([elements //block, size], name)
     if integer(item.get("bytes"), name, maximum=SIZE_MAX) != expected_bytes:
         raise ValueError(f"tensor byte count differs: {name}")
 
@@ -87,7 +87,7 @@ def tokenizer(document):
     if not isinstance(ends, list) or not ends or len(ends) > item["count"]:
         raise ValueError("missing end-marker identities")
     for index in ends:
-        integer(index, "end-marker ID", 0, item["count"]-1)
+        integer(index, "end-marker ID", 0, item["count"] -1)
     if len(set(ends)) != len(ends):
         raise ValueError("duplicate end-marker ID")
     return item
@@ -107,8 +107,8 @@ def validate_pair(target, draft, publisher):
         raise ValueError("missing dflash_config")
     hidden = scalar(target, "qwen35.embedding_length")
     total_layers = scalar(target, "qwen35.block_count", maximum=1024)
-    nextn = scalar(target, "qwen35.nextn_predict_layers", 0, total_layers-1) if "qwen35.nextn_predict_layers" in target["metadata"] else 0
-    trunk = total_layers-nextn
+    nextn = scalar(target, "qwen35.nextn_predict_layers", 0, total_layers -1) if "qwen35.nextn_predict_layers" in target["metadata"] else 0
+    trunk = total_layers -nextn
     if integer(publisher.get("num_target_layers"), "num_target_layers", maximum=1024) != trunk:
         raise ValueError("draft was trained for a different target layer count")
     if integer(publisher.get("hidden_size"), "hidden_size") != hidden:
@@ -116,14 +116,14 @@ def validate_pair(target, draft, publisher):
     source_ids = config.get("target_layer_ids")
     if not isinstance(source_ids, list) or not 1 <= len(source_ids) <= 1024:
         raise ValueError("invalid target feature list")
-    expected_ids = [integer(index, "target_layer_ids", 0, trunk-2)+1 for index in source_ids]
+    expected_ids = [integer(index, "target_layer_ids", 0, trunk -2) +1 for index in source_ids]
     if len(set(expected_ids)) != len(expected_ids):
         raise ValueError("duplicate feature layers")
     actual_ids = metadata(draft, "dflash.target_layers", [["ARRAY", kind] for kind in INTEGER_TYPES])
     if not isinstance(actual_ids, list):
         raise ValueError("invalid converted feature list")
     for index in actual_ids:
-        integer(index, "dflash.target_layers", 1, trunk-1)
+        integer(index, "dflash.target_layers", 1, trunk -1)
     if actual_ids != expected_ids:
         raise ValueError("feature order or output-to-input layer mapping differs")
     encoded_width = product([len(expected_ids), hidden], "encoded input width", INT_MAX)
@@ -151,7 +151,7 @@ def validate_pair(target, draft, publisher):
     checked = {}
     for suffix, (source, container) in properties.items():
         expected = integer(container.get(source), source)
-        actual = scalar(draft, "dflash."+suffix)
+        actual = scalar(draft, "dflash." +suffix)
         if actual != expected:
             raise ValueError(f"publisher/GGUF metadata differs: {suffix}")
         checked[suffix] = actual
@@ -171,24 +171,24 @@ def validate_pair(target, draft, publisher):
     pattern = metadata(draft, "dflash.attention.sliding_window_pattern", [["ARRAY", "BOOL"]])
     if not isinstance(pattern, list) or len(pattern) != layers or any(value is not True for value in pattern):
         raise ValueError("draft cache is not uniformly bounded SWA")
-    if publisher.get("layer_types") != ["sliding_attention"]*layers:
+    if publisher.get("layer_types") != ["sliding_attention"] *layers:
         raise ValueError("publisher layer types differ")
-    mask_id = integer(config.get("mask_token_id"), "mask_token_id", 0, vocab-1)
-    if scalar(draft, "tokenizer.ggml.mask_token_id", 0, vocab-1) != mask_id:
+    mask_id = integer(config.get("mask_token_id"), "mask_token_id", 0, vocab -1)
+    if scalar(draft, "tokenizer.ggml.mask_token_id", 0, vocab -1) != mask_id:
         raise ValueError("special token differs: mask_token_id")
-    publisher_eos = integer(publisher.get("eos_token_id"), "eos_token_id", 0, vocab-1)
-    gguf_eos = scalar(draft, "tokenizer.ggml.eos_token_id", 0, vocab-1)
-    if gguf_eos != scalar(target, "tokenizer.ggml.eos_token_id", 0, vocab-1):
+    publisher_eos = integer(publisher.get("eos_token_id"), "eos_token_id", 0, vocab -1)
+    gguf_eos = scalar(draft, "tokenizer.ggml.eos_token_id", 0, vocab -1)
+    if gguf_eos != scalar(target, "tokenizer.ggml.eos_token_id", 0, vocab -1):
         raise ValueError("target/draft EOS flags differ")
     if publisher_eos not in target["tokenizer"]["end_token_ids"] or gguf_eos not in target["tokenizer"]["end_token_ids"]:
         raise ValueError("EOS alias is not a recognized Qwen end marker")
     rank, top_k = checked["selector_rank"], checked["selector_top_k"]
-    lattice = product([top_k, top_k+1], "selector lattice", INT_MAX)
+    lattice = product([top_k, top_k +1], "selector lattice", INT_MAX)
     if lattice > hidden or top_k > vocab:
         raise ValueError("selector lattice does not fit hidden/vocabulary width")
     query_width = product([checked["attention.key_length"], heads], "query projection", INT_MAX)
     kv_width = product([checked["attention.key_length"], kv_heads], "KV projection", INT_MAX)
-    projected = product([2, checked["conv_kernel_size"], hidden//checked["conv_group_size"]], "convolution projection", INT_MAX)
+    projected = product([2, checked["conv_kernel_size"], hidden //checked["conv_group_size"]], "convolution projection", INT_MAX)
     for name in ("token_embd.weight", "output.weight"):
         check_tensor(target, name, [hidden, vocab])
         if name in draft.get("tensors", {}):
@@ -217,7 +217,7 @@ def validate_pair(target, draft, publisher):
         "metadata_compatible": True, "runtime_qualified": False,
         "vocab_size": vocab, "tokenizer_model": target["tokenizer"]["model"],
         "token_ids_sha256": target["tokenizer"]["token_ids_sha256"],
-        "block_size": checked["block_size"], "max_draft_tokens": checked["block_size"]-1,
+        "block_size": checked["block_size"], "max_draft_tokens": checked["block_size"] -1,
         "target_input_layers": expected_ids, "encoded_input_width": encoded_width,
         "draft_cache_role": "bounded_resident", "draft_kv_aliases_target": False,
         "draft_layers": layers, "window": checked["attention.sliding_window"],
@@ -258,12 +258,12 @@ def read_gguf(path, end_tokens=(b"<|endoftext|>", b"<|im_end|>")):
         text_digest.update(raw)
     fields = {}
     for name, item in reader.fields.items():
-        if name == "general.architecture" or name.startswith(architecture+".") or name in ("tokenizer.ggml.mask_token_id", "tokenizer.ggml.eos_token_id"):
+        if name == "general.architecture" or name.startswith(architecture +".") or name in ("tokenizer.ggml.mask_token_id", "tokenizer.ggml.eos_token_id"):
             if len(item.data) > 1024:
                 raise ValueError(f"unbounded model metadata: {name}")
             fields[name] = {"types": [kind.name for kind in item.types], "value": item.contents()}
     tensors = {item.name: {"shape": [int(value) for value in item.shape],
-                          "type": item.tensor_type.name, "bytes": int(item.n_bytes)}
+                           "type": item.tensor_type.name, "bytes": int(item.n_bytes)}
                for item in reader.tensors}
     return {"metadata": fields, "tensors": tensors,
             "tokenizer": {"model": model.contents(), "count": len(tokens.data),
@@ -307,16 +307,17 @@ def validate_manifest(manifest):
                               ("filename", "[A-Za-z0-9][A-Za-z0-9_.-]*")]:
             if not isinstance(pin.get(name), str) or not re.fullmatch(pattern, pin[name]):
                 raise ValueError(f"invalid pinned {name}: {role}")
-        integer(pin.get("size"), role+" size", maximum=SIZE_MAX)
+        integer(pin.get("size"), role +" size", maximum=SIZE_MAX)
 
 
 def read_json(path, maximum=65536):
     if not 0 < path.stat().st_size <= maximum:
         raise ValueError(f"JSON input must be 1 to {maximum} bytes: {path}")
     with path.open("rb") as stream:
-        raw = stream.read(maximum+1)
+        raw = stream.read(maximum +1)
     if len(raw) > maximum:
         raise ValueError("JSON input changed or grew")
+
     def unique_pairs(pairs):
         result = {}
         for name, value in pairs:
@@ -334,6 +335,7 @@ def inspect_artifacts(paths, manifest):
     validate_manifest(manifest)
     if set(paths) != set(manifest["artifacts"]) or not all(isinstance(path, Path) for path in paths.values()):
         raise ValueError("artifact paths must name all three pinned inputs")
+
     def signature(path):
         info = path.stat()
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
@@ -349,10 +351,10 @@ def inspect_artifacts(paths, manifest):
         total = 0
         for item in document["tensors"].values():
             size = integer(item["bytes"], "tensor bytes", maximum=SIZE_MAX)
-            if size > SIZE_MAX-total:
+            if size > SIZE_MAX -total:
                 raise ValueError("total tensor bytes overflow")
             total += size
-        report[role+"_tensor_bytes"] = total
+        report[role +"_tensor_bytes"] = total
     return report
 
 
@@ -361,15 +363,15 @@ def main():
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--draft", type=Path, required=True)
     parser.add_argument("--draft-config", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, default=ROOT/"benchmarks/data/dflash2-qwen27b-artifacts.json")
+    parser.add_argument("--manifest", type=Path, default=ROOT /"benchmarks/data/dflash2-qwen27b-artifacts.json")
     args = parser.parse_args()
     try:
         manifest = read_json(args.manifest)
         paths = {"target": args.target, "draft": args.draft, "draft_config": args.draft_config}
         report = inspect_artifacts(paths, manifest)
-        print(json.dumps(report, indent=2))
+        sys.stdout.write(str(json.dumps(report, indent=2)) + "\n")
     except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
-        print(f"artifact audit failed: {exc}", file=sys.stderr)
+        sys.stderr.write(str(f"artifact audit failed: {exc}") + "\n")
         return 1
     return 0
 

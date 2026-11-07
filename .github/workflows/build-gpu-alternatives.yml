@@ -1,0 +1,144 @@
+name: Manual alternate GPU backend compilation
+'on':
+  workflow_dispatch:
+    inputs:
+      backend:
+        type: choice
+        required: true
+        options:
+        - hip-linux
+        - hip-windows
+        - musa
+permissions:
+  contents: read
+jobs:
+  hip-linux:
+    runs-on: ubuntu-22.04
+    container: rocm/dev-ubuntu-22.04:6.1.2
+    steps:
+    - name: Clone
+      id: checkout
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+    - name: Dependencies
+      id: depends
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev libssl-dev rocwmma-dev jq python3-venv
+    - name: ccache
+      uses: ggml-org/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d
+      with:
+        restore: false
+        save: false
+    - name: Build with native CMake HIP support
+      id: cmake_build
+      run: |
+        cmake -B build -S . \
+          -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+          -DGPU_TARGETS="gfx1030" \
+          -DGGML_HIP=ON
+        cmake --build build --config Release -j $(nproc)
+    if: inputs.backend == 'hip-linux'
+    timeout-minutes: 330
+  musa:
+    runs-on: ubuntu-22.04
+    container: registry.mthreads.com/mcconline/musa_sdk:5.2.0-devel-ubuntu22.04-s5000
+    steps:
+    - name: Clone
+      id: checkout
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+    - name: Dependencies
+      id: depends
+      run: |
+        apt-get update
+        apt-get install -y build-essential git cmake libssl-dev jq python3-venv musa-mualg-5-2 musa-muthrust-5-2 libmthreads-compute
+    - name: ccache
+      uses: ggml-org/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d
+      with:
+        restore: false
+        save: false
+    - name: Build with native CMake MUSA support
+      id: cmake_build
+      run: |
+        cmake -B build -S . \
+          -DGGML_MUSA=ON \
+          -DMUSA_ARCHITECTURES=31
+        cmake --build build --config Release -j $(nproc)
+    if: inputs.backend == 'musa'
+    timeout-minutes: 330
+  hip-windows:
+    runs-on: windows-2022
+    permissions:
+      actions: write
+    env:
+      ROCM_VERSION: 7.14.0
+    strategy:
+      matrix:
+        include:
+        - name: radeon
+          gpu_targets: gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032
+    steps:
+    - name: Clone
+      id: checkout
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+    - name: Setup ROCm
+      uses: ./.github/actions/windows-setup-rocm
+      with:
+        version: ${{ env.ROCM_VERSION }}
+    - name: Setup ROCm Environment
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        # Activate venv from cache or fresh install
+        & C:\TheRock\build\.venv\Scripts\Activate.ps1
+
+        # Expand the devel tree (idempotent; no-op if already done during install)
+        rocm-sdk init
+        if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed with exit code $LASTEXITCODE" }
+
+        # Get ROCm installation paths using the rocm-sdk CLI tool
+        $rocmPath = (rocm-sdk path --root)
+        if (-not $rocmPath) { throw "rocm-sdk path --root returned empty - devel package may not be installed" }
+        $rocmPath = $rocmPath.Trim()
+        $cmakePath = (rocm-sdk path --cmake).Trim()
+        $binPath = (rocm-sdk path --bin).Trim()
+        write-host "ROCm root: $rocmPath"
+
+        echo "HIP_PATH=$rocmPath" >> $env:GITHUB_ENV
+        echo "CMAKE_PREFIX_PATH=$cmakePath" >> $env:GITHUB_ENV
+        echo "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" >> $env:GITHUB_ENV
+        echo "HIP_PLATFORM=amd" >> $env:GITHUB_ENV
+        echo "LLVM_PATH=$rocmPath\lib\llvm" >> $env:GITHUB_ENV
+        echo "$binPath" >> $env:GITHUB_PATH
+
+        # Keep venv in PATH for subsequent steps
+        echo "C:\TheRock\build\.venv\Scripts" >> $env:GITHUB_PATH
+    - name: Verify ROCm
+      id: verify
+      run: |
+        # Test the ROCm clang shipped in the installed wheel
+        & "${env:HIP_PATH}\lib\llvm\bin\clang.exe" --version
+    - name: ccache
+      uses: ggml-org/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d
+      with:
+        key: cuda-windows-2022-x64-hip-${{ env.ROCM_VERSION }}-${{ matrix.name }}
+    - name: Build
+      id: cmake_build
+      run: |
+        cmake -G "Unix Makefiles" -B build -S . `
+          -DCMAKE_PREFIX_PATH="${env:HIP_PATH}" `
+          -DCMAKE_C_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+          -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang++.exe" `
+          -DCMAKE_HIP_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DLLAMA_BUILD_BORINGSSL=ON `
+          -DHIP_PATH="${env:HIP_PATH}" `
+          -DGGML_HIP=ON `
+          -DGPU_TARGETS="gfx1100" `
+          -DGGML_RPC=ON
+        cmake --build build -j ${env:NUMBER_OF_PROCESSORS}
+    - name: ccache-clear
+      uses: ./.github/actions/ccache-clear
+      with:
+        key: cuda-windows-2022-x64-hip-${{ env.ROCM_VERSION }}-${{ matrix.name }}
+    if: inputs.backend == 'hip-windows'
+    timeout-minutes: 330

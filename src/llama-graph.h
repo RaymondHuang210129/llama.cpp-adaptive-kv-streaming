@@ -229,7 +229,7 @@ public:
     llm_graph_input_out_ids(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            uint32_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
+            int64_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
     virtual ~llm_graph_input_out_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -241,7 +241,7 @@ public:
     const llama_hparams hparams;
     const llama_cparams cparams;
 
-    const uint32_t n_outputs;
+    const int64_t n_outputs;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {

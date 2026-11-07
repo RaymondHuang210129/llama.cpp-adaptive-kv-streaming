@@ -7,6 +7,7 @@ import collections
 import json
 import math
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -53,22 +54,23 @@ def summarize_cpu_trace(rows):
             if role not in ("target", "draft") or kind not in ("tokens", "features") or type(count) is not int or count < 1:
                 raise ValueError("invalid process role/geometry")
             groups[f"{phase}/{role}/{kind}/{count}"].append(duration)
+
     def summary(values):
         ordered = sorted(values)
-        return {"count":len(ordered), "total_host_us":sum(ordered)/1000,
-            **{f"p{percent}_us":ordered[math.ceil(len(ordered)*percent/100)-1]/1000 if ordered else None for percent in (50,95,99)}}
+        return {"count":len(ordered), "total_host_us":sum(ordered) /1000,
+                **{f"p{percent}_us":ordered[math.ceil(len(ordered) *percent /100) -1] /1000 if ordered else None for percent in (50,95,99)}}
     return {"lookup":{"all":summary(groups["ngram_draft"]), "first_use":summary(groups["first_use"]),
             "first_statistics":summary(groups["first_statistics"]), "steady":summary(groups["steady"]), "outcomes":dict(outcomes)},
-        "begin":summary(groups["ngram_begin"]), "draft_driver":summary(groups["draft_driver"]),
-        "process_calls":{name:summary(values) for name,values in groups.items() if "/" in name},
-        "map_reserved_bytes_peak":map_peak, "history_capacity_bytes_peak":history_peak,
-        "notes":["Whole-call host wall times, not one hash access, kernel time or uninstrumented throughput.",
-            "First-use includes initial hash indexing; first-statistics can happen at a later matching key.",
-            "Lookup, driver and process intervals can nest and must not be added as independent costs.",
-            "Driver time includes nested diagnostic recording; process time is host submission/wait time, not GPU kernel duration.",
-            "The server emits generation_begin after prefill. With that marker, process summaries cover decode only; ordinary request timings measure prefill.",
-            "Nearest-rank percentiles; sample counts are explicit and small tail estimates are not precise.",
-            "Vector reserved bytes exclude allocator overhead and all other server/host KV memory. History capacity is separate."]}
+            "begin":summary(groups["ngram_begin"]), "draft_driver":summary(groups["draft_driver"]),
+            "process_calls":{name:summary(values) for name,values in groups.items() if "/" in name},
+            "map_reserved_bytes_peak":map_peak, "history_capacity_bytes_peak":history_peak,
+            "notes":["Whole-call host wall times, not one hash access, kernel time or uninstrumented throughput.",
+                     "First-use includes initial hash indexing; first-statistics can happen at a later matching key.",
+                     "Lookup, driver and process intervals can nest and must not be added as independent costs.",
+                     "Driver time includes nested diagnostic recording; process time is host submission/wait time, not GPU kernel duration.",
+                     "The server emits generation_begin after prefill. With that marker, process summaries cover decode only; ordinary request timings measure prefill.",
+                     "Nearest-rank percentiles; sample counts are explicit and small tail estimates are not precise.",
+                     "Vector reserved bytes exclude allocator overhead and all other server/host KV memory. History capacity is separate."]}
 
 
 def interval_ns(intervals):
@@ -77,7 +79,7 @@ def interval_ns(intervals):
     for first, last in sorted(intervals):
         if last < first:
             raise ValueError("reversed trace interval")
-        total += max(0, last-max(first, end if end is not None else first))
+        total += max(0, last -max(first, end if end is not None else first))
         end = max(last, end if end is not None else last)
     return total
 
@@ -137,45 +139,45 @@ def summarize_records(ranges, runtime, kernels, copies):
     for first, last, thread, correlation, name in runtime:
         phase = "unattributed"
         values = by_thread.get(thread, [])
-        index = bisect.bisect_right(starts.get(thread, []), first)-1
+        index = bisect.bisect_right(starts.get(thread, []), first) -1
         if index >= 0 and first <= values[index][1]:
             phase = values[index][2]
         if correlation:
             previous = correlated.get(correlation)
             correlated[correlation] = phase if previous is None or previous == phase else "unattributed"
         if "Synchronize" in name:
-            groups[phase]["cpu_wait_ns"] += last-first
+            groups[phase]["cpu_wait_ns"] += last -first
             groups[phase]["cpu_wait_calls"] += 1
     for first, last, correlation, name in kernels:
         group = groups[correlated.get(correlation, "unattributed")]
-        group["kernel_ns"] += last-first
+        group["kernel_ns"] += last -first
         group["kernel_calls"] += 1
         group["kernels"].append((first, last))
         category = group["kernel_categories"].setdefault(kernel_category(name), {"ns": 0, "calls": 0})
-        category["ns"] += last-first
+        category["ns"] += last -first
         category["calls"] += 1
     for first, last, correlation, size, kind in copies:
         group = groups[correlated.get(correlation, "unattributed")]
         group["copies"].append((first, last))
         direction = {1: "h2d", 2: "d2h", 8: "d2d"}.get(kind)
         if direction:
-            group[direction+"_bytes"] += size
-            group[direction+"_calls"] += 1
+            group[direction +"_bytes"] += size
+            group[direction +"_calls"] += 1
         if direction == "h2d":
             group["h2d"].append((first, last))
     for group in groups.values():
         group["kernel_active_ns"] = interval_ns(group["kernels"])
-        group["device_busy_ns"] = interval_ns(group["kernels"]+group["copies"])
+        group["device_busy_ns"] = interval_ns(group["kernels"] +group["copies"])
         group["h2d_active_ns"] = interval_ns(group["h2d"])
         group["cpu_range_ns"] = interval_ns(group["cpu_ranges"])
-        group["h2d_active_gbps"] = group["h2d_bytes"]/group["h2d_active_ns"] if group["h2d_active_ns"] else None
+        group["h2d_active_gbps"] = group["h2d_bytes"] /group["h2d_active_ns"] if group["h2d_active_ns"] else None
         for key in ("kernels", "copies", "h2d", "cpu_ranges"):
             del group[key]
     return dict(groups)
 
 
 def summarize_profile(path):
-    with sqlite3.connect(path.resolve().as_uri()+"?mode=ro", uri=True) as connection:
+    with sqlite3.connect(path.resolve().as_uri() +"?mode=ro", uri=True) as connection:
         strings = dict(connection.execute("SELECT id,value FROM StringIds"))
         ranges = [(a,b,t,text or strings.get(text_id, "")) for a,b,t,text,text_id in connection.execute(
             "SELECT start,end,globalTid,text,textId FROM NVTX_EVENTS")]
@@ -185,13 +187,13 @@ def summarize_profile(path):
             "SELECT start,end,correlationId,demangledName FROM CUPTI_ACTIVITY_KIND_KERNEL")]
         copies = list(connection.execute("SELECT start,end,correlationId,bytes,copyKind FROM CUPTI_ACTIVITY_KIND_MEMCPY"))
     return {"source": str(path.resolve()), "phases": summarize_records(ranges, runtime, kernels, copies),
-        "notes": ["GPU work follows the correlated CPU submission, even when it completes after a range ends.",
-                  "Missing or conflicting correlations remain unattributed; do not infer a phase from completion time.",
-                  "Kernel sums are not wall time; active intervals merge overlap.",
-                  "Checkpoint work inside resumed attention is included in its kernel, not separately timed.",
-                  "Inline KV conversion is included in attention; the conversion category counts only separate kernels.",
-                  "Target labels use the control's query-width buckets (>8 prefill, <=8 verification); short prompt tails can share the latter bucket.",
-                  "Nsight-instrumented throughput is not an uninstrumented performance result."]}
+            "notes": ["GPU work follows the correlated CPU submission, even when it completes after a range ends.",
+                      "Missing or conflicting correlations remain unattributed; do not infer a phase from completion time.",
+                      "Kernel sums are not wall time; active intervals merge overlap.",
+                      "Checkpoint work inside resumed attention is included in its kernel, not separately timed.",
+                      "Inline KV conversion is included in attention; the conversion category counts only separate kernels.",
+                      "Target labels use the control's query-width buckets (>8 prefill, <=8 verification); short prompt tails can share the latter bucket.",
+                      "Nsight-instrumented throughput is not an uninstrumented performance result."]}
 
 
 def main():
@@ -205,7 +207,7 @@ def main():
     if args.cpu_trace:
         report["cpu_source"] = str(args.cpu_trace.resolve())
         report["cpu"] = summarize_cpu_trace([json.loads(line) for line in args.cpu_trace.read_text().splitlines()])
-    print(json.dumps(report, indent=2))
+    sys.stdout.write(str(json.dumps(report, indent=2)) + "\n")
 
 
 if __name__ == "__main__":

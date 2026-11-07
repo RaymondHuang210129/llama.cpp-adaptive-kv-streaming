@@ -13,7 +13,11 @@ function(ggml_add_cpu_backend_features cpu_name arch)
     # from inlining architecture-specific instructions into the score function.
     # Without this, LTO can cause SIGILL when loading backends on older CPUs
     # (e.g., loading power10 backend on power9 crashes before feature check runs).
-    target_compile_options(${GGML_CPU_FEATS_NAME} PRIVATE -fno-lto)
+    if (MSVC)
+        target_compile_options(${GGML_CPU_FEATS_NAME} PRIVATE /GL-)
+    else()
+        target_compile_options(${GGML_CPU_FEATS_NAME} PRIVATE -fno-lto)
+    endif()
     target_link_libraries(${cpu_name} PRIVATE ${GGML_CPU_FEATS_NAME})
 endfunction()
 

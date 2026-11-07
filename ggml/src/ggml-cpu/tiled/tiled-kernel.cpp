@@ -287,7 +287,9 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
                         const __m256i w = _mm256_sub_epi8(q0_32, _mm256_set1_epi8((int8_t) BIAS)); // debiased weight
                         if constexpr (ACTBIAS) {
                             // activation pre-biased (+128) by repack; q1b unsigned, w signed
+#ifdef __GNUC__
                             #pragma GCC unroll 8
+#endif
                             for (int t = 0; t < GROUP; t++) {
                                 const __m256i q1b_32 = _mm256_load_si256((const __m256i *) &q1_ptr[t][s * SUBBLK]);
                                 acc[t] = _mm256_add_epi32(acc[t],
@@ -296,7 +298,9 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
                         } else {
                             // iq4_xs (Wmax > 64 overflows act-bias): sign trick, both operands <= 127
                             const __m256i ax = _mm256_sign_epi8(w, w);
+#ifdef __GNUC__
                             #pragma GCC unroll 8
+#endif
                             for (int t = 0; t < GROUP; t++) {
                                 const __m256i q1_32 = _mm256_load_si256((const __m256i *) &q1_ptr[t][s * SUBBLK]);
                                 acc[t] = _mm256_add_epi32(acc[t],
@@ -304,7 +308,9 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
                             }
                         }
                     } else {
+#ifdef __GNUC__
                         #pragma GCC unroll 8
+#endif
                         for (int t = 0; t < GROUP; t++) {
                             const __m256i q1_32 = _mm256_load_si256((const __m256i *) &q1_ptr[t][s * SUBBLK]);
                             acc[t] = _mm256_add_epi32(acc[t],
@@ -327,7 +333,9 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
                         const __m256i w = _mm256_sub_epi8(q0_32, _mm256_set1_epi8((int8_t) BIAS)); // debiased weight
                         if constexpr (ACTBIAS) {
                             // activation pre-biased (+128) by repack; q1b unsigned, w signed
+#ifdef __GNUC__
                             #pragma GCC unroll 8
+#endif
                             for (int t = 0; t < GROUP; t++) {
                                 const __m256i q1b_32 = _mm256_load_si256((const __m256i *) &q1_ptr[t][sp * SUBBLK]);
                                 acc[t] = _mm256_add_epi32(acc[t], _mm256_madd_epi16(
@@ -336,7 +344,9 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
                         } else {
                             // iq4_xs (Wmax > 64 overflows act-bias): sign trick, both operands <= 127
                             const __m256i ax = _mm256_sign_epi8(w, w);
+#ifdef __GNUC__
                             #pragma GCC unroll 8
+#endif
                             for (int t = 0; t < GROUP; t++) {
                                 const __m256i q1_32 = _mm256_load_si256((const __m256i *) &q1_ptr[t][sp * SUBBLK]);
                                 acc[t] = _mm256_add_epi32(acc[t], _mm256_madd_epi16(
@@ -344,7 +354,9 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
                             }
                         }
                     } else {
+#ifdef __GNUC__
                         #pragma GCC unroll 8
+#endif
                         for (int t = 0; t < GROUP; t++) {
                             const __m256i q1_32 = _mm256_load_si256((const __m256i *) &q1_ptr[t][sp * SUBBLK]);
                             acc[t] = _mm256_add_epi32(acc[t], _mm256_madd_epi16(
@@ -365,7 +377,9 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
             // OPTIMIZATION 2: Vectorized Epilogue with FMA3 gating
             // Reduce accumulators into a 256-bit vector across 8 columns
             alignas(32) int32_t s1_vals[GROUP];
+#ifdef __GNUC__
             #pragma GCC unroll 8
+#endif
             for (int t = 0; t < GROUP; t++) {
                 s1_vals[t] = hsum256_epi32(acc[t]);
             }

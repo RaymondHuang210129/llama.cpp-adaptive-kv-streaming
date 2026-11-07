@@ -6,7 +6,8 @@ function(llama_add_compile_flags)
             list(APPEND C_FLAGS   -Werror)
             list(APPEND CXX_FLAGS -Werror)
         elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-            add_compile_options(/WX)
+            add_compile_options("$<$<COMPILE_LANGUAGE:C>:/WX>"
+                                "$<$<COMPILE_LANGUAGE:CXX>:/WX>")
         endif()
     endif()
 
