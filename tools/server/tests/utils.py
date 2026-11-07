@@ -542,8 +542,11 @@ class ServerPreset:
         ]
         for server in servers:
             server.offline = False
-            server.start()
-            server.stop()
+            try:
+                # Instrumented model/tokenizer initialization can exceed the ordinary startup deadline.
+                server.start(timeout_seconds=DEFAULT_REQUEST_TIMEOUT)
+            finally:
+                server.stop()
 
     @staticmethod
     def tinyllama2() -> ServerProcess:

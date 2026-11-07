@@ -65,7 +65,7 @@ jobs:
     if: needs.changes.outputs.draft != 'true' && needs.changes.outputs.server == 'true'
     uses: ./.github/workflows/server.yml
   sanitize:
-    needs: changes
+    needs: [changes, ui-build]
     if: needs.changes.outputs.draft != 'true' && needs.changes.outputs.sanitize == 'true'
     uses: ./.github/workflows/build-sanitize.yml
   ui:

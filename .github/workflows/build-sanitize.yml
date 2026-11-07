@@ -1,6 +1,10 @@
 name: Hosted sanitizers
 on:
   workflow_call:
+    inputs:
+      ui-ready:
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       thread:
@@ -10,7 +14,12 @@ on:
 permissions:
   contents: read
 jobs:
+  ui-build:
+    if: ${{ !inputs.ui-ready }}
+    uses: ./.github/workflows/ui-build.yml
   sanitize:
+    needs: ui-build
+    if: ${{ !cancelled() && (inputs.ui-ready || needs.ui-build.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -27,6 +36,10 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install cmake==3.31.10 ninja==1.13.0
       - run: sudo apt-get update && sudo apt-get install -y ninja-build gcc-13 g++-13 libssl-dev
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: ui-dist
+          path: tools/ui/dist
       - run: python .github/scripts/build.py --sanitizer "$SANITIZER"
         env:
           SANITIZER: ${{ matrix.sanitizer }}

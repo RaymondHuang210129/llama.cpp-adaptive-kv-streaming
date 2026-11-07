@@ -24,6 +24,21 @@ BASE = "https://developer.download.nvidia.com/compute/cuda/redist/"
 COMPONENTS = ("cuda_cccl", "cuda_crt", "cuda_cudart", "cuda_nvcc", "libcublas", "libnvvm")
 
 
+def prepare_layout(destination, platform):
+    if platform == "linux-x86_64":
+        libraries = destination / "lib64"
+        if not libraries.exists() and not libraries.is_symlink():
+            libraries.symlink_to("lib", target_is_directory=True)
+        runtime = ("lib64/libcudadevrt.a", "lib64/libcudart_static.a")
+        compiler = "bin/nvcc"
+    else:
+        runtime = ("lib/x64/cudadevrt.lib", "lib/x64/cudart_static.lib")
+        compiler = "bin/nvcc.exe"
+    for name in (compiler, "include/cuda_runtime.h", "nvvm/libdevice/libdevice.10.bc", *runtime):
+        if not (destination / name).is_file():
+            raise ValueError("CUDA toolkit is incomplete: " + name)
+
+
 def install(destination, version=VERSION):
     manifest_sha256 = MANIFESTS[version]
     components = COMPONENTS if version == "13.0.1" else ("cuda_cccl", "cuda_cudart", "cuda_nvcc", "libcublas")
@@ -33,8 +48,7 @@ def install(destination, version=VERSION):
         data = json.loads(receipt.read_text())
         if data.get("manifest_sha256") != manifest_sha256 or data.get("platform") != platform:
             raise ValueError("cached CUDA toolkit has a different identity")
-        if not (destination / "bin" / ("nvcc.exe" if sys.platform == "win32" else "nvcc")).is_file():
-            raise ValueError("cached CUDA toolkit is incomplete")
+        prepare_layout(destination, platform)
         return
     destination.mkdir(parents=True, exist_ok=True)
     raw = urllib.request.urlopen(BASE + "redistrib_" + version + ".json", timeout=120).read()
@@ -73,6 +87,7 @@ def install(destination, version=VERSION):
             installed[name] = {"version": manifest[name]["version"], "sha256": entry["sha256"]}
         sys.stdout.write("Installed " + name + "\n")
         sys.stdout.flush()
+    prepare_layout(destination, platform)
     receipt.write_text(json.dumps({"toolkit": version, "platform": platform,
                                   "manifest_sha256": manifest_sha256, "components": installed}, indent=2) + "\n")
 

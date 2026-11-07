@@ -83,6 +83,8 @@ if (WIN32)
 endif()
 
 if (MSVC)
+    # Backend C entry points can propagate exceptions from C++ callbacks.
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/EHsc->")
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/bigobj>")

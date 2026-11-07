@@ -38,7 +38,7 @@ jobs:
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: ${{ runner.temp }}/cuda
-          key: cuda-redist-12.9.1-${{ runner.os }}-v1
+          key: cuda-redist-12.9.1-${{ runner.os }}-v2
       - name: Install pinned CUDA toolkit without a driver
         run: python .github/scripts/setup_cuda.py "$RUNNER_TEMP/cuda" --version 12.9.1
       - name: Compile and link (no GPU execution)

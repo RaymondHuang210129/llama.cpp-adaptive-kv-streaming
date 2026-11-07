@@ -3,8 +3,10 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from typing import Any
 import yaml
 
@@ -252,6 +254,37 @@ class FakeGitHub:
 
     def download_manifest(self, asset_id):
         return self.data[asset_id]
+
+
+class CudaToolkit(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("setup_cuda", SCRIPT.parent / "setup_cuda.py")
+        assert spec is not None and spec.loader is not None
+        self.sdk = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"fork_ci": ci}):
+            spec.loader.exec_module(self.sdk)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for name in ("bin/nvcc", "include/cuda_runtime.h", "lib/libcudadevrt.a",
+                     "lib/libcudart_static.a", "nvvm/libdevice/libdevice.10.bc"):
+            p = self.root / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"SDK fixture")
+        (self.root / "redistributables.json").write_text(json.dumps({
+            "manifest_sha256": self.sdk.MANIFESTS[self.sdk.VERSION], "platform": "linux-x86_64"}))
+
+    def test_cached_linux_sdk_exposes_runtime_libraries_at_nvcc_search_path(self):
+        with patch.object(self.sdk.sys, "platform", "linux"):
+            self.sdk.install(self.root)
+            self.sdk.install(self.root)
+        self.assertTrue((self.root / "lib64/libcudadevrt.a").is_file())
+        self.assertTrue((self.root / "lib64/libcudart_static.a").is_file())
+
+    def test_incomplete_cached_sdk_fails_before_compilation(self):
+        (self.root / "lib/libcudart_static.a").unlink()
+        with patch.object(self.sdk.sys, "platform", "linux"), self.assertRaises(ValueError):
+            self.sdk.install(self.root)
 
 
 class Workflows(unittest.TestCase):
