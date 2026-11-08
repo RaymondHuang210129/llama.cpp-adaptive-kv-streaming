@@ -147,6 +147,7 @@ def test_vision_completion(prompt, image_data, success, re_content):
         assert res.status_code != 200
 
 
+@pytest.mark.parametrize("backend_sampling", [False, True])
 @pytest.mark.parametrize(
     "prompt, image_data, success",
     [
@@ -157,8 +158,9 @@ def test_vision_completion(prompt, image_data, success, re_content):
         ("What is this:\n",             "base64",               False), # non-image data
     ]
 )
-def test_vision_embeddings(prompt, image_data, success):
+def test_vision_embeddings(prompt, image_data, success, backend_sampling, monkeypatch):
     global server
+    monkeypatch.setenv("LLAMA_ARG_BACKEND_SAMPLING", "1" if backend_sampling else "0")
     server.server_embeddings = True
     server.n_batch = 512
     server.start()
