@@ -4,11 +4,13 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
 from typing import Any
 import yaml
+import zipfile
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "fork_ci.py"
@@ -147,6 +149,38 @@ class Packages(unittest.TestCase):
         (build / "bin/libcublas.so.13").unlink()
         with self.assertRaises(ValueError):
             ci.package(build, self.output, SHA, "linux-x64-cuda")
+
+    def test_cuda_and_dependency_licenses_survive_in_both_package_formats(self):
+        for variant in ci.VARIANTS:
+            with self.subTest(variant=variant):
+                build = self.fixture(variant)
+                dependency = build / "_deps/third-party/LICENSE"
+                dependency.parent.mkdir(parents=True)
+                dependency.write_bytes(b"dependency license fixture")
+                sdk = self.root / (variant + "-sdk")
+                licenses = {"cuda_nvcc/LICENSE": b"NVCC license fixture",
+                            "libcublas/LICENSE": b"cuBLAS license fixture"}
+                for name, data in licenses.items():
+                    path = sdk / "licenses" / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                receipt = {"toolkit": "13.0.1", "components": {"cuda_nvcc": {"version": "13.0.88"}}}
+                (sdk / "redistributables.json").write_text(json.dumps(receipt))
+                row = ci.package(build, self.output, SHA, variant, sdk)
+                self.assertEqual(row["build"]["cuda_redistributables"], receipt)
+                licenses["_deps/third-party/LICENSE"] = dependency.read_bytes()
+                archive = self.output / row["file"]
+                prefix = row["file"].removesuffix(".tar.gz").removesuffix(".zip") + "/licenses/"
+                if variant.startswith("windows"):
+                    with zipfile.ZipFile(archive) as payload:
+                        for name, data in licenses.items():
+                            self.assertEqual(payload.read(prefix + name), data)
+                else:
+                    with tarfile.open(archive) as payload:
+                        for name, data in licenses.items():
+                            content = payload.extractfile(prefix + name)
+                            assert content is not None
+                            self.assertEqual(content.read(), data)
 
     def test_published_release_is_immutable_and_must_be_complete(self):
         self.all_packages()

@@ -146,7 +146,7 @@ def package(build, output, sha, variant, cuda_root=None):
                     license_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(path, license_path)
         if cuda_root and (cuda_root / "licenses").is_dir():
-            shutil.copytree(cuda_root / "licenses", stage / "licenses")
+            shutil.copytree(cuda_root / "licenses", stage / "licenses", dirs_exist_ok=True)
         metadata = {"sha": sha, "variant": variant, "configuration": read_configuration(build),
                     "run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
                     "files": {name: digest(path) for name, path in sorted(files.items())}}

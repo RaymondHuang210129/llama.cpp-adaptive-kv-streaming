@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 
-ARCHITECTURES = "75-virtual;80-virtual;86-real;89-real;90-virtual;120"
+ARCHITECTURES = "75-virtual;86-real;89-real;120"
 
 
 def main():

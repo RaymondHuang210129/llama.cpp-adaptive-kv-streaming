@@ -23,7 +23,7 @@ def main():
     if digest(archive) != manifest["sha256"]:
         raise ValueError("package checksum changed before startup checks")
     with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         if archive.suffix == ".zip":
             with zipfile.ZipFile(archive) as payload:
                 if any(not (root / name).resolve().is_relative_to(root) for name in payload.namelist()):

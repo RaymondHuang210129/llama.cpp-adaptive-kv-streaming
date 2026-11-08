@@ -21,7 +21,7 @@ UI assets are built from the same checkout and passed to the C++ builds. Package
 
 ### Parallel CUDA compilation
 
-The Linux and Windows components call `build-cuda-sharded.yml`. A planning job reads Ninja's complete compilation database. Each private `kv-stream-*` translation unit gets its own shard; the remaining CUDA files are distributed across eight groups. Up to eight shards run concurrently per OS, using free standard hosted runners. No architecture, format specialization or translation unit is dropped or regrouped.
+The Linux and Windows components call `build-cuda-sharded.yml`. A planning job reads Ninja's complete compilation database. Each private `kv-stream-*` translation unit gets its own shard; the remaining CUDA files are distributed across eight groups. Up to eight shards run concurrently per OS, using free standard hosted runners. Sharding preserves every selected architecture and format specialization without regrouping translation units.
 
 Each shard returns compressed compiler objects and their source/command/dependency checksums. The final job rejects missing or duplicate objects, changed headers, mixed source/toolchain cohorts and invalid archives. A private CMake hook substitutes validated objects in the original source/link order. The final job compiles host code, links the complete CUDA backend, checks packaged startup and records shard provenance in the package manifest. It refuses to rebuild CUDA sources serially during final linking.
 
@@ -31,7 +31,7 @@ Temporary object archives use Actions artifact storage and expire after one day.
 
 ## CUDA coverage
 
-The default toolkit is NVIDIA CUDA 13.0.1, installed from checksum-pinned redistributables without a driver. One package contains multiple GPU targets; separate downloads per GPU generation are not required. The configured architecture list is `75-virtual;80-virtual;86-real;89-real;90-virtual;120`. Existing CUDA CMake logic normalizes SM120 to SM120a for the native Blackwell path. Build manifests record the compiler and CMake architecture configuration.
+The default toolkit is NVIDIA CUDA 13.0.1, installed from checksum-pinned redistributables without a driver. One package contains multiple GPU targets; separate downloads per GPU generation are not required. The default PR and release architecture list is `75-virtual;86-real;89-real;120`: Turing PTX, native RTX 30/40 code, and native Blackwell code plus PTX. Dedicated SM80 and SM90 targets are omitted to focus these builds on consumer/workstation GPUs. Existing CUDA CMake logic normalizes SM120 to SM120a for the native Blackwell path. Build manifests record the compiler and CMake architecture configuration. Custom `--cuda-architectures` selections remain available.
 
 These hosted jobs compile CUDA and check executable startup, not GPU execution. They do not establish numerical correctness or performance on physical GPUs. Paid hosted GPU validation remains a separate decision. `build-cuda-compat.yml` provides manual CUDA 12.9.1 compilation for legacy SM61/SM70; those targets are not included in the initial CUDA 13 release packages.
 

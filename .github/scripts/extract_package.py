@@ -22,7 +22,7 @@ def main():
     if archive.parent != directory or digest(archive) != row["sha256"]:
         raise ValueError("invalid package identity/checksum")
     with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         if archive.suffix == ".zip":
             with zipfile.ZipFile(archive) as payload:
                 if any(not (root / name).resolve().is_relative_to(root) for name in payload.namelist()):

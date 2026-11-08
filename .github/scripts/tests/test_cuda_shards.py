@@ -62,7 +62,7 @@ class NativeHandoff(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cuda shard fixture ")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.build = self.root / "build"
         self.archives = self.root / "archives"
         self.destination = self.root / "external"
@@ -113,6 +113,35 @@ class NativeHandoff(unittest.TestCase):
         self.run_command([str(self.build / ("probe.exe" if os.name == "nt" else "probe"))])
         self.assertEqual(len(json.loads((self.build / "cuda-shards.json").read_text())["objects"]), 2)
 
+    def test_msvc_header_only_dependencies_preserve_source_hashes(self):
+        check_output = subprocess.check_output
+        sources = {entry["source"] for entry in self.plan["units"].values()}
+
+        def header_dependencies(command, **kwargs):
+            text = check_output(command, **kwargs)
+            if command[:3] == ["ninja", "-t", "deps"]:
+                headers = []
+                for line in text.splitlines():
+                    if not line.startswith("    "):
+                        continue
+                    path = Path(line[4:])
+                    if not path.is_absolute():
+                        path = self.build / path
+                    if str(path.resolve()) not in sources:
+                        headers.append(line)
+                text = f"{command[-1]}: #deps {len(headers)} (VALID)\n" + "\n".join(headers) + "\n"
+            return text
+
+        archives = self.root / "msvc-archives"
+        with patch.object(shards.subprocess, "check_output", side_effect=header_dependencies):
+            for index in range(len(self.plan["shards"])):
+                shards.build_shard(self.plan, index, self.root, self.build, archives / str(index) / "objects.zip")
+        shards.assemble(self.plan, self.root, self.build, archives, self.destination)
+        dependencies = json.loads((self.build / "cuda-shards.json").read_text())["dependencies"]
+        for source in sources:
+            self.assertEqual(dependencies[source], shards.digest(Path(source)))
+        self.assertEqual(dependencies[str((self.build / "generated.h").resolve())], shards.digest(self.build / "generated.h"))
+
     def test_missing_shard_and_duplicate_coverage_are_rejected(self):
         (self.archives / "1/objects.zip").unlink()
         with self.assertRaisesRegex(ValueError, "missing CUDA shard"):
@@ -129,6 +158,17 @@ class NativeHandoff(unittest.TestCase):
             payload[name] += b"changed"
         self.rewrite_archive(corrupt)
         with self.assertRaises(ValueError):
+            shards.assemble(self.plan, self.root, self.build, self.archives, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_missing_source_hash_is_rejected_before_linking(self):
+        def remove_source(payload):
+            manifest = json.loads(payload["manifest.json"])
+            source = next(iter(manifest["objects"].values()))["source"]
+            manifest["dependencies"].pop(source)
+            payload["manifest.json"] = json.dumps(manifest).encode()
+        self.rewrite_archive(remove_source)
+        with self.assertRaisesRegex(ValueError, "missing compiler source dependencies"):
             shards.assemble(self.plan, self.root, self.build, self.archives, self.destination)
         self.assertFalse(self.destination.exists())
 

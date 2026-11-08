@@ -157,6 +157,10 @@ def build_shard(plan, index, root, build, output):
     subprocess.run(["cmake", "--build", str(build), "--parallel", "1", "--target", *outputs],
                    check=True, timeout=remaining(plan))
     dependencies = dependency_hashes(build, outputs, root)
+    # MSVC's include records omit the source, which Ninja tracks as an explicit input.
+    for name in outputs:
+        source = plan["units"][name]["source"]
+        dependencies[source] = digest(Path(source))
     manifest = {"schema": 1, "shard": index, "profile": plan["profile"], "dependencies": dependencies, "objects": {}}
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
