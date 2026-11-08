@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--shared", choices=("ON", "OFF"), default="ON")
     parser.add_argument("--fatal-warnings", choices=("ON", "OFF"), default="ON")
     parser.add_argument("--sanitizer", choices=("ADDRESS", "UNDEFINED", "THREAD"))
-    parser.add_argument("--cuda-architectures", default=ARCHITECTURES)
+    parser.add_argument("--cuda-architectures", default="120a" if sys.platform == "win32" else ARCHITECTURES)
     parser.add_argument("--configure-only", action="store_true")
     args = parser.parse_args()
     cuda = args.backend == "cuda"

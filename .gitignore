@@ -142,6 +142,7 @@ flake.lock
 /run-spec.sh
 /.ccache/
 /.ci-cuda/
+/cuda-compile-diagnostics/
 
 # IDE
 

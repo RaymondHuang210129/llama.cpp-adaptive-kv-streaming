@@ -327,7 +327,7 @@ class Workflows(unittest.TestCase):
         self.workflows = {path.name: yaml.load(path.read_text(), Loader=yaml.BaseLoader)
                           for path in self.root.glob("*.yml")}
 
-    def build_commands(self, platform, backend, fatal=None, configure_only=False):
+    def build_commands(self, platform, backend, fatal=None, configure_only=False, architectures=None):
         spec = importlib.util.spec_from_file_location("ci_build", SCRIPT.parent / "build.py")
         assert spec is not None and spec.loader is not None
         build = importlib.util.module_from_spec(spec)
@@ -337,6 +337,8 @@ class Workflows(unittest.TestCase):
             args += ["--fatal-warnings", fatal]
         if configure_only:
             args += ["--configure-only"]
+        if architectures is not None:
+            args += ["--cuda-architectures", architectures]
         with patch.object(sys, "argv", args), patch.object(sys, "platform", platform), \
                 patch.dict(build.os.environ, {"CUDA_PATH": "/sdk"}), patch.object(build.subprocess, "run") as run:
             build.main()
@@ -347,6 +349,14 @@ class Workflows(unittest.TestCase):
     def test_configure_only_jobs_do_not_start_compilation(self):
         for platform in ("linux", "win32"):
             self.build_commands(platform, "cuda", configure_only=True)
+
+    def test_cuda_platform_defaults_and_explicit_legacy_overrides(self):
+        for platform, expected in (("linux", "75-virtual;86-real;89-real;120"), ("win32", "120a")):
+            with self.subTest(platform=platform):
+                command = self.build_commands(platform, "cuda", configure_only=True)
+                self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=" + expected, command)
+                override = self.build_commands(platform, "cuda", configure_only=True, architectures="61-real;70-real")
+                self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=61-real;70-real", override)
 
     def test_build_helper_defaults_to_fatal_warnings_on_both_platforms(self):
         for platform in ("linux", "win32"):
