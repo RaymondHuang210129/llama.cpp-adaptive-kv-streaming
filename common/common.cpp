@@ -1517,7 +1517,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
-    if (params.sampling.backend_sampling) {
+    // Embedding contexts output every token and do not need token sampling at startup.
+    if (params.sampling.backend_sampling && !cparams.embeddings) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }

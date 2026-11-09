@@ -1,0 +1,23 @@
+name: Source consistency
+on:
+  workflow_call:
+    inputs:
+      flags:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  style:
+    uses: ./.github/workflows/code-style.yml
+  editorconfig:
+    uses: ./.github/workflows/editorconfig.yml
+  vendor:
+    if: fromJSON(inputs.flags).vendor == 'true'
+    uses: ./.github/workflows/check-vendor.yml
+  tokenizer:
+    if: fromJSON(inputs.flags).tokenizer == 'true'
+    uses: ./.github/workflows/pre-tokenizer-hashes.yml
+  ops:
+    if: fromJSON(inputs.flags).ops == 'true'
+    uses: ./.github/workflows/update-ops-docs.yml

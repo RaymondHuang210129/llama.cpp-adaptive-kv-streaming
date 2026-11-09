@@ -23,11 +23,11 @@ def field(value, kind="UINT32"):
 
 
 def tensor(*shape):
-    return {"shape": list(shape), "type": "F32", "bytes": math.prod(shape)*4}
+    return {"shape": list(shape), "type": "F32", "bytes": math.prod(shape) *4}
 
 
 def profiles():
-    tokenizer = {"model": "gpt2", "count": 128, "token_ids_sha256": "a"*64, "end_token_ids": [1, 2]}
+    tokenizer = {"model": "gpt2", "count": 128, "token_ids_sha256": "a" *64, "end_token_ids": [1, 2]}
     target = {
         "metadata": {"general.architecture": field("qwen35", "STRING"),
                      "qwen35.block_count": field(9), "qwen35.nextn_predict_layers": field(1),
@@ -40,7 +40,7 @@ def profiles():
         "architectures": ["DFlash2DraftModel"], "hidden_size": 32, "head_dim": 8,
         "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
         "intermediate_size": 64, "num_target_layers": 8, "max_position_embeddings": 4096,
-        "layer_types": ["sliding_attention"]*2, "sliding_window": 128, "use_sliding_window": True,
+        "layer_types": ["sliding_attention"] *2, "sliding_window": 128, "use_sliding_window": True,
         "is_causal": False, "eos_token_id": 1, "vocab_size": 128,
         "dflash_config": {"block_size": 8, "conv_kernel_size": 2, "conv_group_size": 16,
                           "selector_rank": 8, "selector_top_k": 2, "mask_token_id": 127,
@@ -54,7 +54,7 @@ def profiles():
         "attention.sliding_window": 128, "block_size": 8, "conv_kernel_size": 2,
         "conv_group_size": 16, "selector_rank": 8, "selector_top_k": 2,
     }.items():
-        metadata["dflash."+name] = field(value)
+        metadata["dflash." +name] = field(value)
     metadata["dflash.attention.causal"] = field(False, "BOOL")
     metadata["dflash.attention.sliding_window_pattern"] = {"types": ["ARRAY", "BOOL"], "value": [True, True]}
     metadata["dflash.target_layers"] = {"types": ["ARRAY", "INT32"], "value": [2, 6]}
@@ -88,7 +88,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(result["target_input_layers"], [2, 6])
         self.assertFalse(result["draft_kv_aliases_target"])
         self.assertEqual(result["vocab_size"], 128)
-        self.assertEqual(result["token_ids_sha256"], "a"*64)
+        self.assertEqual(result["token_ids_sha256"], "a" *64)
         self.assertEqual(documents, saved)
 
     def test_required_fields_cannot_silently_use_loader_defaults(self):
@@ -149,7 +149,7 @@ class ProfileTests(unittest.TestCase):
                     AUDIT.validate_pair(target, draft, config)
 
     def test_tokenizer_identity_is_not_just_vocabulary_size(self):
-        for key, value in [("count", 127), ("model", "llama"), ("token_ids_sha256", "b"*64)]:
+        for key, value in [("count", 127), ("model", "llama"), ("token_ids_sha256", "b" *64)]:
             target, draft, config = profiles()
             draft["tokenizer"][key] = value
             with self.assertRaises(ValueError):
@@ -174,8 +174,8 @@ class ProfileTests(unittest.TestCase):
                     AUDIT.validate_pair(target, draft, config)
 
     def test_geometry_and_encoded_input_overflow_are_rejected(self):
-        for key, value in [("hidden_size", 2**31-1), ("num_attention_heads", 2**31),
-                           ("selector_top_k", 2**31-1), ("conv_group_size", 3)]:
+        for key, value in [("hidden_size", 2**31 -1), ("num_attention_heads", 2**31),
+                           ("selector_top_k", 2**31 -1), ("conv_group_size", 3)]:
             target, draft, config = profiles()
             if key in config["dflash_config"]:
                 config["dflash_config"][key] = value
@@ -236,7 +236,7 @@ class ProfileTests(unittest.TestCase):
 class IntegrityTests(unittest.TestCase):
     def audit_fixture(self, directory):
         documents = profiles()
-        paths = {role: Path(directory)/name for role, name in
+        paths = {role: Path(directory) /name for role, name in
                  [("target", "target.gguf"), ("draft", "draft.gguf"), ("draft_config", "config.json")]}
         paths["target"].write_bytes(b"target")
         paths["draft"].write_bytes(b"draft")
@@ -244,7 +244,7 @@ class IntegrityTests(unittest.TestCase):
         artifacts = {}
         for role, path in paths.items():
             raw = path.read_bytes()
-            artifacts[role] = {"repo": "fixture/model", "revision": "0"*40, "filename": path.name,
+            artifacts[role] = {"repo": "fixture/model", "revision": "0" *40, "filename": path.name,
                                "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
         return paths, {"schema_version": 1, "artifacts": artifacts}, documents
 
@@ -256,7 +256,7 @@ class IntegrityTests(unittest.TestCase):
             self.assertEqual(reader.call_count, 2)
             self.assertFalse(report["runtime_qualified"])
             self.assertEqual(set(report["sha256"]), set(paths))
-            manifest["artifacts"]["draft"]["sha256"] = "0"*64
+            manifest["artifacts"]["draft"]["sha256"] = "0" *64
             with patch.object(AUDIT, "read_gguf") as reader, self.assertRaises(ValueError):
                 AUDIT.inspect_artifacts(paths, manifest)
             reader.assert_not_called()
@@ -264,9 +264,10 @@ class IntegrityTests(unittest.TestCase):
     def test_replaced_file_after_hash_cannot_publish_a_matching_report(self):
         with tempfile.TemporaryDirectory() as directory:
             paths, manifest, documents = self.audit_fixture(directory)
+
             def reader(path):
                 if path == paths["draft"]:
-                    replacement = Path(directory)/"replacement"
+                    replacement = Path(directory) /"replacement"
                     replacement.write_bytes(b"target")
                     replacement.replace(paths["target"])
                     return documents[1]
@@ -276,27 +277,27 @@ class IntegrityTests(unittest.TestCase):
 
     def test_checksums_and_sizes_are_verified_not_just_recorded(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)/"model.gguf"
+            path = Path(directory) /"model.gguf"
             path.write_bytes(b"payload")
             pin = {"size": 7, "sha256": hashlib.sha256(b"payload").hexdigest()}
             self.assertEqual(AUDIT.verify_file(path, pin), pin["sha256"])
-            for changed in [dict(pin, size=8), dict(pin, sha256="0"*64), dict(pin, size=True),
+            for changed in [dict(pin, size=8), dict(pin, sha256="0" *64), dict(pin, size=True),
                             dict(pin, sha256="invalid"), None]:
                 with self.subTest(pin=changed), self.assertRaises(ValueError):
                     AUDIT.verify_file(path, changed)
 
     def test_json_is_bounded_and_duplicate_keys_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)/"config.json"
+            path = Path(directory) /"config.json"
             path.write_text('{"block": 8}')
             self.assertEqual(AUDIT.read_json(path), {"block": 8})
-            for data in ["", "[]" , '{"block": 8, "block": 16}', " "*65537]:
+            for data in ["", "[]" , '{"block": 8, "block": 16}', " " *65537]:
                 path.write_text(data)
                 with self.assertRaises(ValueError):
                     AUDIT.read_json(path)
 
     def test_manifest_requires_immutable_revisions_and_all_artifacts(self):
-        manifest = json.loads((SCRIPT.parent/"data/dflash2-qwen27b-artifacts.json").read_text())
+        manifest = json.loads((SCRIPT.parent /"data/dflash2-qwen27b-artifacts.json").read_text())
         AUDIT.validate_manifest(manifest)
         for role in manifest["artifacts"]:
             for key, value in [("revision", "main"), ("size", True), ("sha256", "bad"), ("filename", "../model.gguf")]:
@@ -314,7 +315,7 @@ class IntegrityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             results = []
             for number, words in enumerate([["a", "b", "<|im_end|>"], ["b", "a", "<|im_end|>"]]):
-                path = Path(directory)/f"{number}.gguf"
+                path = Path(directory) /f"{number}.gguf"
                 writer = GGUFWriter(path, "dflash")
                 writer.add_tokenizer_model("gpt2")
                 writer.add_token_list(words)
@@ -341,8 +342,8 @@ class OrdinaryControls(unittest.TestCase):
         from types import SimpleNamespace
         for mode, depth in (("mtp", 3), ("dflash", 7)):
             args = SimpleNamespace(server=Path("server"), target=Path("target"), draft=Path("draft"),
-                port=12351, target_k="q5_1", target_v="q8_0", draft_k="q5_1", draft_v="q8_0",
-                arena_mib=1024, spec_mode=mode)
+                                   port=12351, target_k="q5_1", target_v="q8_0", draft_k="q5_1", draft_v="q8_0",
+                                   arena_mib=1024, spec_mode=mode)
             command = self.controls.server_command(args, 8192, depth)
             self.assertNotIn("--spec-draft-type-k", command)
             self.assertNotIn("--spec-draft-type-v", command)
@@ -351,13 +352,13 @@ class OrdinaryControls(unittest.TestCase):
         from types import SimpleNamespace
         for mode, depth in (("none", 0), ("mtp", 3), ("dflash", 7)):
             args = SimpleNamespace(server=Path("server"), target=Path("target"), draft=Path("draft"),
-                port=12351, draft_k="q8_0", draft_v="q4_0", arena_mib=1024, spec_mode=mode)
+                                   port=12351, draft_k="q8_0", draft_v="q4_0", arena_mib=1024, spec_mode=mode)
             command = self.controls.server_command(args, 8192, depth)
-            self.assertEqual(command[command.index("--kv-stream-arena-mib")+1], "1024")
+            self.assertEqual(command[command.index("--kv-stream-arena-mib") +1], "1024")
             self.assertEqual("--model-draft" in command, mode == "dflash")
             self.assertEqual("--spec-type" in command, mode != "none")
             if mode == "mtp":
-                self.assertEqual(command[command.index("--spec-type")+1], "draft-mtp")
+                self.assertEqual(command[command.index("--spec-type") +1], "draft-mtp")
                 self.assertNotIn("--spec-draft-type-k", command)
                 self.assertNotIn("--spec-draft-type-v", command)
 
@@ -365,7 +366,7 @@ class OrdinaryControls(unittest.TestCase):
         from types import SimpleNamespace
         for mode, depth in (("none", 3), ("mtp", 7), ("dflash", 0), ("unknown", 3)):
             args = SimpleNamespace(server=Path("server"), target=Path("target"), draft=Path("draft"),
-                port=12351, draft_k="q8_0", draft_v="q4_0", spec_mode=mode)
+                                   port=12351, draft_k="q8_0", draft_v="q4_0", spec_mode=mode)
             with self.subTest(mode=mode, depth=depth), self.assertRaises(ValueError):
                 self.controls.server_command(args, 8192, depth)
 
@@ -390,10 +391,10 @@ class OrdinaryControls(unittest.TestCase):
                 self.controls.validate_context_end({**result, **changed}, 8190, 8192, 16)
 
     def test_lifecycle_refuses_an_incomplete_recovery_response(self):
-        self.controls.validate_recovery({"tokens": [1]*16, "timings": {"predicted_n": 16}}, 16)
+        self.controls.validate_recovery({"tokens": [1] *16, "timings": {"predicted_n": 16}}, 16)
         for changed in ({"tokens": []}, {"timings": {"predicted_n": 15}}):
             with self.assertRaises(ValueError):
-                self.controls.validate_recovery({"tokens": [1]*16, "timings": {"predicted_n": 16}, **changed}, 16)
+                self.controls.validate_recovery({"tokens": [1] *16, "timings": {"predicted_n": 16}, **changed}, 16)
 
     def test_only_the_observed_oversized_prompt_diagnostic_is_allowed(self):
         message = "request (8193 tokens) exceeds the available context size (8192 tokens)"
@@ -411,9 +412,9 @@ class OrdinaryControls(unittest.TestCase):
         from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(output=Path(directory), arena_mib=512, port=12351,
-                prompt_tokens=256, decode_tokens=8, request_timeout=60, lifecycle=True)
-            completed = {"tokens": [1]*8, "timings": {"prompt_n": 256, "predicted_n": 8,
-                "draft_n": 7, "prompt_per_second": 100.0, "predicted_per_second": 20.0}}
+                                   prompt_tokens=256, decode_tokens=8, request_timeout=60, lifecycle=True)
+            completed = {"tokens": [1] *8, "timings": {"prompt_n": 256, "predicted_n": 8,
+                                                       "draft_n": 7, "prompt_per_second": 100.0, "predicted_per_second": 20.0}}
             with patch.object(self.controls, "server_command", return_value=["server"]), \
                     patch.object(self.controls.subprocess, "Popen", return_value=SimpleNamespace(pid=123)), \
                     patch.object(self.controls, "wait_for_health"), \
@@ -433,7 +434,7 @@ class OrdinaryControls(unittest.TestCase):
         for option,value in (("--batch-size","512"),("--ubatch-size","128"),
                              ("--cache-type-k","q5_1"),("--cache-type-v","q4_1")):
             self.assertEqual(command.count(option),1)
-            self.assertEqual(command[command.index(option)+1],value)
+            self.assertEqual(command[command.index(option) +1],value)
 
     def test_shared_prompt_headroom_preserves_comparison_prefix(self):
         from types import SimpleNamespace
@@ -461,11 +462,13 @@ class OrdinaryControls(unittest.TestCase):
         args=SimpleNamespace(server=Path("server"),target=Path("target"),draft=Path("draft"),
                              port=12351,draft_k="f16",draft_v="f16",batch_size=256,ubatch_size=0)
         command=self.controls.server_command(args,4096,7)
-        self.assertEqual(command[command.index("--ubatch-size")+1],"0")
+        self.assertEqual(command[command.index("--ubatch-size") +1],"0")
         self.assertEqual(self.controls.effective_microbatch(args,4096),256)
-        args.batch_size=128; args.ubatch_size=256
+        args.batch_size=128
+        args.ubatch_size=256
         self.assertEqual(self.controls.effective_microbatch(args,4096),128)
-        args.batch_size=1024; args.ubatch_size=1024
+        args.batch_size=1024
+        args.ubatch_size=1024
         self.assertEqual(self.controls.effective_microbatch(args,512),512)
 
     def test_auto_arena_qualifies_full_workload_and_does_not_retry_correctness_errors(self):
@@ -474,6 +477,7 @@ class OrdinaryControls(unittest.TestCase):
             args=SimpleNamespace(output=Path(temp),arena_mib=128,auto_max_arena=True,
                                  prompt_tokens=16000,decode_tokens=256)
             calls=[]
+
             def probe(config,context,depth,tokens,mode):
                 calls.append((config.arena_mib,config.prompt_tokens,config.decode_tokens))
                 full=config.prompt_tokens == args.prompt_tokens
@@ -488,7 +492,7 @@ class OrdinaryControls(unittest.TestCase):
             with patch.object(self.controls,"run_point",side_effect=AssertionError("fixed must not probe")):
                 self.assertEqual(self.controls.auto_arena_for_point(args,16384,7,{}),(128,None))
             args.auto_max_arena=True
-            args.output=Path(temp)/"correctness-error"
+            args.output=Path(temp) /"correctness-error"
             with patch.object(self.controls,"run_point",return_value={"status":"failed","error":"numerical mismatch"}) as run:
                 with self.assertRaisesRegex(RuntimeError,"numerical mismatch"):
                     self.controls.auto_arena_for_point(args,16384,7,{})
@@ -505,14 +509,14 @@ class OrdinaryControls(unittest.TestCase):
                                   ("--spec-draft-type-k", "f16"), ("--spec-draft-type-v", "f16"),
                                   ("--batch-size", "256"), ("--ubatch-size", "256"), ("--fit", "off"),
                                   ("--n-gpu-layers", "999"), ("--spec-draft-ngl", "999")):
-                self.assertEqual(command[command.index(option)+1], value)
+                self.assertEqual(command[command.index(option) +1], value)
             self.assertNotIn("--kv-stream-arena-mib", command)
             self.assertNotIn("--kv-stream-auxiliary-layers", command)
         with self.assertRaises(ValueError):
             self.controls.server_command(args, 4096, 8)
 
     def test_incomplete_or_nonfinite_results_are_not_successful(self):
-        result = {"tokens": [4]*32, "timings": {"prompt_n": 2304, "predicted_n": 32,
+        result = {"tokens": [4] *32, "timings": {"prompt_n": 2304, "predicted_n": 32,
                   "prompt_per_second": 500.0, "predicted_per_second": 50.0, "draft_n": 16}}
         self.controls.validate_result(result, 2304, 32)
         for field in ("prompt_n", "predicted_n", "prompt_per_second", "predicted_per_second"):
@@ -528,7 +532,7 @@ class OrdinaryControls(unittest.TestCase):
         args = SimpleNamespace(server=Path("server"),target=Path("target"),draft=Path("draft"),
                                port=12351,draft_k="f16",draft_v="f16",arena_mib=1536)
         command=self.controls.server_command(args,16384,7)
-        self.assertEqual(command[command.index("--kv-stream-arena-mib")+1],"1536")
+        self.assertEqual(command[command.index("--kv-stream-arena-mib") +1],"1536")
         self.assertNotIn("--kv-stream-pool-mib",command)
         self.assertNotIn("--kv-stream-auxiliary-layers",command)
 
@@ -540,31 +544,31 @@ class OrdinaryControls(unittest.TestCase):
             self.assertEqual(self.controls.failure_kind(text), "failed")
 
     def test_successful_fallback_without_any_drafts_is_not_a_dflash_control(self):
-        result={"tokens":[4]*32,"timings":{"prompt_n":2304,"predicted_n":32,
-            "prompt_per_second":100,"predicted_per_second":50,"draft_n":0}}
+        result={"tokens":[4] *32,"timings":{"prompt_n":2304,"predicted_n":32,
+                                            "prompt_per_second":100,"predicted_per_second":50,"draft_n":0}}
         with self.assertRaises(ValueError):
             self.controls.validate_result(result,2304,32)
 
     def test_trace_requires_all_three_workloads(self):
         rows: list[dict[str, Any]] = [{"event": "process", "role": "target", "kind": "tokens", "rows": 4, "ret": 0},
-                {"event": "process", "role": "draft", "kind": "features", "rows": 256, "ret": 0,
-                 "feature_width": 25600},
-                {"event": "process", "role": "draft", "kind": "tokens", "rows": 4, "ret": 0},
-                {"event": "tensor", "role": "draft", "name": "lattice", "file": "lattice.bin"},
-                {"event": "attention", "role": "draft", "query_rows": 4,
-                 "visible_rows": [2048, 2048, 2048, 2048], "mask_file": "mask.bin"}]
+                                      {"event": "process", "role": "draft", "kind": "features", "rows": 256, "ret": 0,
+                                       "feature_width": 25600},
+                                      {"event": "process", "role": "draft", "kind": "tokens", "rows": 4, "ret": 0},
+                                      {"event": "tensor", "role": "draft", "name": "lattice", "file": "lattice.bin"},
+                                      {"event": "attention", "role": "draft", "query_rows": 4,
+                                       "visible_rows": [2048, 2048, 2048, 2048], "mask_file": "mask.bin"}]
         summary = self.controls.summarize_trace(rows, 3)
         self.assertEqual(summary["injection_rows"], [256])
         self.assertEqual(summary["draft_widths"], [4])
         self.assertEqual(summary["target_widths"], [4])
         for index in range(len(rows)):
             with self.assertRaises(ValueError):
-                self.controls.summarize_trace(rows[:index]+rows[index+1:], 3)
+                self.controls.summarize_trace(rows[:index] +rows[index +1:], 3)
         with self.assertRaises(ValueError):
             self.controls.summarize_trace(rows, 7)
         warm = {"event": "process", "role": "draft", "kind": "tokens", "rows": 2,
                 "ret": 0, "warmup": True}
-        self.assertEqual(self.controls.summarize_trace([warm]+rows, 3)["draft_widths"], [4])
+        self.assertEqual(self.controls.summarize_trace([warm] +rows, 3)["draft_widths"], [4])
         wider=copy.deepcopy(rows)
         wider[1]["rows"]=512
         self.assertEqual(self.controls.summarize_trace(wider,3,max_injection_rows=512)["injection_rows"],[512])
@@ -575,13 +579,13 @@ class OrdinaryControls(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             content = b"a native control payload"
-            (root/"payload.bin").write_bytes(content)
+            (root /"payload.bin").write_bytes(content)
             row = {"file": "payload.bin", "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
             self.assertEqual(self.controls.validate_payloads(root, [row, {"nested": row}]), 1)
-            for changed in (dict(row, file="../payload.bin"), dict(row, bytes=0), dict(row, sha256="0"*64)):
+            for changed in (dict(row, file="../payload.bin"), dict(row, bytes=0), dict(row, sha256="0" *64)):
                 with self.assertRaises(ValueError):
                     self.controls.validate_payloads(root, [changed])
-            (root/"payload.bin").write_bytes(b"x"*len(content))
+            (root /"payload.bin").write_bytes(b"x" *len(content))
             with self.assertRaises(ValueError):
                 self.controls.validate_payloads(root, [row])
 
@@ -592,11 +596,11 @@ class OrdinaryControls(unittest.TestCase):
         row = {"status": "ok", "mode": "capture", "context": 4096, "depth": 3,
                "prompt_tokens": 2304, "decode_tokens": 64, "uvm": False,
                "command": self.controls.server_command(args, 4096, 3),
-               "result": {"tokens": [42]*64}}
-        artifacts = {"sha256": {"target": "1"*64, "draft": "2"*64, "draft_config": "3"*64}}
+               "result": {"tokens": [42] *64}}
+        artifacts = {"sha256": {"target": "1" *64, "draft": "2" *64, "draft_config": "3" *64}}
         trace: list[dict[str, Any]] = [{"event": "process", "role": "target", "tokens": [42, 43, 44, 45], "positions": [100, 101, 102, 103]},
-                 {"event": "attention", "visible_columns": [[0, 1, 3]], "mask": {"sha256": "a"*64}},
-                 {"event": "memory", "devices": [{"free": 100}]}]
+                                       {"event": "attention", "visible_columns": [[0, 1, 3]], "mask": {"sha256": "a" *64}},
+                                       {"event": "memory", "devices": [{"free": 100}]}]
         self.controls.compare_control_rows(row, row, artifacts, artifacts, trace, trace)
         uvm_control=dict(row,uvm=True)
         self.controls.compare_control_rows(row,uvm_control,artifacts,artifacts,trace,trace,allow_uvm_difference=True)
@@ -609,7 +613,7 @@ class OrdinaryControls(unittest.TestCase):
         for index, field, value in ((0, "tokens", [42, 43, 46, 45]),
                                     (0, "positions", [100, 101, 103, 102]),
                                     (1, "visible_columns", [[0, 2, 3]]),
-                                    (1, "mask", {"sha256": "b"*64})):
+                                    (1, "mask", {"sha256": "b" *64})):
             changed = copy.deepcopy(trace)
             changed[index][field] = value
             with self.assertRaises(ValueError):
@@ -621,8 +625,9 @@ class OrdinaryControls(unittest.TestCase):
             self.controls.compare_control_rows(row, row, artifacts, {"sha256": {}}, trace, trace)
 
     def test_lattice_comparison_preserves_scores_across_unsorted_top_k(self):
-        rows: list[list[float]] = [[0]*8, [4, 6, 10, 20, 10, 20, 0, 0], [8, 10, 1, 2, 3, 4, 0, 0]]
-        reordered: list[list[float]] = [[0]*8, [6, 4, 20, 10, 20, 10, 0, 0], [10, 8, 4, 3, 2, 1, 0, 0]]
+        rows: list[list[float]] = [[0] *8, [4, 6, 10, 20, 10, 20, 0, 0], [8, 10, 1, 2, 3, 4, 0, 0]]
+        reordered: list[list[float]] = [[0] *8, [6, 4, 20, 10, 20, 10, 0, 0], [10, 8, 4, 3, 2, 1, 0, 0]]
+
         def encode(value):
             return struct.pack("<24f", *(v for row in value for v in row))
         expected = self.controls.canonical_lattice(encode(rows), 3, 8, 2, 32)
@@ -649,9 +654,9 @@ class OrdinaryControls(unittest.TestCase):
                 {"buffer": "CUDA0", "model": 100, "context": 20}]}]
         ledger = self.controls.fit_ledger(row, trace, 262144)
         self.assertFalse(ledger["ordinary_full_context_fits"])
-        self.assertEqual(ledger["ordinary_lower_bound_bytes"], 1000+100+524288+400+20)
-        self.assertEqual(ledger["streamed_parent_upper_bound_before_scratch_bytes"], 10000-1000-100-100)
-        self.assertEqual(ledger["target_elastic_upper_bound_before_scratch_bytes"], 10000-1000-100-100-20)
+        self.assertEqual(ledger["ordinary_lower_bound_bytes"], 1000 +100 +524288 +400 +20)
+        self.assertEqual(ledger["streamed_parent_upper_bound_before_scratch_bytes"], 10000 -1000 -100 -100)
+        self.assertEqual(ledger["target_elastic_upper_bound_before_scratch_bytes"], 10000 -1000 -100 -100 -20)
         self.assertFalse(ledger["streamed_fit_qualified"])
         with self.assertRaises(ValueError):
             self.controls.fit_ledger(dict(row, context=1000), trace, 262144)
@@ -661,7 +666,7 @@ class DflashPlotTests(unittest.TestCase):
     def test_unified_control_rows_keep_target_mtp_and_dflash_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            log = root/"server.log"
+            log = root /"server.log"
             log.write_text("memory_phase: phase=decode kv_pool=104857600\n")
             rows = []
             for mode, depth in (("none", 0), ("mtp", 3), ("dflash", 3)):
@@ -669,48 +674,49 @@ class DflashPlotTests(unittest.TestCase):
                 if depth:
                     timing.update(draft_n=10, draft_n_accepted=5)
                 rows.append({"status": "ok", "mode": "timing", "context": 8192,
-                    "spec_mode": mode, "depth": depth, "log": str(log), "result": {"timings": timing}})
-            (root/"results.jsonl").write_text("\n".join(map(json.dumps, rows)))
+                             "spec_mode": mode, "depth": depth, "log": str(log), "result": {"timings": timing}})
+            (root /"results.jsonl").write_text("\n".join(map(json.dumps, rows)))
             points = self.plot.load_series(root)
             self.assertEqual({p["spec_type"] for p in points}, {"none", "mtp", "dflash"})
 
     def setUp(self):
-        spec=importlib.util.spec_from_file_location("dflash_plot",SCRIPT.parent/"plot_dflash_controls.py")
+        spec=importlib.util.spec_from_file_location("dflash_plot",SCRIPT.parent /"plot_dflash_controls.py")
         assert spec is not None and spec.loader is not None
-        self.plot=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.plot)
+        self.plot=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.plot)
 
     def test_target_mtp_controls_keep_modes_and_no_speculation_has_no_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
-            log=root/"server.log"
+            log=root /"server.log"
             log.write_text("memory_phase: phase=decode parent=1073741824 kv_pool=900000000\n")
             row={"status":"ok","uvm":False,"context_capacity":8192,"mtp_length":0,"arena_mib":1024,"log":str(log),
                  "prefill_tps":1000,"decode_tps":40,"mtp_draft_generated":None,"mtp_draft_accepted":None}
             mtp=dict(row,mtp_length=3,mtp_draft_generated=100,mtp_draft_accepted=80,decode_tps=80)
-            (root/"results.jsonl").write_text(json.dumps(row)+"\n"+json.dumps(mtp)+"\n")
+            (root /"results.jsonl").write_text(json.dumps(row) +"\n" +json.dumps(mtp) +"\n")
             points=self.plot.load_series(root)
             self.assertEqual({p["spec_type"] for p in points},{"none","mtp"})
             baseline=next(p for p in points if p["spec_type"] == "none")
             self.assertIsNone(baseline["acceptance_pct"])
             self.assertEqual(next(p for p in points if p["spec_type"] == "mtp")["acceptance_pct"],80)
             mtp["mtp_draft_generated"]=0
-            (root/"results.jsonl").write_text(json.dumps(mtp)+"\n")
+            (root /"results.jsonl").write_text(json.dumps(mtp) +"\n")
             with self.assertRaises(ValueError):self.plot.load_series(root)
 
     def test_timing_only_and_decode_grant_not_arena_are_reported(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
-            log=root/"server.log"
+            log=root /"server.log"
             log.write_text("memory_phase: phase=prefill parent=1073741824 kv_pool=800000000\n"
                            "memory_phase: phase=decode parent=1073741824 kv_pool=900000000\n")
             row={"mode":"timing","status":"ok","context":8192,"depth":7,"arena_mib":1024,"log":str(log),
-                "result":{"timings":{"prompt_per_second":1000,"predicted_per_second":60,"draft_n":100,"draft_n_accepted":40}}}
-            (root/"results.jsonl").write_text(json.dumps(dict(row,mode="capture"))+"\n"+json.dumps(row)+"\n")
+                 "result":{"timings":{"prompt_per_second":1000,"predicted_per_second":60,"draft_n":100,"draft_n_accepted":40}}}
+            (root /"results.jsonl").write_text(json.dumps(dict(row,mode="capture")) +"\n" +json.dumps(row) +"\n")
             points=self.plot.load_series(root)
             self.assertEqual(len(points),1)
-            self.assertEqual(points[0]["decode_kv_pool_mib"],900000000/1048576)
+            self.assertEqual(points[0]["decode_kv_pool_mib"],900000000 /1048576)
             self.assertEqual(points[0]["acceptance_pct"],40)
-            (root/"results.jsonl").write_text(json.dumps(row)+"\n"+json.dumps(row)+"\n")
+            (root /"results.jsonl").write_text(json.dumps(row) +"\n" +json.dumps(row) +"\n")
             with self.assertRaises(ValueError):self.plot.load_series(root)
 
     def test_failed_and_numerical_only_runs_are_not_performance_points(self):
@@ -718,7 +724,7 @@ class DflashPlotTests(unittest.TestCase):
             root=Path(temporary)
             for row in ({"mode":"timing","status":"failed"},
                         {"mode":"timing","status":"ok","numerical_control_only":True}):
-                (root/"results.jsonl").write_text(json.dumps(row)+"\n")
+                (root /"results.jsonl").write_text(json.dumps(row) +"\n")
                 with self.assertRaises(ValueError):self.plot.load_series(root)
 
 

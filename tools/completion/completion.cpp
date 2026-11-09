@@ -383,7 +383,7 @@ int llama_completion(int argc, char ** argv) {
             LOG_INF("%6d -> '%s'\n", embd_inp[i], common_token_to_piece(ctx, embd_inp[i]).c_str());
         }
 
-        if (params.n_keep > add_bos) {
+        if (params.n_keep > static_cast<int>(add_bos)) {
             LOG_INF("%s: static prompt based on n_keep: '", __func__);
             for (int i = 0; i < params.n_keep; i++) {
                 LOG_CNT("%s", common_token_to_piece(ctx, embd_inp[i]).c_str());

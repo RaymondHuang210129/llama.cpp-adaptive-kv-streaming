@@ -161,6 +161,10 @@ static generation_result test_baseline(struct llama_model * model, const struct 
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create baseline context\n", __func__);
+        return {};
+    }
 
     auto sparams = llama_sampler_chain_default_params();
     auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};

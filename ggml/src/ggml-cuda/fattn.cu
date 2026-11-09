@@ -881,8 +881,8 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_spans_case(
         return ggml_cuda_flash_attn_ext_mma_f16_spans_case<DKQ,DV,ncols1,ncols2>(
             ctx,&logical,spans,count,workspace,plan,control);
     }
-    ggml_kv_mma_span_kernel_t kernel=nullptr;
-    ggml_kv_mma_runtime_kernel_t runtime=nullptr;
+    [[maybe_unused]] ggml_kv_mma_span_kernel_t kernel=nullptr;
+    [[maybe_unused]] ggml_kv_mma_runtime_kernel_t runtime=nullptr;
     if constexpr (DKQ == 512) {
         runtime=ggml_cuda_kv_stream_mma_runtime_kernel(dst->src[1]->type,dst->src[2]->type,
             ncols1,ncols2,plan.resumable,plan.dense_strided);

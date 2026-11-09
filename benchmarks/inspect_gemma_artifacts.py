@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from inspect_dflash_artifacts import (
+from inspect_dflash_artifacts import (  # noqa: E402
     INTEGER_TYPES, ROOT, check_tensor, integer, metadata, product,
     read_gguf, read_json, scalar, tokenizer, verify_file,
 )
@@ -17,30 +17,30 @@ from inspect_dflash_artifacts import (
 def cache_profile(document, architecture):
     if metadata(document, "general.architecture", [["STRING"]]) != architecture:
         raise ValueError(f"expected architecture {architecture}")
-    prefix = architecture+"."
-    layers = scalar(document, prefix+"block_count", maximum=1024)
-    pattern = metadata(document, prefix+"attention.sliding_window_pattern", [["ARRAY", "BOOL"]])
+    prefix = architecture +"."
+    layers = scalar(document, prefix +"block_count", maximum=1024)
+    pattern = metadata(document, prefix +"attention.sliding_window_pattern", [["ARRAY", "BOOL"]])
     if not isinstance(pattern, list) or len(pattern) != layers or any(type(local) is not bool for local in pattern):
         raise ValueError("invalid sliding-window pattern")
-    head_types = [[kind] for kind in INTEGER_TYPES]+[["ARRAY", kind] for kind in INTEGER_TYPES]
-    heads = metadata(document, prefix+"attention.head_count_kv", head_types)
+    head_types = [[kind] for kind in INTEGER_TYPES] +[["ARRAY", kind] for kind in INTEGER_TYPES]
+    heads = metadata(document, prefix +"attention.head_count_kv", head_types)
     if type(heads) is int:
-        heads = [heads]*layers
+        heads = [heads] *layers
     if not isinstance(heads, list) or len(heads) != layers:
         raise ValueError("invalid per-layer KV head count")
-    query_heads = scalar(document, prefix+"attention.head_count")
+    query_heads = scalar(document, prefix +"attention.head_count")
     for count in heads:
         if query_heads % integer(count, "KV heads"):
             raise ValueError("query heads are not divisible by KV heads")
-    full = (scalar(document, prefix+"attention.key_length"), scalar(document, prefix+"attention.value_length"))
-    local = (scalar(document, prefix+"attention.key_length_swa"), scalar(document, prefix+"attention.value_length_swa"))
+    full = (scalar(document, prefix +"attention.key_length"), scalar(document, prefix +"attention.value_length"))
+    local = (scalar(document, prefix +"attention.key_length_swa"), scalar(document, prefix +"attention.value_length_swa"))
     return {
         "layers": layers, "pattern": pattern, "query_heads": query_heads,
         "geometry": [(*(local if windowed else full), heads[i]) for i, windowed in enumerate(pattern)],
-        "window": scalar(document, prefix+"attention.sliding_window"),
-        "context": scalar(document, prefix+"context_length"),
-        "hidden": scalar(document, prefix+"embedding_length"),
-        "shared": scalar(document, prefix+"attention.shared_kv_layers", 0, layers),
+        "window": scalar(document, prefix +"attention.sliding_window"),
+        "context": scalar(document, prefix +"context_length"),
+        "hidden": scalar(document, prefix +"embedding_length"),
+        "shared": scalar(document, prefix +"attention.shared_kv_layers", 0, layers),
     }
 
 
@@ -108,6 +108,7 @@ def inspect_artifacts(target, assistant, manifest):
     if not isinstance(pins, dict) or set(pins) != {"target", "assistant"}:
         raise ValueError("manifest requires target and assistant pins")
     paths = {"target": target, "assistant": assistant}
+
     def signature(path):
         info = path.stat()
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
@@ -118,8 +119,8 @@ def inspect_artifacts(target, assistant, manifest):
     for role, path in paths.items():
         if signature(path) != before[role]:
             raise ValueError(f"artifact changed during inspection: {role}")
-        report[role+"_tensor_bytes"] = sum(integer(item["bytes"], "tensor bytes", maximum=2**63-1)
-            for item in documents[role]["tensors"].values())
+        report[role +"_tensor_bytes"] = sum(integer(item["bytes"], "tensor bytes", maximum=2**63 -1)
+                                            for item in documents[role]["tensors"].values())
     report["sha256"] = checksums
     report["tensor_bytes_are_gpu_allocations"] = False
     return report
@@ -129,12 +130,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--assistant", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, default=ROOT/"benchmarks/data/gemma4-31b-artifacts.json")
+    parser.add_argument("--manifest", type=Path, default=ROOT /"benchmarks/data/gemma4-31b-artifacts.json")
     args = parser.parse_args()
     try:
-        print(json.dumps(inspect_artifacts(args.target, args.assistant, read_json(args.manifest)), indent=2))
+        sys.stdout.write(str(json.dumps(inspect_artifacts(args.target, args.assistant, read_json(args.manifest)), indent=2)) + "\n")
     except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
-        print(f"Gemma artifact audit failed: {exc}", file=sys.stderr)
+        sys.stderr.write(str(f"Gemma artifact audit failed: {exc}") + "\n")
         return 1
     return 0
 

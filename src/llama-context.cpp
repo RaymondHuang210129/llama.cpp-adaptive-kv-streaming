@@ -1080,6 +1080,8 @@ void llama_context::sched_reserve() {
     int n_input_tensors_tg = -1;
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    // [TAG_RESERVE_DIAG_DECAY] These intermediates scale with tokens per sequence squared.
+    const uint32_t n_seqs_pp = model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01 ? 1 : n_seqs;
 
     auto prepare_arenas = [&]() {
         struct attention_intent_restore {
@@ -1101,6 +1103,17 @@ void llama_context::sched_reserve() {
             n_seqs, n_seqs, n_seqs, mctx.get(), true,
             measurements.data() + backend_ptrs.size());
         if (!gf_pp || !gf_tg) return false;
+        if (n_seqs_pp != n_seqs) {
+            std::vector<size_t> single(backend_ptrs.size());
+            cparams.kv_stream_decode = false;
+            cparams.mtp_span_attention = false;
+            if (!graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), true, single.data())) return false;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                measurements[i] = std::max(measurements[i], single[i]);
+            }
+            cparams.kv_stream_decode = cparams.kv_streaming();
+            cparams.mtp_span_attention = cparams.mtp_publish_host;
+        }
         if (serial_feature_images) {
             const bool decode_intent=cparams.kv_stream_decode;
             std::vector<uint32_t> measured;
@@ -1236,18 +1249,7 @@ void llama_context::sched_reserve() {
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
-        ggml_cgraph * gf = nullptr;
-        switch (model.arch) {
-            case LLM_ARCH_KIMI_LINEAR:
-            case LLM_ARCH_MINIMAX_01:
-                // [TAG_RESERVE_DIAG_DECAY]
-                // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
-                // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
-                break;
-            default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
-        };
+        ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");

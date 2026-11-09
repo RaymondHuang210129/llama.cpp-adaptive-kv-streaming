@@ -1294,7 +1294,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse);
-    constexpr bool feature_pipeline = KV::feature_pipelined && DKQ == 512 && DV == 512 && ncols1 == 8 && ncols2 == 8 && !use_sparse && !V_is_K_view;
+    [[maybe_unused]] constexpr bool feature_pipeline = KV::feature_pipelined && DKQ == 512 && DV == 512 && ncols1 == 8 && ncols2 == 8 && !use_sparse && !V_is_K_view;
     const uint32_t native_block=kv.block_index(), native_blocks=kv.block_count();
 
     int kb0_start=native_start, kb0_stop=native_stop;
@@ -1346,7 +1346,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         KQ_max[col] = -FLT_MAX/2.0f;
     }
 
-    char * checkpoint=nullptr;
+    [[maybe_unused]] char * checkpoint=nullptr;
     if constexpr (KV::resumable) {
         static_assert((DKQ == 256 || DKQ == 512) && DKQ == DV, "unsupported resumed head geometry");
         constexpr size_t thread_bytes=sizeof(VKQ_C)+sizeof(KQ_max)+sizeof(KQ_rowsum);
@@ -1506,7 +1506,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     if constexpr (KV::resumable) {
         if (kb0_stop < native_stop) {
             // Resolve only at each copy; do not keep the checkpoint address across the MMA loop.
-            constexpr size_t thread_bytes=sizeof(VKQ_C)+sizeof(KQ_max)+sizeof(KQ_rowsum);
+            [[maybe_unused]] constexpr size_t thread_bytes=sizeof(VKQ_C)+sizeof(KQ_max)+sizeof(KQ_rowsum);
             char * destination=checkpoint;
             if constexpr (feature_pipeline)
                 destination=ggml_cuda_fattn_mma_checkpoint_thread<thread_bytes>(kv.control,kv.slice,native_block);

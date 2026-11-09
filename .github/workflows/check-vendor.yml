@@ -1,23 +1,7 @@
 name: Check vendor
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      'vendor/**',
-      'scripts/sync_vendor.py'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      'vendor/**',
-      'scripts/sync_vendor.py'
-    ]
-
-cache-mode: none
+  workflow_call:
 permissions:
   contents: read
 
@@ -27,12 +11,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.x'
 

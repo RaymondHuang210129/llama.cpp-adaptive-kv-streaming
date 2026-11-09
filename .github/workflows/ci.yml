@@ -1,0 +1,94 @@
+name: CI
+on:
+  pull_request:
+    branches: [feature/adaptive-kv-stream-v2]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  push:
+    branches: [feature/adaptive-kv-stream-v2]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      draft: ${{ steps.flags.outputs.draft }}
+      server: ${{ steps.flags.outputs.server }}
+      sanitize: ${{ steps.flags.outputs.sanitize }}
+      ui: ${{ steps.flags.outputs.ui }}
+      vendor: ${{ steps.flags.outputs.vendor }}
+      tokenizer: ${{ steps.flags.outputs.tokenizer }}
+      ops: ${{ steps.flags.outputs.ops }}
+      requirements: ${{ steps.flags.outputs.requirements }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: flags
+        run: python3 .github/scripts/fork_ci.py changes
+  ui-build:
+    needs: changes
+    if: needs.changes.outputs.draft != 'true'
+    uses: ./.github/workflows/ui-build.yml
+  cpu:
+    needs: [changes, ui-build]
+    if: needs.changes.outputs.draft != 'true'
+    uses: ./.github/workflows/build-cpu.yml
+  cuda-linux:
+    needs: [changes, ui-build]
+    if: needs.changes.outputs.draft != 'true'
+    uses: ./.github/workflows/build-cuda-ubuntu.yml
+  cuda-windows:
+    needs: [changes, ui-build]
+    if: needs.changes.outputs.draft != 'true'
+    uses: ./.github/workflows/build-cuda-windows.yml
+  cmake-package:
+    needs: changes
+    if: needs.changes.outputs.draft != 'true'
+    uses: ./.github/workflows/build-cmake-pkg.yml
+  python:
+    needs: changes
+    uses: ./.github/workflows/python-checks.yml
+    with:
+      requirements: ${{ needs.changes.outputs.requirements == 'true' }}
+  source:
+    needs: changes
+    uses: ./.github/workflows/source-checks.yml
+    with:
+      flags: ${{ toJSON(needs.changes.outputs) }}
+  server:
+    needs: [changes, cpu]
+    if: needs.changes.outputs.draft != 'true' && needs.changes.outputs.server == 'true'
+    uses: ./.github/workflows/server.yml
+  sanitize:
+    needs: [changes, ui-build]
+    if: needs.changes.outputs.draft != 'true' && needs.changes.outputs.sanitize == 'true'
+    uses: ./.github/workflows/build-sanitize.yml
+  ui:
+    needs: [changes, ui-build]
+    if: needs.changes.outputs.draft != 'true' && needs.changes.outputs.ui == 'true'
+    uses: ./.github/workflows/ui.yml
+  required:
+    name: required
+    if: always()
+    needs: [changes, ui-build, cpu, cuda-linux, cuda-windows, cmake-package, python, source, server, sanitize, ui]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/fork_ci.py required
+        env:
+          CI_FLAGS: ${{ toJSON(needs.changes.outputs) }}
+          CI_RESULTS: ${{ toJSON(needs) }}
+  publish:
+    needs: required
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feature/adaptive-kv-stream-v2' && needs.required.result == 'success'
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/release.yml

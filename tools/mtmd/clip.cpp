@@ -5247,7 +5247,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                                 std::fill(
                                     mask.begin() + row_offset + (dst_0 * merge_ratio * merge_ratio),
                                     mask.begin() + row_offset + (dst   * merge_ratio * merge_ratio),
-                                    0.0);
+                                    0.0f);
                                 mask_row++;
                             }
                         }

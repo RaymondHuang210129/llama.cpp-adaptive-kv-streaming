@@ -55,6 +55,7 @@ class ArenaFinderTests(unittest.TestCase):
             args.output = Path(temporary)
             args.prefill_text = Path(temporary) / "corpus.txt"
             args.prefill_text.write_text("corpus")
+
             def request(url, body: dict | None = None, **kwargs):
                 if url.endswith("/tokenize"):
                     return {"tokens": list(range(4096))}
@@ -78,6 +79,7 @@ class ArenaFinderTests(unittest.TestCase):
             args.output = Path(temporary)
             args.image = [Path(temporary) / "image.png"]
             args.image[0].write_bytes(b"fixture image")
+
             def request(url, body: dict | None = None, **kwargs):
                 self.assertTrue(url.endswith("/completion"))
                 assert body is not None
@@ -92,6 +94,7 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args("--probe-mode", "preflight", "--context-size", "262144", "--mmproj", "vision.gguf")
         with tempfile.TemporaryDirectory() as temporary:
             args.output = Path(temporary)
+
             def probe(config, candidate):
                 return {"arena_mib": candidate, "fits": candidate <= 1000,
                         "timings": {"prompt_n": 2048, "predicted_n": 256}}
@@ -108,6 +111,7 @@ class ArenaFinderTests(unittest.TestCase):
         calls = []
         with tempfile.TemporaryDirectory() as temporary:
             args.output = Path(temporary)
+
             def probe(config, candidate):
                 calls.append((config.probe_mode, candidate, config.output))
                 return {"arena_mib": candidate, "fits": candidate <= 1000,
@@ -124,6 +128,7 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args("--probe-mode", "preflight", "--validate-selected")
         with tempfile.TemporaryDirectory() as temporary:
             args.output = Path(temporary)
+
             def probe(config, candidate):
                 return {"arena_mib": candidate, "fits": config.probe_mode != "full" and candidate <= 1000}
             with patch.object(FINDER, "probe", side_effect=probe):
@@ -142,6 +147,7 @@ class ArenaFinderTests(unittest.TestCase):
                 args.output = Path(temporary)
                 args.prefill_text = args.output / "corpus.txt"
                 args.prefill_text.write_text("corpus")
+
                 def request(url, *unused, **kwargs):
                     return {"tokens": list(range(2048))} if url.endswith("/tokenize") else response
                 with patch.object(FINDER.subprocess, "Popen"), patch.object(FINDER.SWEEP, "wait_ready"), \
@@ -154,6 +160,7 @@ class ArenaFinderTests(unittest.TestCase):
         for fault in ("an illegal memory access was encountered", "misaligned address", "device-side assert triggered", "unspecified launch failure"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
                 args.output = Path(temporary)
+
                 def launch(*unused, **kwargs):
                     kwargs["stdout"].write("CUDA error: " + fault + "\ncudaMalloc failed: out of memory\n")
                     return object()
@@ -167,6 +174,7 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args("--probe-mode", "preflight", "--validate-selected")
         with tempfile.TemporaryDirectory() as temporary:
             args.output = Path(temporary)
+
             def probe(config, candidate):
                 if config.probe_mode == "full":
                     raise RuntimeError("unsupported full-runtime kernel")
@@ -209,8 +217,8 @@ class ArenaFinderTests(unittest.TestCase):
     def test_mtp_allows_an_optional_external_assistant_with_inherited_cache_types(self):
         args=self.args("--spec-mode","mtp","--model-draft","assistant.gguf","--cache-type-k","q5_1","--cache-type-v","q8_0")
         command=FINDER.server_command(args,1024)
-        self.assertEqual(command[command.index("--model-draft")+1],"assistant.gguf")
-        self.assertEqual(command[command.index("--spec-draft-ngl")+1],"999")
+        self.assertEqual(command[command.index("--model-draft") +1],"assistant.gguf")
+        self.assertEqual(command[command.index("--spec-draft-ngl") +1],"999")
         self.assertNotIn("--spec-draft-type-k",command)
         self.assertNotIn("--spec-draft-type-v",command)
         self.assertNotIn("--model-draft",FINDER.server_command(self.args("--spec-mode","mtp"),1024))
@@ -230,6 +238,7 @@ class ArenaFinderTests(unittest.TestCase):
         args=self.args()
         with tempfile.TemporaryDirectory() as temp:
             args.output=Path(temp)
+
             def reject(*command,**kwargs):
                 kwargs["stdout"].write("persistent local cache does not fit the declared shared arena: insufficient arena quota; required=788880128, available=536870912, additional=252009216 bytes; phase=1, resource=6\n")
                 return object()
@@ -254,6 +263,7 @@ class ArenaFinderTests(unittest.TestCase):
         for message in messages:
             with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
                 args.output = Path(temporary)
+
                 def launch(*command, **kwargs):
                     kwargs["stdout"].write(message)
                     return object()
@@ -267,6 +277,7 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args("--spec-mode", "mtp", "--probe-mode", "preflight")
         with tempfile.TemporaryDirectory() as temporary:
             args.output = Path(temporary)
+
             def launch(*command, **kwargs):
                 kwargs["stdout"].write("MTP graph exceeds shared arena quota: available=536870912 required=1254383744 bytes; trying a separate workspace\n")
                 return object()
@@ -279,9 +290,9 @@ class ArenaFinderTests(unittest.TestCase):
         for mode, depth in (("none", 0), ("mtp", 3), ("dflash", 7)):
             args = self.args("--spec-mode", mode, *(["--model-draft", "draft.gguf"] if mode == "dflash" else []))
             command = FINDER.server_command(args, 1234)
-            self.assertEqual(command[command.index("--shared-device-memory-mib")+1], "1234")
+            self.assertEqual(command[command.index("--shared-device-memory-mib") +1], "1234")
             self.assertEqual(args.draft_length, depth)
-            self.assertEqual(command[command.index("--spec-type")+1], {"none":"none","mtp":"draft-mtp","dflash":"draft-dflash"}[mode])
+            self.assertEqual(command[command.index("--spec-type") +1], {"none":"none","mtp":"draft-mtp","dflash":"draft-dflash"}[mode])
             self.assertNotIn("--spec-draft-type-k", command)
             self.assertNotIn("--spec-draft-type-v", command)
         for mode in ("none", "mtp"):
@@ -293,11 +304,11 @@ class ArenaFinderTests(unittest.TestCase):
 
     def test_invalid_combinations_are_rejected_before_starting_a_server(self):
         for options in (("--spec-mode","mtp","--draft-length","4"),
-                ("--spec-mode","none","--draft-length","3"), ("--spec-mode","dflash"),
-                ("--spec-mode","dflash-k4v","--model-draft","draft","--mmproj","vision","--image","x","--ngram-m","8"),
-                ("--mmproj","vision","--prompt-file","text"), ("--image","x"), ("--prompt-tokens","8192"),
-                ("--batch-size","0"), ("--decode-tokens","0"), ("--initial-arena-mib","0"),
-                ("--request-timeout","nan"), ("--port","70000")):
+                        ("--spec-mode","none","--draft-length","3"), ("--spec-mode","dflash"),
+                        ("--spec-mode","dflash-k4v","--model-draft","draft","--mmproj","vision","--image","x","--ngram-m","8"),
+                        ("--mmproj","vision","--prompt-file","text"), ("--image","x"), ("--prompt-tokens","8192"),
+                        ("--batch-size","0"), ("--decode-tokens","0"), ("--initial-arena-mib","0"),
+                        ("--request-timeout","nan"), ("--port","70000")):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 self.args(*options)
 
@@ -307,7 +318,7 @@ class ArenaFinderTests(unittest.TestCase):
         for key in FINDER.SWEEP.KV_TYPES:
             args = self.args("--cache-type-k", key, "--cache-type-v", "q5_1")
             command = FINDER.server_command(args, 1000)
-            self.assertEqual(command[command.index("--cache-type-k")+1], key)
+            self.assertEqual(command[command.index("--cache-type-k") +1], key)
         with patch.dict(FINDER.os.environ, {"GGML_CUDA_ENABLE_UNIFIED_MEMORY":"1","GGML_CUDA_DISABLE_GRAPHS":"1","LLAMA_ARG_MODEL":"wrong","KEEP_ME":"yes"}):
             env = FINDER.environment()
         self.assertFalse("GGML_CUDA_ENABLE_UNIFIED_MEMORY" in env)
@@ -331,7 +342,7 @@ class ArenaFinderTests(unittest.TestCase):
         valid = {"tokens":list(range(8)), "timings":{"predicted_n":8,"prompt_n":7921}}
         FINDER.validate_result(args, valid, 7921)
         for result in ({"tokens":[1],"timings":{"predicted_n":8,"prompt_n":7921}},
-                {"tokens":list(range(8)),"timings":{"predicted_n":8,"prompt_n":7920}}):
+                       {"tokens":list(range(8)),"timings":{"predicted_n":8,"prompt_n":7920}}):
             with self.assertRaises(RuntimeError):
                 FINDER.validate_result(args, result, 7921)
         args = self.args("--spec-mode", "mtp", "--decode-tokens", "8")
@@ -342,6 +353,7 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args("--initial-arena-mib", "1000")
         with tempfile.TemporaryDirectory() as temp:
             args.output = Path(temp)
+
             def probe(config, candidate):
                 if candidate < 979:
                     raise FINDER.SWEEP.ArenaTooSmallError(979)
@@ -351,15 +363,15 @@ class ArenaFinderTests(unittest.TestCase):
             self.assertEqual(report["arena_mib"], 1066)
             self.assertEqual(report["initial_arena_mib"], 1000)
             self.assertEqual(report["next_mib_rejected"], 1067)
-            self.assertTrue((args.output/"result.json").is_file())
+            self.assertTrue((args.output /"result.json").is_file())
             launch = shlex.split(report["posix_shell_command"])
             self.assertEqual(launch, report["command"])
             self.assertNotIn("SetEnvironmentVariable", report["powershell_command"])
             self.assertNotIn("$env:", report["powershell_command"])
             self.assertEqual(report["shell"], "powershell" if os.name == "nt" else "posix")
-            self.assertEqual((args.output/"command.ps1").read_text(encoding="utf-8-sig").strip(), report["powershell_command"])
+            self.assertEqual((args.output /"command.ps1").read_text(encoding="utf-8-sig").strip(), report["powershell_command"])
             self.assertFalse(report["vision_execution_validated"])
-            records = [json.loads(line) for line in (args.output/"probes.jsonl").read_text().splitlines()]
+            records = [json.loads(line) for line in (args.output /"probes.jsonl").read_text().splitlines()]
             self.assertTrue(any(row.get("arena_mib") == 1067 and not row.get("fits") for row in records))
             with patch.object(FINDER, "probe", side_effect=RuntimeError("kernel unsupported")), self.assertRaisesRegex(RuntimeError,"kernel unsupported"):
                 FINDER.fit(args)
@@ -370,13 +382,13 @@ class ArenaFinderTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows PowerShell launcher")
     def test_powershell_launcher_preserves_arguments_and_inherits_environment(self):
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)/"arguments.json"
-            script = Path(temporary)/"command.ps1"
+            output = Path(temporary) /"arguments.json"
+            script = Path(temporary) /"command.ps1"
             values = [r"C:\models\O'Brien $draft\model.gguf", "space argument", "Unicode \u6a21\u578b"]
             code = "import json,os,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps([sys.argv[2:],os.getenv('LLAMA_ARG_MODEL'),os.getenv('LLAMA_MEDIA_MARKER')]), encoding='utf-8')"
             command = [sys.executable, "-c", code, str(output), *values]
             launch = FINDER.shell_commands(command)["powershell"]
-            script.write_text(launch+"\n", encoding="utf-8-sig")
+            script.write_text(launch +"\n", encoding="utf-8-sig")
             with patch.dict(os.environ, {"LLAMA_ARG_MODEL":"inherited model", "LLAMA_MEDIA_MARKER":"inherited marker"}):
                 subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
                                check=True, capture_output=True, timeout=30)
@@ -386,8 +398,9 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args("--decode-tokens", "8", "--prompt-tokens", "4")
         with tempfile.TemporaryDirectory() as temp:
             args.output = Path(temp)
-            args.prefill_text = Path(temp)/"corpus.txt"
+            args.prefill_text = Path(temp) /"corpus.txt"
             args.prefill_text.write_text("article text")
+
             def request(url, body: dict | None = None, **kwargs):
                 if url.endswith("/tokenize"):
                     return {"tokens":[1,2,3,4]}
@@ -419,12 +432,14 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args()
         with tempfile.TemporaryDirectory() as temp:
             args.output = Path(temp)
+
             def allocate(*command, **kwargs):
                 kwargs["stdout"].write("CUDA error: out of memory\n")
                 return object()
             with patch.object(FINDER.subprocess,"Popen",side_effect=allocate), patch.object(FINDER.SWEEP,"wait_ready",side_effect=RuntimeError("startup")), \
                     patch.object(FINDER.SWEEP,"stop_process"):
                 self.assertFalse(FINDER.probe(args,1000)["fits"])
+
             def too_small(*command, **kwargs):
                 kwargs["stdout"].write("shared arena quota insufficient: required=503316480 bytes\n")
                 return object()
@@ -437,6 +452,7 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args("--initial-arena-mib", "1000")
         with tempfile.TemporaryDirectory() as temp:
             args.output = Path(temp)
+
             def search(start, probe):
                 self.assertTrue(probe(1000))
                 return 1000
@@ -448,8 +464,9 @@ class ArenaFinderTests(unittest.TestCase):
         args = self.args("--mmproj","projector.gguf","--prompt-tokens","4","--decode-tokens","8")
         with tempfile.TemporaryDirectory() as temp:
             args.output = Path(temp)
-            args.prefill_text = Path(temp)/"corpus.txt"
+            args.prefill_text = Path(temp) /"corpus.txt"
             args.prefill_text.write_text("article")
+
             def request(url, body: dict | None = None, **kwargs):
                 if url.endswith("/tokenize"):
                     return {"tokens":[1,2,3,4]}

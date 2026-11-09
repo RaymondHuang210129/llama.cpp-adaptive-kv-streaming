@@ -321,14 +321,6 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     kv_swa->state_read(io, seq_id, flags);
 }
 
-llama_kv_cache * llama_kv_cache_iswa::get_base() const {
-    return kv_base.get();
-}
-
-llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
-    return kv_swa.get();
-}
-
 //
 // llama_kv_cache_iswa_context
 //

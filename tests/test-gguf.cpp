@@ -671,7 +671,7 @@ static bool handcrafted_check_tensors(const gguf_context * gguf_ctx, const unsig
     bool ok = true;
 
     const int id_alignment = gguf_find_key(gguf_ctx, GGUF_KEY_GENERAL_ALIGNMENT);
-    const uint32_t alignment = id_alignment >= 0 ? gguf_get_val_u32(gguf_ctx, id_alignment) : GGUF_DEFAULT_ALIGNMENT;
+    const size_t alignment = id_alignment >= 0 ? gguf_get_val_u32(gguf_ctx, id_alignment) : GGUF_DEFAULT_ALIGNMENT;
 
     uint64_t expected_offset = 0;
     for (int i = 0; i < int(tensor_configs.size()); ++i) {

@@ -163,10 +163,15 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_kv_stream_runtime_instances("${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}" SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    include(${CMAKE_CURRENT_SOURCE_DIR}/ci-objects.cmake)
+    ggml_cuda_ci_objects(GGML_SOURCES_CUDA ${GGML_SOURCES_CUDA})
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+    if (GGML_CUDA_CI_OBJECTS_FILE)
+        set_target_properties(ggml-cuda PROPERTIES LINKER_LANGUAGE CUDA)
+    endif()
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
@@ -247,6 +252,9 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_FATAL_WARNINGS)
         list(APPEND CUDA_FLAGS -Werror all-warnings)
+        if (MSVC)
+            list(APPEND CUDA_CXX_FLAGS /WX)
+        endif()
     endif()
 
     if (GGML_ALL_WARNINGS AND NOT MSVC)
