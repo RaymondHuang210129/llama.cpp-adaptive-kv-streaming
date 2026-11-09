@@ -5,6 +5,60 @@
 #include <algorithm>
 #include <array>
 
+struct ggml_kv_stream_copy_rectangle {
+    ggml_backend_buffer_t source = nullptr;
+    size_t source_offset = 0, source_stride = 0;
+    size_t destination_offset = 0, destination_stride = 0;
+    size_t row_bytes = 0, rows = 0;
+};
+
+struct ggml_kv_stream_gather_row {
+    uint32_t source = UINT32_MAX;
+    size_t token = 0;
+};
+
+// Native columns keep their order, including empty cells. The caller masks empty columns.
+// Views may omit unloaded intervals; every referenced row must be available in its private source.
+// Destination is one exact 256-row encoded tile. Failure preserves rectangles and all payloads.
+GGML_API bool ggml_kv_stream_gather_make(const ggml_kv_stream_span_plan_view * sources, size_t count,
+        const std::vector<ggml_kv_stream_gather_row> & columns, size_t first,
+        ggml_backend_buffer_t destination, std::vector<ggml_kv_stream_copy_rectangle> & rectangles);
+
+// One bounded 256-row K/V tile. Validate every byte range before clearing or copying scratch.
+inline bool ggml_kv_stream_gather_validate(ggml_backend_buffer_t destination,
+        const ggml_kv_stream_copy_rectangle * rectangles, size_t count) {
+    if (!destination || count > 512 || (count && !rectangles)) return false;
+    const size_t capacity=ggml_backend_buffer_get_size(destination);
+    const auto base=uintptr_t(ggml_backend_buffer_get_base(destination));
+    if (!base || !capacity || capacity > UINTPTR_MAX-base) return false;
+    struct range { size_t begin, end; };
+    std::array<range,512> writes;
+    size_t used=0;
+    for (size_t i=0;i<count;++i) {
+        const auto & r=rectangles[i];
+        if (!r.source || !r.row_bytes || !r.rows || r.rows > 256 || r.rows > writes.size()-used ||
+                r.source_stride < r.row_bytes || r.destination_stride < r.row_bytes ||
+                (r.rows > 1 && (r.source_stride > INT32_MAX || r.destination_stride > INT32_MAX)) ||
+                r.destination_offset > capacity || r.row_bytes > capacity-r.destination_offset ||
+                r.rows-1 > (capacity-r.destination_offset-r.row_bytes)/r.destination_stride) return false;
+        const size_t source_size=ggml_backend_buffer_get_size(r.source);
+        const auto source_base=uintptr_t(ggml_backend_buffer_get_base(r.source));
+        if (!source_base || source_size > UINTPTR_MAX-source_base || r.source_offset > source_size ||
+                r.row_bytes > source_size-r.source_offset ||
+                r.rows-1 > (source_size-r.source_offset-r.row_bytes)/r.source_stride) return false;
+        const auto source_begin=source_base+r.source_offset;
+        const auto source_end=source_begin+(r.rows-1)*r.source_stride+r.row_bytes;
+        if (source_begin < base+capacity && base < source_end) return false;
+        for (size_t row=0;row<r.rows;++row) {
+            const size_t first=r.destination_offset+row*r.destination_stride;
+            writes[used++]={first,first+r.row_bytes};
+        }
+    }
+    std::sort(writes.begin(),writes.begin()+used,[](const range & a,const range & b) {return a.begin<b.begin;});
+    for (size_t i=1;i<used;++i) if (writes[i].begin < writes[i-1].end) return false;
+    return true;
+}
+
 // Clamp a logical run to both the physical ring boundary and the caller's span ceiling.
 inline size_t ggml_kv_stream_contiguous_pages(size_t block, size_t blocks, size_t slots, size_t limit) {
     if (block >= blocks || !slots || !limit) return 0;
@@ -161,5 +215,10 @@ struct ggml_kv_stream_copy_ops {
     // Borrow retained resources; never silently allocate missing capacity or unprepared feedback storage.
     void * (*create_prepared)(ggml_backend_t, void * prepared, ggml_backend_buffer_t device,
                              ggml_backend_buffer_t host, const ggml_kv_stream_shape &, size_t slots);
+    // Version 12: gather encoded rows on the producer stream. Initialize clears the tile before its first packet.
+    // Later packets preserve earlier rows; the caller proves complete native-wave coverage before attention.
+    // No allocation or host wait. Caller retains every source/destination lease until completion.
+    bool (*gather)(ggml_backend_t, ggml_backend_buffer_t destination,
+                   const ggml_kv_stream_copy_rectangle *, size_t count, bool initialize) = nullptr;
 };
 using ggml_kv_stream_copy_ops_get = const ggml_kv_stream_copy_ops * (*)();

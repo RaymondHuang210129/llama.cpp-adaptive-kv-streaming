@@ -1,4 +1,5 @@
 #include "../ggml/src/ggml-kv-stream.h"
+#include "../ggml/src/ggml-kv-stream-copy.h"
 #include "testing.h"
 #include "../src/llama-kv-stream-selection.h"
 #include <memory>
@@ -46,6 +47,106 @@ static ggml_kv_stream_span_source span(
 
 int main() {
     testing t;
+
+    t.test("native_column_projection_gathers_private_rows_without_reordering_attention", [](testing & t) {
+        allocation a,b;
+        const auto geometry=shape();
+        ggml_kv_stream_layout tile;
+        if (!t.assert_true(a.valid() && b.valid() && ggml_kv_stream_layout_make(geometry,256,tile).status==status::success)) return;
+        allocation scratch(tile.bytes);
+        if (!t.assert_true(scratch.valid())) return;
+        auto * destination=ggml_backend_memory_lease_buffer(scratch.lease);
+        ggml_kv_stream_span_plan_t plans[2]={};
+        ggml_kv_stream_span_plan_view views[2];
+        for (size_t owner=0;owner<2;++owner) {
+            auto * lease=owner ? b.lease : a.lease;
+            auto * buffer=ggml_backend_memory_lease_buffer(lease);
+            auto * bytes=static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer));
+            for (size_t row=0;row<16;++row) for (size_t plane=0;plane<2;++plane)
+                std::memset(bytes+plane*1024+row*64,int(owner*61+row*7+plane*3),64);
+            const auto source=span(lease,lease,0,16,0,1024);
+            if (!t.assert_true(ggml_kv_stream_span_plan_make(geometry,&source,1,16,1,plans[owner]).status==status::success &&
+                    ggml_kv_stream_span_plan_get_view(plans[owner],views[owner]))) return;
+        }
+        struct retirement {
+            ggml_kv_stream_span_plan_t * plans;
+            ~retirement() {for (size_t i=0;i<2;++i) ggml_kv_stream_span_plan_free(plans[i]);}
+        } retained{plans};
+        std::vector<ggml_kv_stream_gather_row> columns(256);
+        size_t used=0;
+        for (size_t i=0;i<5;++i) columns[used++]={0,i};
+        for (size_t i=0;i<3;++i) columns[used++]={1,i};
+        for (size_t i=0;i<8;++i) {columns[used++]={0,5+i};columns[used++]={1,3+i};}
+        std::vector<ggml_kv_stream_copy_rectangle> copies;
+        ggml_backend_buffer_clear(destination,0xa5);
+        if (!t.assert_true(ggml_kv_stream_gather_make(views,2,columns,0,destination,copies))) return;
+        t.assert_equal(size_t(8),copies.size());
+        auto * output=static_cast<uint8_t *>(ggml_backend_buffer_get_base(destination));
+        t.assert_true(std::all_of(output,output+tile.bytes,[](uint8_t x) {return x==0xa5;}));
+        std::memset(output,0,tile.bytes);
+        for (const auto & copy : copies) for (size_t row=0;row<copy.rows;++row)
+            std::memcpy(output+copy.destination_offset+row*copy.destination_stride,
+                static_cast<const uint8_t *>(ggml_backend_buffer_get_base(copy.source))+copy.source_offset+row*copy.source_stride,copy.row_bytes);
+        std::vector<uint8_t> expected(tile.bytes,0);
+        for (size_t col=0;col<used;++col) for (size_t plane=0;plane<2;++plane)
+            std::memset(expected.data()+(plane ? tile.v_offset : 0)+col*64,
+                int(columns[col].source*61+columns[col].token*7+plane*3),64);
+        t.assert_true(!std::memcmp(expected.data(),output,tile.bytes));
+        const auto saved=copies;
+        for (int change=0;change<8;++change) {
+            auto bad_columns=columns;auto x=views[0],y=views[1];
+            if (change==0) bad_columns[0].source=2;
+            if (change==1) bad_columns[0].token=16;
+            if (change==2) bad_columns[255].token=1;
+            if (change==3) bad_columns.pop_back();
+            if (change==4) y.count=4;
+            if (change==5) y.active_tokens=15;
+            if (change==6) y=x;
+            if (change==7) y.shape.type_v=GGML_TYPE_Q8_0;
+            const ggml_kv_stream_span_plan_view invalid[]={x,y};
+            t.assert_true(!ggml_kv_stream_gather_make(invalid,2,bad_columns,0,destination,copies));
+            t.assert_true(copies.size()==saved.size() && copies.front().source==saved.front().source &&
+                copies.back().destination_offset==saved.back().destination_offset);
+        }
+        t.assert_true(!ggml_kv_stream_gather_make(views,2,columns,1,destination,copies));
+        auto packet=columns;
+        for (auto & row : packet) if (row.source==0) row={};
+        auto unloaded=views[0];unloaded.spans=nullptr;unloaded.count=0;
+        const ggml_kv_stream_span_plan_view partial[]={unloaded,views[1]};
+        if (!t.assert_true("a packet may omit another slot's unloaded pages",
+                ggml_kv_stream_gather_make(partial,2,packet,0,destination,copies))) return;
+        const size_t starts[]={0,3,10},counts[]={3,7,6},offsets[]={1664,768,0};
+        ggml_kv_stream_span wrapped[2][3];
+        for (size_t owner=0;owner<2;++owner) {
+            auto * buffer=ggml_backend_memory_lease_buffer(owner ? b.lease : a.lease);
+            auto * bytes=static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer));
+            for (size_t part=0;part<3;++part) {
+                wrapped[owner][part]={buffer,buffer,starts[part],counts[part],offsets[part],offsets[part]+counts[part]*64};
+                for (size_t row=0;row<counts[part];++row) for (size_t plane=0;plane<2;++plane)
+                    std::memset(bytes+offsets[part]+plane*counts[part]*64+row*64,int(owner*61+(starts[part]+row)*7+plane*3),64);
+            }
+            views[owner].spans=wrapped[owner];views[owner].count=3;
+        }
+        columns.resize(512);
+        uint32_t random=0x512256;
+        for (size_t trial=0;trial<64;++trial) {
+            for (auto & row : columns) {
+                random=1664525*random+1013904223;
+                row=random%7 ? ggml_kv_stream_gather_row{(random>>16)%2,(random>>8)%16} : ggml_kv_stream_gather_row{};
+            }
+            for (size_t first : {size_t(0),size_t(256)}) {
+                if (!t.assert_true(ggml_kv_stream_gather_make(views,2,columns,first,destination,copies))) return;
+                std::memset(output,0,tile.bytes);std::fill(expected.begin(),expected.end(),0);
+                for (const auto & copy : copies) for (size_t row=0;row<copy.rows;++row)
+                    std::memcpy(output+copy.destination_offset+row*copy.destination_stride,
+                        static_cast<const uint8_t *>(ggml_backend_buffer_get_base(copy.source))+copy.source_offset+row*copy.source_stride,copy.row_bytes);
+                for (size_t col=0;col<256;++col) if (columns[first+col].source!=UINT32_MAX) for (size_t plane=0;plane<2;++plane)
+                    std::memset(expected.data()+(plane ? tile.v_offset : 0)+col*64,
+                        int(columns[first+col].source*61+columns[first+col].token*7+plane*3),64);
+                if (!t.assert_true("wrapped sources retain native columns and exact padding",!std::memcmp(expected.data(),output,tile.bytes))) return;
+            }
+        }
+    });
 
     t.test("exclusive_slot_pages_cover_every_resident_ring_rotation_and_tail", [](testing & t) {
         llama_kv_stream_selection selected;

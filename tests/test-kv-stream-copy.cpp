@@ -206,14 +206,128 @@ static int benchmark(ggml_backend_t backend, bool overlap, size_t span_pages, si
     return 0;
 }
 
+static int gather_copy_contract(ggml_backend_t backend) {
+    testing t;
+    t.test("producer_stream_gather_preserves_private_sources_and_native_byte_order", [&](testing & t) {
+        auto * device=ggml_backend_get_device(backend);
+        const auto get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(device),"ggml_backend_kv_stream_copy_ops"));
+        const auto * ops=get ? get() : nullptr;
+        if (!t.assert_true(ops && ops->version>=11)) return;
+        ggml_backend_buffer_ptr parent(ggml_backend_buft_alloc_buffer(llama_kv_stream_device_buffer_type(device),12800));
+        if (!t.assert_true(bool(parent))) return;
+        ggml_backend_buffer_ptr a(ggml_backend_buffer_view(parent.get(),128,4096)),
+            b(ggml_backend_buffer_view(parent.get(),4224,4096)),
+            scratch(ggml_backend_buffer_view(parent.get(),8320,4096));
+        if (!t.assert_true(a && b && scratch)) return;
+        ggml_backend_buffer_clear(parent.get(),0xa5);
+        const auto raw=[](ggml_backend_buffer_t buffer) {
+            ggml_tensor tensor{};tensor.type=GGML_TYPE_I8;tensor.ne[0]=int64_t(ggml_backend_buffer_get_size(buffer));
+            tensor.ne[1]=tensor.ne[2]=tensor.ne[3]=1;tensor.nb[0]=1;
+            tensor.nb[1]=tensor.nb[2]=tensor.nb[3]=size_t(tensor.ne[0]);
+            tensor.buffer=buffer;tensor.data=ggml_backend_buffer_get_base(buffer);return tensor;
+        };
+        std::vector<uint8_t> left(4096),right(4096),observed(4096);
+        for (size_t i=0;i<left.size();++i) {left[i]=uint8_t(i*7+1);right[i]=uint8_t(i*11+37);}
+        auto ta=raw(a.get()),tb=raw(b.get());
+        ggml_backend_tensor_set(&ta,left.data(),0,left.size());ggml_backend_tensor_set(&tb,right.data(),0,right.size());
+        ggml_backend_tensor_get(&ta,observed.data(),0,observed.size());
+        if (!t.assert_true("ordinary CUDA transport control",observed==left)) return;
+        if (!t.assert_true("bounded producer-stream gather extension",ops->version>=12 && ops->gather)) return;
+        const ggml_kv_stream_copy_rectangle rectangles[]={
+            {a.get(),0,32,0,64,32,16},{b.get(),0,32,32,64,32,16}};
+        auto output=raw(scratch.get());
+        std::vector<uint8_t> expected(4096,0);
+        for (size_t row=0;row<16;++row) {
+            std::memcpy(expected.data()+64*row,left.data()+32*row,32);
+            std::memcpy(expected.data()+64*row+32,right.data()+32*row,32);
+        }
+        for (size_t replay=0;replay<16;++replay) {
+            if (!t.assert_true(ops->gather(backend,scratch.get(),rectangles,2,true))) return;
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_get(&output,observed.data(),0,observed.size());
+            if (!t.assert_true("interleaved rows and zero padding are exact",observed==expected)) return;
+        }
+#ifdef KV_COPY_CUDA_TEST
+        {
+            ggml_backend_buffer_ptr host(ggml_backend_buft_alloc_buffer(llama_kv_stream_host_buffer_type(device),12288));
+            if (!t.assert_true(bool(host))) return;
+            auto * bytes=static_cast<uint8_t *>(ggml_backend_buffer_get_base(host.get()));
+            for (size_t i=0;i<4096;++i) {left[i]=uint8_t(i*3+97);right[i]=uint8_t(i*13+71);}
+            std::memcpy(bytes,left.data(),4096);std::memcpy(bytes+4096,right.data(),4096);
+            for (size_t row=0;row<16;++row) {
+                std::memcpy(expected.data()+64*row,left.data()+32*row,32);
+                std::memcpy(expected.data()+64*row+32,right.data()+32*row,32);
+            }
+            delayed_event gate(backend);
+            std::atomic<bool> submitted{false},watchdog_used{false};
+            std::thread watchdog([&]() {
+                const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+                while (!submitted.load() && std::chrono::steady_clock::now()<deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!submitted.load()) {watchdog_used=true;gate.open();}
+            });
+            gate.arm(backend);
+            ggml_backend_tensor_set_async(backend,&ta,bytes,0,4096);
+            ggml_backend_tensor_set_async(backend,&tb,bytes+4096,0,4096);
+            const bool queued=ops->gather(backend,scratch.get(),rectangles,2,true);
+            ggml_backend_tensor_get_async(backend,&output,bytes+8192,0,4096);
+            submitted=true;gate.open();watchdog.join();
+            ggml_backend_synchronize(backend);
+            t.assert_true("gather enqueues without waiting for a blocked producer",queued && !watchdog_used.load());
+            t.assert_true("gather and consumer follow the actual producer stream",!std::memcmp(bytes+8192,expected.data(),4096));
+        }
+#endif
+        for (int change=0;change<7;++change) {
+            auto bad=rectangles[1];
+            if (change==0) bad.source=nullptr;
+            if (change==1) bad.source_offset=4090;
+            if (change==2) bad.destination_offset=4090;
+            if (change==3) bad.destination_offset=0;
+            if (change==4) bad.source=scratch.get();
+            if (change==5) bad.rows=257;
+            if (change==6) bad.source_stride=SIZE_MAX;
+            const ggml_kv_stream_copy_rectangle invalid[]={rectangles[0],bad};
+            ggml_backend_tensor_memset(&output,0xa5,0,4096);
+            t.assert_true(!ops->gather(backend,scratch.get(),invalid,2,true));
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_get(&output,observed.data(),0,observed.size());
+            t.assert_true("invalid later rectangle cannot clear or modify scratch",
+                std::all_of(observed.begin(),observed.end(),[](uint8_t x) {return x==0xa5;}));
+        }
+        ggml_backend_tensor_get(&ta,observed.data(),0,observed.size());t.assert_true(observed==left);
+        ggml_backend_tensor_get(&tb,observed.data(),0,observed.size());t.assert_true(observed==right);
+        ggml_backend_buffer_ptr foreign(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),4096));
+        auto invalid=rectangles[0];invalid.source=foreign.get();
+        t.assert_true(!ops->gather(backend,scratch.get(),&invalid,1,true));
+        t.assert_true(!ops->gather(nullptr,scratch.get(),rectangles,2,true));
+        t.assert_true(!ops->gather(backend,nullptr,rectangles,2,true));
+        t.assert_true(ops->gather(backend,scratch.get(),nullptr,0,true));
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(&output,observed.data(),0,observed.size());
+        t.assert_true(std::all_of(observed.begin(),observed.end(),[](uint8_t x) {return x==0;}));
+        auto root=raw(parent.get());std::vector<uint8_t> all(12800);
+        ggml_backend_tensor_get(&root,all.data(),0,all.size());
+        t.assert_true(std::all_of(all.begin(),all.begin()+128,[](uint8_t x) {return x==0xa5;}) &&
+            std::all_of(all.begin()+12416,all.end(),[](uint8_t x) {return x==0xa5;}));
+        t.assert_true(ops->gather(backend,scratch.get(),rectangles,1,true));
+        t.assert_true(ops->gather(backend,scratch.get(),rectangles+1,1,false));
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(&output,observed.data(),0,observed.size());
+        t.assert_true("a later private-page packet preserves the earlier packet",observed==expected);
+    });
+    return t.summary();
+}
+
 int main(int argc, char ** argv) {
     const bool registered = argc > 1 && std::strcmp(argv[1], "--cuda-registered") == 0;
+    const bool gather = argc > 1 && std::strcmp(argv[1], "--cuda-gather") == 0;
     const bool wide = argc > 1 && std::strcmp(argv[1],"--bench-wide") == 0;
     const bool ordered = argc > 1 && std::strcmp(argv[1],"--bench-ordered") == 0;
     const bool spans = argc > 1 && std::strcmp(argv[1],"--bench-span") == 0;
     const bool fallback = argc > 1 && std::strcmp(argv[1],"--bench-fallback") == 0;
     const bool bench = wide || ordered || spans || fallback || (argc > 1 && std::strcmp(argv[1],"--bench") == 0);
-    const bool cuda = registered || bench || (argc > 1 && std::strcmp(argv[1],"--cuda") == 0);
+    const bool cuda = gather || registered || bench || (argc > 1 && std::strcmp(argv[1],"--cuda") == 0);
     const bool queue_only = cuda && !bench && argc == 3 && std::strcmp(argv[2],"--queue-only") == 0;
     ggml_backend_ptr backend;
     if (cuda) {
@@ -225,6 +339,7 @@ int main(int argc, char ** argv) {
         backend.reset(ggml_backend_dev_init(dev,nullptr));
     } else backend.reset(ggml_backend_cpu_init());
     if (!backend) return 1;
+    if (gather) return gather_copy_contract(backend.get());
     if (registered) return registered_copy_contract(backend.get());
     if (bench) {
         const size_t span_pages = argc > 2 ? std::strtoull(argv[2],nullptr,10) : (spans ? 2 : 1);
@@ -233,6 +348,85 @@ int main(int argc, char ** argv) {
         return benchmark(backend.get(),!ordered,span_pages,slots,fallback,wide);
     }
     testing t;
+    t.test("gather_rectangles_validate_all_rows_before_touching_shared_scratch", [](testing & t) {
+        ggml_backend_buffer_ptr source(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),4096));
+        ggml_backend_buffer_ptr destination(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),4096));
+        if (!t.assert_true(source && destination)) return;
+        const ggml_kv_stream_copy_rectangle rectangles[]={
+            {source.get(),0,32,0,64,32,16},
+            {source.get(),1024,32,32,64,32,16}};
+        t.assert_true(ggml_kv_stream_gather_validate(destination.get(),rectangles,2));
+        t.assert_true(ggml_kv_stream_gather_validate(destination.get(),nullptr,0));
+        for (int change=0;change<13;++change) {
+            auto bad=rectangles[1];
+            if (change==0) bad.source=nullptr;
+            if (change==1) bad.source_offset=SIZE_MAX;
+            if (change==2) bad.destination_offset=SIZE_MAX;
+            if (change==3) bad.source_stride=SIZE_MAX;
+            if (change==4) bad.destination_stride=SIZE_MAX;
+            if (change==5) bad.row_bytes=0;
+            if (change==6) bad.rows=0;
+            if (change==7) bad.rows=257;
+            if (change==8) bad.source_stride=31;
+            if (change==9) bad.destination_stride=31;
+            if (change==10) bad.destination_offset=0;
+            if (change==11) bad.source=destination.get();
+            if (change==12) bad.row_bytes=4097;
+            const ggml_kv_stream_copy_rectangle invalid[]={rectangles[0],bad};
+            t.assert_true(!ggml_kv_stream_gather_validate(destination.get(),invalid,2));
+        }
+        t.assert_true(!ggml_kv_stream_gather_validate(nullptr,rectangles,2));
+        t.assert_true(!ggml_kv_stream_gather_validate(destination.get(),nullptr,1));
+        t.assert_true(!ggml_kv_stream_gather_validate(destination.get(),rectangles,513));
+    });
+    t.test("gather_rectangles_match_an_independent_byte_ownership_oracle", [](testing & t) {
+        ggml_backend_buffer_ptr source(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),4096));
+        ggml_backend_buffer_ptr destination(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),4096));
+        if (!t.assert_true(source && destination)) return;
+        uint32_t seed=0x713512;
+        const auto next=[&]() {seed=1664525*seed+1013904223;return seed;};
+        const size_t capacity=ggml_backend_buffer_get_size(destination.get());
+        for (size_t trial=0;trial<4096;++trial) {
+            ggml_kv_stream_copy_rectangle rectangles[2];
+            std::vector<bool> occupied(capacity,false);
+            bool expected=true;
+            for (auto & r : rectangles) {
+                r={source.get(),next()%64,next()%32,next()%64,next()%32,next()%16+1,next()%9};
+                if (trial%7==0) r.destination_offset=capacity-16+next()%32;
+                if (trial%11==0) r.source_offset=ggml_backend_buffer_get_size(source.get())-16+next()%32;
+                expected&=r.rows && r.source_stride>=r.row_bytes && r.destination_stride>=r.row_bytes;
+                for (size_t row=0;row<r.rows;++row) for (size_t byte=0;byte<r.row_bytes;++byte) {
+                    const size_t src=r.source_offset+row*r.source_stride+byte;
+                    const size_t dst=r.destination_offset+row*r.destination_stride+byte;
+                    expected&=src<ggml_backend_buffer_get_size(source.get()) && dst<capacity;
+                    if (dst<capacity) {expected=expected && !occupied[dst];occupied[dst]=true;}
+                }
+            }
+            if (!t.assert_equal(expected,ggml_kv_stream_gather_validate(destination.get(),rectangles,2))) return;
+        }
+    });
+    t.test("gather_views_use_physical_aliases_and_bound_host_metadata", [](testing & t) {
+        ggml_backend_buffer_ptr parent(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),16384));
+        if (!t.assert_true(bool(parent))) return;
+        ggml_backend_buffer_ptr source(ggml_backend_buffer_view(parent.get(),0,4096));
+        ggml_backend_buffer_ptr destination(ggml_backend_buffer_view(parent.get(),4096,4096));
+        if (!t.assert_true(source && destination)) return;
+        ggml_kv_stream_copy_rectangle r{source.get(),0,32,0,64,32,16};
+        t.assert_true(ggml_kv_stream_gather_validate(destination.get(),&r,1));
+        r.source=parent.get();
+        t.assert_true(ggml_kv_stream_gather_validate(destination.get(),&r,1));
+        r.source_offset=4000;
+        t.assert_true(!ggml_kv_stream_gather_validate(destination.get(),&r,1));
+        std::vector<ggml_kv_stream_copy_rectangle> copies;
+        for (size_t i=0;i<512;++i) copies.push_back({source.get(),0,1,i,1,1,1});
+        t.assert_true(ggml_kv_stream_gather_validate(destination.get(),copies.data(),copies.size()));
+        copies.push_back({source.get(),0,1,512,1,1,1});
+        t.assert_true(!ggml_kv_stream_gather_validate(destination.get(),copies.data(),copies.size()));
+        copies={{source.get(),0,1,0,1,1,256},{source.get(),0,1,256,1,1,256}};
+        t.assert_true(ggml_kv_stream_gather_validate(destination.get(),copies.data(),copies.size()));
+        copies.push_back({source.get(),0,1,512,1,1,1});
+        t.assert_true(!ggml_kv_stream_gather_validate(destination.get(),copies.data(),copies.size()));
+    });
     t.test("feedback_slots_never_overwrite_uncollected_windows", [](testing & t) {
         ggml_kv_stream_feedback_slots slots;
         t.assert_true(slots.begin());

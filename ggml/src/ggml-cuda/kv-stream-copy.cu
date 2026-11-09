@@ -749,11 +749,39 @@ static ggml_kv_stream_copy_feedback feedback(void * handle) {
 
 // Destruction also drains, so no retained allocation can outlive its final GPU use.
 static void destroy(void * handle) { delete static_cast<copy_queue *>(handle); }
+
+// Reorder encoded rows in borrowed attention scratch without changing native KV pages.
+static bool gather(ggml_backend_t backend,ggml_backend_buffer_t destination,
+        const ggml_kv_stream_copy_rectangle * rectangles,size_t count,bool initialize) {
+    if (!backend || !ggml_backend_is_cuda(backend) ||
+            !ggml_kv_stream_gather_validate(destination,rectangles,count)) return false;
+    auto & ctx=*static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto * type=ggml_backend_cuda_device_buffer_type(ctx.device);
+    if (ggml_backend_buffer_get_type(destination)!=type) return false;
+    for (size_t i=0;i<count;++i) if (ggml_backend_buffer_get_type(rectangles[i].source)!=type) return false;
+    ggml_cuda_set_device(ctx.device);
+    cudaStreamCaptureStatus capture;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(),&capture));
+    if (capture!=cudaStreamCaptureStatusNone) return false;
+    auto * target=static_cast<char *>(ggml_backend_buffer_get_base(destination));
+    if (initialize) CUDA_CHECK(cudaMemsetAsync(target,0,ggml_backend_buffer_get_size(destination),ctx.stream()));
+    for (size_t i=0;i<count;++i) {
+        const auto & r=rectangles[i];
+        const auto * source=static_cast<const char *>(ggml_backend_buffer_get_base(r.source))+r.source_offset;
+        if (r.rows==1) {
+            CUDA_CHECK(cudaMemcpyAsync(target+r.destination_offset,source,r.row_bytes,cudaMemcpyDeviceToDevice,ctx.stream()));
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(target+r.destination_offset,r.destination_stride,source,r.source_stride,
+                r.row_bytes,r.rows,cudaMemcpyDeviceToDevice,ctx.stream()));
+        }
+    }
+    return true;
+}
 } // namespace
 
 // Expose the CUDA adapter through an opaque, backend-neutral ownership contract.
 const ggml_kv_stream_copy_ops * ggml_cuda_kv_stream_copy_ops() {
-    static const ggml_kv_stream_copy_ops ops{11,create,begin,enqueue,ready,acquire,release,drain,destroy,enqueue_span,stats,release_completed,measure,acquire_span,feedback,feedback_id,poll_feedback,begin_with_feedback,enqueue_span_with_feedback,fence_producer,probe_layer,release_span,prepare,free_prepared,create_prepared};
+    static const ggml_kv_stream_copy_ops ops{12,create,begin,enqueue,ready,acquire,release,drain,destroy,enqueue_span,stats,release_completed,measure,acquire_span,feedback,feedback_id,poll_feedback,begin_with_feedback,enqueue_span_with_feedback,fence_producer,probe_layer,release_span,prepare,free_prepared,create_prepared,gather};
     return &ops;
 }
 

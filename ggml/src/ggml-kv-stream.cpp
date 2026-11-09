@@ -1,5 +1,6 @@
 #include "ggml-kv-stream.h"
 #include "ggml-backend-execution.h"
+#include "ggml-kv-stream-copy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -300,5 +301,91 @@ bool ggml_kv_stream_span_plan_get_view(
     next.k_bytes = plan->k_bytes;
     next.v_bytes = plan->v_bytes;
     output = next;
+    return true;
+}
+
+bool ggml_kv_stream_gather_make(const ggml_kv_stream_span_plan_view * sources, size_t count,
+        const std::vector<ggml_kv_stream_gather_row> & columns, size_t first,
+        ggml_backend_buffer_t destination, std::vector<ggml_kv_stream_copy_rectangle> & rectangles) {
+    if (!sources || !count || count>256 || !destination || columns.empty() || columns.size()>INT32_MAX ||
+            columns.size()%256 || first%256 || first>=columns.size()) return false;
+    const auto & shape=sources[0].shape;
+    ggml_kv_stream_layout tile;
+    if (ggml_kv_stream_layout_make(shape,256,tile).status!=status::success ||
+            ggml_backend_buffer_get_size(destination)!=tile.bytes) return false;
+    const auto base=uintptr_t(ggml_backend_buffer_get_base(destination));
+    if (!base || tile.bytes>UINTPTR_MAX-base) return false;
+    struct range { uintptr_t begin,end; };
+    std::array<range,1536> ranges;
+    size_t used=0;
+    for (size_t source=0;source<count;++source) {
+        const auto & view=sources[source];const auto & geometry=view.shape;
+        if (geometry.type_k!=shape.type_k || geometry.type_v!=shape.type_v || geometry.head_dim_k!=shape.head_dim_k ||
+                geometry.head_dim_v!=shape.head_dim_v || geometry.heads!=shape.heads || geometry.page_tokens!=shape.page_tokens ||
+                geometry.alignment!=shape.alignment || (view.count && !view.spans) || view.count>3 ||
+                !view.active_tokens || view.active_tokens>INT32_MAX || !view.query_tokens || view.query_tokens>view.active_tokens) return false;
+        size_t previous=0;
+        for (size_t i=0;i<view.count;++i) {
+            const auto & span=view.spans[i];ggml_kv_stream_layout layout;
+            if (span.token_begin<previous || span.token_begin>view.active_tokens || !span.tokens ||
+                    span.tokens>view.active_tokens-span.token_begin ||
+                    ggml_kv_stream_layout_make(shape,span.tokens,layout).status!=status::success) return false;
+            previous=span.token_begin+span.tokens;
+            for (bool value : {false,true}) {
+                auto * buffer=value ? span.v_buffer : span.k_buffer;
+                const size_t offset=value ? span.v_offset : span.k_offset,bytes=value ? layout.v_bytes : layout.k_bytes;
+                if (!buffer) return false;
+                const auto address=uintptr_t(ggml_backend_buffer_get_base(buffer));
+                const size_t capacity=ggml_backend_buffer_get_size(buffer);
+                if (!address || capacity>UINTPTR_MAX-address || offset>capacity || bytes>capacity-offset) return false;
+                const range touched{address+offset,address+offset+bytes};
+                if (touched.begin<base+tile.bytes && base<touched.end) return false;
+                ranges[used++]=touched;
+            }
+        }
+    }
+    std::sort(ranges.begin(),ranges.begin()+used,[](const range & a,const range & b) {return a.begin<b.begin;});
+    for (size_t i=1;i<used;++i) if (ranges[i].begin<ranges[i-1].end) return false;
+    size_t populated=0;
+    for (size_t col=first;col<first+256;++col) {
+        const auto & row=columns[col];
+        if (row.source==UINT32_MAX) {if (row.token) return false;continue;}
+        if (row.source>=count || row.token>=sources[row.source].active_tokens) return false;
+        const auto & view=sources[row.source];bool found=false;
+        for (size_t i=0;i<view.count;++i) {
+            const auto & span=view.spans[i];
+            found|=row.token>=span.token_begin && row.token-span.token_begin<span.tokens;
+        }
+        if (!found) return false;
+        ++populated;
+    }
+    try {rectangles.reserve(2*populated);} catch (const std::bad_alloc &) {return false;}
+    rectangles.clear();
+    for (size_t source=0;source<count;++source) for (size_t i=0;i<sources[source].count;++i) for (bool value : {false,true}) {
+        const auto & span=sources[source].spans[i];
+        const size_t width=value ? tile.v_token_bytes : tile.k_token_bytes;
+        ggml_kv_stream_copy_rectangle pending;
+        for (size_t col=first;col<first+256;++col) {
+            const auto & row=columns[col];
+            if (row.source!=source || row.token<span.token_begin || row.token-span.token_begin>=span.tokens) continue;
+            const size_t src=(value ? span.v_offset : span.k_offset)+(row.token-span.token_begin)*width;
+            const size_t dst=(value ? tile.v_offset : 0)+(col-first)*width;
+            if (pending.rows) {
+                const size_t s=pending.source_offset,d=pending.destination_offset;
+                if (pending.rows==1 && src>s && dst>d && src-s>=width && dst-d>=width && src-s<=INT32_MAX && dst-d<=INT32_MAX) {
+                    pending.source_stride=src-s;pending.destination_stride=dst-d;pending.rows=2;continue;
+                }
+                if (pending.rows>1 && src>=s && dst>=d &&
+                        (src-s)%pending.rows==0 && (src-s)/pending.rows==pending.source_stride &&
+                        (dst-d)%pending.rows==0 && (dst-d)/pending.rows==pending.destination_stride) {
+                    ++pending.rows;continue;
+                }
+                rectangles.push_back(pending);
+            }
+            pending={value ? span.v_buffer : span.k_buffer,src,width,dst,width,width,1};
+        }
+        if (pending.rows) rectangles.push_back(pending);
+    }
+    GGML_ASSERT(ggml_kv_stream_gather_validate(destination,rectangles.data(),rectangles.size()));
     return true;
 }
