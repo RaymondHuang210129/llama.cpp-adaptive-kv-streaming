@@ -68,6 +68,17 @@ inline std::vector<float> stock_attention(fixture & f, block_inputs & input, uin
     ggml_prec_set_acc(out,GGML_PREC_F32);
     auto * graph=ggml_new_graph_custom(ctx.get(),64,false); ggml_build_forward_expand(graph,out);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),f.backend)); GGML_ASSERT(buffer);
+    using release_fn=void (*)(ggml_backend_t,const void *);
+    release_fn release=nullptr;
+    if (f.cuda) {
+        auto * reg=ggml_backend_dev_backend_reg(ggml_backend_get_device(f.backend));
+        release=reinterpret_cast<release_fn>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_graph_release"));
+    }
+    // This transient reference must retire captures before its metadata and buffers are freed.
+    struct retirement {
+        ggml_backend_t backend;const void * key;release_fn release;
+        ~retirement() {if (release) {ggml_backend_synchronize(backend);release(backend,key);}}
+    } captured{f.backend,ggml_graph_node(graph,0),release};
     llama_kv_stream_host_layer host; GGML_ASSERT(f.host->layer(layer,host));
     std::vector<uint8_t> key_bytes,value_bytes;
     const void * key_source=host.k, * value_source=host.v;

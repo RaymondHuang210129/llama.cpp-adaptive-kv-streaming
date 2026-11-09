@@ -1,5 +1,9 @@
 #include "../ggml/src/ggml-kv-stream.h"
 #include "testing.h"
+#include "../src/llama-kv-stream-selection.h"
+#include <memory>
+#include <cstring>
+#include <algorithm>
 
 #include <limits>
 
@@ -43,6 +47,86 @@ static ggml_kv_stream_span_source span(
 int main() {
     testing t;
 
+    t.test("exclusive_slot_pages_cover_every_resident_ring_rotation_and_tail", [](testing & t) {
+        llama_kv_stream_selection selected;
+        if (!t.assert_true(llama_kv_stream_select({128*1024,2},{{0,90*1024},{1,30*1024}},selected)==llama_kv_stream_selection_status::success)) return;
+        llama_kv_stream_page_partition partition;
+        if (!t.assert_true(llama_kv_stream_partition_pages(selected,7,{{0,2},{1,2}},partition).status==llama_kv_stream_page_partition_status::success)) return;
+        size_t cases=0;
+        for (auto pair : {std::pair{GGML_TYPE_F16,GGML_TYPE_F16},std::pair{GGML_TYPE_Q8_0,GGML_TYPE_Q4_0},std::pair{GGML_TYPE_Q5_1,GGML_TYPE_Q5_1}}) {
+            const ggml_kv_stream_shape geometry{pair.first,pair.second,32,32,1,16,16};
+            ggml_kv_stream_layout page;
+            if (!t.assert_true(ggml_kv_stream_layout_make(geometry,16,page).status==status::success)) return;
+            auto * type=ggml_backend_cpu_buffer_type();const size_t guard=ggml_backend_buft_get_alignment(type);
+            std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> parent(
+                ggml_backend_memory_arena_new(type,7*page.bytes+2*guard),ggml_backend_memory_arena_free);
+            if (!t.assert_true(parent && ggml_backend_memory_arena_begin(parent.get(),0))) return;
+            for (const auto & slot : partition.slots) if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),10+slot.slot,
+                    guard+size_t(slot.first_page)*page.bytes,size_t(slot.pages)*page.bytes,guard,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr))) return;
+            if (!t.assert_true(ggml_backend_memory_arena_commit(parent.get()))) return;
+            using lease_ptr=std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)>;
+            lease_ptr owners[]={lease_ptr(ggml_backend_memory_arena_acquire(parent.get(),10),ggml_backend_memory_lease_free),
+                lease_ptr(ggml_backend_memory_arena_acquire(parent.get(),11),ggml_backend_memory_lease_free)};
+            if (!t.assert_true(owners[0] && owners[1])) return;
+            ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(parent.get()),0xa5);
+            for (size_t owner=0;owner<2;++owner) {
+                auto * storage=ggml_backend_memory_lease_buffer(owners[owner].get());
+                auto * other=ggml_backend_memory_lease_buffer(owners[1-owner].get());
+                const auto * peer=static_cast<const uint8_t *>(ggml_backend_buffer_get_base(other));
+                const std::vector<uint8_t> saved(peer,peer+ggml_backend_buffer_get_size(other));
+                auto * base=static_cast<uint8_t *>(ggml_backend_buffer_get_base(storage));
+                const size_t quota=partition.slots[owner].pages;
+                ggml_kv_stream_layout full;
+                if (!t.assert_true(ggml_kv_stream_layout_make(geometry,quota*16,full).status==status::success)) return;
+                for (size_t resident=0;resident<=quota;++resident) for (size_t ring=0;ring<=quota-resident;++ring)
+                for (size_t head=0;head<std::max(size_t(1),ring);++head) for (size_t live=0;live<=ring;++live) {
+                    if (!resident && !live) continue;
+                    for (size_t tail=1;tail<=16;++tail) {
+                        const size_t active=(resident+live-1)*16+tail;
+                        ggml_backend_buffer_clear(storage,0xa5);
+                        for (size_t token=0;token<active;++token) {
+                            const size_t logical_page=token/16;
+                            const size_t physical_page=logical_page<resident ? logical_page : resident+(head+logical_page-resident)%ring;
+                            const size_t row=physical_page*16+token%16;
+                            std::memset(base+row*full.k_token_bytes,int((owner*71+token*7)%251),full.k_token_bytes);
+                            std::memset(base+full.v_offset+row*full.v_token_bytes,int((owner*71+token*7+3)%251),full.v_token_bytes);
+                        }
+                        std::vector<ggml_kv_stream_span_source> sources;
+                        size_t first=0;
+                        const auto append=[&](size_t count,size_t physical) {
+                            if (!count) return;
+                            sources.push_back({owners[owner].get(),owners[owner].get(),first,count,
+                                physical*full.k_token_bytes,full.v_offset+physical*full.v_token_bytes});first+=count;
+                        };
+                        append(std::min(active,resident*16),0);
+                        if (first<active) append(std::min(active-first,(ring-head)*16),(resident+head)*16);
+                        if (first<active) append(active-first,resident*16);
+                        if (!t.assert_true(first==active && !sources.empty() && sources.size()<=3)) return;
+                        ggml_kv_stream_span_plan_t plan=nullptr;
+                        if (!t.assert_true(ggml_kv_stream_span_plan_make(geometry,sources.data(),sources.size(),active,1,plan).status==status::success)) return;
+                        ggml_kv_stream_span_plan_view view;
+                        const bool valid=ggml_kv_stream_span_plan_get_view(plan,view);
+                        bool exact=valid;
+                        for (size_t i=0;valid && i<view.count;++i) for (size_t row=0;row<view.spans[i].tokens;++row) {
+                            const auto & span=view.spans[i];const auto token=span.token_begin+row;
+                            const auto * k=static_cast<const uint8_t *>(ggml_backend_buffer_get_base(span.k_buffer))+span.k_offset+row*full.k_token_bytes;
+                            const auto * v=static_cast<const uint8_t *>(ggml_backend_buffer_get_base(span.v_buffer))+span.v_offset+row*full.v_token_bytes;
+                            exact&=std::all_of(k,k+full.k_token_bytes,[&](uint8_t x) {return x==uint8_t((owner*71+token*7)%251);}) &&
+                                std::all_of(v,v+full.v_token_bytes,[&](uint8_t x) {return x==uint8_t((owner*71+token*7+3)%251);});
+                        }
+                        ggml_kv_stream_span_plan_free(plan);
+                        if (!t.assert_true("linear fragments equal the independent cyclic page oracle",exact)) return;
+                        ++cases;
+                    }
+                }
+                t.assert_true("every other slot page stays untouched",!std::memcmp(saved.data(),peer,saved.size()));
+            }
+            const auto * root=static_cast<const uint8_t *>(ggml_backend_buffer_get_base(ggml_backend_memory_arena_parent(parent.get())));
+            t.assert_true(std::all_of(root,root+guard,[](uint8_t v) {return v==0xa5;}) &&
+                std::all_of(root+guard+7*page.bytes,root+2*guard+7*page.bytes,[](uint8_t v) {return v==0xa5;}));
+        }
+        t.assert_true(cases>1000);
+    });
     t.test("one_and_multiple_spans_cover_one_logical_sequence", [](testing & t) {
         allocation storage;
         if (!t.assert_true(storage.valid())) return;

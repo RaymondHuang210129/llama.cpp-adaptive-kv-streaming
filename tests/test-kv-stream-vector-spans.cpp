@@ -4,11 +4,14 @@
 #include "../ggml/src/ggml-cuda/kv-stream-span.h"
 #include "../ggml/src/ggml-backend-execution.h"
 #include "../src/llama-kv-stream-model.h"
+#include "../src/llama-kv-stream-selection.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <utility>
+#include <map>
+#include <thread>
 
 #ifdef KV_STREAM_PASCAL_CUDA_TEST
 bool kv_stream_test_is_sm61_only();
@@ -70,6 +73,7 @@ struct tg1_only_test_ops {
 
 struct span_storage {
     std::unique_ptr<block_workspace> storage;
+    lease_ptr borrowed_lease{nullptr,ggml_backend_memory_lease_free};
     ggml_kv_stream_span_plan_t plan = nullptr;
 
     ~span_storage() {
@@ -78,7 +82,8 @@ struct span_storage {
 
     static std::unique_ptr<span_storage> create(
             fixture & f, uint32_t layer, size_t active, uint32_t queries,
-            const std::vector<size_t> & cuts, bool wrapped = false) {
+            const std::vector<size_t> & cuts, bool wrapped = false, ggml_backend_memory_lease_t borrowed = nullptr,
+            bool keep_prefix = true) {
         if (cuts.size() < 2 || cuts.front() != 0 || cuts.back() != active) return {};
         auto result = std::make_unique<span_storage>();
         std::vector<ggml_kv_stream_layout> layouts;
@@ -99,14 +104,20 @@ struct span_storage {
         if (wrapped) {
             bytes = 0;
             for (size_t i = 0; i < layouts.size(); ++i) {
-                const size_t logical = i == 0 ? 0 : layouts.size()-i;
+                const size_t logical = keep_prefix ? (i == 0 ? 0 : layouts.size()-i) : layouts.size()-1-i;
                 bytes = (bytes+127)/128*128;
                 offsets[logical] = bytes;
                 bytes += layouts[logical].bytes;
             }
         }
-        result->storage = std::make_unique<block_workspace>(f, bytes, 71);
-        auto * buffer = ggml_backend_memory_lease_buffer(result->storage->lease.get());
+        if (borrowed) {
+            auto * buffer=ggml_backend_memory_lease_buffer(borrowed);
+            auto * type=f.cuda ? llama_kv_stream_device_buffer_type(ggml_backend_get_device(f.backend)) : ggml_backend_cpu_buffer_type();
+            if (!buffer || ggml_backend_buffer_get_type(buffer)!=type || bytes>ggml_backend_buffer_get_size(buffer)) return {};
+            result->borrowed_lease.reset(ggml_backend_memory_lease_retain(borrowed));
+        } else result->storage = std::make_unique<block_workspace>(f, bytes, 71);
+        auto * lease=borrowed ? result->borrowed_lease.get() : result->storage->lease.get();
+        auto * buffer = ggml_backend_memory_lease_buffer(lease);
         auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer));
         llama_kv_stream_host_layer host;
         if (!f.host->layer(layer, host)) return {};
@@ -143,7 +154,7 @@ struct span_storage {
                 static_cast<const uint8_t *>(host.v) + first*full.v_token_bytes,
                 0, layout.v_bytes);
             sources.push_back({
-                result->storage->lease.get(), result->storage->lease.get(),
+                lease, lease,
                 first, tokens, k_offset, v_offset});
         }
         if (ggml_kv_stream_span_plan_make(
@@ -237,6 +248,14 @@ struct stock_attention_case {
         ggml_backend_tensor_set(v_storage, host.v, 0, ggml_nbytes(v_storage));
     }
 
+    ~stock_attention_case() {
+        if (!f.cuda || !graph || !ggml_graph_n_nodes(graph)) return;
+        auto * reg=ggml_backend_dev_backend_reg(ggml_backend_get_device(f.backend));
+        const auto release=reinterpret_cast<void (*)(ggml_backend_t,const void *)>(
+            ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_graph_release"));
+        if (release) {ggml_backend_synchronize(f.backend);release(f.backend,ggml_graph_node(graph,0));}
+    }
+
     void run() {
         GGML_ASSERT(ggml_backend_graph_compute(f.backend, graph) == GGML_STATUS_SUCCESS);
         ggml_backend_synchronize(f.backend);
@@ -250,10 +269,12 @@ struct span_attention_case {
     ggml_context_ptr context;
     ggml_tensor op = {};
     std::unique_ptr<block_workspace> workspace;
+    ggml_kv_stream_resume_plan continuation{};
+    bool resumable=false;
 
     span_attention_case(
             fixture & f, const ggml_kv_stream_partial_ops * ops, stock_attention_case & stock,
-            span_storage & storage, block_inputs & input) :
+            span_storage & storage, block_inputs & input, ggml_tensor * compact = nullptr) :
         f(f), ops(ops), storage(storage), context(ggml_init({65536, nullptr, true})) {
         auto * node = ggml_flash_attn_ext(
             context.get(),input.q,stock.k,stock.v,input.mask,1.0f/16,0,0);
@@ -263,13 +284,44 @@ struct span_attention_case {
         op.buffer = input.output->buffer;
         op.data = input.output->data;
         size_t bytes = 0;
-        GGML_ASSERT(ops->spans_workspace(f.backend, &op, storage.plan, bytes));
+        if (compact) {
+            op.src[3]=nullptr;GGML_ASSERT(ggml_backend_execution_set_mask_bounds(&op,compact));
+            const ggml_kv_stream_attention_request request{f.policy.shape,uint32_t(input.query_heads),uint32_t(input.queries),input.padded};
+            GGML_ASSERT(ggml_kv_stream_resume_plan_query(ops,f.backend,request,continuation) &&
+                ggml_kv_stream_workspace_query(ops,f.backend,request,ggml_kv_stream_workspace_kind::decode,bytes));
+            resumable=true;
+        } else GGML_ASSERT(ops->spans_workspace(f.backend, &op, storage.plan, bytes));
         workspace = std::make_unique<block_workspace>(f, bytes, 97);
     }
 
     void run() {
-        GGML_ASSERT(ops->spans(
-            f.backend, &op, storage.plan, ggml_backend_memory_lease_buffer(workspace->lease.get())));
+        auto * scratch=ggml_backend_memory_lease_buffer(workspace->lease.get());
+        if (!resumable) {
+            GGML_ASSERT(ops->spans(f.backend,&op,storage.plan,scratch));
+        } else {
+            ggml_kv_stream_span_plan_view view;
+            GGML_ASSERT(ggml_kv_stream_span_plan_get_view(storage.plan,view) && view.active_tokens==continuation.tokens);
+            if (continuation.span_resume) {
+                GGML_ASSERT(ops->resume_spans(f.backend,&op,scratch,continuation,view,0,continuation.tokens));
+            } else for (size_t i=0;i<view.count;++i) {
+                const auto & span=view.spans[i];
+                ggml_kv_stream_layout layout;
+                GGML_ASSERT(ggml_kv_stream_layout_make(view.shape,span.tokens,layout).status==ggml_kv_stream_status::success);
+                ggml_tensor key{},value{};
+                for (auto * tensor : {&key,&value}) {
+                    const bool v=tensor==&value;
+                    tensor->type=ggml_type(v ? view.shape.type_v : view.shape.type_k);
+                    tensor->ne[0]=v ? view.shape.head_dim_v : view.shape.head_dim_k;
+                    tensor->ne[1]=int64_t(span.tokens);tensor->ne[2]=view.shape.heads;tensor->ne[3]=1;
+                    tensor->nb[0]=ggml_type_size(tensor->type);tensor->nb[1]=v ? layout.v_token_bytes : layout.k_token_bytes;
+                    tensor->nb[2]=v ? layout.v_row_bytes : layout.k_row_bytes;tensor->nb[3]=v ? layout.v_bytes : layout.k_bytes;
+                    tensor->buffer=v ? span.v_buffer : span.k_buffer;
+                    tensor->data=static_cast<uint8_t *>(ggml_backend_buffer_get_base(tensor->buffer))+(v ? span.v_offset : span.k_offset);
+                }
+                auto step=op;step.src[1]=&key;step.src[2]=&value;
+                GGML_ASSERT(ops->resume(f.backend,&step,scratch,continuation,continuation.tokens,span.token_begin,i+1==view.count));
+            }
+        }
         ggml_backend_synchronize(f.backend);
     }
 };
@@ -702,7 +754,370 @@ static void check_d512_pipeline(testing & t, bool hazards) {
     }
 }
 
+// Transport/ownership only: shared native multi-sequence launches are qualified separately.
+static void check_slot_page_partitions(testing & t) {
+    ggml_backend_load_all();
+    auto * device=ggml_backend_dev_by_name("CUDA0");
+    if (!t.assert_true(device!=nullptr)) return;
+    ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
+    auto * reg=ggml_backend_dev_backend_reg(device);
+    auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_partial_ops"));
+    const auto * ops=get ? get() : nullptr;
+    const auto retire=reinterpret_cast<void (*)(ggml_backend_t)>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_graph_release_all"));
+    if (!t.assert_true(backend && ops && ops->capabilities && ops->spans && ops->spans_workspace && retire)) return;
+    auto * type=llama_kv_stream_device_buffer_type(device);
+    const ggml_type types[]={GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16,GGML_TYPE_Q8_0,
+        GGML_TYPE_Q5_0,GGML_TYPE_Q5_1,GGML_TYPE_Q4_0,GGML_TYPE_Q4_1};
+    size_t profiles=0;
+    const auto read_bytes=[](ggml_backend_buffer_t buffer,size_t offset=0,size_t count=0) {
+        const size_t bytes=ggml_backend_buffer_get_size(buffer);
+        ggml_tensor raw{};raw.type=GGML_TYPE_I8;raw.ne[0]=int64_t(bytes);raw.ne[1]=raw.ne[2]=raw.ne[3]=1;
+        raw.nb[0]=1;raw.nb[1]=raw.nb[2]=raw.nb[3]=bytes;raw.buffer=buffer;raw.data=ggml_backend_buffer_get_base(buffer);
+        std::vector<uint8_t> result(count ? count : bytes);
+        ggml_backend_tensor_get(&raw,result.data(),offset,result.size());return result;
+    };
+    for (uint32_t dimension : {256u,512u}) for (auto key : types) for (auto value : types) {
+        const ggml_kv_stream_shape shape{key,value,dimension,dimension,4,256,128};
+        ggml_kv_stream_layout page;
+        if (!t.assert_true(ggml_kv_stream_layout_make(shape,256,page).status==ggml_kv_stream_status::success)) return;
+        llama_kv_stream_policy_config native;
+        native.shape=shape;native.capabilities=ops->capabilities(backend.get(),key,value);native.layers=2;
+        if (!t.assert_true(native.capabilities.direct_pair)) return;
+        size_t minimum=0;
+        if (!t.assert_true(llama_kv_stream_policy_minimum_pool_bytes(native,minimum).status==llama_kv_stream_policy_status::success && minimum%page.bytes==0)) return;
+        const auto min_pages=uint32_t(minimum/page.bytes);
+        llama_kv_stream_selection selected;
+        if (!t.assert_true(llama_kv_stream_select({4096,2},{{0,2049},{1,769}},selected)==llama_kv_stream_selection_status::success)) return;
+        llama_kv_stream_page_partition partition;
+        if (!t.assert_true(llama_kv_stream_partition_pages(selected,17,{{0,min_pages},{1,min_pages}},partition).status==
+                llama_kv_stream_page_partition_status::success)) return;
+        const size_t alignment=ggml_backend_buft_get_alignment(type),guard=(alignment+127)/128*128;
+        arena_ptr parent(ggml_backend_memory_arena_new(type,17*page.bytes+2*guard),ggml_backend_memory_arena_free);
+        if (!t.assert_true(parent && ggml_backend_memory_arena_begin(parent.get(),0))) return;
+        for (const auto & slot : partition.slots) if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),101+slot.slot,
+                guard+size_t(slot.first_page)*page.bytes,size_t(slot.pages)*page.bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr))) return;
+        if (!t.assert_true(ggml_backend_memory_arena_commit(parent.get()))) return;
+        lease_ptr left(ggml_backend_memory_arena_acquire(parent.get(),101),ggml_backend_memory_lease_free),
+            right(ggml_backend_memory_arena_acquire(parent.get(),102),ggml_backend_memory_lease_free);
+        if (!t.assert_true(left && right)) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(parent.get()),0xa5);
+        fixture a(backend.get(),true,key,value,4096,false,2,4,partition.slots[0].pages,dimension,dimension,left.get(),37,0);
+        fixture b(backend.get(),true,key,value,4096,false,2,4,partition.slots[1].pages,dimension,dimension,right.get(),38,101);
+        if (!t.assert_true(!a.arena && !b.arena && a.host->cache_id()!=b.host->cache_id() && a.attach() && b.attach())) return;
+        auto pin_a=a.binding->acquire(),pin_b=b.binding->acquire();
+        if (!t.assert_true(pin_a && pin_b)) return;
+        for (uint32_t queries : {1u,4u,8u}) {
+            block_inputs input_a(a,2049,queries,false,dimension==256 ? 24 : 32),input_b(b,769,queries,false,dimension==256 ? 24 : 32);
+            stock_attention_case stock_a(a,input_a),stock_b(b,input_b);
+            ggml_context_ptr masks(ggml_init({4096+2*ggml_tensor_overhead(),nullptr,true}));
+            auto * bounds_a=ggml_new_tensor_2d(masks.get(),GGML_TYPE_I32,4,queries);
+            auto * bounds_b=ggml_new_tensor_2d(masks.get(),GGML_TYPE_I32,4,queries);
+            ggml_backend_buffer_ptr mask_buffer(ggml_backend_alloc_ctx_tensors(masks.get(),backend.get()));
+            if (!t.assert_true(bool(mask_buffer))) return;
+            for (auto side : {false,true}) {
+                const auto & input=side ? input_b : input_a;
+                std::vector<int32_t> bounds(4*queries);
+                for (uint32_t q=0;q<queries;++q) {
+                    bounds[4*q]=0;bounds[4*q+1]=int32_t(input.active-queries+q+1);
+                    bounds[4*q+2]=int32_t(input.padded);bounds[4*q+3]=1;
+                }
+                ggml_backend_tensor_set(side ? bounds_b : bounds_a,bounds.data(),0,bounds.size()*sizeof(int32_t));
+            }
+            struct capture_retirement {
+                ggml_backend_t backend;void (*release)(ggml_backend_t);
+                ~capture_retirement() { ggml_backend_synchronize(backend);release(backend); }
+            } retirement{backend.get(),retire};
+            struct geometry { std::vector<size_t> a,b;bool wrap,prefix; };
+            const std::vector<geometry> layouts={
+                {{0,2304},{0,1024},false,true},
+                {{0,256,2304},{0,256,1024},false,true},
+                {{0,256,1024,2304},{0,256,512,1024},true,true},
+                {{0,1024,2304},{0,512,1024},true,false}};
+            for (bool compact : {false,true}) for (const auto & layout : layouts) {
+                auto peer=read_bytes(ggml_backend_memory_lease_buffer(right.get()));
+                auto spans_a=span_storage::create(a,0,input_a.padded,queries,layout.a,layout.wrap,left.get(),layout.prefix);
+                if (!t.assert_true(spans_a!=nullptr)) return;
+                t.assert_true("first-slot uploads stay inside its pages",peer==read_bytes(ggml_backend_memory_lease_buffer(right.get())));
+                auto previous=read_bytes(ggml_backend_memory_lease_buffer(left.get()));
+                auto spans_b=span_storage::create(b,0,input_b.padded,queries,layout.b,layout.wrap,right.get(),layout.prefix);
+                if (!t.assert_true(spans_b!=nullptr)) return;
+                t.assert_true("second-slot uploads stay inside its pages",previous==read_bytes(ggml_backend_memory_lease_buffer(left.get())));
+                span_attention_case streamed_a(a,ops,stock_a,*spans_a,input_a,compact ? bounds_a : nullptr),
+                    streamed_b(b,ops,stock_b,*spans_b,input_b,compact ? bounds_b : nullptr);
+                for (size_t replay=0;replay<3;++replay) {
+                    stock_a.run();stock_b.run();
+                    std::vector<float> expected_a(ggml_nelements(stock_a.output)),expected_b(ggml_nelements(stock_b.output));
+                    ggml_backend_tensor_get(stock_a.output,expected_a.data(),0,ggml_nbytes(stock_a.output));
+                    ggml_backend_tensor_get(stock_b.output,expected_b.data(),0,ggml_nbytes(stock_b.output));
+                    streamed_a.run();const auto before=input_a.read();
+                    t.assert_true("first slot preserves native bits",same_float_bits(expected_a,before));
+                    streamed_b.run();
+                    t.assert_true("second slot preserves its own native bits",same_float_bits(expected_b,input_b.read()));
+                    t.assert_true("peer execution cannot rewrite a finished output",same_float_bits(before,input_a.read()));
+                }
+                ++profiles;
+            }
+        }
+        auto first_guard=read_bytes(ggml_backend_memory_arena_parent(parent.get()),0,guard);
+        auto last_guard=read_bytes(ggml_backend_memory_arena_parent(parent.get()),guard+17*page.bytes,guard);
+        t.assert_true(std::all_of(first_guard.begin(),first_guard.end(),[](uint8_t v) {return v==0xa5;}));
+        t.assert_true(std::all_of(last_guard.begin(),last_guard.end(),[](uint8_t v) {return v==0xa5;}));
+        t.out << "slot pages D=" << dimension << " K=" << ggml_type_name(key) << " V=" << ggml_type_name(value) << " quota=" << partition.slots[0].pages << '+' << partition.slots[1].pages
+              << " minimum=" << min_pages << " shared-parent-bytes=" << 17*page.bytes+2*guard << std::endl;
+    }
+    t.assert_equal(size_t(3072),profiles);
+}
+
+// Return an error only after a real successful operation on one owner's queue.
+struct slot_queue_fault {
+    inline static slot_queue_fault * active=nullptr;
+    ggml_backend_reg_t reg;
+    decltype(ggml_backend_reg_i::get_proc_address) original;
+    const ggml_kv_stream_copy_ops * base;
+    ggml_kv_stream_copy_ops replacement;
+    std::map<void *,uintptr_t> owners;
+    std::map<uintptr_t,size_t> drains;
+    std::map<void *,uint64_t> submitted,collected;
+    std::map<void *,ggml_kv_stream_copy_feedback> reports;
+    uintptr_t watched=0;
+    int kind=-1;
+    size_t seen=0;
+    bool fired=false;
+    bool fail(void * queue,int operation) {
+        if (kind!=operation || owners.at(queue)!=watched) return false;
+        if (++seen!=(kind==0 ? 3u : 1u)) return false;
+        fired=true;return true;
+    }
+    explicit slot_queue_fault(ggml_backend_t backend) : reg(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend))),
+        original(reg->iface.get_proc_address) {
+        GGML_ASSERT(!active);active=this;
+        const auto get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(original(reg,"ggml_backend_kv_stream_copy_ops"));
+        base=get ? get() : nullptr;
+        GGML_ASSERT(base && base->version>=10 && base->create && base->enqueue_span &&
+            base->enqueue_span_with_feedback && base->acquire_span && base->release_span);
+        replacement=*base;
+        replacement.create=[](ggml_backend_t b,ggml_backend_buffer_t device,ggml_backend_buffer_t host,
+                const ggml_kv_stream_shape & shape,size_t slots) {
+            auto * queue=active->base->create(b,device,host,shape,slots);
+            if (queue) { active->owners[queue]=uintptr_t(ggml_backend_buffer_get_base(device)); }
+            return queue;
+        };
+        if (base->create_prepared) replacement.create_prepared=[](ggml_backend_t b,void * prepared,
+                ggml_backend_buffer_t device,ggml_backend_buffer_t host,const ggml_kv_stream_shape & shape,size_t slots) {
+            auto * queue=active->base->create_prepared(b,prepared,device,host,shape,slots);
+            if (queue) { active->owners[queue]=uintptr_t(ggml_backend_buffer_get_base(device)); }
+            return queue;
+        };
+        replacement.free=[](void * queue) {
+            active->owners.erase(queue);active->submitted.erase(queue);active->collected.erase(queue);active->reports.erase(queue);
+            active->base->free(queue);
+        };
+        replacement.begin_with_feedback=[](void * queue,bool eligible) {
+            const bool ok=active->base->begin_with_feedback(queue,eligible);
+            if (ok) {const auto id=active->base->feedback_id(queue);if (id) active->submitted[queue]=id;}
+            return ok;
+        };
+        replacement.poll_feedback=[](void * queue,ggml_kv_stream_copy_snapshot * snapshot) {
+            const bool ok=active->base->poll_feedback(queue,snapshot);
+            if (ok) {active->collected[queue]=snapshot->id;active->reports[queue]=snapshot->value;}
+            return ok;
+        };
+        replacement.drain=[](void * queue) {++active->drains[active->owners.at(queue)];active->base->drain(queue);};
+        replacement.enqueue_span=[](void * q,size_t slot,const void * k,const void * v,size_t live,size_t padded) {
+            const bool ok=active->base->enqueue_span(q,slot,k,v,live,padded);return ok && !active->fail(q,0);
+        };
+        replacement.enqueue_span_with_feedback=[](void * q,size_t slot,const void * k,const void * v,size_t live,size_t padded,bool eligible) {
+            const bool ok=active->base->enqueue_span_with_feedback(q,slot,k,v,live,padded,eligible);return ok && !active->fail(q,0);
+        };
+        replacement.acquire_span=[](void * q,size_t slot,size_t count) {
+            const bool ok=active->base->acquire_span(q,slot,count);return ok && !active->fail(q,1);
+        };
+        replacement.release_span=[](void * q,size_t slot,size_t count) {
+            const bool ok=active->base->release_span(q,slot,count);return ok && !active->fail(q,2);
+        };
+        reg->iface.get_proc_address=[](ggml_backend_reg_t r,const char * name) -> void * {
+            if (!std::strcmp(name,"ggml_backend_kv_stream_copy_ops"))
+                return reinterpret_cast<void *>(+[]() -> const ggml_kv_stream_copy_ops * {return &active->replacement;});
+            return active->original(r,name);
+        };
+    }
+    ~slot_queue_fault() {reg->iface.get_proc_address=original;active=nullptr;}
+};
+
+static bool slot_feedback_equal(const llama_kv_stream_feedback & a,const llama_kv_stream_feedback & b) {
+    return a.available==b.available && a.epoch==b.epoch && a.samples==b.samples && a.misses==b.misses &&
+        a.copy_busy_ratio==b.copy_busy_ratio && a.peak_slots==b.peak_slots && a.layer_samples==b.layer_samples && a.layer_misses==b.layer_misses;
+}
+
+static void check_slot_page_queues(testing & t) {
+    ggml_backend_load_all();auto * device=ggml_backend_dev_by_name("CUDA0");
+    if (!t.assert_true(device!=nullptr)) return;
+    ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
+    auto * reg=ggml_backend_dev_backend_reg(device);
+    const auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_partial_ops"));
+    const auto * ops=get ? get() : nullptr;
+    const auto retire=reinterpret_cast<void (*)(ggml_backend_t)>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_graph_release_all"));
+    if (!t.assert_true(ops && retire)) return;
+    const std::vector<std::pair<ggml_type,ggml_type>> pairs={{GGML_TYPE_Q8_0,GGML_TYPE_Q4_0},
+        {GGML_TYPE_Q8_0,GGML_TYPE_Q8_0},{GGML_TYPE_Q5_1,GGML_TYPE_Q5_1},{GGML_TYPE_Q5_0,GGML_TYPE_Q4_1},
+        {GGML_TYPE_F16,GGML_TYPE_BF16},{GGML_TYPE_F16,GGML_TYPE_F16},{GGML_TYPE_F32,GGML_TYPE_F32}};
+    size_t profiles=0;
+    for (uint32_t dimension : {256u,512u}) for (auto pair : pairs) for (uint32_t pages : {6u,17u,96u}) {
+        slot_queue_fault fault(backend.get());
+        const ggml_kv_stream_shape shape{pair.first,pair.second,dimension,dimension,4,256,128};
+        const uint32_t heads=dimension==256 ? 24 : 32;
+        const ggml_kv_stream_attention_request requests[]={{shape,heads,1,2304},{shape,heads,4,1024}};
+        size_t scratch=0;
+        for (const auto & request : requests) {size_t bytes=0;
+            if (!t.assert_true(ggml_kv_stream_workspace_query(ops,backend.get(),request,ggml_kv_stream_workspace_kind::decode,bytes))) return;
+            scratch=std::max(scratch,bytes);
+        }
+        ggml_kv_stream_layout page;
+        if (!t.assert_true(ggml_kv_stream_layout_make(shape,256,page).status==ggml_kv_stream_status::success)) return;
+        llama_kv_stream_policy_config config;config.shape=shape;config.capabilities=ops->capabilities(backend.get(),pair.first,pair.second);config.layers=2;
+        size_t minimum=0;
+        if (!t.assert_true(llama_kv_stream_policy_minimum_pool_bytes(config,minimum).status==llama_kv_stream_policy_status::success && minimum%page.bytes==0)) return;
+        const auto minimum_pages=uint32_t(minimum/page.bytes);
+        llama_kv_stream_selection selected;llama_kv_stream_page_partition partition;
+        if (!t.assert_true(llama_kv_stream_select({4096,2},{{0,2049},{1,769}},selected)==llama_kv_stream_selection_status::success &&
+                llama_kv_stream_partition_pages(selected,pages,{{0,minimum_pages},{1,minimum_pages}},partition).status==llama_kv_stream_page_partition_status::success)) return;
+        auto * type=llama_kv_stream_device_buffer_type(device);const size_t alignment=ggml_backend_buft_get_alignment(type);
+        const size_t guard=(alignment+127)/128*128,pool_end=guard+size_t(pages)*page.bytes;
+        const size_t scratch_offset=(pool_end+guard+alignment-1)/alignment*alignment;
+        arena_ptr parent(ggml_backend_memory_arena_new(type,scratch_offset+scratch+guard),ggml_backend_memory_arena_free);
+        if (!t.assert_true(parent && ggml_backend_memory_arena_begin(parent.get(),0))) return;
+        for (const auto & slot : partition.slots) if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),101+slot.slot,
+                guard+size_t(slot.first_page)*page.bytes,size_t(slot.pages)*page.bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr))) return;
+        if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),201,scratch_offset,scratch,alignment,0,nullptr) && ggml_backend_memory_arena_commit(parent.get()))) return;
+        lease_ptr a_lease(ggml_backend_memory_arena_acquire(parent.get(),101),ggml_backend_memory_lease_free),
+            b_lease(ggml_backend_memory_arena_acquire(parent.get(),102),ggml_backend_memory_lease_free),
+            workspace(ggml_backend_memory_arena_acquire(parent.get(),201),ggml_backend_memory_lease_free);
+        if (!t.assert_true(a_lease && b_lease && workspace)) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(parent.get()),0xa5);
+        fixture a(backend.get(),true,pair.first,pair.second,4096,false,2,4,partition.slots[0].pages,dimension,dimension,a_lease.get(),37,0),
+            b(backend.get(),true,pair.first,pair.second,4096,false,2,4,partition.slots[1].pages,dimension,dimension,b_lease.get(),38,101);
+        llama_kv_stream_policy_state placement_a,placement_b;
+        if (!t.assert_true(llama_kv_stream_policy_initialize(a.policy,placement_a).status==llama_kv_stream_policy_status::success &&
+                llama_kv_stream_policy_initialize(b.policy,placement_b).status==llama_kv_stream_policy_status::success)) return;
+        if (pages==6) {placement_a.resident_pages_per_layer=placement_b.resident_pages_per_layer=0;
+            placement_a.ring_slots=placement_a.budget.pages;placement_b.ring_slots=placement_b.budget.pages;}
+        if (!t.assert_true(a.attach(&placement_a) && b.attach(&placement_b) &&
+                a.resident->configure_native_graph_attention(true) && b.resident->configure_native_graph_attention(true) &&
+                a.resident->configure_resumed_decode(true) && b.resident->configure_resumed_decode(true) &&
+                a.resident->configure_feedback(true) && b.resident->configure_feedback(true))) return;
+        auto a_pin=a.binding->acquire(),b_pin=b.binding->acquire();
+        if (!t.assert_true(a_pin && b_pin)) return;
+        const auto gen_a=a.content->generation(),gen_b=b.content->generation();
+        std::vector<uint8_t> host_a(a.host->bytes()),host_b(b.host->bytes());
+        std::memcpy(host_a.data(),ggml_backend_buffer_get_base(a.host->buffer()),host_a.size());
+        std::memcpy(host_b.data(),ggml_backend_buffer_get_base(b.host->buffer()),host_b.size());
+        block_inputs input_a(a,2049,1,false,heads),input_b(b,769,4,false,heads);
+        struct layer_control : stock_attention_case {
+            layer_control(fixture & f,block_inputs & input,uint32_t layer) : stock_attention_case(f,input) {
+                if (layer) {llama_kv_stream_host_layer source;GGML_ASSERT(f.host->layer(layer,source));
+                    ggml_backend_tensor_set(k_storage,source.k,0,ggml_nbytes(k_storage));
+                    ggml_backend_tensor_set(v_storage,source.v,0,ggml_nbytes(v_storage));}
+            }
+        };
+        std::vector<std::unique_ptr<layer_control>> native_a,native_b;
+        for (uint32_t layer : {0u,1u}) {native_a.emplace_back(new layer_control(a,input_a,layer));native_b.emplace_back(new layer_control(b,input_b,layer));}
+        struct capture_retirement {ggml_backend_t backend;void (*release)(ggml_backend_t);
+            ~capture_retirement() {ggml_backend_synchronize(backend);release(backend);}} retirement{backend.get(),retire};
+        const auto run_layer=[&](fixture & f,block_inputs & input,layer_control & reference,uint32_t layer) {
+            reference.run();std::vector<float> expected(ggml_nelements(reference.output));
+            ggml_backend_tensor_get(reference.output,expected.data(),0,ggml_nbytes(reference.output));
+            if (!t.assert_true(f.resident->compute_streamed(layer,input.q,input.mask,input.output,input.active,1.0f/16,workspace.get(),true,1))) return false;
+            ggml_backend_synchronize(backend.get());
+            return t.assert_true("queued slot attention retains native bits",same_float_bits(expected,input.read()));
+        };
+        const auto begin=[&](fixture & f,const block_inputs & input) {
+            return f.resident->begin_sequence({0,1},input.active,1,SIZE_MAX,{uint32_t(input.queries),true,false});
+        };
+        for (size_t replay=0;replay<3;++replay) {
+            if (!t.assert_true(begin(a,input_a) && begin(b,input_b))) return;
+            for (uint32_t layer : {0u,1u}) {
+                if (!run_layer(a,input_a,*native_a[layer],layer)) return;
+                const auto previous=input_a.read();
+                if (!run_layer(b,input_b,*native_b[layer],layer)) return;
+                t.assert_true("peer queues cannot rewrite the previous output",same_float_bits(previous,input_a.read()));
+            }
+            t.assert_true(!a.resident->sequence_active() && !b.resident->sequence_active());
+            t.assert_true(a.resident->sequence_stats().peak_pages<=placement_a.ring_slots && b.resident->sequence_stats().peak_pages<=placement_b.ring_slots);
+        }
+        a.resident->cancel_sequence();b.resident->cancel_sequence();
+        auto frozen=a.resident->feedback();const auto a_result=input_a.read();
+        if (pages!=96) {
+            const auto base=uintptr_t(ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(a_lease.get())));
+            void * queue=nullptr;
+            for (const auto & item : fault.owners) if (item.second==base) queue=item.first;
+            const auto ticket=queue ? fault.submitted[queue] : 0;
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+            while (queue && ticket && fault.collected[queue]<ticket && std::chrono::steady_clock::now()<deadline) {
+                frozen=a.resident->feedback();std::this_thread::yield();
+            }
+            frozen=a.resident->feedback();
+            if (!t.assert_true("the TG1 owner has completed real feedback before checking isolation",
+                    ticket && fault.collected[queue]>=ticket && frozen.available && frozen.samples>0)) {
+                const auto report=fault.reports[queue];
+                t.out << "feedback ticket=" << ticket << " collected=" << fault.collected[queue]
+                      << " available=" << frozen.available << " samples=" << frozen.samples << " layers=" << frozen.layer_samples
+                      << " raw-samples=" << report.samples << " raw-layers=" << report.layer_samples
+                      << " bytes=" << report.bytes << " timed=" << report.timed_bytes << " ms=" << report.elapsed_ms << std::endl;
+                return;
+            }
+        }
+        if (!t.assert_true(begin(b,input_b))) return;
+        for (uint32_t layer : {0u,1u}) if (!run_layer(b,input_b,*native_b[layer],layer)) return;
+        b.resident->cancel_sequence();
+        t.assert_true("peer geometry cannot reset or train another slot",slot_feedback_equal(frozen,a.resident->feedback()));
+        t.assert_true(same_float_bits(a_result,input_a.read()));
+        if (dimension==512 && pair.first==GGML_TYPE_Q8_0 && pair.second==GGML_TYPE_Q4_0 && pages==17) {
+            const auto b_base=uintptr_t(ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(b_lease.get())));
+            if (!t.assert_true(begin(b,input_b) && begin(a,input_a))) return;
+            const auto drains=fault.drains[b_base];a.resident->cancel_sequence();
+            t.assert_true(b.resident->sequence_active() && fault.drains[b_base]==drains);
+            for (uint32_t layer : {0u,1u}) if (!run_layer(b,input_b,*native_b[layer],layer)) return;
+            for (int kind : {0,1,2}) {
+                if (!t.assert_true(begin(b,input_b))) return;
+                fault.watched=uintptr_t(ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(a_lease.get())));
+                fault.kind=kind;fault.seen=0;fault.fired=false;
+                bool ok=begin(a,input_a);
+                if (ok) ok=a.resident->compute_streamed(0,input_a.q,input_a.mask,input_a.output,input_a.active,1.0f/16,workspace.get(),true,1);
+                if (!t.assert_true(!ok && fault.fired && fault.seen>0)) return;
+                fault.kind=-1;const auto before=fault.drains[b_base];a.resident->cancel_sequence();ggml_backend_synchronize(backend.get());
+                t.assert_true(b.resident->sequence_active() && fault.drains[b_base]==before);
+                for (uint32_t layer : {0u,1u}) if (!run_layer(b,input_b,*native_b[layer],layer)) return;
+                if (!t.assert_true(begin(a,input_a))) return;
+                for (uint32_t layer : {0u,1u}) if (!run_layer(a,input_a,*native_a[layer],layer)) return;
+            }
+        }
+        t.assert_equal(gen_a,a.content->generation());t.assert_equal(gen_b,b.content->generation());
+        t.assert_true(!std::memcmp(host_a.data(),ggml_backend_buffer_get_base(a.host->buffer()),host_a.size()) &&
+            !std::memcmp(host_b.data(),ggml_backend_buffer_get_base(b.host->buffer()),host_b.size()));
+        ggml_tensor raw{};auto * buffer=ggml_backend_memory_arena_parent(parent.get());
+        raw.type=GGML_TYPE_I8;raw.ne[0]=int64_t(ggml_backend_buffer_get_size(buffer));raw.ne[1]=raw.ne[2]=raw.ne[3]=1;
+        raw.nb[0]=1;raw.nb[1]=raw.nb[2]=raw.nb[3]=size_t(raw.ne[0]);raw.buffer=buffer;raw.data=ggml_backend_buffer_get_base(buffer);
+        for (auto offset : {size_t(0),pool_end,scratch_offset+scratch}) {std::vector<uint8_t> bytes(guard);
+            ggml_backend_tensor_get(&raw,bytes.data(),offset,bytes.size());
+            t.assert_true(std::all_of(bytes.begin(),bytes.end(),[](uint8_t value) {return value==0xa5;}));}
+        ++profiles;
+        t.out << "slot queues D=" << dimension << " K=" << ggml_type_name(pair.first) << " V=" << ggml_type_name(pair.second)
+              << " pages=" << pages << " split=" << partition.slots[0].pages << '+' << partition.slots[1].pages << std::endl;
+    }
+    t.assert_equal(size_t(42),profiles);
+}
+
 int main(int argc, char ** argv) {
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-queues")) {
+        testing t;t.test("shared_parent_slots_keep_queue_progress_and_feedback_independent",[&](testing & t) {check_slot_page_queues(t);});
+        return t.summary();
+    }
+
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-pages")) {
+        testing t;t.test("independent_page_grants_preserve_native_span_bits",[&](testing & t) { check_slot_page_partitions(t); });
+        return t.summary();
+    }
+
     if (argc > 1 && (!std::strcmp(argv[1],"--cuda-d512-pipeline") ||
             !std::strcmp(argv[1],"--cuda-d512-pipeline-hazards"))) {
         testing t;

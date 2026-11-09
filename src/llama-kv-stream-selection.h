@@ -62,3 +62,35 @@ llama_kv_stream_selection_status llama_kv_stream_select(
         const std::vector<llama_kv_stream_selection_slot> & admitted,
         llama_kv_stream_selection & output,
         llama_kv_stream_selection_admit admit = nullptr, void * user_data = nullptr);
+
+struct llama_kv_stream_page_minimum {
+    uint32_t slot = 0, pages = 0;
+};
+
+struct llama_kv_stream_page_partition_slot {
+    uint32_t slot = 0, first_page = 0, pages = 0;
+    size_t logical_offset = 0, projected_tokens = 0;
+};
+
+struct llama_kv_stream_page_partition {
+    uint32_t pages = 0;
+    std::vector<llama_kv_stream_page_partition_slot> slots;
+};
+
+enum class llama_kv_stream_page_partition_status {
+    success, invalid_selection, invalid_minimum, insufficient_pages, allocation_failed,
+};
+
+struct llama_kv_stream_page_partition_result {
+    llama_kv_stream_page_partition_status status = llama_kv_stream_page_partition_status::success;
+    uint64_t minimum_pages = 0;
+};
+
+// One homogeneous owning-KV page unit; aliases share their owner. Caller supplies measured native minima.
+// Whole pages are exclusive until the next selection.
+// Input is a fresh selection snapshot; live consumption cursors stay with their slot owners.
+// Weight by history plus logical growth, clamp minima, then round remainders by slot ID. No GPU allocation.
+// Logical offsets are not page indices. Failure preserves output; this does not prove kernel admission.
+llama_kv_stream_page_partition_result llama_kv_stream_partition_pages(
+        const llama_kv_stream_selection & selected, uint32_t pages,
+        const std::vector<llama_kv_stream_page_minimum> & minima, llama_kv_stream_page_partition & output);

@@ -57,8 +57,177 @@ static std::vector<uint32_t> oracle(size_t capacity, size_t maximum,
     return best;
 }
 
+// Enumerate active lower bounds, then all integer partitions; minimize exact distance to the continuous target.
+static std::vector<uint32_t> page_oracle(const std::vector<uint32_t> & weights,
+        const std::vector<uint32_t> & minima,uint32_t pages) {
+    uint64_t denominator=0;
+    std::vector<uint64_t> target(weights.size());
+    for (uint32_t mask=0;mask<(uint32_t(1)<<weights.size());++mask) {
+        uint32_t reserved=0;uint64_t weight=0;
+        for (size_t i=0;i<weights.size();++i) {
+            if (mask&(uint32_t(1)<<i)) reserved+=minima[i];else weight+=weights[i];
+        }
+        if (reserved>pages) continue;
+        if (!weight) {
+            if (reserved!=pages) continue;
+            denominator=1;
+            for (size_t i=0;i<weights.size();++i) target[i]=minima[i];
+            break;
+        }
+        bool valid=true;
+        for (size_t i=0;i<weights.size();++i) {
+            const uint64_t bound=uint64_t(minima[i])*weight,ideal=uint64_t(pages-reserved)*weights[i];
+            if (mask&(uint32_t(1)<<i)) { valid&=bound>=ideal;target[i]=bound; }
+            else { valid&=bound<=ideal;target[i]=ideal; }
+        }
+        if (valid) { denominator=weight;break; }
+    }
+    if (!denominator) return {};
+    uint64_t best=UINT64_MAX;
+    std::vector<uint32_t> answer,candidate(weights.size());
+    const auto search=[&](const auto & self,size_t index,uint32_t used) -> void {
+        if (index==weights.size()) {
+            if (used!=pages) return;
+            uint64_t score=0;
+            for (size_t i=0;i<weights.size();++i) {
+                const uint64_t scaled=uint64_t(candidate[i])*denominator;
+                const uint64_t delta=scaled>target[i] ? scaled-target[i] : target[i]-scaled;
+                score+=delta*delta;
+            }
+            if (score<best || (score==best && candidate>answer)) { best=score;answer=candidate; }
+            return;
+        }
+        for (uint32_t count=minima[index];count<=pages-used;++count) {
+            candidate[index]=count;self(self,index+1,used+count);
+        }
+    };
+    search(search,0,0);
+    return answer;
+}
+
+static selection projected_selection(const std::vector<uint32_t> & weights) {
+    selection result;
+    for (size_t i=0;i<weights.size();++i) {
+        result.slots.push_back({uint32_t(i*3+1),size_t(weights[i]-1),1,result.context_tokens});
+        result.context_tokens+=weights[i];result.history_tokens+=weights[i]-1;
+    }
+    return result;
+}
+
 int main() {
     testing t;
+    t.test("selected_page_quotas_follow_projected_extent_not_logical_offsets", [](testing & t) {
+        selection chosen;
+        if (!t.assert_true(llama_kv_stream_select({128*1024,2},{{1,30*1024},{0,90*1024}},chosen)==selection_status::success)) return;
+        llama_kv_stream_page_partition physical;
+        const auto status=llama_kv_stream_partition_pages(chosen,64,{{1,2},{0,2}},physical);
+        if (!t.assert_true(status.status==llama_kv_stream_page_partition_status::success)) return;
+        if (!t.assert_equal(size_t(2),physical.slots.size())) return;
+        t.assert_equal(uint32_t(47),physical.slots[0].pages);
+        t.assert_equal(uint32_t(17),physical.slots[1].pages);
+        t.assert_equal(uint32_t(0),physical.slots[0].first_page);
+        t.assert_equal(uint32_t(47),physical.slots[1].first_page);
+        t.assert_equal(size_t(94*1024),physical.slots[1].logical_offset);
+        t.assert_equal(size_t(34*1024),physical.slots[1].projected_tokens);
+        t.assert_equal(uint32_t(64),physical.pages);
+        t.assert_equal(uint64_t(4),status.minimum_pages);
+    });
+    t.test("native_page_minima_are_enforced_without_cross_slot_borrowing", [](testing & t) {
+        selection chosen;
+        if (!t.assert_true(llama_kv_stream_select({128,2},{{0,90},{1,30}},chosen)==selection_status::success)) return;
+        llama_kv_stream_page_partition physical;
+        auto result=llama_kv_stream_partition_pages(chosen,13,{{0,2},{1,5}},physical);
+        if (!t.assert_true(result.status==llama_kv_stream_page_partition_status::success)) return;
+        t.assert_equal(uint32_t(8),physical.slots[0].pages);
+        t.assert_equal(uint32_t(5),physical.slots[1].pages);
+        result=llama_kv_stream_partition_pages(chosen,6,{{0,2},{1,5}},physical);
+        t.assert_true(result.status==llama_kv_stream_page_partition_status::insufficient_pages);
+        t.assert_equal(uint64_t(7),result.minimum_pages);
+        t.assert_equal(uint32_t(13),physical.pages);
+        t.assert_equal(uint32_t(5),physical.slots[1].pages);
+    });
+    t.test("page_partition_matches_independent_small_integer_oracle", [](testing & t) {
+        using ps=llama_kv_stream_page_partition_status;
+        for (uint32_t w0=1;w0<=4;++w0) for (uint32_t w1=1;w1<=4;++w1) for (uint32_t w2=1;w2<=4;++w2)
+        for (uint32_t m0=1;m0<=3;++m0) for (uint32_t m1=1;m1<=3;++m1) for (uint32_t m2=1;m2<=3;++m2)
+        for (uint32_t pages=1;pages<=12;++pages) {
+            const std::vector<uint32_t> weights{w0,w1,w2},minimum{m0,m1,m2};
+            const auto chosen=projected_selection(weights);
+            llama_kv_stream_page_partition output;output.pages=99;
+            const auto status=llama_kv_stream_partition_pages(chosen,pages,{{7,m2},{1,m0},{4,m1}},output);
+            if (m0+m1+m2>pages) {
+                if (!t.assert_true(status.status==ps::insufficient_pages && status.minimum_pages==m0+m1+m2 && output.pages==99)) return;
+                continue;
+            }
+            const auto expected=page_oracle(weights,minimum,pages);
+            if (!t.assert_true(status.status==ps::success && output.slots.size()==3 && expected.size()==3)) return;
+            uint32_t end=0;
+            for (size_t i=0;i<3;++i) {
+                if (!t.assert_equal(expected[i],output.slots[i].pages)) return;
+                if (!t.assert_equal(end,output.slots[i].first_page)) return;
+                end+=output.slots[i].pages;
+            }
+            if (!t.assert_equal(pages,end)) return;
+        }
+    });
+    t.test("page_partition_large_products_and_future_slot_counts_do_not_wrap", [](testing & t) {
+        using ps=llama_kv_stream_page_partition_status;
+        auto chosen=projected_selection({uint32_t(INT32_MAX-1),1});
+        llama_kv_stream_page_partition output;
+        if (!t.assert_true(llama_kv_stream_partition_pages(chosen,UINT32_MAX,{{1,1},{4,1}},output).status==ps::success)) return;
+        t.assert_equal(UINT32_MAX-2,output.slots[0].pages);t.assert_equal(uint32_t(2),output.slots[1].pages);
+        t.assert_equal(UINT32_MAX-2,output.slots[1].first_page);
+        chosen=projected_selection({1,1,1});
+        const auto failed=llama_kv_stream_partition_pages(chosen,UINT32_MAX,{{1,UINT32_MAX},{4,UINT32_MAX},{7,UINT32_MAX}},output);
+        t.assert_true(failed.status==ps::insufficient_pages);
+        t.assert_equal(uint64_t(UINT32_MAX)*3,failed.minimum_pages);
+        t.assert_equal(uint32_t(UINT32_MAX),output.pages);
+        chosen=projected_selection(std::vector<uint32_t>(256,1));
+        std::vector<llama_kv_stream_page_minimum> minima;
+        for (const auto & slot : chosen.slots) minima.push_back({slot.id,1});
+        if (!t.assert_true(llama_kv_stream_partition_pages(chosen,UINT32_MAX,minima,output).status==ps::success)) return;
+        uint64_t end=0;
+        for (size_t i=0;i<output.slots.size();++i) {
+            t.assert_equal(i==255 ? uint32_t(16777215) : uint32_t(16777216),output.slots[i].pages);
+            t.assert_equal(end,uint64_t(output.slots[i].first_page));end+=output.slots[i].pages;
+        }
+        t.assert_equal(uint64_t(UINT32_MAX),end);
+    });
+    t.test("malformed_page_inputs_leave_the_previous_partition_unchanged", [](testing & t) {
+        using ps=llama_kv_stream_page_partition_status;
+        const auto good=projected_selection({3,4});
+        llama_kv_stream_page_partition saved; saved.pages=77;saved.slots={{99,4,5,6,7}};
+        for (int mutation=0;mutation<10;++mutation) {
+            auto invalid=good;
+            if (mutation==0) invalid.context_tokens=0;
+            if (mutation==1) invalid.context_tokens=SIZE_MAX;
+            if (mutation==2) invalid.slots.clear();
+            if (mutation==3) invalid.history_tokens++;
+            if (mutation==4) invalid.slots[0].growth_tokens=0;
+            if (mutation==5) invalid.slots[1].offset_tokens++;
+            if (mutation==6) invalid.slots[1].id=invalid.slots[0].id;
+            if (mutation==7) invalid.slots[0].history_tokens=SIZE_MAX;
+            if (mutation==8) invalid.slots[0].growth_tokens=SIZE_MAX;
+            if (mutation==9) std::swap(invalid.slots[0],invalid.slots[1]);
+            const auto result=llama_kv_stream_partition_pages(invalid,10,{{1,1},{4,1}},saved);
+            t.assert_true(result.status==ps::invalid_selection);
+            t.assert_true(saved.pages==77 && saved.slots.size()==1 && saved.slots[0].slot==99 && saved.slots[0].projected_tokens==7);
+        }
+        for (const auto & minima : std::vector<std::vector<llama_kv_stream_page_minimum>>{
+                {},{{1,1}},{{1,1},{4,1},{7,1}},{{1,1},{1,1}},{{1,0},{4,1}},{{1,1},{7,1}}}) {
+            t.assert_true(llama_kv_stream_partition_pages(good,10,minima,saved).status==ps::invalid_minimum);
+            t.assert_equal(uint32_t(77),saved.pages);
+        }
+    });
+    t.test("page_partition_rejects_edited_equal_growth_snapshot", [](testing & t) {
+        selection chosen;
+        if (!t.assert_true(llama_kv_stream_select({10,2},{{0,2},{1,2}},chosen)==selection_status::success)) return;
+        ++chosen.slots[0].growth_tokens;--chosen.slots[1].growth_tokens;++chosen.slots[1].offset_tokens;
+        llama_kv_stream_page_partition saved;saved.pages=77;
+        const auto status=llama_kv_stream_partition_pages(chosen,10,{{0,1},{1,1}},saved);
+        t.assert_true("complete extents cannot bypass the equal allowance contract",
+            status.status==llama_kv_stream_page_partition_status::invalid_selection && saved.pages==77);
+    });
     t.test("slot_logical_group_and_total_storage_limits_are_distinct", [](testing & t) {
         llama_kv_stream_context_limits limits;
         t.assert_true(llama_kv_stream_context_limits_make(1000, 1024, 2, limits));

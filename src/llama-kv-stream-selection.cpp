@@ -107,3 +107,68 @@ llama_kv_stream_selection_status llama_kv_stream_select(
         return status::allocation_failed;
     }
 }
+
+llama_kv_stream_page_partition_result llama_kv_stream_partition_pages(
+        const llama_kv_stream_selection & selected, uint32_t pages,
+        const std::vector<llama_kv_stream_page_minimum> & minima, llama_kv_stream_page_partition & output) {
+    using status=llama_kv_stream_page_partition_status;
+    if (!selected.context_tokens || selected.context_tokens>size_t(INT32_MAX) || selected.slots.empty() ||
+            selected.slots.size()>LLAMA_MAX_SEQ || selected.history_tokens>selected.context_tokens) return {status::invalid_selection};
+    if (minima.size()!=selected.slots.size()) return {status::invalid_minimum};
+    try {
+        size_t extent=0,history=0;
+        for (size_t i=0;i<selected.slots.size();++i) {
+            const auto & slot=selected.slots[i];
+            if ((i && selected.slots[i-1].id>=slot.id) || slot.offset_tokens!=extent || !slot.growth_tokens ||
+                    slot.history_tokens>selected.context_tokens-history || slot.growth_tokens>selected.context_tokens-extent ||
+                    slot.history_tokens>selected.context_tokens-extent-slot.growth_tokens) return {status::invalid_selection};
+            history+=slot.history_tokens;extent+=slot.history_tokens+slot.growth_tokens;
+        }
+        if (extent!=selected.context_tokens || history!=selected.history_tokens) return {status::invalid_selection};
+        const size_t spare=selected.context_tokens-history,count=selected.slots.size();
+        for (size_t i=0;i<count;++i) {
+            if (selected.slots[i].growth_tokens!=spare/count+(i<spare%count)) return {status::invalid_selection};
+        }
+        auto sorted=minima;
+        std::sort(sorted.begin(),sorted.end(),[](const auto & a,const auto & b) { return a.slot<b.slot; });
+        uint64_t required=0;
+        for (size_t i=0;i<sorted.size();++i) {
+            if (sorted[i].slot!=selected.slots[i].id || !sorted[i].pages) return {status::invalid_minimum};
+            required+=sorted[i].pages;
+        }
+        if (required>pages) return {status::insufficient_pages,required};
+        llama_kv_stream_page_partition next;
+        next.pages=pages;next.slots.reserve(sorted.size());
+        for (const auto & slot : selected.slots)
+            next.slots.push_back({slot.id,0,0,slot.offset_tokens,slot.history_tokens+slot.growth_tokens});
+        std::vector<bool> fixed(sorted.size(),false);
+        uint64_t remaining=pages,weight=selected.context_tokens;
+        for (;;) {
+            bool clamped=false;
+            for (size_t i=0;i<sorted.size();++i) {
+                if (fixed[i] || uint64_t(sorted[i].pages)*weight<=remaining*next.slots[i].projected_tokens) continue;
+                fixed[i]=true;next.slots[i].pages=sorted[i].pages;
+                remaining-=sorted[i].pages;weight-=next.slots[i].projected_tokens;
+                clamped=true;break;
+            }
+            if (!clamped) break;
+        }
+        struct remainder { uint64_t value;size_t slot; };
+        std::vector<remainder> remainders;
+        uint64_t assigned=0;
+        for (size_t i=0;i<sorted.size();++i) if (!fixed[i]) {
+            const uint64_t numerator=remaining*next.slots[i].projected_tokens;
+            next.slots[i].pages=uint32_t(numerator/weight);
+            assigned+=next.slots[i].pages;
+            remainders.push_back({numerator%weight,i});
+        }
+        std::sort(remainders.begin(),remainders.end(),[](const remainder & a,const remainder & b) {
+            return a.value!=b.value ? a.value>b.value : a.slot<b.slot;
+        });
+        for (size_t i=0;i<size_t(remaining-assigned);++i) ++next.slots[remainders[i].slot].pages;
+        uint64_t offset=0;
+        for (auto & slot : next.slots) { slot.first_page=uint32_t(offset);offset+=slot.pages; }
+        output=std::move(next);
+        return {status::success,required};
+    } catch (const std::bad_alloc &) { return {status::allocation_failed}; }
+}

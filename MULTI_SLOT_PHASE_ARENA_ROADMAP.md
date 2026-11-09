@@ -1,6 +1,6 @@
 # Multi-slot adaptive KV streaming and phase-arena roadmap
 
-Status: implementation in progress, 2026-11-09. MS1 (CPU planner), MS2 (demand-backed host storage), MS3 (independent histories/native metadata) and MS4 (selected-state storage/ownership) are complete as independent components; runtime multi-slot admission remains disabled. MS5-MS14 are pending. No new server configuration is qualified.
+Status: implementation in progress, 2026-11-09. MS1 (CPU planner), MS2 (demand-backed host storage), MS3 (independent histories/native metadata), MS4 (selected-state storage/ownership) and MS5 (exclusive page grants/reader ownership) are complete as independent components; runtime multi-slot admission remains disabled. MS6-MS14 are pending. No new server configuration is qualified.
 
 Inspected baseline: `f6ca3e8a172473578b909a4691e616bb2234fb54`, on `feature/ci-workflow-migration`. Recheck the implementation base and local changes before starting work on a dedicated feature branch. Historical measurements retain their original source, binaries, models and configuration; they are not new multi-slot evidence.
 
@@ -397,12 +397,24 @@ Evidence, failed attempts, source patches and immutable own-library cohorts rema
 
 ### MS5 - Exclusive page partition and span planning
 
-- [ ] Quote per-slot native working minima; implement proportional projected-extent page allocation with deterministic rounding and stable ownership.
-- [ ] Exhaustively exercise resident-only, ring-only, split resident/ring and both wrap positions, including empty segments, unequal histories, append boundaries and poisoned neighboring pages.
-- [ ] Prove three-span coverage for every submitted wave or diagnose the precise layout conflict. Preserve legal native resume intervals and checkpoint order.
-- [ ] Keep per-slot feedback and ring progress independent; no unchosen-slot pages or cross-slot quota borrowing.
+- [x] Quote per-slot native working minima; implement proportional projected-extent page allocation with deterministic rounding and stable ownership.
+- [x] Exhaustively exercise resident-only, ring-only, split resident/ring and both wrap positions, including empty segments, unequal histories, append boundaries and poisoned neighboring pages.
+- [x] Prove three-span coverage for every submitted wave or diagnose the precise layout conflict. Preserve legal native resume intervals and checkpoint order.
+- [x] Keep per-slot feedback and ring progress independent; no unchosen-slot pages or cross-slot quota borrowing.
 
 Exit: CPU geometry/property tests and CUDA transport/native-bit tests with stable page ownership and complete reader fencing.
+
+Completed as page-planning and reader-ownership components. The CPU planner consumes a validated, immutable MS1 selection and caller-measured native page minima, weights pages by projected history plus allowance, clamps minima and uses deterministic largest-remainder rounding. All physical pages belong to one selected slot until reselection. The planner does not infer backend admission or enable public multi-slot execution. Equal-growth snapshot validation was added after an exact one-failure behavioral red; missing-API evidence and all failures remain preserved.
+
+Normal and full ASAN/UBSAN inventories each passed 54 executable tests with two expected CUDA-only tile skips. Selection checks passed 16 tests/123,622 assertions, including an independent active-bound/brute-integer allocation oracle, extreme products, future 256-slot metadata and transactional malformed-input guards. Span geometry passed 8 tests/20,112 assertions, including every resident/ring split, ring rotation, live extent and partial tail in the bounded geometry grid, with independent physical-row byte oracles and poisoned peer pages.
+
+Fresh CUDA ownership controls passed all64 reader pairs at D256/D512, TG1/4/8, four physical layouts and dense/compact masks: 3,072 profiles/42,115 assertions in both normal and strict runs. Queued controls passed 42 profiles/2,803 assertions in both modes, covering all eight encodings, exact-minimum ring-only through resident-heavy quotas, one shared KV/scratch parent, independent sources/feedback, cancellation and errors returned only after successful real enqueue/acquire/release operations. Actual submitted feedback tickets were collected before freezing the isolation reference; ring-only histories legally have no complete-layer feedback samples. Canonical host bytes/generations, peer outputs and page canaries remain unchanged. These use separate per-slot attention calls and do not claim the MS6 shared-launch objective.
+
+The mapped existing-reader/prefill controls also passed: D512 spans 9,295 assertions normal/strict, D512 tile 27,521 normal, prepared conversion 19,969 normal/strict, transfer pipeline 8,368 normal/strict, GQA6 89 normal and all64 D256 pairs 3,081 normal. The final qualification contains 13 native gates and five strict default-PDL memchecks with zero errors, API reporting all, exit99, no kernel filters and eager loading only for the sanitizer. Native graphs remain enabled; transient reference helpers explicitly retire their captures before freeing dependencies. No CUDA kernel or production arithmetic changed, and the new pure CPU planner has no existing runtime call sites. Full request-level performance qualification remains MS13 work.
+
+The final runner expected one test for the legacy D256 command, which actually runs an earlier CPU geometry test plus the complete all64 native matrix. Both passed (2 tests/3,081 assertions, 512 zero-error comparisons, 64 pairs, exit0). The failed runner and primary error are preserved; a separate audit verified every completed log, inactive owned units, current source/library identities and CPU inventories without rerunning or changing a numerical check. Evidence is local under `benchmarks/results/multi-slot-20261109/ms5-final/` and `ms5-final-audit/`; artifacts are not committed.
+
+A CPU-only ordinary-native placement probe for MS6 also confirmed that successive unified two-sequence appends interleave native KV columns: one 64-row tile already has eight owner runs after a short decode. Its exact masks contain holes and cannot be represented by one compact interval. This is a native logical-projection issue, distinct from the proved per-slot physical three-span bound. MS6 must review bounded staging/projection against native checkpoint boundaries before adopting a shared-launch representation; it cannot reorder columns, approximate masks or serialize compatible work to avoid the conflict.
 
 ### MS6 - Shared-launch target-only attention
 
