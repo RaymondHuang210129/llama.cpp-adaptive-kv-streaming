@@ -4,6 +4,7 @@
 #include "../ggml/src/ggml-backend-memory.h"
 
 #include <memory>
+#include <functional>
 
 struct llama_memory_bounded_kv_layer {
     uint32_t id = 0;
@@ -62,6 +63,14 @@ public:
     // Complete compute/copies before finishing. Failed writes close read admission until explicit reconstruction.
     bool finish_write(uint64_t ticket, bool success) noexcept;
     bool reconstruct(llama_memory_phase_cache_identity expected) noexcept;
+    // Caller retires graphs first. Callbacks finish all accesses before returning or throwing.
+    // The slot owner retains the native snapshot; physical parking does not change its semantic generation.
+    bool park(llama_memory_phase_cache_identity expected,
+            const std::function<bool(const llama_memory_bounded_kv_read &)> & save);
+    // Restore completes all writes before publication; failure leaves the snapshot parked and unreadable.
+    bool restore_parked(llama_memory_phase_cache_identity expected, ggml_backend_memory_lease_t lease,
+            const std::function<bool(ggml_backend_buffer_t)> & restore);
+    bool parked() const noexcept;
     llama_memory_phase_cache_identity identity() const noexcept;
     const llama_memory_bounded_kv_layout & layout() const noexcept;
 private:
@@ -71,4 +80,5 @@ private:
     std::shared_ptr<llama_memory_bounded_kv_binding> active;
     uint64_t next_ticket = 0, pending_ticket = 0;
     bool valid = false, preparing = false;
+    bool parked_state = false;
 };

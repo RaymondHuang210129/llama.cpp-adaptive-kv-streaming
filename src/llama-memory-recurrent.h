@@ -25,7 +25,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter, bool stream_host_spill = false);
+        const layer_filter_cb & filter, bool stream_host_spill = false, bool defer_current = false);
 
     ~llama_memory_recurrent() override;
 
@@ -71,6 +71,18 @@ public:
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    bool current_storage_pending() const noexcept;
+    bool current_storage_requirements(ggml_backend_buffer_type_t & type, size_t & bytes) const noexcept;
+    // Opt an already drained native bank into explicit arena-owned parking on the same device.
+    bool enable_current_storage_parking(ggml_backend_buffer_type_t type);
+    // Retire graphs first. Restore captured raw rows before admitting execution on a rebound bank.
+    bool bind_current_storage(ggml_backend_memory_lease_t lease);
+    bool release_current_storage();
+    // Retire graphs and complete producer work first. Keep raw provisional and rollback rows in RAM.
+    bool park_current_storage();
+    bool current_storage_parked() const noexcept;
+    bool restore_current_storage(ggml_backend_memory_lease_t lease,
+            ggml_backend_memory_lease_t publication_lease = nullptr);
     bool spill_enabled() const noexcept;
     bool complete_spill();
     bool staged_publication_enabled() const noexcept;
@@ -144,6 +156,9 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    struct current_storage_state;
+    std::unique_ptr<current_storage_state> selected_storage;
+    bool replace_current_storage(ggml_backend_memory_lease_t lease);
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;

@@ -111,11 +111,16 @@ public:
     llama_recurrent_spill_bank & operator=(const llama_recurrent_spill_bank &) = delete;
 
     bool begin_capture(llama_recurrent_spill_identity identity);
-    bool enable_publication(ggml_backend_dev_t device, ggml_backend_buffer_type_t stage_type, uint32_t slots);
+    bool enable_publication(ggml_backend_dev_t device, ggml_backend_buffer_type_t stage_type, uint32_t slots,
+            bool defer_stage = false);
     bool staged_publication_enabled() const noexcept;
     size_t staged_device_bytes() const noexcept;
     // Retire graph users first; only idle publication can replace its ephemeral staging addresses.
     bool bind_publication_stage(ggml_backend_memory_lease_t lease);
+    // Retire external graphs first. Keep host snapshots/resources while releasing the stage lease.
+    // Failed drains keep the old stage bound; resume only with an explicit borrowed lease.
+    bool park_publication_stage();
+    bool publication_stage_parked() const noexcept;
     ggml_tensor * publication_tensor(size_t layer, bool value, uint32_t snapshot) const noexcept;
     ggml_tensor * staging_tensor(size_t layer, bool value, uint32_t snapshot) const noexcept;
     // Publish a complete produced plane with one boundary when its physical rows are packed.

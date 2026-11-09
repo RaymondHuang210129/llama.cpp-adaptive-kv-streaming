@@ -1,6 +1,6 @@
 # Multi-slot adaptive KV streaming and phase-arena roadmap
 
-Status: implementation in progress, 2026-11-09. MS1 (CPU planner), MS2 (demand-backed host storage) and MS3 (independent histories/native metadata) are complete as independent components; runtime multi-slot admission remains disabled. MS4-MS14 are pending. No new server configuration is qualified.
+Status: implementation in progress, 2026-11-09. MS1 (CPU planner), MS2 (demand-backed host storage), MS3 (independent histories/native metadata) and MS4 (selected-state storage/ownership) are complete as independent components; runtime multi-slot admission remains disabled. MS5-MS14 are pending. No new server configuration is qualified.
 
 Inspected baseline: `f6ca3e8a172473578b909a4691e616bb2234fb54`, on `feature/ci-workflow-migration`. Recheck the implementation base and local changes before starting work on a dedicated feature branch. Historical measurements retain their original source, binaries, models and configuration; they are not new multi-slot evidence.
 
@@ -370,12 +370,30 @@ An earlier roughly1% Gemma MTP3 slowdown triggered library isolation and P/E-cor
 
 ### MS4 - Selected-state parking and activation
 
-- [ ] Extend recurrent spill/rollback and Gemma bounded local/SWA ownership to physical banks for selected slots.
-- [ ] Preserve pending anchors, rollback rows, current state and semantic generations through park/resume; distinguish physical rebinding from content mutation.
-- [ ] Inject failures before/after queued copies, publication, lease retirement, graph rebinding and activation. Recover the previous state or fail quiescently without duplicate output.
-- [ ] Prove outgoing slots retain no required GPU allocations after completion and that incoming slots do not require a second full arena/state bank.
+- [x] Extend recurrent spill/rollback and Gemma bounded local/SWA ownership to physical banks for selected slots.
+- [x] Preserve pending anchors, rollback rows, current state and semantic generations through park/resume; distinguish physical rebinding from content mutation.
+- [x] Inject failures before/after queued copies, publication, lease retirement, graph rebinding and activation. Recover the previous state or fail quiescently without duplicate output.
+- [x] Prove outgoing slots retain no required GPU allocations after completion and that incoming slots do not require a second full arena/state bank.
 
 Exit: compact real-model pause/resume exactness plus CPU/ASAN ownership/recovery coverage.
+
+Completed as storage/ownership components. Selection projection, complete workload admission, server request/sampler ownership and speculative group integration remain MS6-MS10 work; these passes do not enable `--parallel 2`.
+
+Recurrent current-state roots can start without device payload, quote native allocation sizes and bind checked persistent leases. Parking saves all raw current/provisional/rollback rows in RAM and retains native cells, source/tail indices, rollback indices, spill namespaces/generations and pending bookkeeping. It does not serialize only the accepted checkpoint. Partial capture keeps the original bank; partial restore keeps the saved image and closes execution until retry. State export/import, restore, materialization and publication cannot bypass the parked gate. Clear cannot resurrect old saved bytes.
+
+Gemma local/SWA roots use the existing native constructor/binding path. Their parked image preserves physical encoded row order and native cell metadata, including spatial/token fields; native checkpoint repacking is not substituted for physical suspension. Bounded-owner pins and writer tickets prevent parking unfinished or escaped readers. Callers must drain work and retire every graph/reader before replacing native roots. Failed restore stays unreadable; semantic source IDs, generations and frontiers remain unchanged by a successful physical rebind.
+
+Publication setup can prepare its native queues/events and host destinations without allocating a private device stage. Explicit borrowed current/publication regions must both be present before admission. Actual Qwen geometry quoted 156,893,184 bytes for one current state, 313,786,368 for two, and 19,611,648 for depth-three publication staging, inside the fixed 1 GiB component parent. Retained queue/event resources are not a claim of zero driver footprint; the complete admission catalog remains MS7 work. Native CUDA arithmetic, kernels and reader formats did not change.
+
+TDD preserved missing-API and behavior reds for unbound I/O, invalid geometry, parked operations, incomplete publication binding and stale rows after clear. Real-copy failures exercise retry after actual native downloads/uploads. A strict-run host crash was localized with GDB to an existing short/padded fixture retaining CUDA captures across freed dependencies. The fixture now drains and explicitly retires native captures before releasing its buffers and also proves three live capture/replay epochs with exact bytes/generations. Graphs, API reporting and comparisons were not relaxed.
+
+Final fresh qualification: 11 native gates, including three default-PDL strict memchecks with API reporting `all`, error exit 99, no filters and eager loading only for the tools; all three report zero errors. Native publication executes 42 tests/4,571 assertions; real-geometry Qwen current-state caches execute 1,872 assertions and Gemma physical SWA caches 3,127, normally and strictly. Normal and full ASAN/UBSAN host inventories each execute 54 tests plus two expected CUDA-only tile skips. Ordinary GPU-weight Qwen/Gemma runs compare full logits, hidden vectors and state against uninterrupted matching controls through repeated parking; Gemma uses a wrapped 1,333-token prefix. Existing Qwen MTP depths 1-3 at 16,381 prefill tokens/eight rounds compare 7,736 framed native/streamed records per variant; DFlash shared-workspace and Gemma assistant widths/quotas also pass.
+
+Sanitizer scope is explicit: a full-model Qwen strict attempt could not allocate 12,726.35 MiB of weights before context creation and reported two API errors/exit 99. That failure is preserved, not counted as a memory pass. The strict cache fixtures map the unchanged model weights on CPU, perform no neural computation, and exercise actual native device state/cache geometry, transfers, bindings and failure recovery. The separate ordinary full-model controls retain the original GPU weights and arena. This is not a full-model sanitizer or global OOM-prevention claim.
+
+The final-runtime short single-slot screen and alternating pairs cover Qwen/Gemma target-only/MTP3 and Qwen DFlash7/DFlash7+K4V7: 36 processes, 144 requests and 9,216 generated IDs, with exact prompts, output IDs and speculative counters. Paired decode median changes were +0.123% Qwen target-only, +0.392% Gemma target-only, -0.132% DFlash7 and -0.123% DFlash7+K4V7; residual sub-percent timing differences overlap observed control variation and are not advertised as gains or exact timing parity. The full MS13 long-context/per-mode regression ledger is still required. Both variants use their own pinned libraries, the same 1 GiB arena, 4 Ki context, 1,333-token natural SWE prompt, 64 outputs, one warmup/three fresh measured requests and four distinct P cores. No clock or production setting changed.
+
+Evidence, failed attempts, source patches and immutable own-library cohorts remain local under `benchmarks/results/multi-slot-20261109/` (`ms4-qualification.json`, `ms4-final/`, `ms4-final-runtime-bin/` and the final performance directories). Final source/binary/input identities were checked before/after qualification. Binaries were compiled from the preceding commit plus the saved qualified patch and are not relabelled as rebuilt by the metadata-only milestone commit. Raw artifacts are not committed.
 
 ### MS5 - Exclusive page partition and span planning
 

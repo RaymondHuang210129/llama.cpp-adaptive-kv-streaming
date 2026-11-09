@@ -251,6 +251,70 @@ int main(int argc, char ** argv) {
                 t.assert_equal(before.bytes,layout.allocation.bytes);
             }
     });
+    t.test("bounded_state_parking_preserves_identity_and_rejects_unfinished_or_escaped_readers", [](testing & t) {
+        auto * type=ggml_backend_cpu_buffer_type();
+        llama_memory_cache_requirement cache;
+        cache.identity={809,3}; cache.role=llama_memory_cache_role::bounded_resident;
+        cache.layers=1;cache.history_rows=4096;cache.window_rows=16;cache.headroom_rows=16;cache.row_padding=32;
+        cache.format={GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,32,32,1,false};cache.row_bytes=52;
+        llama_memory_bounded_kv_layout layout;
+        if (!t.assert_true(llama_memory_bounded_kv_layout_make(cache,{7},type,layout))) return;
+        const size_t a=layout.allocation.alignment,bytes=layout.allocation.bytes;
+        arena_ptr arena(ggml_backend_memory_arena_new(type,bytes+2*a),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),91,a,bytes,a,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        lease_ptr lease(ggml_backend_memory_arena_acquire(arena.get(),91),ggml_backend_memory_lease_free);
+        llama_memory_bounded_kv owner(layout);
+        if (!t.assert_true(lease && owner.bind(lease.get()))) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(lease.get()),0x53);
+        std::vector<uint8_t> saved(bytes);
+        size_t captures=0;
+        const auto save=[&](const llama_memory_bounded_kv_read & source) {
+            ++captures;
+            t.assert_true(!owner.read(cache.identity) && !owner.begin_write(cache.identity));
+            std::memcpy(saved.data(),ggml_backend_buffer_get_base(source.buffer()),bytes);
+            return true;
+        };
+        auto pin=owner.read(cache.identity);
+        t.assert_true(!owner.park(cache.identity,save) && captures==0);
+        pin.reset();
+        const auto write=owner.begin_write(cache.identity);
+        t.assert_true(write && !owner.park(cache.identity,save) && owner.finish_write(write,true));
+        cache.identity=owner.identity();
+        t.assert_true(!owner.park({809,3},save));
+        t.assert_true(!owner.park(cache.identity,[](const auto &) -> bool { throw std::runtime_error("snapshot failure"); }));
+        t.assert_true(bool(owner.read(cache.identity)));
+        t.assert_true(!owner.park(cache.identity,[&](const auto & source) { pin=source;return true; }));
+        t.assert_true(!owner.parked() && bool(pin));pin.reset();
+        if (!t.assert_true(owner.park(cache.identity,save))) return;
+        t.assert_true(owner.parked() && !owner.read(cache.identity) && !owner.begin_write(cache.identity));
+        t.assert_equal(uint64_t(4),owner.identity().generation);
+        t.assert_true(!owner.bind(lease.get()));
+        lease.reset();
+        if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),92,a,bytes,a,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        lease.reset(ggml_backend_memory_arena_acquire(arena.get(),92));
+        if (!t.assert_true(bool(lease))) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(lease.get()),0xa5);
+        const auto restore=[&](ggml_backend_buffer_t destination) {
+            t.assert_true(!owner.read(cache.identity) && !owner.begin_write(cache.identity));
+            std::memcpy(ggml_backend_buffer_get_base(destination),saved.data(),bytes);
+            return true;
+        };
+        t.assert_true(!owner.restore_parked({810,4},lease.get(),restore));
+        t.assert_true(!owner.restore_parked(cache.identity,lease.get(),[&](auto destination) {
+            ggml_backend_buffer_clear(destination,0x6b);return false;
+        }));
+        t.assert_true(owner.parked() && !owner.read(cache.identity));
+        if (!t.assert_true(owner.restore_parked(cache.identity,lease.get(),restore))) return;
+        t.assert_true(!owner.parked());
+        pin=owner.read(cache.identity);
+        if (!t.assert_true(bool(pin))) return;
+        t.assert_equal(uint64_t(4),owner.identity().generation);
+        t.assert_true(!std::memcmp(saved.data(),ggml_backend_buffer_get_base(pin.buffer()),bytes));
+    });
     t.test("bounded_KV_pins_preserve_storage_and_close_stale_writer_admission", [](testing & t) {
         auto * buft=ggml_backend_cpu_buffer_type();
         llama_memory_cache_requirement cache;

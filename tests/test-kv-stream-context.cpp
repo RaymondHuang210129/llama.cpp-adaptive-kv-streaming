@@ -542,6 +542,33 @@ static void test_dflash_failure_recovery(testing & t,llama_model * model,const c
     }
 }
 
+struct image_writer : llama_io_write_i {
+    std::vector<uint8_t> bytes;
+    void write(const void * data,size_t size) override {
+        const auto * begin=static_cast<const uint8_t *>(data);
+        bytes.insert(bytes.end(),begin,begin+size);
+    }
+    void write_tensor(ggml_tensor * tensor,size_t offset,size_t size) override {
+        const auto start=bytes.size(); bytes.resize(start+size);
+        ggml_backend_tensor_get(tensor,bytes.data()+start,offset,size);
+    }
+    size_t n_bytes() override { return bytes.size(); }
+};
+struct image_reader : llama_io_read_i {
+    const std::vector<uint8_t> & bytes;
+    size_t cursor=0;
+    explicit image_reader(const std::vector<uint8_t> & bytes) : bytes(bytes) {}
+    void read(void * data,size_t size) override {
+        if (size > bytes.size()-cursor) throw std::runtime_error("truncated lifecycle fixture");
+        std::memcpy(data,bytes.data()+cursor,size); cursor+=size;
+    }
+    void read_tensor(ggml_tensor * tensor,size_t offset,size_t size) override {
+        if (size > bytes.size()-cursor) throw std::runtime_error("truncated lifecycle tensor");
+        ggml_backend_tensor_set(tensor,bytes.data()+cursor,offset,size); cursor+=size;
+    }
+    size_t n_bytes() override { return cursor; }
+};
+
 struct recurrent_snapshot : llama_io_write_i {
     std::vector<uint8_t> metadata;
     std::vector<std::vector<float>> tensors;
@@ -564,6 +591,231 @@ struct run_result {
 };
 
 // Compare matching target forwards, selected rollback state and replay without allocating a draft context.
+struct native_state_copy_fault {
+    inline static native_state_copy_fault * active=nullptr;
+    ggml_backend_buffer_ptr buffer;
+    decltype(ggml_backend_buffer_i::get_tensor) get;
+    decltype(ggml_backend_buffer_i::set_tensor) set;
+    size_t calls=0;
+    native_state_copy_fault(ggml_backend_buffer_t source,bool upload) : buffer(ggml_backend_buffer_retain(source)),
+        get(source->iface.get_tensor),set(source->iface.set_tensor) {
+        GGML_ASSERT(!active);active=this;
+        if (upload) source->iface.set_tensor=[](ggml_backend_buffer_t b,ggml_tensor * tensor,const void * data,size_t offset,size_t bytes) {
+            active->set(b,tensor,data,offset,bytes);
+            if (++active->calls==2) throw std::runtime_error("after native state upload");
+        };
+        else source->iface.get_tensor=[](ggml_backend_buffer_t b,const ggml_tensor * tensor,void * data,size_t offset,size_t bytes) {
+            active->get(b,tensor,data,offset,bytes);
+            if (++active->calls==2) throw std::runtime_error("after native state download");
+        };
+    }
+    ~native_state_copy_fault() { buffer->iface.get_tensor=get;buffer->iface.set_tensor=set;active=nullptr; }
+};
+
+struct native_state_export_probe : llama_io_write_i {
+    size_t calls=0;
+    void write(const void *,size_t) override { ++calls;throw std::runtime_error("state export started"); }
+    void write_tensor(ggml_tensor *,size_t,size_t) override { ++calls;throw std::runtime_error("state export started"); }
+    size_t n_bytes() override { return 0; }
+};
+
+static void test_selected_current_parking(testing & t,llama_model * model) {
+    if (!t.assert_true(model && (model->arch==LLM_ARCH_QWEN35 || model->arch==LLM_ARCH_GEMMA4))) return;
+    const bool gemma=model->arch==LLM_ARCH_GEMMA4;
+    const int32_t prompt=gemma ? 1333 : 64;
+    kv_stream_bit_oracle oracle;
+    for (bool moved : {false,true}) {
+        if (moved) oracle.compare();
+        auto cp=llama_context_default_params();
+        cp.n_ctx=4096;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=1;
+        cp.n_threads=cp.n_threads_batch=4;cp.n_rs_seq=0;
+        cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;
+        cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.shared_device_memory_bytes=size_t(1024)*1048576;
+        cp.swa_full=false;cp.pooling_type=LLAMA_POOLING_TYPE_NONE;
+        std::unique_ptr<llama_context_memory_loan> current;
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> local_arena(nullptr,ggml_backend_memory_arena_free);
+        std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> local_lease(nullptr,ggml_backend_memory_lease_free);
+        context_ptr context(llama_init_from_model(model,cp),llama_free);
+        if (!t.assert_true(bool(context))) return;
+        auto * hybrid=dynamic_cast<llama_memory_hybrid *>(llama_get_memory(context.get()));
+        auto * owner=llama_context_compute_memory(context.get());
+        auto * iswa=dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(context.get()));
+        if (!t.assert_true((gemma ? iswa!=nullptr : hybrid!=nullptr) && owner && owner->shares_kv_memory())) return;
+        auto * recurrent=hybrid ? hybrid->get_mem_recr() : nullptr;
+        auto * local=iswa ? iswa->get_swa() : nullptr;
+        auto * stream=(gemma ? iswa->get_base() : hybrid->get_mem_attn())->get_kv_stream();
+        llama_set_embeddings(context.get(),true);
+        if (!t.assert_true(stream!=nullptr)) return;
+        common_batch batch(context.get());
+        for (int32_t first=0;first<prompt;) {
+            const int32_t rows=std::min<int32_t>(256,prompt-first);
+            batch.clear();
+            for (int32_t row=0;row<rows;++row) batch.add(llama_token(10+(first+row)%64),first+row,0,row==rows-1);
+            if (!t.assert_equal(0,llama_process(context.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get()))) return;
+            first+=rows;
+        }
+        llama_set_kv_stream_decode(context.get(),true);
+        for (int32_t step=0;step<8;++step) {
+            if (moved && (step==1 || step==4)) {
+                llama_synchronize(context.get());
+                if (!t.assert_true(owner->prepare_serial_target() && owner->retire_graph())) return;
+                const auto tokens=stream->tokens();
+                llama_memory_cache_requirement before_source;
+                if (!t.assert_true(stream->read_source(before_source))) return;
+                if (gemma) {
+                    if (!local_arena) {
+                        auto * buffer=local->get_k_storage(0)->buffer;
+                        const auto bytes=ggml_backend_buffer_get_size(buffer);
+                        local_arena.reset(ggml_backend_memory_arena_new_from_buffer(buffer));
+                        if (!t.assert_true(local_arena && ggml_backend_memory_arena_begin(local_arena.get(),0) &&
+                                ggml_backend_memory_arena_reserve_at(local_arena.get(),91,0,bytes,
+                                    ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(buffer)),
+                                    GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) && ggml_backend_memory_arena_commit(local_arena.get()))) return;
+                        local_lease.reset(ggml_backend_memory_arena_acquire(local_arena.get(),91));
+                    }
+                    if (step==1) {
+                        native_state_copy_fault fault(local->get_k_storage(0)->buffer,false);
+                        t.assert_true(!local->park_bounded_storage());
+                        t.assert_equal(size_t(2),fault.calls);
+                        t.assert_true(!local->bounded_storage_pending());
+                    }
+                    if (!t.assert_true(local_lease && local->park_bounded_storage() && local->bounded_storage_pending())) return;
+                    native_state_export_probe probe;
+                    bool rejected=false;
+                    try { local->state_write(probe,0,0); } catch (const std::runtime_error &) { rejected=true; }
+                    if (!t.assert_true("parked bounded state export rejects before touching the output",rejected && probe.calls==0)) return;
+                    t.assert_true(!local->bind_bounded_storage(local_lease.get()));
+                    ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(local_lease.get()),0xa5);
+                    if (step==1) {
+                        native_state_copy_fault fault(ggml_backend_memory_lease_buffer(local_lease.get()),true);
+                        t.assert_true(!local->restore_bounded_storage(local_lease.get()));
+                        t.assert_equal(size_t(2),fault.calls);
+                        t.assert_true(local->bounded_storage_pending() && !local->get_k_storage(0)->data);
+                    }
+                    if (!t.assert_true(local->restore_bounded_storage(local_lease.get()))) return;
+                } else {
+                recurrent_snapshot before;recurrent->state_write(before,0,0);
+                if (step==1 && !t.assert_true(recurrent->enable_current_storage_parking(
+                        ggml_backend_buffer_get_type(owner->shared_parent())))) return;
+                ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+                if (!t.assert_true(recurrent->current_storage_requirements(type,bytes) && recurrent->park_current_storage())) return;
+                if (!current) current=owner->reserve_staging(bytes);
+                if (!t.assert_true(current && recurrent->restore_current_storage(current->lease()))) return;
+                recurrent_snapshot after;recurrent->state_write(after,0,0);
+                if (!t.assert_true(before.metadata==after.metadata && before.tensors.size()==after.tensors.size())) return;
+                for (size_t layer=0;layer<before.tensors.size();++layer)
+                    t.assert_true(kv_stream_bytes_equal(before.tensors[layer].data(),before.tensors[layer].size()*sizeof(float),
+                        after.tensors[layer].data(),after.tensors[layer].size()*sizeof(float)));
+                }
+                llama_memory_cache_requirement after_source;
+                if (!t.assert_true(stream->read_source(after_source))) return;
+                t.assert_equal(before_source.identity.id,after_source.identity.id);
+                t.assert_equal(before_source.identity.generation,after_source.identity.generation);
+                t.assert_equal(before_source.history_rows,after_source.history_rows);
+                t.assert_equal(tokens,stream->tokens());
+                t.assert_equal(cp.shared_device_memory_bytes,owner->shared_parent_capacity());
+            }
+            batch.clear();batch.add(llama_token(80+step),prompt+step,0,true);
+            if (!t.assert_equal(0,llama_process(context.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get()))) return;
+            llama_synchronize(context.get());
+            const auto name="current/"+std::to_string(step);
+            oracle.bytes(name+"/logits",llama_get_logits_ith(context.get(),0),
+                size_t(llama_vocab_n_tokens(llama_model_get_vocab(model)))*sizeof(float));
+            oracle.bytes(name+"/hidden",llama_get_embeddings_ith(context.get(),0),size_t(model->hparams.n_embd_out())*sizeof(float));
+        }
+        recurrent_snapshot final;
+        if (recurrent) recurrent->state_write(final,0,0);
+        oracle.bytes("current/final-metadata",final.metadata.data(),final.metadata.size());
+        for (size_t layer=0;layer<final.tensors.size();++layer)
+            oracle.bytes("current/final/"+std::to_string(layer),final.tensors[layer].data(),final.tensors[layer].size()*sizeof(float));
+        if (moved) oracle.finish();
+    }
+}
+
+// Real model geometry, native device state, and CPU-mapped weights; this fixture performs no neural computation.
+static void test_qwen_current_cache_parking(testing & t,llama_model * model) {
+    if (!t.assert_true(model && model->arch==LLM_ARCH_QWEN35)) return;
+    for (const auto & shape : std::vector<std::pair<uint32_t,uint32_t>>{{1,0},{2,0},{1,3}}) {
+        const auto selected=shape.first,depth=shape.second;
+        llama_memory_recurrent memory(*model,GGML_TYPE_F32,GGML_TYPE_F32,true,selected,selected,depth,
+            [&](int32_t layer) { return model->hparams.is_recr(layer); },depth!=0,true);
+        ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+        if (!t.assert_true(memory.current_storage_requirements(type,bytes))) return;
+        const auto alignment=ggml_backend_buft_get_alignment(type);
+        size_t stage_bytes=0;
+        if (depth) {
+            std::vector<llama_recurrent_spill_layer> specs(memory.r_l.size());
+            for (size_t layer=0;layer<specs.size();++layer) if (memory.r_l[layer]) specs[layer]={
+                GGML_TYPE_F32,GGML_TYPE_F32,uint64_t(memory.r_l[layer]->ne[0]),uint64_t(memory.s_l[layer]->ne[0]),true};
+            llama_recurrent_spill_layout rows;llama_recurrent_stage_layout stage;
+            if (!t.assert_true(llama_recurrent_spill_layout_make(specs,selected,depth,rows) &&
+                    llama_recurrent_stage_layout_make(rows,2,alignment,stage))) return;
+            stage_bytes=stage.total_bytes;
+            t.assert_true(memory.spill_bank()->publication_stage_parked() && memory.spill_bank()->staged_device_bytes()==0);
+        }
+        constexpr size_t capacity=size_t(1024)*1048576;
+        if (!t.assert_true(bytes<=capacity && stage_bytes<=capacity-bytes)) return;
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new(type,capacity),ggml_backend_memory_arena_free);
+        if (!t.assert_true(bool(arena))) return;
+        const auto plan=[&](uint64_t id) {
+            return ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),id,0,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                (!depth || ggml_backend_memory_arena_reserve_at(arena.get(),id+1,bytes,stage_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr)) &&
+                ggml_backend_memory_arena_commit(arena.get());
+        };
+        if (!t.assert_true(plan(101))) return;
+        using lease_ptr=std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)>;
+        lease_ptr current(ggml_backend_memory_arena_acquire(arena.get(),101),ggml_backend_memory_lease_free),
+            publication(depth ? ggml_backend_memory_arena_acquire(arena.get(),102) : nullptr,ggml_backend_memory_lease_free);
+        if (!t.assert_true(current && memory.bind_current_storage(current.get()) && (!depth || memory.bind_spill_stage(publication.get())))) return;
+        std::vector<std::vector<float>> expected;
+        for (size_t layer=0;layer<memory.r_l.size();++layer) for (auto * tensor : {memory.r_l[layer],memory.s_l[layer]}) {
+            if (!tensor) continue;
+            expected.emplace_back(ggml_nelements(tensor));
+            auto & row=expected.back();
+            for (size_t i=0;i<row.size();++i) row[i]=float(int(i%97)-48)*0.125f+float(layer);
+            row[0]=-0.0f;
+            ggml_backend_tensor_set(tensor,row.data(),0,ggml_nbytes(tensor));
+        }
+        memory.used=selected;memory.head=selected-1;memory.n=selected;
+        for (uint32_t seq=0;seq<selected;++seq) {
+            memory.cells[seq].pos=llama_pos(71+seq);memory.cells[seq].tail=seq;
+            memory.cells[seq].src=int32_t(seq);memory.cells[seq].src0=int32_t(seq);memory.cells[seq].seq_id.insert(seq);
+        }
+        if (!t.assert_true(memory.park_current_storage() && memory.current_storage_pending())) return;
+        current.reset();publication.reset();
+        if (!t.assert_true(plan(111))) return;
+        current.reset(ggml_backend_memory_arena_acquire(arena.get(),111));
+        if (depth) publication.reset(ggml_backend_memory_arena_acquire(arena.get(),112));
+        if (!t.assert_true(bool(current))) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(arena.get()),0xa5);
+        {
+            native_state_copy_fault fault(ggml_backend_memory_lease_buffer(current.get()),true);
+            t.assert_true(!memory.restore_current_storage(current.get(),publication.get()));
+            t.assert_equal(size_t(2),fault.calls);
+            t.assert_true(memory.current_storage_parked() && memory.current_storage_pending());
+        }
+        if (!t.assert_true(memory.restore_current_storage(current.get(),publication.get()))) return;
+        size_t index=0;
+        for (size_t layer=0;layer<memory.r_l.size();++layer) for (auto * tensor : {memory.r_l[layer],memory.s_l[layer]}) {
+            if (!tensor) continue;
+            std::vector<float> actual(expected[index].size());
+            ggml_backend_tensor_get(tensor,actual.data(),0,ggml_nbytes(tensor));
+            t.assert_true(kv_stream_bytes_equal(expected[index].data(),expected[index].size()*sizeof(float),actual.data(),ggml_nbytes(tensor)));
+            ++index;
+        }
+        t.assert_equal(selected,memory.used);t.assert_equal(selected-1,memory.head);
+        for (uint32_t seq=0;seq<selected;++seq) t.assert_true(memory.cells[seq].has_seq_id(seq) &&
+            memory.cells[seq].pos==llama_pos(71+seq) && memory.cells[seq].tail==int32_t(seq));
+        t.assert_true(!memory.current_storage_pending() && memory.prepare({}));
+        if (depth) t.assert_true(memory.staged_publication_enabled() && !memory.spill_bank()->publication_stage_parked());
+        t.out << "Qwen native current selected=" << selected << " rollback=" << depth << " bytes=" << bytes
+              << " publication=" << stage_bytes << " parent=" << capacity << std::endl;
+    }
+}
+
 static void test_wide_target_rollback(testing & t,llama_model * model) {
     kv_stream_exact_config cfg;
     std::ifstream input(cfg.corpus,std::ios::binary);
@@ -1333,32 +1585,6 @@ static void test_gemma_lifecycle(testing & t, llama_model * model) {
     t.assert_true(full == positions(*cache.get_base()));
     t.assert_true("rejected interior removal preserves local cells",local == positions(*cache.get_swa()));
 
-    struct image_writer : llama_io_write_i {
-        std::vector<uint8_t> bytes;
-        void write(const void * data,size_t size) override {
-            const auto * begin=static_cast<const uint8_t *>(data);
-            bytes.insert(bytes.end(),begin,begin+size);
-        }
-        void write_tensor(ggml_tensor * tensor,size_t offset,size_t size) override {
-            const auto start=bytes.size(); bytes.resize(start+size);
-            ggml_backend_tensor_get(tensor,bytes.data()+start,offset,size);
-        }
-        size_t n_bytes() override { return bytes.size(); }
-    };
-    struct image_reader : llama_io_read_i {
-        const std::vector<uint8_t> & bytes;
-        size_t cursor=0;
-        explicit image_reader(const std::vector<uint8_t> & bytes) : bytes(bytes) {}
-        void read(void * data,size_t size) override {
-            if (size > bytes.size()-cursor) throw std::runtime_error("truncated lifecycle fixture");
-            std::memcpy(data,bytes.data()+cursor,size); cursor+=size;
-        }
-        void read_tensor(ggml_tensor * tensor,size_t offset,size_t size) override {
-            if (size > bytes.size()-cursor) throw std::runtime_error("truncated lifecycle tensor");
-            ggml_backend_tensor_set(tensor,bytes.data()+cursor,offset,size); cursor+=size;
-        }
-        size_t n_bytes() override { return cursor; }
-    };
     const auto save=[&] {
         image_writer image;
         cache.state_write(image,0,0);
@@ -1902,6 +2128,100 @@ static void test_gemma_deferred_local(testing & t, llama_model * model) {
     llama_memory_bounded_kv_layout bound;
     t.assert_true(local->describe_bounded_storage(608,1,8192,256,bound));
     t.assert_equal(bytes,bound.allocation.bytes);
+    auto & cells=const_cast<llama_kv_cells &>(local->get_cells(0));
+    cells.pos_set(0,17);cells.seq_add(0,0);
+    image_writer image;
+    local->state_write(image,0,0);
+    const auto full_generation=cache.get_base()->get_kv_stream()->tokens();
+    if (!t.assert_true(local->release_bounded_storage())) return;
+    t.assert_true(local->bounded_storage_pending() && local->get_cells(0).get_used()==0);
+    t.assert_true(!local->get_k_storage(0)->data && !local->get_v_storage(0)->data);
+    t.assert_true(local->release_bounded_storage());
+    lease.reset();short_lease.reset();short_arena.reset();short_buffer.reset();
+    if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) &&
+            ggml_backend_memory_arena_reserve_at(arena.get(),79,alignment,bytes,alignment,
+                GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) && ggml_backend_memory_arena_commit(arena.get()))) return;
+    lease.reset(ggml_backend_memory_arena_acquire(arena.get(),79));
+    if (!t.assert_true(bool(lease))) return;
+    ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(lease.get()),0xa5);
+    if (!t.assert_true(local->bind_bounded_storage(lease.get()))) return;
+    image_reader restored(image.bytes);
+    local->state_read(restored,0,0);
+    t.assert_equal(image.bytes.size(),restored.n_bytes());
+    t.assert_equal(llama_pos(17),local->seq_pos_max(0));
+    t.assert_equal(uint32_t(1),local->get_cells(0).get_used());
+    ggml_backend_tensor_get(local->get_k_storage(0),after.data(),0,after.size());
+    t.assert_true(marker==after);
+    t.assert_equal(full_generation,cache.get_base()->get_kv_stream()->tokens());
+    cells.pos_set(511,18);cells.seq_add(511,0);cells.pos_set(1250,19);cells.seq_add(1250,0);
+    cells.ext_set(511,{31,12,4097});cells.ext_set(1250,{5,7,LLAMA_TOKEN_NULL});
+    const auto physical_cells=local->get_cells(0);
+    kv_stream_bit_oracle physical;
+    for (const auto & layer : quote.layers) for (bool value : {false,true}) {
+        auto * tensor=value ? local->get_v_storage(int32_t(layer.id)) : local->get_k_storage(int32_t(layer.id));
+        physical.tensor("SWA/"+std::to_string(layer.id)+(value ? "/V" : "/K"),tensor);
+    }
+    {
+        native_state_copy_fault fault(local->get_k_storage(0)->buffer,false);
+        t.assert_true(!local->park_bounded_storage());
+        t.assert_equal(size_t(2),fault.calls);t.assert_true(!local->bounded_storage_pending());
+    }
+    if (!t.assert_true(local->park_bounded_storage())) return;
+    t.assert_true(local->bounded_storage_pending() && !local->get_k_storage(0)->data);
+    t.assert_equal(physical_cells.get_used(),local->get_cells(0).get_used());
+    native_state_export_probe probe;
+    bool rejected=false;
+    try { local->state_write(probe,0,0); } catch (const std::runtime_error &) { rejected=true; }
+    t.assert_true(rejected && probe.calls==0);
+    lease.reset();
+    if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) &&
+            ggml_backend_memory_arena_reserve_at(arena.get(),89,alignment,bytes,alignment,
+                GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) && ggml_backend_memory_arena_commit(arena.get()))) return;
+    lease.reset(ggml_backend_memory_arena_acquire(arena.get(),89));
+    if (!t.assert_true(bool(lease))) return;
+    ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(lease.get()),0x6b);
+    {
+        native_state_copy_fault fault(ggml_backend_memory_lease_buffer(lease.get()),true);
+        t.assert_true(!local->restore_bounded_storage(lease.get()));
+        t.assert_equal(size_t(2),fault.calls);
+        t.assert_true(local->bounded_storage_pending() && !local->get_k_storage(0)->data);
+    }
+    t.assert_true(!local->bind_bounded_storage(lease.get()));
+    if (!t.assert_true(local->restore_bounded_storage(lease.get()))) return;
+    physical.compare();
+    for (const auto & layer : quote.layers) for (bool value : {false,true}) {
+        auto * tensor=value ? local->get_v_storage(int32_t(layer.id)) : local->get_k_storage(int32_t(layer.id));
+        physical.tensor("SWA/"+std::to_string(layer.id)+(value ? "/V" : "/K"),tensor);
+    }
+    physical.finish();
+    for (uint32_t row=0;row<quote.allocation.capacity_rows;++row) {
+        const auto & restored_cells=local->get_cells(0);
+        if (!t.assert_equal(physical_cells.is_empty(row),restored_cells.is_empty(row))) return;
+        if (!physical_cells.is_empty(row)) {
+            t.assert_equal(physical_cells.pos_get(row),restored_cells.pos_get(row));
+            t.assert_true(physical_cells.seq_get_all(row)==restored_cells.seq_get_all(row));
+            const auto & expected_ext=physical_cells.ext_get(row);
+            const auto & actual_ext=restored_cells.ext_get(row);
+            t.assert_equal(expected_ext.x,actual_ext.x);t.assert_equal(expected_ext.y,actual_ext.y);
+            t.assert_equal(expected_ext.tok,actual_ext.tok);
+        }
+    }
+    t.assert_equal(physical_cells.get_used(),local->get_cells(0).get_used());
+    t.assert_equal(full_generation,cache.get_base()->get_kv_stream()->tokens());
+    if (!t.assert_true(local->park_bounded_storage())) return;
+    local->clear(true);
+    if (!t.assert_true(local->restore_bounded_storage(lease.get()))) return;
+    t.assert_equal(uint32_t(0),local->get_cells(0).get_used());
+    for (const auto & layer : quote.layers) for (bool value : {false,true}) {
+        auto * tensor=value ? local->get_v_storage(int32_t(layer.id)) : local->get_k_storage(int32_t(layer.id));
+        std::vector<uint8_t> zero(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor,zero.data(),0,zero.size());
+        t.assert_true(std::all_of(zero.begin(),zero.end(),[](uint8_t byte) {return byte==0;}));
+    }
+    ggml_backend_tensor_get(&raw,guard.data(),0,guard.size());
+    t.assert_true(std::all_of(guard.begin(),guard.end(),[](uint8_t byte) {return byte==0x5a;}));
+    ggml_backend_tensor_get(&raw,guard.data(),alignment+bytes,guard.size());
+    t.assert_true(std::all_of(guard.begin(),guard.end(),[](uint8_t byte) {return byte==0x5a;}));
 }
 
 static void test_gemma_stream_groups(testing & t, llama_model * model) {
@@ -3649,12 +3969,24 @@ int main(int argc,char ** argv) {
     }
     auto mparams = llama_model_default_params(); mparams.n_gpu_layers = 999;
     const llama_model_tensor_buft_override cache_only_weights[]={{".*",ggml_backend_cpu_buffer_type()},{nullptr,nullptr}};
-    if (std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-read-source-cache"); })) {
-        // This cache-only oracle needs no weight computation; leave VRAM for the stock full-history attention graph.
+    const bool deferred_local_cache_only=std::any_of(argv+3,argv+argc,[](const char * arg) {
+        return !std::strcmp(arg,"--gemma-deferred-local-cache-only");
+    });
+    const bool recurrent_cache_only=std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--qwen-current-cache-only"); });
+    if (recurrent_cache_only || deferred_local_cache_only || std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-read-source-cache"); })) {
+        // Cache-only oracles compute no weights; preserve device memory for their native cache/control graphs.
         mparams.tensor_buft_overrides=cache_only_weights;
     }
     mparams.load_mtp = embedded_mtp_control || mtp_memory_probe || mtp_sustained_control || target_drift_control || rollback_probe || serial_workspace_growth || mtp_bit_exact_control;
     model_ptr model(llama_model_load_from_file(argv[2],mparams),llama_model_free);
+    if (recurrent_cache_only) {
+        t.test("Qwen_real_geometry_native_current_banks_park_and_restore",[&](testing & t) { test_qwen_current_cache_parking(t,model.get()); });
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--qwen-current-park") || !std::strcmp(arg,"--gemma-current-park"); })) {
+        t.test("Selected_current_state_parking_preserves_native_vectors",[&](testing & t) { test_selected_current_parking(t,model.get()); });
+        return t.summary();
+    }
     for (int i=3;i<argc;++i) if (!std::strcmp(argv[i],"--gemma-acceptance")) {
         if (i+1 == argc) { std::fprintf(stderr,"missing Gemma assistant artifact\n"); return 1; }
         const bool compact=std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-assistant-memory"); });
@@ -3762,7 +4094,7 @@ int main(int argc,char ** argv) {
             [&](testing & t) { test_gemma_phase_parent(t,model.get(),true); });
         return t.summary();
     }
-    if (std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-deferred-local"); })) {
+    if (deferred_local_cache_only || std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-deferred-local"); })) {
         t.test("Gemma_local_cache_metadata_binds_transactionally_without_private_storage",
             [&](testing & t) { test_gemma_deferred_local(t,model.get()); });
         return t.summary();

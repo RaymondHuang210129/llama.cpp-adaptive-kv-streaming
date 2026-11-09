@@ -175,7 +175,12 @@ bool llama_kv_cache::describe_bounded_storage(uint64_t identity,uint64_t generat
     output=std::move(next); return true;
 }
 
-bool llama_kv_cache::bounded_storage_pending() const noexcept { return bounded_pending; }
+struct llama_kv_cache::bounded_parking_state {
+    std::vector<std::vector<uint8_t>> rows;
+    bool restoring = false;
+};
+
+bool llama_kv_cache::bounded_storage_pending() const noexcept { return bounded_pending || bool(parked_bounded); }
 
 bool llama_kv_cache::bind_bounded_storage(ggml_backend_memory_lease_t lease) {
     if (!lease || !n_swa || n_seq_max != 1 || n_stream != 1 || other || kv_stream || attached_mtp_cache ||
@@ -188,7 +193,8 @@ bool llama_kv_cache::bind_bounded_storage(ggml_backend_memory_lease_t lease) {
             old.id == next.id && old.offset == next.offset && old.size == next.size &&
             old.alignment == next.alignment && old.flags == next.flags;
     }
-    for (const auto & cells : v_cells) if (cells.get_used()) return false;
+    if (parked_bounded && !parked_bounded->restoring) return false;
+    if (!parked_bounded) for (const auto & cells : v_cells) if (cells.get_used()) return false;
     try {
         auto * buffer=ggml_backend_memory_lease_buffer(lease);
         auto * buft=ggml_backend_buffer_get_type(ctxs_bufs.front().second.get());
@@ -216,6 +222,71 @@ bool llama_kv_cache::bind_bounded_storage(ggml_backend_memory_lease_t lease) {
         bounded_pending=false;
         return true;
     } catch (...) { return false; }
+}
+
+bool llama_kv_cache::release_bounded_storage() {
+    if (!n_swa || n_seq_max!=1 || n_stream!=1 || other || kv_stream || attached_mtp_cache ||
+            layers.empty() || ctxs_bufs.size()!=1) return false;
+    if (bounded_pending) return !bounded_lease;
+    if (!bounded_lease) return false;
+    try {
+        const auto ids=get_layer_ids();
+        const layer_filter_cb filter=[&](int32_t il) { return std::find(ids.begin(),ids.end(),uint32_t(il))!=ids.end(); };
+        llama_memory_params params{};
+        params.type_k=type_k();params.type_v=type_v();params.defer_bounded_cache=true;
+        llama_kv_cache next(model,hparams,params.type_k,params.type_v,v_trans,true,true,get_size(),1,n_pad,
+            n_swa,swa_type,nullptr,filter,nullptr,nullptr,"",&params);
+        if (next.get_layer_ids()!=ids || next.ctxs_bufs.size()!=1 || !next.bounded_pending || next.bounded_lease) return false;
+        retired_bounded_metadata.clear();
+        ctxs_bufs.swap(next.ctxs_bufs);
+        layers.swap(next.layers);
+        map_layer_ids.swap(next.map_layer_ids);
+        bounded_lease.swap(next.bounded_lease);
+        std::swap(bounded_pending,next.bounded_pending);
+        if (!parked_bounded) for (uint32_t stream=0;stream<n_stream;++stream) {
+            v_cells[stream].reset();v_heads[stream]=0;
+        }
+        return true;
+    } catch (...) { return false; }
+}
+
+bool llama_kv_cache::park_bounded_storage() {
+    if (parked_bounded) return bounded_pending || release_bounded_storage();
+    if (bounded_pending || !bounded_lease || !n_swa || n_seq_max!=1 || n_stream!=1 || other ||
+            kv_stream || attached_mtp_cache || layers.empty() || ctxs_bufs.size()!=1) return false;
+    try {
+        auto next=std::make_unique<bounded_parking_state>();
+        for (const auto & layer : layers) for (auto * tensor : {layer.k,layer.v}) {
+            if (!tensor || !tensor->data || !ggml_is_contiguous(tensor)) return false;
+            next->rows.emplace_back(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor,next->rows.back().data(),0,next->rows.back().size());
+        }
+        parked_bounded=std::move(next);
+        if (release_bounded_storage()) return true;
+        parked_bounded.reset();
+    } catch (...) {}
+    return false;
+}
+
+bool llama_kv_cache::restore_bounded_storage(ggml_backend_memory_lease_t lease) {
+    if (!parked_bounded || !bounded_pending || !lease) return false;
+    parked_bounded->restoring=true;
+    if (!bind_bounded_storage(lease)) { parked_bounded->restoring=false;return false; }
+    try {
+        size_t index=0;
+        for (const auto & layer : layers) for (auto * tensor : {layer.k,layer.v}) {
+            const auto & row=parked_bounded->rows.at(index++);
+            if (row.size()!=ggml_nbytes(tensor)) throw std::runtime_error("parked bounded row geometry changed");
+            ggml_backend_tensor_set(tensor,row.data(),0,row.size());
+        }
+        if (index!=parked_bounded->rows.size()) throw std::runtime_error("parked bounded layer count changed");
+        parked_bounded.reset();
+        return true;
+    } catch (...) {
+        parked_bounded->restoring=false;
+        release_bounded_storage();
+        return false;
+    }
 }
 
 std::unique_ptr<llama_memory_bounded_kv> llama_kv_cache::retain_bounded_storage(uint64_t identity,uint64_t generation,
@@ -767,6 +838,7 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+    if (data && parked_bounded) for (auto & row : parked_bounded->rows) std::fill(row.begin(),row.end(),0);
 }
 
 bool llama_kv_cache::kv_stream_can_remove(llama_seq_id seq_id,llama_pos p0,llama_pos p1,size_t * retained) const {
@@ -1194,7 +1266,7 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
 
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
-    if (bounded_pending) return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    if (bounded_storage_pending()) return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 
     bool do_shift = get_has_shift();
 
@@ -1203,7 +1275,7 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
-    if (bounded_pending) return res;
+    if (bounded_storage_pending()) return res;
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -1350,6 +1422,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+    if (bounded_storage_pending()) return {};
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -2555,6 +2628,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (bounded_storage_pending()) throw std::runtime_error("bounded storage is unbound");
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2634,6 +2708,7 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+    if (bounded_storage_pending()) throw std::runtime_error("bounded storage is unbound");
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;

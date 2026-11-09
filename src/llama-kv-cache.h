@@ -214,6 +214,12 @@ public:
     bool bounded_storage_pending() const noexcept;
     // Bind an empty deferred cache after retiring reservation graphs; old placeholder metadata stays alive.
     bool bind_bounded_storage(ggml_backend_memory_lease_t lease);
+    // Capture native state and retire all graphs/readers first. Release roots and reset only their projection cells.
+    // Rebinding uses the existing deferred path; the caller restores the saved state before activation.
+    bool release_bounded_storage();
+    // Retire graphs/readers first. Preserve physical row order as well as native cell metadata.
+    bool park_bounded_storage();
+    bool restore_bounded_storage(ggml_backend_memory_lease_t lease);
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
 
@@ -418,6 +424,8 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
+    struct bounded_parking_state;
+    std::unique_ptr<bounded_parking_state> parked_bounded;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

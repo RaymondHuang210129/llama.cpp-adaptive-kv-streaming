@@ -213,7 +213,7 @@ bool llama_memory_bounded_kv::prepare(const llama_memory_transition_target & tar
 }
 
 bool llama_memory_bounded_kv::bind(ggml_backend_memory_lease_t lease) noexcept {
-    if (pending_ticket || !lease) return false;
+    if (pending_ticket || parked_state || !lease) return false;
     try {
         std::vector<uint32_t> ids;
         for (const auto & layer : planned.layers) ids.push_back(layer.id);
@@ -280,6 +280,49 @@ bool llama_memory_bounded_kv::reconstruct(llama_memory_phase_cache_identity expe
     active->layout.cache.identity=planned.cache.identity; active->layout.allocation.cache=planned.cache.identity;
     valid=true; return true;
 }
+
+bool llama_memory_bounded_kv::park(llama_memory_phase_cache_identity expected,
+        const std::function<bool(const llama_memory_bounded_kv_read &)> & save) {
+    if (!save || !active || !valid || pending_ticket || preparing || active.use_count()!=1 ||
+            next_ticket==UINT64_MAX || expected.id!=planned.cache.identity.id ||
+            expected.generation!=planned.cache.identity.generation) return false;
+    pending_ticket=++next_ticket;
+    llama_memory_bounded_kv_read pin;
+    pin.binding=active;
+    bool complete=false;
+    try { complete=save(pin); } catch (...) {}
+    if (!complete || active.use_count()!=2) {
+        pending_ticket=0;
+        return false;
+    }
+    pin.reset();
+    active.reset();
+    valid=false;
+    parked_state=true;
+    pending_ticket=0;
+    return true;
+}
+
+bool llama_memory_bounded_kv::restore_parked(llama_memory_phase_cache_identity expected,
+        ggml_backend_memory_lease_t lease, const std::function<bool(ggml_backend_buffer_t)> & restore) {
+    if (!restore || !parked_state || active || pending_ticket || preparing || next_ticket==UINT64_MAX ||
+            expected.id!=planned.cache.identity.id || expected.generation!=planned.cache.identity.generation) return false;
+    parked_state=false;
+    if (!bind(lease)) { parked_state=true;return false; }
+    pending_ticket=++next_ticket;
+    valid=false;
+    bool complete=false;
+    try { complete=restore(ggml_backend_memory_lease_buffer(active->lease.get())); } catch (...) {}
+    if (!complete) {
+        active.reset();
+        parked_state=true;
+    }
+    valid=complete;
+    pending_ticket=0;
+    return complete;
+}
+
+bool llama_memory_bounded_kv::parked() const noexcept { return parked_state; }
 
 llama_memory_phase_cache_identity llama_memory_bounded_kv::identity() const noexcept { return planned.cache.identity; }
 const llama_memory_bounded_kv_layout & llama_memory_bounded_kv::layout() const noexcept { return planned; }

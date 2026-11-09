@@ -285,6 +285,7 @@ struct spill_publication_state {
     std::vector<uint32_t> layer_slots;
     size_t completed_layers = 0;
     bool active = false;
+    ggml_backend_buffer_type_t stage_type = nullptr;
 
     ~spill_publication_state() {
         if (copy_backend) ggml_backend_synchronize(copy_backend);
@@ -319,6 +320,7 @@ struct llama_recurrent_spill_bank::implementation {
     size_t submitted = 0, active_planes = 0;
     bool poisoned = false;
     bool submission_failed = false;
+    std::unique_ptr<spill_publication_state> parked_publication;
 
     ~implementation() {
         if (state != spill_transfer_state::idle && publication && publication->producer)
@@ -326,6 +328,7 @@ struct llama_recurrent_spill_bank::implementation {
         if (backend && state != spill_transfer_state::idle) ggml_backend_synchronize(backend);
         if (event) ggml_backend_event_free(event);
         publication.reset();
+        parked_publication.reset();
         if (host) ggml_backend_buffer_free(host);
     }
 
@@ -505,14 +508,21 @@ std::unique_ptr<llama_recurrent_spill_bank> llama_recurrent_spill_bank::create(
 }
 
 bool llama_recurrent_spill_bank::enable_publication(
-        ggml_backend_dev_t device, ggml_backend_buffer_type_t stage_type, uint32_t slots) {
+        ggml_backend_dev_t device, ggml_backend_buffer_type_t stage_type, uint32_t slots, bool defer_stage) {
     auto & s=*impl;
-    if (s.publication || s.state != spill_transfer_state::idle || !device || !stage_type ||
+    if (s.publication || s.parked_publication || s.state != spill_transfer_state::idle || !device || !stage_type ||
             (s.device && s.device != device) || !ggml_backend_dev_supports_buft(device,stage_type)) return false;
     try {
         auto next=std::make_unique<spill_publication_state>();
-        next->stage=llama_recurrent_stage_buffer::create(s.layout,slots,stage_type);
-        if (!next->stage) return false;
+        next->stage_type=stage_type;
+        if (defer_stage) {
+            llama_recurrent_stage_layout planned;
+            if (!llama_recurrent_stage_layout_make(s.layout,slots,ggml_backend_buft_get_alignment(stage_type),planned) ||
+                    planned.total_bytes>ggml_backend_buft_get_max_size(stage_type)) return false;
+        } else {
+            next->stage=llama_recurrent_stage_buffer::create(s.layout,slots,stage_type);
+            if (!next->stage) return false;
+        }
         next->copy_backend=ggml_backend_dev_init(device,nullptr);
         if (!next->copy_backend) return false;
         const ggml_backend_execution_ops ops{
@@ -600,7 +610,8 @@ bool llama_recurrent_spill_bank::enable_publication(
         if (!s.event) s.event=completion.release();
         s.device=device;
         s.backend=next->copy_backend;
-        s.publication=std::move(next);
+        if (defer_stage) s.parked_publication=std::move(next);
+        else s.publication=std::move(next);
         return true;
     } catch (const std::bad_alloc &) {
         return false;
@@ -618,8 +629,42 @@ size_t llama_recurrent_spill_bank::staged_device_bytes() const noexcept {
     return impl->publication ? impl->publication->stage->bytes() : 0;
 }
 
+bool llama_recurrent_spill_bank::park_publication_stage() {
+    auto & s=*impl;
+    if (s.state != spill_transfer_state::idle) return false;
+    if (s.parked_publication) return true;
+    if (!s.publication || s.publication->active) return false;
+    try {
+        if (s.publication->producer) ggml_backend_synchronize(s.publication->producer);
+        ggml_backend_synchronize(s.publication->copy_backend);
+    } catch (...) { return false; }
+    s.publication->stage_type=ggml_backend_buffer_get_type(s.publication->stage->buffer());
+    s.publication->stage.reset();
+    std::fill(s.publication->slot_busy.begin(),s.publication->slot_busy.end(),0);
+    s.publication->producer=nullptr;
+    s.parked_publication=std::move(s.publication);
+    return true;
+}
+
+bool llama_recurrent_spill_bank::publication_stage_parked() const noexcept {
+    return bool(impl->parked_publication);
+}
+
 bool llama_recurrent_spill_bank::bind_publication_stage(ggml_backend_memory_lease_t lease) {
     auto & s=*impl;
+    if (s.parked_publication) {
+        auto & parked=*s.parked_publication;
+        if (!lease || s.state != spill_transfer_state::idle || parked.active || parked.slot_events.size()>UINT32_MAX) return false;
+        auto * buffer=ggml_backend_memory_lease_buffer(lease);
+        auto * type=buffer ? ggml_backend_buffer_get_type(buffer) : nullptr;
+        if (!type || type!=parked.stage_type || !ggml_backend_dev_supports_buft(s.device,type)) return false;
+        auto next=llama_recurrent_stage_buffer::create(s.layout,uint32_t(parked.slot_events.size()),type,lease);
+        if (!next) return false;
+        try { ggml_backend_synchronize(parked.copy_backend); } catch (...) { return false; }
+        parked.stage=std::move(next);
+        s.publication=std::move(s.parked_publication);
+        return true;
+    }
     if (!lease || !s.publication || s.state != spill_transfer_state::idle || s.publication->active) return false;
     auto * buffer=ggml_backend_memory_lease_buffer(lease);
     auto * type=buffer ? ggml_backend_buffer_get_type(buffer) : nullptr;
@@ -687,7 +732,7 @@ bool llama_recurrent_spill_bank::publish_staged(ggml_context * ctx, ggml_cgraph 
 
 bool llama_recurrent_spill_bank::begin_capture(llama_recurrent_spill_identity identity) {
     auto & s=*impl;
-    if (s.poisoned || s.state != spill_transfer_state::idle || !s.identity(identity) ||
+    if (s.poisoned || s.parked_publication || s.state != spill_transfer_state::idle || !s.identity(identity) ||
             identity.generation <= s.last_generation) return false;
     s.active=identity; s.state=spill_transfer_state::capturing;
     s.submission_failed=false;
