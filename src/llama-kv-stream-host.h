@@ -2,8 +2,11 @@
 
 #include "../ggml/src/ggml-kv-stream.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 
+#include <functional>
 #include <memory>
+#include <vector>
 
 struct llama_kv_stream_host_config {
     uint64_t cache_id = 0;
@@ -55,4 +58,48 @@ private:
     size_t layer_stride = 0, storage_bytes = 0;
     void * base = nullptr;
     ggml_backend_buffer_t storage = nullptr;
+};
+
+struct llama_kv_stream_host_range {
+    ggml_backend_buffer_ptr buffer;
+    size_t offset = 0, bytes = 0;
+};
+
+// Demand-backed alternative for multi-slot histories. The legacy eager allocator is unchanged.
+// This object has no whole-reservation buffer: only committed, registered ranges can be borrowed.
+class llama_kv_stream_host_reservation {
+public:
+    using register_range = std::function<ggml_backend_buffer_t(ggml_backend_buffer_t)>;
+    ~llama_kv_stream_host_reservation();
+    llama_kv_stream_host_reservation(const llama_kv_stream_host_reservation &) = delete;
+    llama_kv_stream_host_reservation & operator=(const llama_kv_stream_host_reservation &) = delete;
+
+    static std::unique_ptr<llama_kv_stream_host_reservation> create(
+            const llama_kv_stream_host_config & config, ggml_backend_dev_t device, size_t chunk_bytes = 1024*1024);
+    // The backend registrar must retain its input until unregistration. Never adopt a pageable fallback.
+    static std::unique_ptr<llama_kv_stream_host_reservation> create(
+            const llama_kv_stream_host_config & config, ggml_backend_buffer_type_t expected_type,
+            register_range registrar, size_t chunk_bytes);
+
+    const ggml_kv_stream_layout & layout() const noexcept;
+    size_t bytes() const noexcept;
+    size_t reserved_bytes() const noexcept;
+    size_t committed_bytes() const noexcept;
+    size_t registered_bytes() const noexcept;
+    // Address metadata only, including uncommitted planes; these are CPU addresses, not CUDA aliases.
+    bool layer(uint32_t index, llama_kv_stream_host_layer & output) const noexcept;
+    // Physical row coverage, including native padding; does not publish a logical frontier/generation.
+    // Serialize mutation against all readers/writers. Failed growth preserves prior coverage and bytes.
+    bool prepare(size_t rows);
+    bool truncate(size_t rows);
+    void clear();
+    // Split at registration boundaries. Each retained buffer keeps its reservation alive for queued users.
+    // Failure leaves output unchanged. Device aliases must be resolved per range, never across registrations.
+    bool ranges(uint32_t layer, ggml_kv_stream_operand operand, size_t offset, size_t bytes,
+            std::vector<llama_kv_stream_host_range> & output) const;
+
+private:
+    llama_kv_stream_host_reservation();
+    struct impl;
+    std::unique_ptr<impl> state;
 };

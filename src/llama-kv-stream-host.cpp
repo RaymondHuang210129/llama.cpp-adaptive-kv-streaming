@@ -1,8 +1,11 @@
 #include "llama-kv-stream-host.h"
+#include "../ggml/src/ggml-backend-memory.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <new>
+#include <utility>
 
 // Validate byte geometry before touching an allocator.
 static bool host_plan(const llama_kv_stream_host_config & c, ggml_kv_stream_layout & planes,
@@ -126,4 +129,193 @@ bool llama_kv_stream_host::layer(uint32_t index, llama_kv_stream_host_layer & ou
     auto * k = static_cast<char *>(base) + size_t(index)*layer_stride;
     output = {k, k + planes.v_offset};
     return true;
+}
+
+struct llama_kv_stream_host_reservation::impl {
+    struct chunk {
+        size_t offset, bytes;
+        ggml_backend_buffer_ptr buffer;
+    };
+    llama_kv_stream_host_config config;
+    ggml_kv_stream_layout planes;
+    size_t stride = 0, bytes = 0, base_offset = 0, chunk_bytes = 0, rows = 0, registered = 0;
+    bool failed = false;
+    ggml_backend_buffer_type_t type = nullptr;
+    register_range registrar;
+    std::unique_ptr<ggml_backend_host_reservation, decltype(&ggml_backend_host_reservation_free)>
+        reservation{nullptr, ggml_backend_host_reservation_free};
+    std::vector<chunk> chunks;
+
+    auto find(size_t offset) const {
+        return std::lower_bound(chunks.begin(), chunks.end(), offset,
+            [](const chunk & c, size_t first) { return c.offset < first; });
+    }
+
+    void zero(size_t first, size_t bytes) {
+        for (const auto & chunk : chunks) {
+            const size_t begin = std::max(first, chunk.offset);
+            const size_t end = std::min(first + bytes, chunk.offset + chunk.bytes);
+            if (begin < end) std::memset(static_cast<char *>(ggml_backend_buffer_get_base(chunk.buffer.get())) +
+                (begin - chunk.offset), 0, end - begin);
+        }
+    }
+};
+
+llama_kv_stream_host_reservation::llama_kv_stream_host_reservation() = default;
+llama_kv_stream_host_reservation::~llama_kv_stream_host_reservation() = default;
+
+std::unique_ptr<llama_kv_stream_host_reservation> llama_kv_stream_host_reservation::create(
+        const llama_kv_stream_host_config & config, ggml_backend_dev_t device, size_t chunk_bytes) {
+    return create(config, llama_kv_stream_host_buffer_type(device),
+        [device](ggml_backend_buffer_t owner) { return llama_kv_stream_host_register(device, owner); }, chunk_bytes);
+}
+
+std::unique_ptr<llama_kv_stream_host_reservation> llama_kv_stream_host_reservation::create(
+        const llama_kv_stream_host_config & config, ggml_backend_buffer_type_t expected_type,
+        register_range registrar, size_t chunk_bytes) {
+    const size_t page = ggml_backend_host_reservation_granularity();
+    if (!expected_type || !ggml_backend_buft_is_host(expected_type) || !registrar || !page ||
+            !chunk_bytes || chunk_bytes%page) return {};
+    try {
+        std::unique_ptr<llama_kv_stream_host_reservation> host(new llama_kv_stream_host_reservation);
+        host->state = std::make_unique<impl>();
+        auto & s = *host->state;
+        if (!host_plan(config, s.planes, s.stride, s.bytes)) return {};
+        s.reservation.reset(ggml_backend_host_reservation_new(s.bytes + config.shape.alignment - 1));
+        if (!s.reservation) return {};
+        const auto address = reinterpret_cast<uintptr_t>(ggml_backend_host_reservation_base(s.reservation.get()));
+        const size_t remainder = address%config.shape.alignment;
+        s.base_offset = remainder ? config.shape.alignment - remainder : 0;
+        s.config = config;
+        s.type = expected_type;
+        s.registrar = std::move(registrar);
+        s.chunk_bytes = chunk_bytes;
+        return host;
+    } catch (const std::bad_alloc &) {
+        return {};
+    }
+}
+
+const ggml_kv_stream_layout & llama_kv_stream_host_reservation::layout() const noexcept { return state->planes; }
+size_t llama_kv_stream_host_reservation::bytes() const noexcept { return state->bytes; }
+size_t llama_kv_stream_host_reservation::reserved_bytes() const noexcept {
+    return ggml_backend_host_reservation_size(state->reservation.get());
+}
+size_t llama_kv_stream_host_reservation::committed_bytes() const noexcept {
+    return ggml_backend_host_reservation_committed(state->reservation.get());
+}
+size_t llama_kv_stream_host_reservation::registered_bytes() const noexcept { return state->registered; }
+
+bool llama_kv_stream_host_reservation::layer(uint32_t index, llama_kv_stream_host_layer & output) const noexcept {
+    const auto & s = *state;
+    if (s.failed || index >= s.config.layers) return false;
+    auto * k = static_cast<char *>(ggml_backend_host_reservation_base(s.reservation.get())) +
+        s.base_offset + index*s.stride;
+    output = {k, k + s.planes.v_offset};
+    return true;
+}
+
+bool llama_kv_stream_host_reservation::prepare(size_t rows) {
+    auto & s = *state;
+    if (s.failed || rows > s.planes.tokens) return false;
+    if (rows <= s.rows) return true;
+    std::vector<size_t> missing, committed;
+    std::vector<impl::chunk> pending;
+    bool success = false;
+    try {
+        for (size_t layer = 0; layer < s.config.layers; ++layer) for (bool value : {false, true}) {
+            const size_t token_bytes = value ? s.planes.v_token_bytes : s.planes.k_token_bytes;
+            const size_t plane = s.base_offset + layer*s.stride + (value ? s.planes.v_offset : 0);
+            const size_t first = plane + s.rows*token_bytes;
+            const size_t end = plane + rows*token_bytes;
+            for (size_t offset = first - first%s.chunk_bytes; offset < end;) {
+                const auto found = s.find(offset);
+                if (found == s.chunks.end() || found->offset != offset) missing.push_back(offset);
+                const size_t remaining = reserved_bytes() - offset;
+                if (s.chunk_bytes >= remaining) break;
+                offset += s.chunk_bytes;
+            }
+        }
+        std::sort(missing.begin(), missing.end());
+        missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
+        pending.reserve(missing.size());
+        committed.reserve(missing.size());
+        s.chunks.reserve(s.chunks.size() + missing.size());
+        for (const size_t offset : missing) {
+            const size_t bytes = std::min(s.chunk_bytes, reserved_bytes() - offset);
+            if (!ggml_backend_host_reservation_commit(s.reservation.get(), offset, bytes)) break;
+            committed.push_back(offset);
+            ggml_backend_buffer_ptr owner(ggml_backend_host_reservation_view(s.reservation.get(), offset, bytes));
+            if (!owner) break;
+            ggml_backend_buffer_ptr pinned(s.registrar(owner.get()));
+            if (!pinned || ggml_backend_buffer_get_type(pinned.get()) != s.type ||
+                    ggml_backend_buffer_get_size(pinned.get()) != bytes ||
+                    ggml_backend_buffer_get_base(pinned.get()) != ggml_backend_buffer_get_base(owner.get())) break;
+            pending.push_back({offset, bytes, std::move(pinned)});
+        }
+        success = pending.size() == missing.size();
+    } catch (...) {
+        success = false;
+    }
+    if (!success) {
+        pending.clear();
+        for (const size_t offset : committed) {
+            const size_t bytes = std::min(s.chunk_bytes, reserved_bytes() - offset);
+            if (!ggml_backend_host_reservation_decommit(s.reservation.get(), offset, bytes)) s.failed = true;
+        }
+        return false;
+    }
+    for (auto & chunk : pending) {
+        s.registered += chunk.bytes;
+        s.chunks.push_back(std::move(chunk));
+    }
+    std::sort(s.chunks.begin(), s.chunks.end(), [](const impl::chunk & a, const impl::chunk & b) { return a.offset < b.offset; });
+    s.rows = rows;
+    return true;
+}
+
+bool llama_kv_stream_host_reservation::truncate(size_t rows) {
+    auto & s = *state;
+    if (s.failed || rows > s.rows) return false;
+    for (size_t layer = 0; layer < s.config.layers; ++layer) for (bool value : {false, true}) {
+        const size_t token_bytes = value ? s.planes.v_token_bytes : s.planes.k_token_bytes;
+        const size_t first = s.base_offset + layer*s.stride + (value ? s.planes.v_offset : 0);
+        s.zero(first + rows*token_bytes, (s.rows - rows)*token_bytes);
+    }
+    s.rows = rows;
+    return true;
+}
+
+void llama_kv_stream_host_reservation::clear() {
+    auto & s = *state;
+    for (const auto & chunk : s.chunks) ggml_backend_buffer_clear(chunk.buffer.get(), 0);
+    s.rows = 0;
+}
+
+bool llama_kv_stream_host_reservation::ranges(uint32_t layer, ggml_kv_stream_operand operand,
+        size_t offset, size_t bytes, std::vector<llama_kv_stream_host_range> & output) const {
+    const auto & s = *state;
+    if (s.failed || layer >= s.config.layers || !bytes ||
+            (operand != ggml_kv_stream_operand::k && operand != ggml_kv_stream_operand::v)) return false;
+    const bool value = operand == ggml_kv_stream_operand::v;
+    const size_t available = s.rows*(value ? s.planes.v_token_bytes : s.planes.k_token_bytes);
+    if (offset > available || bytes > available - offset) return false;
+    size_t first = s.base_offset + layer*s.stride + (value ? s.planes.v_offset : 0) + offset;
+    try {
+        std::vector<llama_kv_stream_host_range> ranges;
+        while (bytes) {
+            const size_t chunk_offset = first - first%s.chunk_bytes;
+            const auto chunk = s.find(chunk_offset);
+            if (chunk == s.chunks.end() || chunk->offset != chunk_offset) return false;
+            const size_t in_chunk = first - chunk_offset;
+            const size_t count = std::min(bytes, chunk->bytes - in_chunk);
+            ranges.push_back({ggml_backend_buffer_ptr(ggml_backend_buffer_retain(chunk->buffer.get())), in_chunk, count});
+            first += count;
+            bytes -= count;
+        }
+        output = std::move(ranges);
+        return true;
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
 }

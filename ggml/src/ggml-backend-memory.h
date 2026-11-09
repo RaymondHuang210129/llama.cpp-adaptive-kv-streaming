@@ -13,6 +13,25 @@ extern "C" {
 typedef struct ggml_backend_memory_planner * ggml_backend_memory_planner_t;
 typedef struct ggml_backend_memory_arena * ggml_backend_memory_arena_t;
 typedef struct ggml_backend_memory_lease * ggml_backend_memory_lease_t;
+typedef struct ggml_backend_host_reservation * ggml_backend_host_reservation_t;
+
+// Stable host address space, independent of device arenas. These calls do not pin/map CUDA memory.
+GGML_API size_t ggml_backend_host_reservation_granularity(void);
+GGML_API ggml_backend_host_reservation_t ggml_backend_host_reservation_new(size_t size);
+GGML_API void ggml_backend_host_reservation_free(ggml_backend_host_reservation_t reservation);
+GGML_API void * ggml_backend_host_reservation_base(ggml_backend_host_reservation_t reservation);
+GGML_API size_t ggml_backend_host_reservation_size(ggml_backend_host_reservation_t reservation);
+GGML_API size_t ggml_backend_host_reservation_committed(ggml_backend_host_reservation_t reservation);
+// Commit disjoint page-aligned ranges; repeating the same range preserves its bytes.
+GGML_API bool ggml_backend_host_reservation_commit(
+        ggml_backend_host_reservation_t reservation, size_t offset, size_t size);
+// Decommit one exact range only after all its buffer views/registrations have retired.
+GGML_API bool ggml_backend_host_reservation_decommit(
+        ggml_backend_host_reservation_t reservation, size_t offset, size_t size);
+// Return an owned CPU view contained in one committed range. Holes never form a buffer.
+// Views retain the virtual reservation and prevent decommit until their last reference retires.
+GGML_API ggml_backend_buffer_t ggml_backend_host_reservation_view(
+        ggml_backend_host_reservation_t reservation, size_t offset, size_t size);
 
 enum ggml_backend_memory_region_flags {
     GGML_BACKEND_MEMORY_REGION_NONE       = 0,

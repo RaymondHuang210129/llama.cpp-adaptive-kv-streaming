@@ -20,6 +20,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
 using planner_ptr = std::unique_ptr<ggml_backend_memory_planner, decltype(&ggml_backend_memory_planner_free)>;
 using arena_ptr = std::unique_ptr<ggml_backend_memory_arena, decltype(&ggml_backend_memory_arena_free)>;
 using lease_ptr = std::unique_ptr<ggml_backend_memory_lease, decltype(&ggml_backend_memory_lease_free)>;
@@ -1544,7 +1548,81 @@ static void run(const char * name, void (*test)()) {
     std::printf("PASSED\n");
 }
 
+static void test_host_reservation_ranges() {
+    using reservation_ptr = std::unique_ptr<ggml_backend_host_reservation,
+        decltype(&ggml_backend_host_reservation_free)>;
+    const size_t page = ggml_backend_host_reservation_granularity();
+    GGML_ASSERT(page && (page & (page - 1)) == 0);
+    reservation_ptr owner(ggml_backend_host_reservation_new(32*page), ggml_backend_host_reservation_free);
+    GGML_ASSERT(owner);
+    void * base = ggml_backend_host_reservation_base(owner.get());
+    GGML_ASSERT(base && uintptr_t(base)%page == 0);
+    GGML_ASSERT(ggml_backend_host_reservation_size(owner.get()) == 32*page);
+    GGML_ASSERT(ggml_backend_host_reservation_committed(owner.get()) == 0);
+    GGML_ASSERT(!ggml_backend_host_reservation_view(owner.get(), 0, page));
+    GGML_ASSERT(!ggml_backend_host_reservation_commit(owner.get(), 1, page));
+    GGML_ASSERT(!ggml_backend_host_reservation_commit(owner.get(), 0, 0));
+    GGML_ASSERT(!ggml_backend_host_reservation_commit(owner.get(), 31*page, 2*page));
+    GGML_ASSERT(!ggml_backend_host_reservation_commit(owner.get(), SIZE_MAX-page+1, page));
+    GGML_ASSERT(ggml_backend_host_reservation_commit(owner.get(), 0, page));
+    GGML_ASSERT(ggml_backend_host_reservation_commit(owner.get(), 17*page, 2*page));
+    GGML_ASSERT(ggml_backend_host_reservation_committed(owner.get()) == 3*page);
+    GGML_ASSERT(ggml_backend_host_reservation_base(owner.get()) == base);
+    GGML_ASSERT(ggml_backend_host_reservation_commit(owner.get(), 17*page, 2*page));
+    GGML_ASSERT(!ggml_backend_host_reservation_commit(owner.get(), 18*page, 2*page));
+    GGML_ASSERT(!ggml_backend_host_reservation_view(owner.get(), page, 17*page));
+    ggml_backend_buffer_ptr first(ggml_backend_host_reservation_view(owner.get(), 0, page));
+    ggml_backend_buffer_ptr second(ggml_backend_host_reservation_view(owner.get(), 17*page, 2*page));
+    GGML_ASSERT(first && second);
+    GGML_ASSERT(ggml_backend_buffer_get_base(first.get()) == base);
+    GGML_ASSERT(ggml_backend_buffer_get_base(second.get()) == static_cast<char *>(base) + 17*page);
+    const auto * bytes = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(second.get()));
+    GGML_ASSERT(std::all_of(bytes, bytes + 2*page, [](uint8_t b) { return b == 0; }));
+    ggml_backend_buffer_clear(first.get(), 0x31);
+    ggml_backend_buffer_clear(second.get(), 0x72);
+    GGML_ASSERT(!ggml_backend_host_reservation_decommit(owner.get(), 0, page));
+    first.reset();
+    GGML_ASSERT(ggml_backend_host_reservation_decommit(owner.get(), 0, page));
+    GGML_ASSERT(ggml_backend_host_reservation_committed(owner.get()) == 2*page);
+    GGML_ASSERT(ggml_backend_host_reservation_commit(owner.get(), 0, page));
+    first.reset(ggml_backend_host_reservation_view(owner.get(), 0, page));
+    GGML_ASSERT(*static_cast<const uint8_t *>(ggml_backend_buffer_get_base(first.get())) == 0);
+    GGML_ASSERT(*bytes == 0x72);
+    ggml_backend_buffer_ptr view(ggml_backend_buffer_view(second.get(), page, page));
+    GGML_ASSERT(view);
+    second.reset();
+    GGML_ASSERT(!ggml_backend_host_reservation_decommit(owner.get(), 17*page, 2*page));
+    first.reset();
+    owner.reset();
+    // A retained view, such as an async registration owner, keeps its reservation alive.
+    GGML_ASSERT(*static_cast<const uint8_t *>(ggml_backend_buffer_get_base(view.get())) == 0x72);
+    ggml_backend_buffer_clear(view.get(), 0x17);
+    GGML_ASSERT(*static_cast<const uint8_t *>(ggml_backend_buffer_get_base(view.get())) == 0x17);
+    GGML_ASSERT(!ggml_backend_host_reservation_new(0));
+    GGML_ASSERT(!ggml_backend_host_reservation_new(SIZE_MAX));
+}
+
+static void test_host_reservation_uncommitted_pages() {
+#ifdef __linux__
+    const size_t page = ggml_backend_host_reservation_granularity();
+    auto * reservation = ggml_backend_host_reservation_new(64*1024*1024);
+    GGML_ASSERT(reservation);
+    const size_t size = ggml_backend_host_reservation_size(reservation);
+    auto * base = static_cast<char *>(ggml_backend_host_reservation_base(reservation));
+    std::vector<unsigned char> resident(size/page);
+    GGML_ASSERT(mincore(base, size, resident.data()) == 0);
+    GGML_ASSERT(std::none_of(resident.begin(), resident.end(), [](unsigned char b) { return b & 1; }));
+    GGML_ASSERT(ggml_backend_host_reservation_commit(reservation, 11*page, 2*page));
+    GGML_ASSERT(ggml_backend_host_reservation_commit(reservation, 301*page, page));
+    GGML_ASSERT(mincore(base, size, resident.data()) == 0);
+    GGML_ASSERT(std::count_if(resident.begin(), resident.end(), [](unsigned char b) { return b & 1; }) == 3);
+    ggml_backend_host_reservation_free(reservation);
+#endif
+}
+
 int main() {
+    run("test_host_reservation_ranges", test_host_reservation_ranges);
+    run("test_host_reservation_uncommitted_pages", test_host_reservation_uncommitted_pages);
     run("test_workspace_group_planning", test_workspace_group_planning);
     run("test_workspace_group_planning_boundaries", test_workspace_group_planning_boundaries);
     run("test_compute_arena_binding_ownership", test_compute_arena_binding_ownership);

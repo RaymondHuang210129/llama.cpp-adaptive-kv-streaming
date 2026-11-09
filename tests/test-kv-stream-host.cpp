@@ -5,6 +5,10 @@
 #include "ggml-cpu.h"
 #include "testing.h"
 
+#ifdef KV_HOST_CUDA_TEST
+#include "ggml-cuda.h"
+#endif
+
 #include <cstring>
 #include <limits>
 
@@ -31,12 +35,200 @@ struct allocation_probe {
     }
 };
 
+struct registration_probe {
+    ggml_backend_buffer_type type = *ggml_backend_cpu_buffer_type();
+    size_t attempts = 0, live = 0, fail_at = SIZE_MAX;
+    bool fallback = false, throws = false;
+    struct context {
+        registration_probe * probe;
+        ggml_backend_buffer_t owner;
+    };
+    ggml_backend_buffer_t pin(ggml_backend_buffer_t owner) {
+        if (++attempts == fail_at) {
+            if (throws) throw std::bad_alloc();
+            return nullptr;
+        }
+        auto * buffer = ggml_backend_cpu_buffer_from_ptr(ggml_backend_buffer_get_base(owner), ggml_backend_buffer_get_size(owner));
+        auto * state = new context{this, ggml_backend_buffer_retain(owner)};
+        buffer->buft = fallback ? ggml_backend_cpu_buffer_type() : &type;
+        buffer->context = state;
+        buffer->iface.get_base = [](ggml_backend_buffer_t b) {
+            return ggml_backend_buffer_get_base(static_cast<context *>(b->context)->owner);
+        };
+        buffer->iface.free_buffer = [](ggml_backend_buffer_t b) {
+            auto * c = static_cast<context *>(b->context);
+            --c->probe->live;
+            ggml_backend_buffer_free(c->owner);
+            delete c;
+        };
+        buffer->iface.clear = [](ggml_backend_buffer_t b, uint8_t value) {
+            ggml_backend_buffer_clear(static_cast<context *>(b->context)->owner, value);
+        };
+        buffer->view_buffer = nullptr;
+        ++live;
+        return buffer;
+    }
+};
+
 int main(int argc, char ** argv) {
     testing t;
+    t.test("demand_backing_reserves_all_planes_without_committing_them", [](testing & t) {
+        registration_probe probe;
+        auto c = config(); c.context_tokens = 65536;
+        auto host = llama_kv_stream_host_reservation::create(c, &probe.type,
+            [&](ggml_backend_buffer_t b) { return probe.pin(b); }, 65536);
+        if (!t.assert_true(host != nullptr)) return;
+        t.assert_equal(size_t(0), host->committed_bytes());
+        t.assert_equal(size_t(0), host->registered_bytes());
+        t.assert_equal(size_t(0), probe.attempts);
+        llama_kv_stream_host_layer before, after;
+        t.assert_true(host->layer(2, before));
+        t.assert_true(host->prepare(257));
+        t.assert_true(host->layer(2, after));
+        t.assert_true(before.k == after.k && before.v == after.v);
+        t.assert_true(host->committed_bytes() < host->bytes()/16);
+        t.assert_equal(host->committed_bytes(), host->registered_bytes());
+        const size_t committed = host->committed_bytes(), calls = probe.attempts;
+        t.assert_true(host->prepare(257));
+        t.assert_equal(committed, host->committed_bytes());
+        t.assert_equal(calls, probe.attempts);
+        std::vector<llama_kv_stream_host_range> ranges;
+        t.assert_true(host->ranges(2, ggml_kv_stream_operand::k, 0, 257*host->layout().k_token_bytes, ranges));
+        size_t total = 0;
+        for (const auto & range : ranges) {
+            auto * bytes = static_cast<uint8_t *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset;
+            t.assert_true(std::all_of(bytes, bytes + range.bytes, [](uint8_t b) { return b == 0; }));
+            std::memset(bytes, 0x38, range.bytes);
+            total += range.bytes;
+        }
+        t.assert_equal(257*host->layout().k_token_bytes, total);
+        t.assert_true(host->prepare(513));
+        t.assert_equal(uint8_t(0x38), *static_cast<uint8_t *>(before.k));
+        t.assert_true(host->truncate(128));
+        t.assert_equal(uint8_t(0x38), *(static_cast<uint8_t *>(before.k) + 127*host->layout().k_token_bytes));
+        t.assert_equal(uint8_t(0), *(static_cast<uint8_t *>(before.k) + 128*host->layout().k_token_bytes));
+        host->clear();
+        t.assert_equal(uint8_t(0), *static_cast<uint8_t *>(before.k));
+        t.assert_true(host->prepare(257));
+        const size_t retained = ranges.size();
+        host.reset();
+        t.assert_equal(retained, probe.live);
+        t.assert_true(!ranges.empty() && ranges.front().buffer != nullptr);
+        ranges.clear();
+        t.assert_equal(size_t(0), probe.live);
+    });
+    t.test("failed_demand_growth_rolls_back_only_new_chunks", [](testing & t) {
+        registration_probe probe;
+        auto c = config(); c.context_tokens = 8192;
+        auto host = llama_kv_stream_host_reservation::create(c, &probe.type,
+            [&](ggml_backend_buffer_t b) { return probe.pin(b); }, 65536);
+        if (!t.assert_true(host && host->prepare(1))) return;
+        llama_kv_stream_host_layer layer;
+        t.assert_true(host->layer(0, layer));
+        *static_cast<uint8_t *>(layer.k) = 0x51;
+        const size_t committed = host->committed_bytes(), registered = host->registered_bytes(), live = probe.live;
+        probe.fail_at = probe.attempts + 3;
+        t.assert_true(!host->prepare(513));
+        t.assert_equal(committed, host->committed_bytes());
+        t.assert_equal(registered, host->registered_bytes());
+        t.assert_equal(live, probe.live);
+        t.assert_equal(uint8_t(0x51), *static_cast<uint8_t *>(layer.k));
+        probe.fail_at = SIZE_MAX;
+        t.assert_true(host->prepare(513));
+        t.assert_equal(uint8_t(0x51), *static_cast<uint8_t *>(layer.k));
+        std::vector<llama_kv_stream_host_range> ranges;
+        t.assert_true(host->ranges(0, ggml_kv_stream_operand::k, 0, 32, ranges));
+        const size_t existing = ranges.size();
+        t.assert_true(!host->ranges(c.layers, ggml_kv_stream_operand::k, 0, 32, ranges));
+        t.assert_true(!host->ranges(0, ggml_kv_stream_operand::k, 8191*host->layout().k_token_bytes, 32, ranges));
+        t.assert_equal(existing, ranges.size());
+        t.assert_true(!host->prepare(SIZE_MAX));
+        probe.fallback = true;
+        t.assert_true(!host->prepare(1025));
+        t.assert_equal(uint8_t(0x51), *static_cast<uint8_t *>(layer.k));
+    });
+    t.test("all_registration_failure_positions_preserve_previous_plane_bytes", [](testing & t) {
+        auto c = config(); c.context_tokens = 1025; c.layers = 2;
+        size_t growth_calls = 0;
+        {
+            registration_probe probe;
+            auto host = llama_kv_stream_host_reservation::create(c, &probe.type,
+                [&](ggml_backend_buffer_t b) { return probe.pin(b); }, 65536);
+            if (!t.assert_true(host && host->prepare(1))) return;
+            const size_t initial = probe.attempts;
+            if (!t.assert_true(host->prepare(1025))) return;
+            growth_calls = probe.attempts - initial;
+        }
+        t.assert_true(growth_calls > 3);
+        for (bool throws : {false, true}) for (size_t fail = 1; fail <= growth_calls; ++fail) {
+            registration_probe probe;
+            auto host = llama_kv_stream_host_reservation::create(c, &probe.type,
+                [&](ggml_backend_buffer_t b) { return probe.pin(b); }, 65536);
+            if (!t.assert_true(host && host->prepare(1))) return;
+            llama_kv_stream_host_layer layer;
+            t.assert_true(host->layer(1, layer));
+            *static_cast<uint8_t *>(layer.v) = 0x5a;
+            const size_t committed = host->committed_bytes(), live = probe.live;
+            probe.fail_at = probe.attempts + fail;
+            probe.throws = throws;
+            t.assert_true(!host->prepare(1025));
+            t.assert_equal(committed, host->committed_bytes());
+            t.assert_equal(committed, host->registered_bytes());
+            t.assert_equal(live, probe.live);
+            t.assert_equal(uint8_t(0x5a), *static_cast<uint8_t *>(layer.v));
+            probe.fail_at = SIZE_MAX;
+            t.assert_true(host->prepare(1025));
+            t.assert_equal(uint8_t(0x5a), *static_cast<uint8_t *>(layer.v));
+        }
+    });
+    t.test("demand_planes_preserve_all64_formats_at_both_attention_widths", [](testing & t) {
+        const int types[] = {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0,
+            GGML_TYPE_Q5_1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL};
+        for (int dim : {256, 512}) for (int k : types) for (int v : types) {
+            registration_probe probe;
+            auto c = config(k, v); c.context_tokens = 513; c.layers = 2;
+            c.shape.head_dim_k = c.shape.head_dim_v = dim;
+            auto host = llama_kv_stream_host_reservation::create(c, &probe.type,
+                [&](ggml_backend_buffer_t b) { return probe.pin(b); }, 65536);
+            auto native = llama_kv_stream_host::create(c, ggml_backend_cpu_buffer_type());
+            if (!t.assert_true(host && native && host->prepare(257))) return;
+            for (uint32_t layer = 0; layer < c.layers; ++layer) for (bool value : {false, true}) {
+                llama_kv_stream_host_layer reference, actual;
+                t.assert_true(native->layer(layer, reference) && host->layer(layer, actual));
+                auto * expected = static_cast<uint8_t *>(value ? reference.v : reference.k);
+                auto * observed = static_cast<uint8_t *>(value ? actual.v : actual.k);
+                const size_t token_bytes = value ? host->layout().v_token_bytes : host->layout().k_token_bytes;
+                for (size_t i = 0; i < 257*token_bytes; ++i) expected[i] = uint8_t(i*37 + layer*71 + value*109);
+                std::vector<llama_kv_stream_host_range> ranges;
+                if (!t.assert_true(host->ranges(layer, value ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,
+                        0, 257*token_bytes, ranges))) return;
+                size_t copied = 0;
+                for (const auto & range : ranges) {
+                    std::memcpy(static_cast<char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset,
+                        expected + copied, range.bytes);
+                    copied += range.bytes;
+                }
+                t.assert_equal(257*token_bytes, copied);
+                t.assert_true(std::memcmp(expected, observed, copied) == 0);
+            }
+            t.assert_true(host->prepare(513));
+            for (uint32_t layer = 0; layer < c.layers; ++layer) for (bool value : {false, true}) {
+                llama_kv_stream_host_layer reference, actual;
+                t.assert_true(native->layer(layer, reference) && host->layer(layer, actual));
+                const auto * expected = static_cast<const uint8_t *>(value ? reference.v : reference.k);
+                const auto * observed = static_cast<const uint8_t *>(value ? actual.v : actual.k);
+                const size_t token_bytes = value ? host->layout().v_token_bytes : host->layout().k_token_bytes;
+                t.assert_true(std::memcmp(expected, observed, 513*token_bytes) == 0);
+            }
+        }
+    });
     ggml_backend_dev_t device = nullptr;
     auto * storage_type = ggml_backend_cpu_buffer_type();
     if (argc > 1 && std::strcmp(argv[1], "--cuda") == 0) {
         ggml_backend_load_all();
+#ifdef KV_HOST_CUDA_TEST
+        if (!ggml_backend_reg_by_name("CUDA")) ggml_backend_register(ggml_backend_cuda_reg());
+#endif
         auto * reg = ggml_backend_reg_by_name("CUDA");
         if (!t.assert_true(reg && ggml_backend_reg_dev_count(reg))) return t.summary();
         device = ggml_backend_reg_dev_get(reg, 0);
@@ -190,6 +382,58 @@ int main(int argc, char ** argv) {
         t.assert_true(host->layer(0, layer));
         t.assert_equal(uint8_t(0x41), *static_cast<uint8_t *>(layer.k));
         t.assert_equal(uint8_t(0x41), *static_cast<uint8_t *>(layer.v));
+    });
+    if (device) t.test("demand_registered_ranges_survive_async_upload_and_owner_release", [&](testing & t) {
+        ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+        if (!t.assert_true(backend != nullptr)) return;
+        for (int dim : {256, 512}) for (const auto & pair : std::vector<std::pair<int, int>>{
+                {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+                {GGML_TYPE_Q5_1, GGML_TYPE_Q5_1}, {GGML_TYPE_F16, GGML_TYPE_F16}}) {
+            auto c = config(pair.first, pair.second); c.context_tokens = 1025; c.layers = 2;
+            c.shape.head_dim_k = c.shape.head_dim_v = dim;
+            auto host = llama_kv_stream_host_reservation::create(c, device, 65536);
+            if (!t.assert_true(host && host->prepare(513))) return;
+            const size_t bytes = 513*host->layout().k_token_bytes;
+            std::vector<uint8_t> expected(bytes), observed(bytes);
+            for (size_t i = 0; i < bytes; ++i) expected[i] = uint8_t(i*37 + 19);
+            std::vector<llama_kv_stream_host_range> ranges;
+            if (!t.assert_true(host->ranges(1, ggml_kv_stream_operand::k, 0, bytes, ranges))) return;
+            ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+            ggml_backend_buffer_ptr output(ggml_backend_buft_alloc_buffer(
+                ggml_backend_get_default_buffer_type(backend.get()), bytes));
+            if (!t.assert_true(ctx && output)) return;
+            auto * tensor = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, int64_t(bytes));
+            if (!t.assert_true(ggml_backend_tensor_alloc(output.get(), tensor, ggml_backend_buffer_get_base(output.get())) == GGML_STATUS_SUCCESS)) return;
+            size_t offset = 0;
+            for (const auto & range : ranges) {
+                auto * source = static_cast<char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset;
+                std::memcpy(source, expected.data() + offset, range.bytes);
+                ggml_backend_tensor_set_async(backend.get(), tensor, source, offset, range.bytes);
+                offset += range.bytes;
+            }
+            ggml_backend_synchronize(backend.get());
+            size_t downloaded = 0;
+            for (const auto & range : ranges) {
+                auto * destination = static_cast<char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset;
+                std::memset(destination, 0xcc, range.bytes);
+                ggml_backend_tensor_get_async(backend.get(), tensor, destination, downloaded, range.bytes);
+                downloaded += range.bytes;
+            }
+            host.reset();
+            ggml_backend_synchronize(backend.get());
+            size_t checked = 0;
+            for (const auto & range : ranges) {
+                const auto * data = static_cast<const char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset;
+                t.assert_true(std::memcmp(data, expected.data() + checked, range.bytes) == 0);
+                checked += range.bytes;
+            }
+            ranges.clear();
+            ggml_backend_tensor_get(tensor, observed.data(), 0, bytes);
+            t.assert_equal(bytes, offset);
+            t.assert_equal(bytes, downloaded);
+            t.assert_equal(bytes, checked);
+            t.assert_true(expected == observed);
+        }
     });
     return t.summary();
 }

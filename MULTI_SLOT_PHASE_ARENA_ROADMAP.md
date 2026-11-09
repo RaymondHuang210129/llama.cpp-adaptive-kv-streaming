@@ -1,6 +1,6 @@
 # Multi-slot adaptive KV streaming and phase-arena roadmap
 
-Status: implementation in progress, 2026-11-09. MS1 is complete as a CPU-only planner; runtime multi-slot admission remains disabled. MS2-MS14 are pending. No new runtime configuration is qualified.
+Status: implementation in progress, 2026-11-09. MS1 (CPU planner) and MS2 (demand-backed host storage) are complete as independent components; runtime multi-slot admission remains disabled. MS3-MS14 are pending. No new server configuration is qualified.
 
 Inspected baseline: `f6ca3e8a172473578b909a4691e616bb2234fb54`, on `feature/ci-workflow-migration`. Recheck the implementation base and local changes before starting work on a dedicated feature branch. Historical measurements retain their original source, binaries, models and configuration; they are not new multi-slot evidence.
 
@@ -326,13 +326,21 @@ Evidence: missing-API compile red; eight tests with 17,254 assertions, including
 
 ### MS2 - Stable host virtual reservation and incremental backing
 
-- [ ] Reproduce upfront clear/registration behavior and establish native pinned controls.
-- [ ] Implement owned stable reservations behind appropriate host-backend interfaces, with committed and registered coverage tracked separately.
-- [ ] Test growth across chunk/layer/K/V boundaries, noncontiguous registration aliases, commit/register failure, rollback of partial growth, clear/truncate/reuse, guards and destruction with queued users.
-- [ ] Verify existing pointers stay unchanged; untouched maximum capacity does not become resident merely through creation/reset.
-- [ ] Compare actual transfer/publication behavior and memory counters against the native pinned implementation before promotion; validate platform capabilities honestly.
+- [x] Reproduce upfront clear/registration behavior and establish native pinned controls.
+- [x] Implement owned stable reservations behind appropriate host-backend interfaces, with committed and registered coverage tracked separately.
+- [x] Test growth across chunk/layer/K/V boundaries, registration-boundary segmentation, commit/register failure, rollback of partial growth, clear/truncate/reuse, guards and destruction with queued users. Device aliases remain per-registration; no contiguous alias assumption is introduced.
+- [x] Verify existing pointers stay unchanged; untouched maximum capacity does not become resident merely through creation/reset.
+- [x] Compare actual transfer/publication behavior and memory counters against the native pinned implementation before promotion; validate platform capabilities honestly.
 
 Exit: stable addresses, correct strict range contracts, bounded demand growth and no implicit pageable fallback.
+
+Accepted implementation: the backend memory interface reserves guarded host address space and exposes owned views only within individual committed ranges. Linux uses `mmap`/`mprotect`; the Windows implementation uses `VirtualAlloc`/`VirtualFree`, with Windows execution still awaiting platform qualification. Views block decommit and retain the reservation. `llama_kv_stream_host_reservation` prepares only newly needed chunks of fixed-stride K/V planes, registers them through the existing strict CUDA host adapter, splits borrowed ranges at registration boundaries and rolls back new chunks on failure. Growth does not rescan the old prefix. No second device arena, device allocation or pageable fallback is added. The eager single-slot allocator and server admission guards are unchanged; server integration follows in later stages.
+
+Evidence: missing-API compile reds; 4,699 host assertions covering all64 formats at D256/D512, every registration-failure position, exception rollback, exact retained bytes and reuse. A Linux `mincore` check observed zero resident pages after reserving 64 MiB and exactly the three explicitly committed pages afterward. Deterministic syscall fault injection covered commit/decommit/discard failure and fail-closed protection recovery. The complete 56-test host inventory passed normally and with full host/server ASAN/UBSAN builds: 54 executions plus two expected CUDA-only skips each. Native registered-range bidirectional async transfers, including dropping the main owner before copy completion, passed 4,898 assertions normally and under strict default-PDL memcheck with API reporting `all`, error exit 99 and zero errors.
+
+Native transport qualification explicitly combines the current host libraries with the archived `a0672f5ea` CUDA component; its strict host-adapter source is byte-identical. Before/after source/library/test hashes, actual loader paths and owned-job cleanup are recorded in local `ms2-native-qualified.json`. This is a host-registration/transport component qualification, not a new full-server or attention-kernel qualification. Linux CUDA SM120 was exercised; missing Windows/hardware execution is not called a pass.
+
+Measured tradeoff for later integration: at the default 1 MiB registration size, two synthetic 8.5/17 MiB H2D payloads used 9/17 DMA calls and took about 0.197/0.394 ms versus 0.181/0.360 ms for the eager native pinned control. Larger 4/8 MiB chunks reduced calls but consumed more initial pinned RAM and retained measurable transfer overhead. Keep the bounded 1 MiB default for now and carry these new-mode costs into MS13 request-level measurements; there is no claimed transfer speedup or existing single-slot slowdown. A proposed single DMA across registrations was rejected by CUDA with `invalid argument`; that failed experiment is preserved and must not be used as a supported coalescing path. Writer publication and reader transport integration must split at the proven registration boundaries, including when a native writer tile crosses one. First-use/setup observations are not repeated startup-performance claims. All generated logs, probes and benchmark sources remain local under the stage evidence directory.
 
 ### MS3 - Independent slot histories and logical metadata
 

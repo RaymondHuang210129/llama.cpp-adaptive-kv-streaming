@@ -1,12 +1,221 @@
 #include "ggml-backend-memory.h"
 #include "ggml-backend-impl.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
+#include <cstring>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+namespace {
+struct host_committed_range {
+    size_t offset;
+    size_t size;
+};
+
+struct host_reservation_state {
+    void * mapping = nullptr;
+    void * base = nullptr;
+    size_t size = 0, mapped_size = 0, committed = 0;
+    bool failed = false;
+    std::mutex mutex;
+    std::vector<std::shared_ptr<host_committed_range>> ranges;
+
+    ~host_reservation_state() {
+        if (!mapping) return;
+#ifdef _WIN32
+        if (!VirtualFree(mapping, 0, MEM_RELEASE)) GGML_LOG_ERROR("host reservation release failed\n");
+#else
+        if (munmap(mapping, mapped_size)) GGML_LOG_ERROR("host reservation release failed\n");
+#endif
+    }
+};
+
+struct host_reservation_view {
+    std::shared_ptr<host_reservation_state> owner;
+    std::shared_ptr<host_committed_range> range;
+    void * data;
+};
+
+static void host_view_free(ggml_backend_buffer_t buffer) {
+    delete static_cast<host_reservation_view *>(buffer->context);
+}
+
+static void * host_view_base(ggml_backend_buffer_t buffer) {
+    return static_cast<host_reservation_view *>(buffer->context)->data;
+}
+
+static void host_view_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    std::memset(host_view_base(buffer), value, buffer->size);
+}
+
+static ggml_backend_buffer_t host_view_make(const host_reservation_view & view, size_t size);
+
+static ggml_backend_buffer_t host_view_slice(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    auto view = *static_cast<host_reservation_view *>(buffer->context);
+    view.data = static_cast<char *>(view.data) + offset;
+    return host_view_make(view, size);
+}
+
+static ggml_backend_buffer_t host_view_make(const host_reservation_view & view, size_t size) {
+    try {
+        auto context = std::make_unique<host_reservation_view>(view);
+        auto * buffer = ggml_backend_cpu_buffer_from_ptr(view.data, size);
+        buffer->context = context.release();
+        buffer->iface.free_buffer = host_view_free;
+        buffer->iface.get_base = host_view_base;
+        buffer->iface.clear = host_view_clear;
+        buffer->view_buffer = host_view_slice;
+        return buffer;
+    } catch (const std::bad_alloc &) {
+        return nullptr;
+    }
+}
+}
+
+struct ggml_backend_host_reservation {
+    std::shared_ptr<host_reservation_state> state;
+};
+
+size_t ggml_backend_host_reservation_granularity(void) {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return info.dwPageSize;
+#else
+    const long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? size_t(page) : 0;
+#endif
+}
+
+ggml_backend_host_reservation_t ggml_backend_host_reservation_new(size_t size) {
+    const size_t page = ggml_backend_host_reservation_granularity();
+    if (!page || (page & (page - 1)) || !size || size > SIZE_MAX - (page - 1)) return nullptr;
+    const size_t padded = (size + page - 1) & ~(page - 1);
+    if (page > size_t(PTRDIFF_MAX)/2 || padded > size_t(PTRDIFF_MAX) - 2*page) return nullptr;
+    try {
+        auto reservation = std::make_unique<ggml_backend_host_reservation>();
+        reservation->state = std::make_shared<host_reservation_state>();
+        auto & state = *reservation->state;
+        state.mapped_size = padded + 2*page;
+#ifdef _WIN32
+        state.mapping = VirtualAlloc(nullptr, state.mapped_size, MEM_RESERVE, PAGE_NOACCESS);
+#else
+        state.mapping = mmap(nullptr, state.mapped_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (state.mapping == MAP_FAILED) state.mapping = nullptr;
+#endif
+        if (!state.mapping) return nullptr;
+        state.base = static_cast<char *>(state.mapping) + page;
+        state.size = padded;
+        return reservation.release();
+    } catch (const std::bad_alloc &) {
+        return nullptr;
+    }
+}
+
+void ggml_backend_host_reservation_free(ggml_backend_host_reservation_t reservation) { delete reservation; }
+
+void * ggml_backend_host_reservation_base(ggml_backend_host_reservation_t reservation) {
+    return reservation ? reservation->state->base : nullptr;
+}
+
+size_t ggml_backend_host_reservation_size(ggml_backend_host_reservation_t reservation) {
+    return reservation ? reservation->state->size : 0;
+}
+
+size_t ggml_backend_host_reservation_committed(ggml_backend_host_reservation_t reservation) {
+    if (!reservation) return 0;
+    std::lock_guard<std::mutex> lock(reservation->state->mutex);
+    return reservation->state->committed;
+}
+
+bool ggml_backend_host_reservation_commit(ggml_backend_host_reservation_t reservation, size_t offset, size_t size) {
+    const size_t page = ggml_backend_host_reservation_granularity();
+    if (!reservation || !page || !size || offset%page || size%page) return false;
+    auto & state = *reservation->state;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.failed || offset > state.size || size > state.size - offset) return false;
+    auto position = std::lower_bound(state.ranges.begin(), state.ranges.end(), offset,
+        [](const std::shared_ptr<host_committed_range> & range, size_t first) { return range->offset < first; });
+    if (position != state.ranges.end() && (*position)->offset == offset && (*position)->size == size) return true;
+    if (position != state.ranges.end() && offset + size > (*position)->offset) return false;
+    if (position != state.ranges.begin()) {
+        const auto & before = *(position - 1);
+        if (before->size > offset - before->offset) return false;
+    }
+    try {
+        const size_t index = size_t(position - state.ranges.begin());
+        auto range = std::make_shared<host_committed_range>(host_committed_range{offset, size});
+        state.ranges.reserve(state.ranges.size() + 1);
+        void * data = static_cast<char *>(state.base) + offset;
+#ifdef _WIN32
+        if (VirtualAlloc(data, size, MEM_COMMIT, PAGE_READWRITE) != data) return false;
+#else
+        if (mprotect(data, size, PROT_READ | PROT_WRITE)) return false;
+#endif
+        std::memset(data, 0, size);
+        state.ranges.insert(state.ranges.begin() + index, std::move(range));
+        state.committed += size;
+        return true;
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+}
+
+bool ggml_backend_host_reservation_decommit(ggml_backend_host_reservation_t reservation, size_t offset, size_t size) {
+    if (!reservation || !size) return false;
+    auto & state = *reservation->state;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto position = std::find_if(state.ranges.begin(), state.ranges.end(), [&](const std::shared_ptr<host_committed_range> & range) {
+        return range->offset == offset && range->size == size;
+    });
+    if (position == state.ranges.end() || position->use_count() != 1) return false;
+    void * data = static_cast<char *>(state.base) + offset;
+#ifdef _WIN32
+    if (!VirtualFree(data, size, MEM_DECOMMIT)) return false;
+#else
+    if (mprotect(data, size, PROT_NONE)) return false;
+    if (madvise(data, size, MADV_DONTNEED)) {
+        if (mprotect(data, size, PROT_READ | PROT_WRITE)) {
+            state.failed = true;
+            GGML_LOG_ERROR("host reservation protection restore failed\n");
+        }
+        return false;
+    }
+#endif
+    state.committed -= size;
+    state.ranges.erase(position);
+    return true;
+}
+
+ggml_backend_buffer_t ggml_backend_host_reservation_view(ggml_backend_host_reservation_t reservation, size_t offset, size_t size) {
+    if (!reservation || !size) return nullptr;
+    auto & state = *reservation->state;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.failed || offset > state.size || size > state.size - offset ||
+            offset%ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type())) return nullptr;
+    auto position = std::upper_bound(state.ranges.begin(), state.ranges.end(), offset,
+        [](size_t first, const std::shared_ptr<host_committed_range> & range) { return first < range->offset; });
+    if (position == state.ranges.begin()) return nullptr;
+    const auto & range = *(position - 1);
+    if (offset - range->offset > range->size || size > range->size - (offset - range->offset)) return nullptr;
+    return host_view_make({reservation->state, range, static_cast<char *>(state.base) + offset}, size);
+}
 
 struct ggml_backend_memory_planner {
     size_t capacity;
