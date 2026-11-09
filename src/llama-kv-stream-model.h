@@ -4,6 +4,11 @@
 class llama_kv_stream_logical_cache;
 class llama_context_memory;
 
+#include <atomic>
+
+// IDs must also admit their four derived resource IDs without overflow.
+uint64_t llama_kv_stream_cache_ids_reserve(std::atomic<uint64_t> & next, uint32_t count) noexcept;
+
 enum class llama_kv_stream_access_role : uint32_t { append, read };
 
 // Scheduling intent only. Read frontiers/generations are resolved after publication, not inferred from cache membership.
@@ -55,6 +60,8 @@ struct llama_kv_stream_model_config {
     uint32_t auxiliary_cache_layers = 0;
     // Quote all target decode widths up to this limit before binding the phase arena.
     uint32_t max_decode_rows = 4;
+    // Internal backing choice; multi-slot server admission remains separately gated.
+    bool demand_host = false;
 };
 
 // Own the host-KV execution buffer and a serial session; proxy-buffer references retain the runtime state.

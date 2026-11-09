@@ -1,13 +1,28 @@
 #include "../src/llama-kv-stream-logical-cache.h"
+#include "../src/llama-kv-cells.h"
 #include "testing.h"
 #include "../src/llama-kv-stream-writer.h"
+#include "../src/llama-kv-stream-model.h"
 #include "ggml-cpp.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <cstring>
 #include <vector>
+#include <thread>
 
 using operand = ggml_kv_stream_operand;
+
+static std::shared_ptr<llama_kv_stream_logical_cache> reserved_cache(uint64_t id) {
+    llama_kv_stream_host_config c{id, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 32, 32, 1, 8, 128},
+        {{GGML_TYPE_Q8_0, true, true, true, true}, {GGML_TYPE_Q4_0, true, true, true, true}, true, true}, 33, 1};
+    auto sparse = llama_kv_stream_host_reservation::create(c, ggml_backend_cpu_buffer_type(),
+        [](ggml_backend_buffer_t owner) {
+            owner->buft = ggml_backend_cpu_buffer_type();
+            return ggml_backend_buffer_retain(owner);
+        }, 65536);
+    return llama_kv_stream_logical_cache::create(llama_kv_stream_host::from_reservation(std::move(sparse)));
+}
 
 static std::shared_ptr<llama_kv_stream_host> host(uint64_t id, ggml_type k = GGML_TYPE_Q8_0, ggml_type v = GGML_TYPE_Q4_0) {
     llama_kv_stream_host_config config;
@@ -64,6 +79,253 @@ struct generated_source {
 
 int main() {
     testing t;
+    t.test("cache_namespace_ranges_do_not_wrap_or_overlap_under_concurrent_creation", [](testing & t) {
+        const uint64_t limit = (UINT64_MAX - 3)/4;
+        std::atomic<uint64_t> clock{1};
+        t.assert_equal(uint64_t(0), llama_kv_stream_cache_ids_reserve(clock, 0));
+        t.assert_equal(uint64_t(1), clock.load());
+        clock = limit;
+        t.assert_equal(uint64_t(0), llama_kv_stream_cache_ids_reserve(clock, 2));
+        t.assert_equal(limit, clock.load());
+        t.assert_equal(limit, llama_kv_stream_cache_ids_reserve(clock, 1));
+        t.assert_equal(uint64_t(0), llama_kv_stream_cache_ids_reserve(clock, 1));
+        t.assert_equal(limit + 1, clock.load());
+        clock = UINT64_MAX;
+        t.assert_equal(uint64_t(0), llama_kv_stream_cache_ids_reserve(clock, 2));
+        t.assert_equal(uint64_t(UINT64_MAX), clock.load());
+        clock = 1;
+        std::vector<uint64_t> ids(4*64*2);
+        std::vector<std::thread> threads;
+        for (size_t thread = 0; thread < 4; ++thread) threads.emplace_back([&, thread] {
+            const uint32_t count = uint32_t(thread%2 + 1);
+            for (size_t i = 0; i < 64; ++i) {
+                const uint64_t first = llama_kv_stream_cache_ids_reserve(clock, count);
+                for (size_t j = 0; j < count; ++j) ids[(thread*64 + i)*2 + j] = first + j;
+            }
+        });
+        for (auto & thread : threads) thread.join();
+        ids.erase(std::remove(ids.begin(), ids.end(), uint64_t(0)), ids.end());
+        std::sort(ids.begin(), ids.end());
+        t.assert_equal(size_t(384), ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) t.assert_equal(uint64_t(i + 1), ids[i]);
+        t.assert_equal(uint64_t(385), clock.load());
+    });
+    t.test("slot_reuse_epoch_preserves_addresses_and_rejects_old_request_handles", [](testing & t) {
+        llama_kv_stream_context_limits limits;
+        t.assert_true(llama_kv_stream_context_limits_make(33, 40, 2, limits));
+        auto table = llama_kv_stream_slot_table::create(limits);
+        auto a = reserved_cache(501), b = reserved_cache(502), auxiliary = reserved_cache(503);
+        llama_kv_stream_slot_handle handle_a, handle_b;
+        if (!t.assert_true(table && a && b && auxiliary)) return;
+        t.assert_true(table->bind(0, {a, auxiliary}, handle_a));
+        t.assert_true(table->bind(1, {b, reserved_cache(504)}, handle_b));
+        t.assert_true(!table->bind(0, {reserved_cache(505)}, handle_a));
+        t.assert_true(append(t, *a, 17, 0x31) && append(t, *b, 9, 0x41));
+        llama_kv_stream_host_layer before, after;
+        t.assert_true(a->host()->layer(0, before));
+        const auto checkpoint_a = a->checkpoint(), checkpoint_b = b->checkpoint();
+        auto old_a = handle_a;
+        t.assert_true(table->advance(handle_a, handle_a));
+        t.assert_equal(old_a.generation + 1, handle_a.generation);
+        std::shared_ptr<llama_kv_stream_logical_cache> resolved;
+        t.assert_true(table->get(handle_a, 0, resolved) && resolved == a);
+        t.assert_true(!table->get(old_a, 0, resolved) && resolved == a);
+        t.assert_true(!table->get(handle_a, 2, resolved) && resolved == a);
+        t.assert_true(a->host()->layer(0, after) && before.k == after.k && before.v == after.v);
+        t.assert_equal(checkpoint_a.generation, a->identity().generation);
+        t.assert_equal(checkpoint_a.tokens, a->tokens());
+        t.assert_equal(checkpoint_b.generation, b->identity().generation);
+        t.assert_true(a->begin(1));
+        const auto busy = handle_a;
+        t.assert_true(!table->advance(handle_a, handle_a));
+        t.assert_equal(busy.generation, handle_a.generation);
+        t.assert_true(a->cancel());
+        t.assert_true(auxiliary->begin(1));
+        t.assert_true(!table->advance(handle_a, handle_a));
+        t.assert_true(auxiliary->cancel());
+        t.assert_true(table->get(handle_b, 0, resolved) && resolved == b);
+    });
+    t.test("slot_native_cells_keep_positions_and_image_metadata_outside_group_projection", [](testing & t) {
+        llama_kv_stream_context_limits limits;
+        t.assert_true(llama_kv_stream_context_limits_make(33,40,2,limits));
+        auto table=llama_kv_stream_slot_table::create(limits);
+        auto a=reserved_cache(511),b=reserved_cache(512),aux=reserved_cache(513);
+        llama_kv_stream_slot_handle ha,hb;
+        if (!t.assert_true(table && table->bind(0,{a,aux},ha) && table->bind(1,{b,reserved_cache(514)},hb))) return;
+        std::shared_ptr<llama_kv_cells> ca,cb,extra;
+        if (!t.assert_true(table->get_cells(ha,0,ca) && table->get_cells(hb,0,cb) && table->get_cells(ha,1,extra))) return;
+        t.assert_true(ca != cb && ca != extra && cb != extra);
+        t.assert_equal(uint32_t(40),ca->size());
+        t.assert_equal(uint32_t(40),cb->size());
+        if (!t.assert_true(append(t,*a,32,0x31) && append(t,*b,33,0x51))) return;
+        for (uint32_t i=0;i<33;++i) {
+            cb->pos_set(i,llama_pos(1024+i));
+            cb->ext_set(i,{llama_pos(i),3,i%2 ? llama_token(42) : LLAMA_TOKEN_NULL});
+            cb->seq_add(i,1);
+            if (i<32) {
+                ca->pos_set(i,llama_pos(i+7));
+                ca->ext_set(i,{2,llama_pos(i),llama_token(100+i)});
+                ca->seq_add(i,0);
+            }
+        }
+        t.assert_equal(uint32_t(32),ca->get_used());
+        t.assert_equal(uint32_t(33),cb->get_used());
+        t.assert_equal(uint32_t(0),extra->get_used());
+        const auto old=ha;
+        t.assert_true(table->advance(ha,ha));
+        auto resolved=cb;
+        t.assert_true(!table->get_cells(old,0,resolved) && resolved == cb);
+        t.assert_true(!table->get_cells(ha,2,resolved) && resolved == cb);
+        t.assert_true(table->get_cells(ha,0,resolved) && resolved == ca);
+        if (!t.assert_true(a->truncate(7))) return;
+        for (uint32_t i=7;i<32;++i) ca->rm(i);
+        t.assert_equal(uint32_t(7),ca->get_used());
+        t.assert_equal(uint32_t(33),cb->get_used());
+        for (uint32_t i=0;i<33;++i) {
+            t.assert_equal(llama_pos(1024+i),cb->pos_get(i));
+            t.assert_true(cb->seq_has(i,1) && !cb->seq_has(i,0));
+            t.assert_equal(llama_pos(i),cb->ext_get(i).x);
+            t.assert_equal(llama_pos(3),cb->ext_get(i).y);
+            t.assert_equal(i%2 ? llama_token(42) : LLAMA_TOKEN_NULL,cb->ext_get(i).tok);
+        }
+        ca->resize(8);
+        resolved=cb;
+        t.assert_true(!table->get_cells(ha,0,resolved) && resolved == cb);
+        t.assert_true(!table->advance(ha,ha));
+        auto cache=b;
+        size_t logical=77;
+        t.assert_true(!table->get(ha,0,cache) && cache == b);
+        t.assert_true(!table->logical_used(ha,0,logical) && logical == 77);
+        t.assert_true(table->get_cells(hb,0,resolved) && resolved == cb);
+    });
+    t.test("sampled_pending_anchor_counts_once_in_logical_context", [](testing & t) {
+        llama_kv_stream_context_limits limits;
+        t.assert_true(llama_kv_stream_context_limits_make(33,40,1,limits));
+        auto table=llama_kv_stream_slot_table::create(limits);
+        auto cache=reserved_cache(509);
+        llama_kv_stream_slot_handle handle;
+        if (!t.assert_true(table && cache && table->bind(0,{cache},handle) && append(t,*cache,30,0x31))) return;
+        size_t logical=0;
+        t.assert_true(table->logical_used(handle,1,logical));
+        t.assert_equal(size_t(31),logical);
+        llama_kv_stream_generation_budget budget;
+        t.assert_true(llama_kv_stream_generation_budget_make(limits.slot_limit-logical,7,SIZE_MAX,budget));
+        t.assert_equal(uint32_t(2),budget.query_rows);
+        t.assert_equal(uint32_t(1),budget.proposal_tokens);
+        // Forward the old anchor plus one accepted proposal; the new bonus remains pending.
+        t.assert_true(append(t,*cache,budget.query_rows,0x41));
+        t.assert_true(table->logical_used(handle,1,logical));
+        t.assert_equal(size_t(33),logical);
+        t.assert_true(!table->logical_used(handle,2,logical));
+        t.assert_equal(size_t(33),logical);
+        // Explicit forwarding without sampling does not add a second logical token.
+        t.assert_true(append(t,*cache,1,0x51));
+        t.assert_true(table->logical_used(handle,0,logical));
+        t.assert_equal(size_t(33),logical);
+        t.assert_true(!table->logical_used(handle,1,logical));
+        t.assert_equal(size_t(33),logical);
+    });
+    t.test("slot_binding_rejects_duplicate_storage_and_inconsistent_capacity", [](testing & t) {
+        llama_kv_stream_context_limits limits;
+        t.assert_true(llama_kv_stream_context_limits_make(33, 40, 3, limits));
+        auto table = llama_kv_stream_slot_table::create(limits);
+        auto cache = reserved_cache(601);
+        llama_kv_stream_slot_handle handle;
+        t.assert_true(table->bind(0, {cache}, handle));
+        handle = {99, 77};
+        t.assert_true(!table->bind(1, {cache}, handle));
+        std::shared_ptr<llama_kv_stream_logical_cache> alias = llama_kv_stream_logical_cache::create(cache->host());
+        t.assert_true(!table->bind(1, {alias}, handle));
+        t.assert_true(!table->bind(1, {reserved_cache(601)}, handle));
+        t.assert_true(!table->bind(3, {reserved_cache(602)}, handle));
+        t.assert_true(!table->bind(1, {}, handle));
+        t.assert_equal(uint64_t(77), handle.generation);
+        t.assert_equal(uint32_t(99), handle.slot);
+        auto invalid = limits; ++invalid.group_limit;
+        t.assert_true(!llama_kv_stream_slot_table::create(invalid));
+        t.assert_true(!table->bind(1, {llama_kv_stream_logical_cache::create(host(603))}, handle));
+        t.assert_true(table->bind(1, {reserved_cache(604)}, handle));
+    });
+    t.test("demand_backed_slot_histories_publish_and_truncate_independently", [](testing & t) {
+        auto first = host(401)->config();
+        first.context_tokens = 33;
+        auto second = first; second.cache_id = 402;
+        const auto reserve = [](const llama_kv_stream_host_config & c) {
+            auto sparse = llama_kv_stream_host_reservation::create(c, ggml_backend_cpu_buffer_type(),
+                [](ggml_backend_buffer_t owner) {
+                    auto * buffer = ggml_backend_buffer_retain(owner);
+                    buffer->buft = ggml_backend_cpu_buffer_type();
+                    return buffer;
+                }, 65536);
+            return llama_kv_stream_host::from_reservation(std::move(sparse));
+        };
+        auto a = llama_kv_stream_logical_cache::create(reserve(first));
+        auto b = llama_kv_stream_logical_cache::create(reserve(second));
+        if (!t.assert_true(a && b)) return;
+        t.assert_true(a->host()->demand_backed() && b->host()->demand_backed());
+        t.assert_true(a->host()->buffer() == nullptr && b->host()->buffer() == nullptr);
+        t.assert_true(append(t, *a, 17, 0x11));
+        t.assert_true(append(t, *b, 9, 0x41));
+        t.assert_equal(size_t(17), a->tokens());
+        t.assert_equal(size_t(9), b->tokens());
+        const auto checkpoint_a = a->checkpoint(), checkpoint_b = b->checkpoint();
+        llama_kv_stream_host_layer plane_a, plane_b;
+        t.assert_true(a->host()->layer(0, plane_a) && b->host()->layer(0, plane_b));
+        t.assert_true(plane_a.k != plane_b.k && plane_a.v != plane_b.v);
+        t.assert_equal(uint8_t(0x11), *static_cast<uint8_t *>(plane_a.k));
+        t.assert_equal(uint8_t(0x41), *static_cast<uint8_t *>(plane_b.k));
+        t.assert_true(a->truncate(4));
+        t.assert_equal(checkpoint_b.generation, b->identity().generation);
+        t.assert_equal(checkpoint_b.tokens, b->tokens());
+        t.assert_true(!a->restore(checkpoint_b) && !b->restore(checkpoint_a));
+        t.assert_true(append(t, *a, 3, 0x21));
+        t.assert_equal(uint8_t(0x41), *static_cast<uint8_t *>(plane_b.k));
+        t.assert_true(append(t, *b, 24, 0x51));
+        t.assert_equal(size_t(33), b->tokens());
+        t.assert_true(!b->begin(1));
+        t.assert_true(a->begin(26));
+        t.assert_true(a->cancel());
+        t.assert_equal(size_t(7), a->tokens());
+    });
+    t.test("unretired_failed_growth_cannot_reopen_cache_admission", [](testing & t) {
+        auto c = host(409)->config();
+        c.shape = {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 256, 256, 4, 256, 128};
+        c.context_tokens = 4097;
+        ggml_backend_buffer_ptr held;
+        bool fail = false;
+        auto sparse = llama_kv_stream_host_reservation::create(c, ggml_backend_cpu_buffer_type(),
+            [&](ggml_backend_buffer_t owner) -> ggml_backend_buffer_t {
+                if (fail) {
+                    held.reset(ggml_backend_buffer_retain(owner));
+                    return nullptr;
+                }
+                owner->buft = ggml_backend_cpu_buffer_type();
+                return ggml_backend_buffer_retain(owner);
+            }, 65536);
+        auto cache = llama_kv_stream_logical_cache::create(llama_kv_stream_host::from_reservation(std::move(sparse)));
+        if (!t.assert_true(cache && append(t, *cache, 1, 0x31))) return;
+        llama_kv_stream_host_layer prefix;
+        t.assert_true(cache->host()->layer(0, prefix));
+        const auto checkpoint = cache->checkpoint();
+        const auto & layout = cache->host()->layout();
+        std::vector<uint8_t> k(256*layout.k_token_bytes, 0x51), v(256*layout.v_token_bytes, 0x61);
+        llama_kv_stream_write write;
+        t.assert_true(cache->begin(256));
+        t.assert_true(cache->content()->prepare({
+            {0, operand::k, layout.k_token_bytes, k.data(), k.size()},
+            {0, operand::v, layout.v_token_bytes, v.data(), v.size()}}, write));
+        fail = true;
+        t.assert_true(!cache->publish_host(write));
+        t.assert_equal(uint8_t(0x31), *static_cast<uint8_t *>(prefix.k));
+        t.assert_true(cache->cancel());
+        t.assert_true(!cache->ready());
+        const bool reopened = cache->begin(1);
+        t.assert_true(!reopened);
+        if (reopened) t.assert_true(cache->cancel());
+        t.assert_true(!cache->restore(checkpoint));
+        t.assert_equal(size_t(1), cache->tokens());
+        held.reset();
+    });
     t.test("suspension_readiness_requires_acknowledged_host_publication", [](testing & t) {
         auto cache = llama_kv_stream_logical_cache::create(host(909));
         if (!t.assert_true(bool(cache) && cache->ready())) return;

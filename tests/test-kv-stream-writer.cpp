@@ -235,6 +235,79 @@ int main(int argc, char ** argv) {
             }
         }
     });
+    t.test("registered_writer_tiles_keep_native_bits_across_download_boundaries", [&](testing & t) {
+        for (uint32_t dimension : {256u,512u}) for (bool value : {false,true}) {
+            writer_fixture f(backend.get(), cuda);
+            encoder e(f,257,value ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0);
+            e.run();
+            std::vector<uint8_t> expected(e.rows*e.row_bytes), actual(expected.size());
+            ggml_backend_tensor_get(e.output, expected.data(), 0, expected.size());
+            auto c = f.host->config(); c.cache_id = 93;
+            c.shape.head_dim_k=c.shape.head_dim_v=dimension;
+            c.shape.heads=1024/dimension;
+            std::unique_ptr<llama_kv_stream_host_reservation> sparse;
+            if (cuda) sparse = llama_kv_stream_host_reservation::create(c, ggml_backend_get_device(backend.get()), 65536);
+            else sparse = llama_kv_stream_host_reservation::create(c, ggml_backend_cpu_buffer_type(),
+                [](ggml_backend_buffer_t owner) {
+                    owner->buft = ggml_backend_cpu_buffer_type();
+                    return ggml_backend_buffer_retain(owner);
+                }, 65536);
+            if (!t.assert_true(sparse && sparse->prepare(e.rows))) return;
+            std::vector<llama_kv_stream_host_range> ranges;
+            if (!t.assert_true(sparse->ranges(0,value ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,0,expected.size(),ranges) && ranges.size() > 1)) return;
+            std::vector<std::pair<const void *, size_t>> addresses;
+            for (const auto & range : ranges) addresses.push_back({
+                static_cast<const char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset, range.bytes});
+            auto * type = ggml_backend_get_default_buffer_type(backend.get());
+            size_t bytes = 0;
+            if (!t.assert_true(llama_kv_stream_writer::requirements(type, c.shape, 512, bytes))) return;
+            ggml_backend_buffer_ptr scratch(ggml_backend_buft_alloc_buffer(type, bytes));
+            auto writer = llama_kv_stream_writer::create(backend.get(), scratch.get(), bytes, c.shape, 512);
+            if (!t.assert_true(writer != nullptr)) return;
+            for (const auto & range : ranges) ggml_backend_buffer_clear(range.buffer.get(),0xa5);
+            std::vector<llama_kv_stream_host_range> duplicated;
+            for (const auto & range : ranges) duplicated.push_back({
+                ggml_backend_buffer_ptr(ggml_backend_buffer_retain(range.buffer.get())),range.offset,range.bytes});
+            duplicated[1].buffer.reset(ggml_backend_buffer_retain(duplicated[0].buffer.get()));
+            llama_kv_stream_writer_completion invalid;
+            const bool accepted=writer->generate_async_registered(e.source,value,duplicated,{},invalid);
+            if (accepted) {
+                if (invalid.device) invalid.device->synchronize();
+                if (invalid.host) invalid.host->synchronize();
+            }
+            t.assert_true("duplicate registrations reject before publication",!accepted);
+            if (!accepted) {
+                t.assert_equal(size_t(0),writer->stats().graph_submissions);
+                bool untouched=true;
+                for (const auto & range : addresses) {
+                    const auto * first=static_cast<const uint8_t *>(range.first);
+                    untouched &= std::all_of(first,first+range.second,[](uint8_t value) { return value == 0xa5; });
+                }
+                t.assert_true(untouched);
+            }
+            writer->release_completed();
+            duplicated.clear();
+            release_probe freed(ranges.front().buffer.get());
+            llama_kv_stream_writer_completion completion;
+            if (!t.assert_true(writer->generate_async_registered(e.source,value,ranges, {}, completion))) return;
+            const auto stats = writer->stats();
+            t.assert_equal(size_t(2), stats.graph_submissions);
+            t.assert_equal(expected.size(), stats.d2h_bytes);
+            t.assert_true(stats.d2h_calls >= ranges.size());
+            t.assert_equal(bytes, stats.device_scratch_bytes);
+            ranges.clear(); sparse.reset();
+            t.assert_equal(0, freed.frees);
+            t.assert_true(completion.device && completion.host && completion.device->synchronize() && completion.host->synchronize());
+            size_t copied = 0;
+            for (const auto & range : addresses) {
+                std::memcpy(actual.data() + copied, range.first, range.second);
+                copied += range.second;
+            }
+            t.assert_true(actual == expected);
+            writer->release_completed();
+            t.assert_equal(1, freed.frees);
+        }
+    });
     t.test("writer_quote_uses_independent_row_traits_and_bounded_tiles", [&](testing & t) {
         const ggml_type types[]={GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16,GGML_TYPE_Q8_0,
             GGML_TYPE_Q4_0,GGML_TYPE_Q4_1,GGML_TYPE_IQ4_NL,GGML_TYPE_Q5_0,GGML_TYPE_Q5_1};

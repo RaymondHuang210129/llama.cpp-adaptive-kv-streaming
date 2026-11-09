@@ -475,6 +475,10 @@ llama_context::llama_context(
         }
     }
 
+    const uint32_t logical_context = cparams.n_ctx;
+    if (cparams.kv_streaming() && logical_context > uint32_t(INT32_MAX) - 255) {
+        throw std::runtime_error("context capacity exceeds the padded token index range");
+    }
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -492,6 +496,10 @@ llama_context::llama_context(
             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
             LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
         }
+    }
+
+    if (!cparams.set_stream_limits(logical_context)) {
+        throw std::runtime_error("streamed context limits require indexed capacity, one or two slots, and a shared unified arena for two slots");
     }
 
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);

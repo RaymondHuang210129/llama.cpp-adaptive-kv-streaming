@@ -10,10 +10,24 @@ struct ggml_backend_execution_ops {
     void (*destroy)(void * context);
 };
 
+// Checked byte access for a logical address space with partially backed host ranges.
+// Callbacks validate committed coverage before touching bytes; clear must not visit holes.
+struct ggml_backend_execution_io {
+    void * context;
+    bool (*read)(void * context, const ggml_tensor * tensor, void * data, size_t offset, size_t bytes);
+    bool (*write)(void * context, const ggml_tensor * tensor, const void * data, size_t offset, size_t bytes);
+    bool (*memset)(void * context, const ggml_tensor * tensor, uint8_t value, size_t offset, size_t bytes);
+    bool (*clear)(void * context, uint8_t value);
+};
+
 // Retain stateless host backing and adopt context only on success; native reset state is not bypassed.
 // Destruction callbacks must not throw. Tensor byte layout remains the backing's layout.
 GGML_API ggml_backend_buffer_t ggml_backend_execution_buffer_new(ggml_backend_dev_t device,
         ggml_backend_buffer_t backing, const ggml_backend_execution_ops & ops, void * context);
+// No ordinary host buffer or implicit host-copy fallback is exposed. The ops context retains the address and I/O owners.
+GGML_API ggml_backend_buffer_t ggml_backend_execution_buffer_new_address_space(ggml_backend_dev_t device,
+        void * base, size_t size, size_t alignment, const ggml_backend_execution_ops & ops,
+        const ggml_backend_execution_io & io, void * context);
 GGML_API bool ggml_backend_buft_is_execution(ggml_backend_buffer_type_t type);
 GGML_API bool ggml_backend_execution_buffers_present();
 // Multiple unrelated owners are rejected. A null owner means ordinary storage.

@@ -59,6 +59,42 @@ static std::vector<uint32_t> oracle(size_t capacity, size_t maximum,
 
 int main() {
     testing t;
+    t.test("slot_logical_group_and_total_storage_limits_are_distinct", [](testing & t) {
+        llama_kv_stream_context_limits limits;
+        t.assert_true(llama_kv_stream_context_limits_make(1000, 1024, 2, limits));
+        t.assert_equal(uint32_t(1000), limits.slot_limit);
+        t.assert_equal(uint32_t(1000), limits.group_limit);
+        t.assert_equal(uint32_t(1024), limits.slot_storage);
+        t.assert_equal(uint32_t(2048), limits.history_storage);
+        t.assert_equal(uint32_t(2), limits.slots);
+        for (const auto & invalid : std::vector<std::vector<size_t>>{
+                {0, 1024, 2}, {1000, 999, 2}, {1000, 1024, 0}, {1000, 1024, 257},
+                {SIZE_MAX, SIZE_MAX, 2}, {1, size_t(INT32_MAX), 3}}) {
+            t.assert_true(!llama_kv_stream_context_limits_make(invalid[0], invalid[1], invalid[2], limits));
+            t.assert_equal(uint32_t(2048), limits.history_storage);
+        }
+        t.assert_true(llama_kv_stream_context_limits_make(8192, 8192, 6, limits));
+        t.assert_equal(uint32_t(49152), limits.history_storage);
+        t.assert_equal(uint32_t(8192), limits.group_limit);
+    });
+    t.test("generation_queries_and_bonus_fit_equal_logical_allowance", [](testing & t) {
+        llama_kv_stream_generation_budget budget;
+        for (size_t headroom : {size_t(1),size_t(2),size_t(4),size_t(8),size_t(9),SIZE_MAX}) {
+            for (uint32_t proposals : {0u,1u,3u,7u}) for (size_t remaining : {size_t(1),size_t(3),SIZE_MAX}) {
+                t.assert_true(llama_kv_stream_generation_budget_make(headroom,proposals,remaining,budget));
+                t.assert_true(budget.query_rows >= 1 && budget.query_rows <= 8);
+                t.assert_equal(budget.query_rows-1,budget.proposal_tokens);
+                t.assert_true(budget.query_rows <= headroom && budget.query_rows <= remaining);
+                t.assert_true(budget.proposal_tokens <= proposals);
+            }
+        }
+        budget={77,66};
+        t.assert_true(!llama_kv_stream_generation_budget_make(0,7,SIZE_MAX,budget));
+        t.assert_true(!llama_kv_stream_generation_budget_make(8,7,0,budget));
+        t.assert_true(!llama_kv_stream_generation_budget_make(16,15,SIZE_MAX,budget));
+        t.assert_equal(uint32_t(77),budget.query_rows);
+        t.assert_equal(uint32_t(66),budget.proposal_tokens);
+    });
     t.test("ninety_thirty_equal_growth_and_packed_offsets", [](testing & t) {
         selection plan;
         t.assert_true(llama_kv_stream_select({128*1024, 2},

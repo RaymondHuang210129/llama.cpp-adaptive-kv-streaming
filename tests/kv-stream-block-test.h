@@ -69,7 +69,17 @@ inline std::vector<float> stock_attention(fixture & f, block_inputs & input, uin
     auto * graph=ggml_new_graph_custom(ctx.get(),64,false); ggml_build_forward_expand(graph,out);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),f.backend)); GGML_ASSERT(buffer);
     llama_kv_stream_host_layer host; GGML_ASSERT(f.host->layer(layer,host));
-    ggml_backend_tensor_set(k,host.k,0,ggml_nbytes(k)); ggml_backend_tensor_set(v,host.v,0,ggml_nbytes(v));
+    std::vector<uint8_t> key_bytes,value_bytes;
+    const void * key_source=host.k, * value_source=host.v;
+    if (f.host->demand_backed()) {
+        std::vector<llama_kv_stream_host_range> ranges;
+        GGML_ASSERT(f.host->address_ranges(host.k,ggml_nbytes(k),ranges) && f.host->address_ranges(host.v,ggml_nbytes(v),ranges));
+        key_bytes.resize(ggml_nbytes(k)); value_bytes.resize(ggml_nbytes(v));
+        std::memcpy(key_bytes.data(),host.k,key_bytes.size());
+        std::memcpy(value_bytes.data(),host.v,value_bytes.size());
+        key_source=key_bytes.data(); value_source=value_bytes.data();
+    }
+    ggml_backend_tensor_set(k,key_source,0,ggml_nbytes(k)); ggml_backend_tensor_set(v,value_source,0,ggml_nbytes(v));
     GGML_ASSERT(ggml_backend_graph_compute(f.backend,graph) == GGML_STATUS_SUCCESS);
     if (native_override) GGML_ASSERT(native_override(f.backend,out));
     std::vector<float> result(ggml_nelements(out)); ggml_backend_tensor_get(out,result.data(),0,ggml_nbytes(out)); return result;

@@ -1,5 +1,7 @@
 #include "kv-stream-block-test.h"
 #include "../ggml/src/ggml-kv-stream-copy.h"
+#include "../ggml/src/ggml-kv-stream-registered-copy.h"
+#include "ggml-cuda.h"
 #include <chrono>
 #include <iomanip>
 #ifdef KV_COPY_CUDA_TEST
@@ -28,6 +30,153 @@ struct delayed_event {
     ~delayed_event() { open(); cudaStreamSynchronize(stream); ggml_backend_event_free(event); cudaStreamDestroy(stream); }
 };
 #endif
+
+static int registered_copy_contract(ggml_backend_t backend) {
+    testing t;
+    auto * device = ggml_backend_get_device(backend);
+    auto * reg = ggml_backend_dev_backend_reg(device);
+    auto old_get = reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_copy_ops"));
+    const auto * old = old_get ? old_get() : nullptr;
+    if (!t.assert_true(old && old->version >= 11)) return t.summary();
+    const ggml_kv_stream_shape shape{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 256, 256, 4, 256, 128};
+    ggml_kv_stream_layout page, ring;
+    if (!t.assert_true(ggml_kv_stream_layout_make(shape, 256, page).status == ggml_kv_stream_status::success &&
+            ggml_kv_stream_layout_make(shape, 512, ring).status == ggml_kv_stream_status::success)) return t.summary();
+    ggml_backend_buffer_ptr gpu(ggml_backend_buft_alloc_buffer(llama_kv_stream_device_buffer_type(device), ring.bytes));
+    ggml_backend_buffer_ptr host(ggml_backend_buft_alloc_buffer(llama_kv_stream_host_buffer_type(device), page.bytes));
+    if (!t.assert_true(gpu && host)) return t.summary();
+    ggml_context_ptr metadata(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+    auto * tensor = ggml_new_tensor_1d(metadata.get(), GGML_TYPE_I8, int64_t(ring.bytes));
+    if (!t.assert_equal(GGML_STATUS_SUCCESS, ggml_backend_tensor_alloc(gpu.get(), tensor, ggml_backend_buffer_get_base(gpu.get())))) return t.summary();
+    auto * bytes = static_cast<uint8_t *>(ggml_backend_buffer_get_base(host.get()));
+    std::memset(bytes, 0x51, page.k_bytes);
+    std::memset(bytes + page.v_offset, 0x61, page.v_bytes);
+    ggml_backend_buffer_clear(gpu.get(), 0xa5);
+    std::unique_ptr<void, void (*)(void *)> queue(old->create(backend, gpu.get(), host.get(), shape, 2), old->free);
+    if (!t.assert_true(queue && old->begin(queue.get()) && old->enqueue_span(queue.get(), 0,
+            bytes, bytes + page.v_offset, 129, 256) && old->acquire_span(queue.get(), 0, 1))) return t.summary();
+    ggml_backend_synchronize(backend);
+    std::vector<uint8_t> observed(ring.bytes);
+    ggml_backend_tensor_get(tensor, observed.data(), 0, observed.size());
+    for (bool value : {false, true}) {
+        const size_t first = value ? ring.v_offset : 0;
+        const size_t stride = value ? page.v_token_bytes : page.k_token_bytes;
+        const size_t capacity = value ? page.v_bytes : page.k_bytes;
+        t.assert_true(std::all_of(observed.begin() + first, observed.begin() + first + 129*stride,
+            [value](uint8_t b) { return b == (value ? 0x61 : 0x51); }));
+        t.assert_true(std::all_of(observed.begin() + first + 129*stride, observed.begin() + first + capacity,
+            [](uint8_t b) { return b == 0; }));
+        t.assert_true(std::all_of(observed.begin() + first + capacity, observed.begin() + first + 2*capacity,
+            [](uint8_t b) { return b == 0xa5; }));
+    }
+    t.assert_true(old->release_completed(queue.get(), 0));
+    old->drain(queue.get());
+    queue.reset();
+    if (t.failures) return t.summary();
+    const auto get = reinterpret_cast<ggml_kv_stream_registered_copy_ops_get>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_registered_copy_ops"));
+    if (!t.assert_true(get && get() && get()->version >= 1)) return t.summary();
+    const auto * registered = get();
+    llama_kv_stream_host_config config{99,shape,
+        {{GGML_TYPE_Q8_0,true,true,true,true},{GGML_TYPE_Q4_0,true,true,true,true},true,true},8192,1};
+    auto sparse = llama_kv_stream_host_reservation::create(config,device,65536);
+    if (!t.assert_true(sparse && sparse->prepare(129))) return t.summary();
+    llama_kv_stream_host_layer source;
+    if (!t.assert_true(sparse->layer(0,source))) return t.summary();
+    const ggml_kv_stream_registered_copy_source scope{source.k,sparse->bytes()};
+    std::vector<llama_kv_stream_host_range> keys,values;
+    if (!t.assert_true(sparse->ranges(0,ggml_kv_stream_operand::k,0,129*page.k_token_bytes,keys) &&
+            sparse->ranges(0,ggml_kv_stream_operand::v,0,129*page.v_token_bytes,values))) return t.summary();
+    std::vector<ggml_kv_stream_registered_copy_fragment> kp,vp;
+    for (const auto & part : keys) {
+        std::memset(static_cast<char *>(ggml_backend_buffer_get_base(part.buffer.get()))+part.offset,0x51,part.bytes);
+        kp.push_back({part.buffer.get(),part.offset,part.bytes});
+    }
+    for (const auto & part : values) {
+        std::memset(static_cast<char *>(ggml_backend_buffer_get_base(part.buffer.get()))+part.offset,0x61,part.bytes);
+        vp.push_back({part.buffer.get(),part.offset,part.bytes});
+    }
+    t.assert_true(kp.size() > 1 && vp.size() > 1);
+    std::unique_ptr<void,void (*)(void *)> prepared(old->prepare(backend,2,false),old->free_prepared);
+    if (!t.assert_true(prepared != nullptr)) return t.summary();
+    t.assert_true(!registered->create(backend,prepared.get(),gpu.get(),{nullptr,scope.bytes},shape,2));
+    queue.reset(registered->create(backend,prepared.get(),gpu.get(),scope,shape,2));
+    if (!t.assert_true(queue != nullptr)) return t.summary();
+    {
+        std::unique_ptr<void,void (*)(void *)> direct(registered->create(backend,nullptr,gpu.get(),scope,shape,2),old->free);
+        t.assert_true(direct != nullptr);
+    }
+    ggml_backend_buffer_clear(gpu.get(),0xa5);
+    if (!t.assert_true(old->begin(queue.get()))) return t.summary();
+    auto bad=vp; --bad.back().bytes;
+    t.assert_true(!registered->enqueue(queue.get(),0,kp.data(),kp.size(),bad.data(),bad.size(),129,256,true));
+    bad=vp; bad.front().owner=nullptr;
+    t.assert_true(!registered->enqueue(queue.get(),0,kp.data(),kp.size(),bad.data(),bad.size(),129,256,true));
+    auto bad_key=kp; bad_key.front().offset=SIZE_MAX;
+    t.assert_true(!registered->enqueue(queue.get(),0,bad_key.data(),bad_key.size(),vp.data(),vp.size(),129,256,true));
+    bad_key=kp; bad_key[1]=bad_key[0];
+    t.assert_true(!registered->enqueue(queue.get(),0,bad_key.data(),bad_key.size(),vp.data(),vp.size(),129,256,true));
+    const ggml_kv_stream_registered_copy_fragment foreign{host.get(),0,129*page.k_token_bytes};
+    t.assert_true(!registered->enqueue(queue.get(),0,&foreign,1,vp.data(),vp.size(),129,256,true));
+    t.assert_true(!old->enqueue_span(queue.get(),0,source.k,source.v,129,256));
+    t.assert_equal(size_t(0),old->stats(queue.get()).bytes);
+    t.assert_equal(size_t(0),old->stats(queue.get()).calls);
+    ggml_backend_synchronize(backend);
+    ggml_backend_tensor_get(tensor,observed.data(),0,observed.size());
+    t.assert_true(std::all_of(observed.begin(),observed.end(),[](uint8_t b) { return b == 0xa5; }));
+    if (!t.assert_true(registered->enqueue(queue.get(),0,kp.data(),kp.size(),vp.data(),vp.size(),129,256,true))) return t.summary();
+    const size_t expected_calls=kp.size()+vp.size();
+    keys.clear(); values.clear(); sparse.reset();
+    if (!t.assert_true(old->acquire_span(queue.get(),0,1))) return t.summary();
+    ggml_backend_synchronize(backend);
+    ggml_backend_tensor_get(tensor,observed.data(),0,observed.size());
+    for (bool value : {false,true}) {
+        const size_t first=value ? ring.v_offset : 0;
+        const size_t stride=value ? page.v_token_bytes : page.k_token_bytes;
+        const size_t capacity=value ? page.v_bytes : page.k_bytes;
+        t.assert_true(std::all_of(observed.begin()+first,observed.begin()+first+129*stride,
+            [value](uint8_t b) { return b == (value ? 0x61 : 0x51); }));
+        t.assert_true(std::all_of(observed.begin()+first+129*stride,observed.begin()+first+capacity,
+            [](uint8_t b) { return b == 0; }));
+        t.assert_true(std::all_of(observed.begin()+first+capacity,observed.begin()+first+2*capacity,
+            [](uint8_t b) { return b == 0xa5; }));
+    }
+    t.assert_equal(expected_calls,old->stats(queue.get()).calls);
+    t.assert_equal(129*(page.k_token_bytes+page.v_token_bytes),old->stats(queue.get()).bytes);
+    t.assert_true(old->release_completed(queue.get(),0));
+    t.assert_true(registered->enqueue(queue.get(),1,kp.data(),kp.size(),vp.data(),vp.size(),129,256,true));
+    t.assert_true(old->acquire_span(queue.get(),1,1));
+    ggml_backend_synchronize(backend);
+    t.assert_true(old->release_completed(queue.get(),1));
+    for (bool value : {false,true}) {
+        const size_t first=value ? ring.v_offset : 0;
+        const size_t stride=value ? page.v_token_bytes : page.k_token_bytes;
+        const size_t capacity=value ? page.v_bytes : page.k_bytes;
+        ggml_backend_tensor_memset(tensor,0xa5,first+capacity+129*stride,127*stride);
+    }
+    ggml_backend_synchronize(backend);
+    const ggml_kv_stream_registered_copy_fragment one_k{kp.front().owner,kp.front().offset,page.k_token_bytes};
+    const ggml_kv_stream_registered_copy_fragment one_v{vp.front().owner,vp.front().offset,page.v_token_bytes};
+    t.assert_true(registered->enqueue(queue.get(),0,&one_k,1,&one_v,1,1,256,true));
+    t.assert_true(old->acquire_span(queue.get(),0,1));
+    ggml_backend_synchronize(backend);
+    ggml_backend_tensor_get(tensor,observed.data(),0,observed.size());
+    for (bool value : {false,true}) {
+        const size_t first=value ? ring.v_offset : 0;
+        const size_t stride=value ? page.v_token_bytes : page.k_token_bytes;
+        const size_t capacity=value ? page.v_bytes : page.k_bytes;
+        const uint8_t pattern=value ? 0x61 : 0x51;
+        t.assert_true(std::all_of(observed.begin()+first,observed.begin()+first+stride,[pattern](uint8_t b) { return b == pattern; }));
+        t.assert_true(std::all_of(observed.begin()+first+stride,observed.begin()+first+capacity,[](uint8_t b) { return b == 0; }));
+        t.assert_true(std::all_of(observed.begin()+first+capacity,observed.begin()+first+capacity+129*stride,[pattern](uint8_t b) { return b == pattern; }));
+        t.assert_true(std::all_of(observed.begin()+first+capacity+129*stride,observed.begin()+first+2*capacity,[](uint8_t b) { return b == 0xa5; }));
+    }
+    t.assert_equal(2*expected_calls+2,old->stats(queue.get()).calls);
+    t.assert_equal(259*(page.k_token_bytes+page.v_token_bytes),old->stats(queue.get()).bytes);
+    t.assert_true(old->release_completed(queue.get(),0));
+    old->drain(queue.get()); queue.reset();
+    return t.summary();
+}
 
 // Fixed synthetic attention cases, not model/server token throughput.
 static int benchmark(ggml_backend_t backend, bool overlap, size_t span_pages, size_t slots, bool fallback, bool wide) {
@@ -58,18 +207,25 @@ static int benchmark(ggml_backend_t backend, bool overlap, size_t span_pages, si
 }
 
 int main(int argc, char ** argv) {
+    const bool registered = argc > 1 && std::strcmp(argv[1], "--cuda-registered") == 0;
     const bool wide = argc > 1 && std::strcmp(argv[1],"--bench-wide") == 0;
     const bool ordered = argc > 1 && std::strcmp(argv[1],"--bench-ordered") == 0;
     const bool spans = argc > 1 && std::strcmp(argv[1],"--bench-span") == 0;
     const bool fallback = argc > 1 && std::strcmp(argv[1],"--bench-fallback") == 0;
     const bool bench = wide || ordered || spans || fallback || (argc > 1 && std::strcmp(argv[1],"--bench") == 0);
-    const bool cuda = bench || (argc > 1 && std::strcmp(argv[1],"--cuda") == 0);
+    const bool cuda = registered || bench || (argc > 1 && std::strcmp(argv[1],"--cuda") == 0);
     const bool queue_only = cuda && !bench && argc == 3 && std::strcmp(argv[2],"--queue-only") == 0;
     ggml_backend_ptr backend;
     if (cuda) {
-        ggml_backend_load_all(); auto * dev = ggml_backend_dev_by_name("CUDA0"); if (!dev) return 1;
+        ggml_backend_load_all();
+#ifdef KV_COPY_CUDA_TEST
+        if (!ggml_backend_reg_by_name("CUDA")) ggml_backend_register(ggml_backend_cuda_reg());
+#endif
+        auto * dev = ggml_backend_dev_by_name("CUDA0"); if (!dev) return 1;
         backend.reset(ggml_backend_dev_init(dev,nullptr));
     } else backend.reset(ggml_backend_cpu_init());
+    if (!backend) return 1;
+    if (registered) return registered_copy_contract(backend.get());
     if (bench) {
         const size_t span_pages = argc > 2 ? std::strtoull(argv[2],nullptr,10) : (spans ? 2 : 1);
         const size_t slots = argc > 3 ? std::strtoull(argv[3],nullptr,10) : 2;

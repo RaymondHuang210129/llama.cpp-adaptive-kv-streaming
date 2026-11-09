@@ -1,6 +1,6 @@
 # Multi-slot adaptive KV streaming and phase-arena roadmap
 
-Status: implementation in progress, 2026-11-09. MS1 (CPU planner) and MS2 (demand-backed host storage) are complete as independent components; runtime multi-slot admission remains disabled. MS3-MS14 are pending. No new server configuration is qualified.
+Status: implementation in progress, 2026-11-09. MS1 (CPU planner), MS2 (demand-backed host storage) and MS3 (independent histories/native metadata) are complete as independent components; runtime multi-slot admission remains disabled. MS4-MS14 are pending. No new server configuration is qualified.
 
 Inspected baseline: `f6ca3e8a172473578b909a4691e616bb2234fb54`, on `feature/ci-workflow-migration`. Recheck the implementation base and local changes before starting work on a dedicated feature branch. Historical measurements retain their original source, binaries, models and configuration; they are not new multi-slot evidence.
 
@@ -165,7 +165,7 @@ Each sequence has its own ordered description of a resident segment, a ring segm
 
 Prove that every submitted sequence interval is representable with at most three spans. A separate persistent appended-tail pocket, arbitrary fragmentation or a misplaced partition boundary can otherwise create a fourth segment. Avoid that by preserving the intended layout, coalescing genuinely adjacent ranges or using existing slot-owned staging. Split waves only at boundaries legal for the native resume/checkpoint plan. Do not increase the span count, change accumulation order, skip a geometry or serialize the selected slots silently to make a test pass.
 
-Sequences can advance through different logical offsets in the same shared wave. A short history can finish while another sequence still has more waves; finished sequences must be excluded from subsequent work without changing their completed output. Maintain independent reset/finish flags and accumulator locations.
+Maintain independent canonical source cursors, reset/finish state and query-output slices. A source cursor ending is not permission to drop masked work from a still-active native unified operator: preserve its complete native checkpoint/reduction plan before finalizing those queries. Separate native microbatches can finish independently; later work must not overwrite their completed outputs.
 
 In-flight copies and all readers retain the source and destination leases. Reassignment requires their completion, not merely CPU submission or one slot finishing its own head. Preserve the qualified two-wave transfer/conversion behavior within each exclusive allocation.
 
@@ -276,6 +276,10 @@ Avoid accidentally sizing/scanning GPU masks and working storage for all parked 
 
 The last row is not K15 or a single sequence with 16 verification rows. Rollback depth remains per sequence. Draft prediction width, target verification width and image-feature injection width remain separate.
 
+Native geometry clarification from the MS3 source audit and real-model probes: unified KV uses one K/V stream and sequence-isolating masks. Two four-query sequences produced an aggregate eight-query attention operation; two eight-query sequences produced sixteen query rows. Separate KV produced two four/eight-query streams instead. Actual Gemma Q3_K_M and Qwen IQ4_XS targets completed both layouts with all logits finite, Q8_0/Q4_0, a 1,024-cell ordinary context and microbatch capacity 16. With unequal two/four-token inputs, Gemma unified attention used one six-query operation; Qwen's recurrent path used native two- and four-query microbatches. Separate KV used a balanced two-sequence microbatch plus a single-sequence tail. Preserve these native partitions rather than forcing ragged work into an invented representation.
+
+Preserve the user's unified-KV policy. Do not force a two-stream/TG4 tensor representation or confuse an aggregate TG8/TG16 operator width with a single sequence's proposal/rollback limit. Quote and qualify aggregate query widths separately from per-sequence maxima. The local `native-sequence-geometry-expanded-*` logs record ordinary native graph geometry, not multi-slot streaming qualification, numerical equivalence between different layouts, or throughput measurements. MS0's remaining baseline/accounting work is still required.
+
 Actual widths can differ because of confidence, K4V hits/misses, remaining headroom and output limits. Audit the native `split_equal`/`split_simple` behavior and kernel-family selection before choosing a representation. Prefer native-compatible balanced microbatches and explicit ragged metadata where supported. Do not insert fake recurrent tokens or change native plans simply to advertise one launch. Incompatible native work may require separate microbatches; any extra per-slot serialization must be visible and justified, not hidden behind a successful multi-slot flag.
 
 Retain the existing producer/reader roles and sequence-specific prefetch intent. A K4V hit must still maintain the neural drafter's required target features and genuine fallback path. Attribute generated/accepted counts to the actual supplying implementation and slot. Never use one slot's counters to satisfy another slot's proof.
@@ -293,6 +297,7 @@ Retain the existing producer/reader roles and sequence-specific prefetch intent.
 - Report per-slot context, aggregate group budget, host reservation/commit/pin bytes, selected-state minima, arena phases, actual rejected upper neighbor, and the workload validated.
 - Keep the user-facing mmproj ratio/resolution probe approach. Validate the largest admitted vision shape and relevant state transitions without requiring users to provide an example image.
 - Prewarm required native variants/library resources before arena sizing where possible. Driver/executable allocations outside the application arena remain explicitly scoped; a short probe is not a guarantee for every long request.
+- Include driver memory caused by host registration in multi-slot sizing. A CUDA-runtime probe observed 4 MiB less free VRAM after registering 2 GiB of 1 MiB host chunks; unregistering restored it. DMA-only default registration showed the same charge, so changing mapping flags is not a demonstrated remedy. The sizing probe must exercise the configured maximum canonical-history registration pressure as well as selected device-state/graph shapes. This is deliberate probe work, not permission to materialize maximum histories during normal lazy startup or to invent an unmeasured fixed reserve. Report the probe's peak host commitment and scope separately.
 
 ## 11. Implementation stages and exit gates
 
@@ -344,12 +349,24 @@ Measured tradeoff for later integration: at the default 1 MiB registration size,
 
 ### MS3 - Independent slot histories and logical metadata
 
-- [ ] Bind separate slot/cache generations and frontiers to existing host logical-cache/content and writer paths.
-- [ ] Separate per-slot C, total logical metadata capacity and selected-group capacity in the core/context/server integration.
-- [ ] Remove sequence-zero assumptions only as their replacement invariants become tested.
-- [ ] Poison adjacent slot ranges and verify byte-exact isolation through append, padding, truncate, replacement, slot-ID reuse and stale-source rejection.
+- [x] Bind separate slot/cache generations and frontiers to existing host logical-cache/content and writer paths.
+- [x] Separate per-slot C, total logical metadata capacity and selected-group capacity in private context parameters and conditional server reporting; retain the runtime admission gate.
+- [x] Use explicit slot/request epochs and independent native cell metadata in the new storage path. Keep existing sequence-zero runtime guards until state, kernel and scheduler replacements are qualified.
+- [x] Poison neighboring slot ranges and verify byte-exact isolation through append, padding, truncate, replacement, slot-ID reuse and stale-source rejection.
 
-Exit: both slots can retain histories up to their individual limits independently of the bounded physical GPU pool.
+Exit: both slots can retain histories up to their individual limits independently of the bounded physical GPU pool. This storage milestone does not enable two-slot server execution; selected-state activation and joint execution follow below.
+
+Accepted implementation: `llama_kv_stream_slot_table` retains stable canonical full/auxiliary histories, request reuse epochs and the existing native `llama_kv_cells` metadata per slot/role. Original positions, M-RoPE coordinates and token labels remain independent of selected-group offsets. Checked execution-buffer byte I/O exposes partially committed reservations without an ordinary readable buffer or pageable fallback. The optional registered-copy interface retains submitted registrations and reuses the existing copy queue/events; writer encoding keeps native tiles and splits only transport at registration boundaries. Duplicate writer destinations are rejected before submission. Cache-ID reservations include the bounded-cache identity and reject exhaustion without wrapping. The common logical generation budget counts the pending sampled anchor once.
+
+Context limits distinguish logical per-slot/group C, padded selected storage and total host-history metadata. Two-slot limits require a shared unified arena; legacy one-slot padding and ordinary-native context handling remain unchanged. Conditional `/props` fields describe all capacities once later runtime admission is enabled. No server `--parallel 2` configuration is qualified yet.
+
+Evidence: API reds, a real eager-buffer admission abort, cache-ID collision and invalid-growth/metadata admission reds are preserved locally. Current normal and full host ASAN/UBSAN inventories each passed 54 executed tests plus two expected CUDA-only skips. Component counts include selection17,640, logical-cache945, context-memory1,848, host4,917 native and writer4,378 native assertions. A fresh full CUDA build and 16 component gates passed, including six strict default-PDL memchecks at API reporting `all`, error exit99 and zero errors. D256 producer304, ten-root D512 producer2,424 and reader1,179 assertions preserve native bits, finite outputs, streaming, publication, rewrite and reader lifetimes. Early diagnostics using archived CUDA math remain explicitly labeled and are superseded by the fresh-backend gates.
+
+Native reference fixtures now read only active committed rows; the initial scalar oracle accessed uncommitted future rows, proved by the preserved debugger trace. Native DMA controls use separate ordinary input storage when a source crosses host registrations. Neither correction changes arithmetic, history lengths, numerical comparisons or runtime budgets. A runner initially expected the CPU host inventory rather than its two additional CUDA tests; all15 native tests had passed, and unchanged successful gates were revalidated by exact identities before continuing.
+
+Regression controls freeze independent placement-base C++/original CUDA adapters and candidate runtimes with the same 223 unchanged CUDA math objects. Qwen IQ4_XS and Gemma Q3_K_M target-only/MTP3, Q8_0/Q4_0, UVM off, 4,096 context/1,333 prompt/64 outputs and a 1GiB arena passed 32 fresh requests with 2,048 exact output IDs, paired draft/accept counters and zero cached prompt tokens. One warmup plus three measured requests per process gave final median prefill changes -0.065% to+0.346% and decode -0.183% to+0.875%; these are short-screen observations, not speedup or long-context claims.
+
+An earlier roughly1% Gemma MTP3 slowdown triggered library isolation and P/E-core/clock diagnostics. The legacy eager execution-storage size and callback bodies are now unchanged from baseline; virtual I/O has separate storage/callbacks. E-core placement alone reduced decode by about4% and prefill by about10% in the diagnostic. Three alternating pairs on four distinct P cores gave +0.040% prefill/+0.051% decode medians, with roughly1% variation present in both versions. No GPU clock settings or production configuration changed. The broader existing-mode/long-context regression ledger remains mandatory at MS13. Source/library/model/corpus/command/loader identities, failures, measurements and immutable runtimes are local under `benchmarks/results/multi-slot-20261109/`; raw artifacts are not committed.
 
 ### MS4 - Selected-state parking and activation
 

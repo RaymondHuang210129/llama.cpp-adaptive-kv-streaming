@@ -3,6 +3,7 @@
 #include "llama-kv-stream-policy.h"
 
 class llama_kv_stream_logical_cache;
+class llama_kv_stream_host;
 struct ggml_tensor;
 
 #include <memory>
@@ -47,6 +48,8 @@ public:
     ~llama_kv_stream_transfer();
     bool begin(ggml_backend_t previous);
     bool upload(ggml_backend_buffer_t buffer, size_t offset, const void * data, size_t bytes);
+    bool upload(ggml_backend_buffer_t buffer, size_t offset, const llama_kv_stream_host & source,
+            const void * data, size_t bytes, size_t & calls);
     bool seal();
     bool wait(ggml_backend_t consumer);
     bool finish();

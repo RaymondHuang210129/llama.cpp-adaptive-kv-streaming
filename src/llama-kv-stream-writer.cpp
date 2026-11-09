@@ -26,6 +26,8 @@ struct llama_kv_stream_writer::implementation {
     ggml_context_ptr context;
     ggml_tensor * roots[2] = {};
     ggml_tensor * indices = nullptr;
+    // Plans drain before these destination registrations are released during destruction.
+    std::vector<ggml_backend_buffer_ptr> destinations;
     // Cached executions drain before this upload storage is released.
     std::vector<int64_t> index_data;
     std::array<std::vector<std::unique_ptr<write_graph>>,2> plans;
@@ -69,7 +71,10 @@ struct llama_kv_stream_writer::implementation {
 };
 
 // The cached executor drains and retires before roots in the shared scratch context are released.
-llama_kv_stream_writer::~llama_kv_stream_writer() = default;
+llama_kv_stream_writer::~llama_kv_stream_writer() {
+    // Downloads follow the encoding graph's own completion marker.
+    if (impl && !impl->destinations.empty()) ggml_backend_synchronize(impl->backend);
+}
 
 bool llama_kv_stream_writer::requirements(ggml_backend_buffer_type_t type, const ggml_kv_stream_shape & shape,
         size_t max_rows, size_t & bytes) {
@@ -192,9 +197,23 @@ bool llama_kv_stream_writer::accepts(const ggml_tensor * source, bool value) con
 bool llama_kv_stream_writer::generate_async(const ggml_tensor * source, bool value, void * host,
         const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
         llama_kv_stream_writer_completion & completion) {
+    return generate_async_impl(source,value,host,nullptr,publish,completion);
+}
+
+bool llama_kv_stream_writer::generate_async_registered(const ggml_tensor * source, bool value,
+        const std::vector<llama_kv_stream_host_range> & destinations,
+        const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
+        llama_kv_stream_writer_completion & completion) {
+    return generate_async_impl(source,value,nullptr,&destinations,publish,completion);
+}
+
+bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, bool value, void * host,
+        const std::vector<llama_kv_stream_host_range> * destinations,
+        const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
+        llama_kv_stream_writer_completion & completion) {
     auto & s=*impl;
     s.last={}; s.last.device_scratch_bytes=s.scratch_bytes; s.last.tile_rows=s.capacity;
-    if (!host || !accepts(source,value) || completion.device || completion.host) return false;
+    if ((!host && !destinations) || !accepts(source,value) || completion.device || completion.host) return false;
     const size_t rows=size_t(source->ne[1]),stride=s.row_bytes(value);
     s.last.host_payload_bytes=rows*stride;
     const auto fail=[&] {
@@ -203,9 +222,36 @@ bool llama_kv_stream_writer::generate_async(const ggml_tensor * source, bool val
         return false;
     };
     try {
+        if (destinations) {
+            if (destinations->empty() || destinations->size() > rows*stride) return false;
+            auto * required_type = s.cpu ? nullptr : llama_kv_stream_host_buffer_type(ggml_backend_get_device(s.backend));
+            if (!s.cpu && !required_type) return false;
+            size_t total = 0;
+            uintptr_t previous = 0;
+            for (const auto & range : *destinations) {
+                if (!range.buffer || !range.bytes || range.bytes > rows*stride-total ||
+                        !ggml_backend_buffer_is_host(range.buffer.get()) ||
+                        (!s.cpu && ggml_backend_buffer_get_type(range.buffer.get()) != required_type)) return false;
+                const size_t capacity = ggml_backend_buffer_get_size(range.buffer.get());
+                const auto address = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(range.buffer.get()));
+                if (!address || range.offset > capacity || range.bytes > capacity-range.offset ||
+                        range.offset > UINTPTR_MAX-address || range.bytes > UINTPTR_MAX-address-range.offset ||
+                        (total && address+range.offset != previous)) return false;
+                previous = address+range.offset+range.bytes;
+                total += range.bytes;
+            }
+            if (total != rows*stride || destinations->size() > s.destinations.max_size()-s.destinations.size()) return false;
+            s.destinations.reserve(s.destinations.size()+destinations->size());
+            for (const auto & range : *destinations) {
+                const auto found = std::find_if(s.destinations.begin(),s.destinations.end(),
+                    [&](const ggml_backend_buffer_ptr & owner) { return owner.get() == range.buffer.get(); });
+                if (found == s.destinations.end()) s.destinations.emplace_back(ggml_backend_buffer_retain(range.buffer.get()));
+            }
+        }
         // Another execution phase may have overwritten the shared scratch.
         ggml_backend_tensor_set_async(s.backend,s.indices,s.index_data.data(),0,std::min(rows,s.capacity)*sizeof(int64_t));
         size_t tile=0;
+        size_t destination=0, destination_offset=0;
         for (size_t first=0; first < rows; first += std::min(s.capacity,rows-first)) {
             const size_t count=std::min(s.capacity,rows-first);
             auto * plan=s.prepare(source,value,tile++,first,count);
@@ -214,9 +260,22 @@ bool llama_kv_stream_writer::generate_async(const ggml_tensor * source, bool val
             if (s.cpu) {
                 if (ggml_backend_graph_compute(s.backend,plan->graph) != GGML_STATUS_SUCCESS) return fail();
             } else if (plan->execution->compute_async({},1) != GGML_STATUS_SUCCESS) return fail();
-            ggml_backend_tensor_get_async(s.backend,plan->output,static_cast<char *>(host)+first*stride,0,count*stride);
+            if (destinations) {
+                size_t copied=0;
+                while (copied < count*stride) {
+                    const auto & range=(*destinations)[destination];
+                    const size_t bytes=std::min(range.bytes-destination_offset,count*stride-copied);
+                    auto * target=static_cast<char *>(ggml_backend_buffer_get_base(range.buffer.get()))+range.offset+destination_offset;
+                    ggml_backend_tensor_get_async(s.backend,plan->output,target,copied,bytes);
+                    s.last.d2h_bytes += bytes; ++s.last.d2h_calls;
+                    copied += bytes; destination_offset += bytes;
+                    if (destination_offset == range.bytes) { ++destination; destination_offset=0; }
+                }
+            } else {
+                ggml_backend_tensor_get_async(s.backend,plan->output,static_cast<char *>(host)+first*stride,0,count*stride);
+                s.last.d2h_bytes += count*stride; ++s.last.d2h_calls;
+            }
             const bool published=!publish || publish(s.roots[value],first,count);
-            s.last.d2h_bytes += count*stride; ++s.last.d2h_calls;
             if (!published) return fail();
             if (publish) { s.last.d2d_bytes += count*stride; ++s.last.d2d_calls; }
         }
@@ -250,9 +309,10 @@ bool llama_kv_stream_writer::generate(const ggml_tensor * source, bool value, vo
 }
 
 void llama_kv_stream_writer::release_completed() noexcept {
-    if (!impl || impl->cpu) return;
-    for (auto & cache : impl->plans) for (auto & plan : cache)
+    if (!impl) return;
+    if (!impl->cpu) for (auto & cache : impl->plans) for (auto & plan : cache)
         if (plan && plan->execution) plan->execution->release_completed();
+    impl->destinations.clear();
 }
 
 llama_kv_stream_write_stats llama_kv_stream_writer::stats() const { return impl->last; }

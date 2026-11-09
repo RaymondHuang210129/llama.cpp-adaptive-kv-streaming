@@ -105,7 +105,8 @@ int main(int argc, char ** argv) {
     const bool consumer_only = argc > 1 && !std::strcmp(argv[1],"--cuda-consumer-prefetch");
     const bool read_only = argc > 1 && !std::strcmp(argv[1],"--cuda-read-only");
     const bool read_reuse = argc > 1 && !std::strcmp(argv[1],"--cuda-read-reuse");
-    const bool cuda = read_reuse || read_only || consumer_only || physical_map_only || guard_only || page_boundary_only || short_prefill_only || prefill_tail_only || wide_resume_only || wave_only || (argc > 1 && !std::strcmp(argv[1],"--cuda"));
+    const bool demand_only = argc > 1 && !std::strcmp(argv[1],"--cuda-demand-host");
+    const bool cuda = demand_only || read_reuse || read_only || consumer_only || physical_map_only || guard_only || page_boundary_only || short_prefill_only || prefill_tail_only || wide_resume_only || wave_only || (argc > 1 && !std::strcmp(argv[1],"--cuda"));
     ggml_backend_ptr backend;
     if (cuda) { ggml_backend_load_all(); auto * dev = ggml_backend_dev_by_name("CUDA0"); if (!dev) return 1; backend.reset(ggml_backend_dev_init(dev,nullptr)); }
     else backend.reset(ggml_backend_cpu_init());
@@ -120,6 +121,28 @@ int main(int argc, char ** argv) {
     if (consumer_only) t.set_filter("explicit_consumer_prefetch_adopts_actual_query_width_without_extra_uploads");
     if (read_only) t.set_filter("borrowed_attention_reads_committed_layers_without_appending");
     if (read_reuse) t.set_filter("immutable_reader_reuses_only_still_present_ring_pages");
+    if (demand_only) t.set_filter("demand_backed_session_admits_committed_host_ranges");
+    if (cuda) t.test("demand_backed_session_admits_committed_host_ranges",[&](testing & t) {
+        fixture f(backend.get(),true,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,513,false,1,4,8);
+        block_workspace writer(f,131072,19), attention(f,f.host->layout().bytes,29);
+        llama_kv_stream_session_config config{f.policy,4,4,false,true,true};
+        auto control=llama_kv_stream_session::create(backend.get(),f.content,config,
+            f.lease.get(),writer.lease.get(),attention.lease.get());
+        if (!t.assert_true(bool(control) && control->restore(129))) return;
+        control.reset();
+        auto sparse=llama_kv_stream_host_reservation::create(f.host->config(),ggml_backend_get_device(backend.get()),65536);
+        f.host=llama_kv_stream_host::from_reservation(std::move(sparse));
+        if (!t.assert_true(bool(f.host) && f.host->buffer() == nullptr)) return;
+        populate(f.host);
+        f.content=std::make_shared<llama_kv_stream_content>(f.host);
+        auto session=llama_kv_stream_session::create(backend.get(),f.content,config,
+            f.lease.get(),writer.lease.get(),attention.lease.get());
+        if (!t.assert_true(bool(session) && session->restore(129))) return;
+        llama_memory_cache_requirement source;
+        t.assert_true(session->read_source(source));
+        t.assert_equal(f.host->cache_id(),source.identity.id);
+        t.assert_equal(size_t(129),session->tokens());
+    });
     if (cuda) t.test("borrowed_attention_reads_committed_layers_without_appending",[&](testing & t) {
         auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get())),"ggml_backend_kv_stream_partial_ops"));

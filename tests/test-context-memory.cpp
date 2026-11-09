@@ -1,4 +1,5 @@
 #include "../src/llama-context-memory.h"
+#include "../src/llama-cparams.h"
 #include "../ggml/src/ggml-cuda-graph.h"
 #include "testing.h"
 #include "ggml-cpp.h"
@@ -149,6 +150,62 @@ static void benchmark(ggml_backend_dev_t dev) {
 
 int main(int argc, char ** argv) {
     testing t;
+    t.test("streamed_context_limits_keep_slot_group_and_storage_independent", [&](testing & t) {
+        llama_cparams p{};
+        p.n_ctx = 4352;
+        p.n_ctx_seq = 2176;
+        p.n_seq_max = 2;
+        p.kv_unified = true;
+        p.shared_device_memory_bytes = 1024;
+        t.assert_true(p.set_stream_limits(4097));
+        t.assert_equal(uint32_t(4352), p.n_ctx);
+        t.assert_equal(uint32_t(4097), p.n_ctx_seq);
+        t.assert_equal(uint32_t(4097), p.stream_limits.slot_limit);
+        t.assert_equal(uint32_t(4097), p.stream_limits.group_limit);
+        t.assert_equal(uint32_t(4352), p.stream_limits.slot_storage);
+        t.assert_equal(uint32_t(8704), p.stream_limits.history_storage);
+        t.assert_equal(uint32_t(2), p.stream_limits.slots);
+        for (uint32_t slots : {0u, 3u, 256u}) {
+            p.n_seq_max = slots;
+            t.assert_true(!p.set_stream_limits(4097));
+            t.assert_equal(uint32_t(4097), p.n_ctx_seq);
+            t.assert_equal(uint32_t(8704), p.stream_limits.history_storage);
+        }
+        p.n_seq_max = 2;
+        p.shared_device_memory_bytes = 0;
+        p.kv_stream_pool_bytes = 1024;
+        t.assert_true(!p.set_stream_limits(4097));
+        t.assert_equal(uint32_t(4097), p.n_ctx_seq);
+        p.shared_device_memory_bytes = 1024;
+        p.kv_stream_pool_bytes = 0;
+        p.kv_unified = false;
+        t.assert_true(!p.set_stream_limits(4097));
+        p.kv_unified = true;
+        for (uint32_t logical : {0u, 4353u, UINT32_MAX}) {
+            t.assert_true(!p.set_stream_limits(logical));
+            t.assert_equal(uint32_t(4097), p.n_ctx_seq);
+            t.assert_equal(uint32_t(8704), p.stream_limits.history_storage);
+        }
+        p.n_seq_max = 1;
+        p.kv_unified = false;
+        t.assert_true(p.set_stream_limits(4097));
+        t.assert_equal(uint32_t(4352), p.n_ctx_seq);
+        t.assert_equal(uint32_t(4352), p.stream_limits.slot_limit);
+        t.assert_equal(uint32_t(4352), p.stream_limits.history_storage);
+        p.shared_device_memory_bytes = 0;
+        p.n_seq_max = 4;
+        p.n_ctx_seq = 1088;
+        t.assert_true(p.set_stream_limits(4097));
+        t.assert_equal(uint32_t(1088), p.n_ctx_seq);
+        t.assert_equal(uint32_t(0), p.stream_limits.slots);
+        p.kv_stream_pool_bytes = 1024;
+        p.n_seq_max = 2;
+        p.kv_unified = true;
+        p.n_ctx = 0;
+        t.assert_true(!p.set_stream_limits(0));
+        t.assert_equal(uint32_t(1088), p.n_ctx_seq);
+        t.assert_equal(uint32_t(0), p.stream_limits.slots);
+    });
     ggml_backend_dev_t dev = nullptr;
     if (argc > 1 && std::strcmp(argv[1], "--cuda") == 0) {
         ggml_backend_load_all();

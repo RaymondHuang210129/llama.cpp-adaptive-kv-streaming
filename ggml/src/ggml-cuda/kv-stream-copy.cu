@@ -2,8 +2,12 @@
 #include "kv-stream-partial.cuh"
 #include "common.cuh"
 #include "../ggml-backend-impl.h"
+#include "../ggml-kv-stream-registered-copy.h"
 #include <memory>
 #include <chrono>
+#include <unordered_set>
+
+const ggml_kv_stream_registered_copy_ops * ggml_cuda_kv_stream_registered_copy_ops();
 
 namespace {
 // Preserve the first initialization error before rollback releases any owned resources.
@@ -142,6 +146,9 @@ struct copy_queue {
     std::shared_ptr<copy_resources> resources;
     ggml_backend_cuda_context * context;
     ggml_backend_buffer_t device = nullptr, host = nullptr;
+    ggml_kv_stream_registered_copy_source source;
+    ggml_backend_buffer_type_t source_type = nullptr;
+    std::unordered_set<ggml_backend_buffer_t> registrations;
     ggml_kv_stream_layout page, ring;
     ggml_kv_stream_copy_state state;
     ggml_kv_stream_copy_stats statistics;
@@ -166,6 +173,7 @@ struct copy_queue {
         }
         timing.reset();
         if (resources && resources->owner == this) resources->owner = nullptr;
+        for (auto * buffer : registrations) ggml_backend_buffer_free(buffer);
         ggml_backend_buffer_free(host); ggml_backend_buffer_free(device);
     }
 };
@@ -267,16 +275,18 @@ static void free_prepared(void * prepared) { delete static_cast<std::shared_ptr<
 
 // Source spans must remain inside the retained pinned allocation; zero or wrapping ranges are invalid.
 static bool source_range(const copy_queue & q, const void * pointer, size_t bytes) {
-    const auto base = uintptr_t(ggml_backend_buffer_get_base(q.host)), p = uintptr_t(pointer);
-    const size_t capacity = ggml_backend_buffer_get_size(q.host);
+    const auto base = uintptr_t(q.host ? ggml_backend_buffer_get_base(q.host) : q.source.base), p = uintptr_t(pointer);
+    const size_t capacity = q.host ? ggml_backend_buffer_get_size(q.host) : q.source.bytes;
     return pointer && bytes && p >= base && p-base <= capacity && bytes <= capacity-(p-base) && p <= UINTPTR_MAX-bytes;
 }
 
 // Allocate only stream/event bookkeeping. KV bytes already belong to the caller's device and host buffers.
 static void * create_queue(ggml_backend_t backend, ggml_backend_buffer_t device, ggml_backend_buffer_t host,
-        const ggml_kv_stream_shape & shape, size_t slots, std::shared_ptr<copy_resources> resources) {
-    if (!backend || !ggml_backend_is_cuda(backend) || !device || !host || !slots || shape.page_tokens <= 0 ||
-            uint64_t(shape.page_tokens) > SIZE_MAX || slots > SIZE_MAX/size_t(shape.page_tokens) || !ggml_backend_buffer_is_host(host)) return nullptr;
+        const ggml_kv_stream_shape & shape, size_t slots, std::shared_ptr<copy_resources> resources,
+        const ggml_kv_stream_registered_copy_source * source = nullptr) {
+    if (!backend || !ggml_backend_is_cuda(backend) || !device || !slots || shape.page_tokens <= 0 ||
+            uint64_t(shape.page_tokens) > SIZE_MAX || slots > SIZE_MAX/size_t(shape.page_tokens) ||
+            (source ? host != nullptr : !host || !ggml_backend_buffer_is_host(host))) return nullptr;
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     if (resources && (resources->context != ctx || slots > resources->ready.size())) return nullptr;
     if (ggml_backend_buffer_get_type(device) != ggml_backend_cuda_device_buffer_type(ctx->device)) return nullptr;
@@ -288,11 +298,22 @@ static void * create_queue(ggml_backend_t backend, ggml_backend_buffer_t device,
     const auto base = uintptr_t(ggml_backend_buffer_get_base(device));
     if (!base || base%shape.alignment || base > UINTPTR_MAX-ring.bytes) return nullptr;
     ggml_cuda_set_device(ctx->device);
-    cudaPointerAttributes attributes = {};
-    if (!initialization_ok(cudaPointerGetAttributes(&attributes,ggml_backend_buffer_get_base(host)),
-            "cudaPointerGetAttributes(copy host)")) return nullptr;
-    if (attributes.type != cudaMemoryTypeHost) {
-        GGML_LOG_ERROR("CUDA KV copy requires pinned host storage\n"); return nullptr;
+    ggml_backend_buffer_type_t source_type = nullptr;
+    if (source) {
+        const auto address = reinterpret_cast<uintptr_t>(source->base);
+        if (!address || !source->bytes || address%shape.alignment || source->bytes > UINTPTR_MAX-address) return nullptr;
+        using factory = ggml_backend_buffer_type_t (*)(int);
+        auto select = reinterpret_cast<factory>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_cuda_kv_host_buffer_type"));
+        source_type = select ? select(ctx->device) : nullptr;
+        if (!source_type) return nullptr;
+    } else {
+        cudaPointerAttributes attributes = {};
+        if (!initialization_ok(cudaPointerGetAttributes(&attributes,ggml_backend_buffer_get_base(host)),
+                "cudaPointerGetAttributes(copy host)")) return nullptr;
+        if (attributes.type != cudaMemoryTypeHost) {
+            GGML_LOG_ERROR("CUDA KV copy requires pinned host storage\n"); return nullptr;
+        }
     }
     try {
         if (!resources) resources = make_resources(ctx, slots, false, false);
@@ -301,6 +322,8 @@ static void * create_queue(ggml_backend_t backend, ggml_backend_buffer_t device,
         q->resources = std::move(resources);
         q->page = page; q->ring = ring;
         q->device = ggml_backend_buffer_retain(device); q->host = ggml_backend_buffer_retain(host);
+        q->source = source ? *source : ggml_kv_stream_registered_copy_source{};
+        q->source_type = source_type;
         q->stream = q->resources->stream; q->producer = q->resources->producer;
         for (size_t i = 0; i < slots; ++i) {
             q->ready[i] = q->resources->ready[i]; q->consumed[i] = q->resources->consumed[i];
@@ -323,6 +346,53 @@ static void * create_prepared(ggml_backend_t backend, void * prepared, ggml_back
         ggml_backend_buffer_t host, const ggml_kv_stream_shape & shape, size_t slots) {
     if (!prepared) return nullptr;
     return create_queue(backend, device, host, shape, slots, *static_cast<std::shared_ptr<copy_resources> *>(prepared));
+}
+
+static void * create_registered(ggml_backend_t backend, void * prepared, ggml_backend_buffer_t device,
+        const ggml_kv_stream_registered_copy_source & source, const ggml_kv_stream_shape & shape, size_t slots) {
+    return create_queue(backend, device, nullptr, shape, slots, prepared ?
+        *static_cast<std::shared_ptr<copy_resources> *>(prepared) : std::shared_ptr<copy_resources>{}, &source);
+}
+
+static bool fragments_valid(const copy_queue & q, const ggml_kv_stream_registered_copy_fragment * parts,
+        size_t count, size_t expected) {
+    if (!parts || !count || count > expected || !q.source_type) return false;
+    size_t total = 0;
+    uintptr_t previous = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const auto & part = parts[i];
+        if (!part.owner || ggml_backend_buffer_get_type(part.owner) != q.source_type || !part.bytes || part.bytes > expected-total) return false;
+        const auto base = uintptr_t(ggml_backend_buffer_get_base(part.owner));
+        const size_t capacity = ggml_backend_buffer_get_size(part.owner);
+        if (part.offset > capacity || part.bytes > capacity-part.offset || part.offset > UINTPTR_MAX-base ||
+                part.bytes > UINTPTR_MAX-base-part.offset ||
+                !source_range(q,reinterpret_cast<const void *>(base+part.offset),part.bytes) ||
+                (i && (part.offset || base != previous)) ||
+                (i+1 < count && part.bytes != capacity-part.offset)) return false;
+        previous = base+part.offset+part.bytes;
+        total += part.bytes;
+    }
+    return total == expected;
+}
+
+static bool retain_fragments(copy_queue & q, const ggml_kv_stream_registered_copy_fragment * k, size_t nk,
+        const ggml_kv_stream_registered_copy_fragment * v, size_t nv) {
+    try {
+        std::vector<ggml_backend_buffer_t> added;
+        for (bool value : {false,true}) {
+            const auto * parts = value ? v : k;
+            const size_t count = value ? nv : nk;
+            for (size_t i = 0; i < count; ++i) {
+                auto * owner = parts[i].owner;
+                if (!q.registrations.count(owner) && std::find(added.begin(),added.end(),owner) == added.end()) added.push_back(owner);
+            }
+        }
+        if (added.empty()) return true;
+        if (added.size() > q.registrations.max_size()-q.registrations.size()) return false;
+        q.registrations.reserve(q.registrations.size()+added.size());
+        for (auto * owner : added) if (q.registrations.insert(owner).second) ggml_backend_buffer_retain(owner);
+        return true;
+    } catch (const std::bad_alloc &) { return false; }
 }
 
 // Extend a running copy window with work published after its original begin fence.
@@ -368,13 +438,18 @@ static bool begin_with_feedback(void * handle, bool eligible) {
 static bool begin(void * handle) { return begin_with_feedback(handle,true); }
 
 // Queue independent K/V copies and finite tail padding after the previous final consumer retires.
-static bool enqueue_span_with_feedback(void * handle, size_t slot, const void * k, const void * v, size_t live, size_t padded, bool eligible) {
+static bool enqueue_span_impl(void * handle, size_t slot, const void * k, const void * v, size_t live, size_t padded, bool eligible,
+        const ggml_kv_stream_registered_copy_fragment * kp, size_t nk,
+        const ggml_kv_stream_registered_copy_fragment * vp, size_t nv) {
     if (!handle) return false;
     auto & q = *static_cast<copy_queue *>(handle);
     if (!live || live > padded || padded > q.ring.tokens) return false;
     const size_t count = padded/q.page.tokens+(padded%q.page.tokens != 0);
-    if (!q.state.can_queue_span(slot,count) ||
-            !source_range(q,k,live*q.page.k_token_bytes) || !source_range(q,v,live*q.page.v_token_bytes)) return false;
+    if (!q.state.can_queue_span(slot,count)) return false;
+    if (q.source_type) {
+        if (k || v || !fragments_valid(q,kp,nk,live*q.page.k_token_bytes) ||
+                !fragments_valid(q,vp,nv,live*q.page.v_token_bytes)) return false;
+    } else if (kp || vp || nk || nv || !source_range(q,k,live*q.page.k_token_bytes) || !source_range(q,v,live*q.page.v_token_bytes)) return false;
     auto * m = q.timing && q.timing->active() ? q.timing.get() : nullptr;
     const auto ready_it=std::find(q.ready_refs.begin(),q.ready_refs.end(),size_t(0));
     if (ready_it == q.ready_refs.end()) return false;
@@ -382,6 +457,7 @@ static bool enqueue_span_with_feedback(void * handle, size_t slot, const void * 
     for (size_t i=0;i<count;++i)
         if (q.ready_owner[slot+i] != copy_queue::no_fence) return false;
     if (m && m->ticket == UINT64_MAX) return false;
+    if (q.source_type && !retain_fragments(q,kp,nk,vp,nv)) return false;
     ggml_cuda_set_device(q.context->device);
     for (size_t i=0;i<count;++i) if (q.state.recycled(slot+i) && !q.completed[slot+i]) {
         const size_t fence=q.consumed_owner[slot+i];
@@ -409,8 +485,21 @@ static bool enqueue_span_with_feedback(void * handle, size_t slot, const void * 
     for (int value = 0; value < 2; ++value) {
         const size_t stride = value ? q.page.v_token_bytes : q.page.k_token_bytes;
         const size_t offset = value ? q.ring.v_offset+slot*q.page.v_bytes : slot*q.page.k_bytes;
-        CUDA_CHECK(cudaMemcpyAsync(base+offset,value ? v : k,live*stride,cudaMemcpyHostToDevice,q.stream));
-        q.statistics.bytes += live*stride; ++q.statistics.calls;
+        if (q.source_type) {
+            const auto * parts = value ? vp : kp;
+            const size_t count = value ? nv : nk;
+            size_t copied = 0;
+            for (size_t i = 0; i < count; ++i) {
+                const auto & part = parts[i];
+                const auto * source = static_cast<const char *>(ggml_backend_buffer_get_base(part.owner))+part.offset;
+                CUDA_CHECK(cudaMemcpyAsync(base+offset+copied,source,part.bytes,cudaMemcpyHostToDevice,q.stream));
+                copied += part.bytes;
+                q.statistics.bytes += part.bytes; ++q.statistics.calls;
+            }
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(base+offset,value ? v : k,live*stride,cudaMemcpyHostToDevice,q.stream));
+            q.statistics.bytes += live*stride; ++q.statistics.calls;
+        }
         if (padded > live) CUDA_CHECK(cudaMemsetAsync(base+offset+live*stride,0,(padded-live)*stride,q.stream));
     }
     if (m) {
@@ -430,6 +519,17 @@ static bool enqueue_span_with_feedback(void * handle, size_t slot, const void * 
     q.ready_refs[ready_fence]=count;
     for (size_t i=0;i<count;++i) q.ready_owner[slot+i]=ready_fence;
     return q.state.queue_span(slot,count);
+}
+
+static bool enqueue_span_with_feedback(void * handle, size_t slot, const void * k, const void * v, size_t live, size_t padded, bool eligible) {
+    return enqueue_span_impl(handle,slot,k,v,live,padded,eligible,nullptr,0,nullptr,0);
+}
+
+static bool enqueue_registered(void * handle, size_t slot,
+        const ggml_kv_stream_registered_copy_fragment * k, size_t nk,
+        const ggml_kv_stream_registered_copy_fragment * v, size_t nv, size_t live, size_t padded, bool eligible) {
+    if (!handle || !static_cast<copy_queue *>(handle)->source_type) return false;
+    return enqueue_span_impl(handle,slot,nullptr,nullptr,live,padded,eligible,k,nk,v,nv);
 }
 
 // Legacy uploads are immutable snapshots; preserve their full deadline coverage.
@@ -654,6 +754,11 @@ static void destroy(void * handle) { delete static_cast<copy_queue *>(handle); }
 // Expose the CUDA adapter through an opaque, backend-neutral ownership contract.
 const ggml_kv_stream_copy_ops * ggml_cuda_kv_stream_copy_ops() {
     static const ggml_kv_stream_copy_ops ops{11,create,begin,enqueue,ready,acquire,release,drain,destroy,enqueue_span,stats,release_completed,measure,acquire_span,feedback,feedback_id,poll_feedback,begin_with_feedback,enqueue_span_with_feedback,fence_producer,probe_layer,release_span,prepare,free_prepared,create_prepared};
+    return &ops;
+}
+
+const ggml_kv_stream_registered_copy_ops * ggml_cuda_kv_stream_registered_copy_ops() {
+    static const ggml_kv_stream_registered_copy_ops ops{1,create_registered,enqueue_registered};
     return &ops;
 }
 #endif

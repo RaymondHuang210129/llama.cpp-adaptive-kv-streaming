@@ -100,6 +100,24 @@ bool llama_kv_stream_transfer::upload(ggml_backend_buffer_t buffer, size_t offse
     return true;
 }
 
+bool llama_kv_stream_transfer::upload(ggml_backend_buffer_t buffer, size_t offset, const llama_kv_stream_host & source,
+        const void * data, size_t bytes, size_t & calls) {
+    if (!impl || !impl->running || impl->sealed || !buffer || !bytes) return false;
+    const size_t capacity=ggml_backend_buffer_get_size(buffer);
+    if (offset > capacity || bytes > capacity-offset) return false;
+    std::vector<llama_kv_stream_host_range> ranges;
+    if (!source.address_ranges(data,bytes,ranges) || ranges.size() > SIZE_MAX-calls) return false;
+    try {
+        for (const auto & range : ranges) {
+            const auto * data=static_cast<const char *>(ggml_backend_buffer_get_base(range.buffer.get()))+range.offset;
+            if (!upload(buffer,offset,data,range.bytes)) return false;
+            ++calls;
+            offset += range.bytes;
+        }
+        return true;
+    } catch (const std::bad_alloc &) { return false; }
+}
+
 // Publish one fence for the whole transfer batch, not one event per page.
 bool llama_kv_stream_transfer::seal() {
     if (!impl || !impl->running || impl->sealed) return false;
@@ -521,13 +539,21 @@ static bool populate_layer(ggml_backend_t backend, llama_kv_stream_complete_laye
                 for (int axis=1; axis<4; ++axis) { tensor.ne[axis]=1; tensor.nb[axis]=dirty.bytes; }
                 auto * address=static_cast<char *>(ggml_backend_buffer_get_base(buffer))+offset;
                 if (ggml_backend_tensor_alloc(buffer,&tensor,address) != GGML_STATUS_SUCCESS) return false;
+                size_t submitted=1;
                 if (transfer) {
-                    if (!transfer->upload(buffer,offset,dirty.data,dirty.bytes)) return false;
+                    if (host->demand_backed()) {
+                        submitted=0;
+                        if (!transfer->upload(buffer,offset,*host,dirty.data,dirty.bytes,submitted)) return false;
+                    } else if (!transfer->upload(buffer,offset,dirty.data,dirty.bytes)) return false;
                 } else {
-                    ggml_backend_tensor_set_async(backend,&tensor,dirty.data,0,dirty.bytes);
+                    if (host->demand_backed()) {
+                        submitted=0;
+                        if (!host->upload(backend,&tensor,0,dirty.data,dirty.bytes,submitted)) return false;
+                    } else ggml_backend_tensor_set_async(backend,&tensor,dirty.data,0,dirty.bytes);
                     ggml_backend_synchronize(backend);
                 }
-                next.bytes+=dirty.bytes; ++next.calls;
+                if (submitted > SIZE_MAX-next.calls) return false;
+                next.bytes+=dirty.bytes; next.calls+=submitted;
                 return true;
             });
             if (!copied) return false;
@@ -546,12 +572,21 @@ static bool populate_layer(ggml_backend_t backend, llama_kv_stream_complete_laye
     }
     try {
         for (size_t i = 0; i < count; ++i) {
+            size_t submitted=1;
             if (transfer) {
                 auto * tensor=uploads[i].tensor;
                 const size_t offset=size_t(static_cast<char *>(tensor->data)-
                     static_cast<char *>(ggml_backend_buffer_get_base(tensor->buffer)));
-                if (!transfer->upload(tensor->buffer,offset,uploads[i].source,uploads[i].bytes)) return false;
+                if (host->demand_backed()) {
+                    submitted=0;
+                    if (!transfer->upload(tensor->buffer,offset,*host,uploads[i].source,uploads[i].bytes,submitted)) return false;
+                } else if (!transfer->upload(tensor->buffer,offset,uploads[i].source,uploads[i].bytes)) return false;
+            } else if (host->demand_backed()) {
+                submitted=0;
+                if (!host->upload(backend,uploads[i].tensor,0,uploads[i].source,uploads[i].bytes,submitted)) return false;
             } else ggml_backend_tensor_set_async(backend, uploads[i].tensor, uploads[i].source, 0, uploads[i].bytes);
+            if (!submitted || submitted-1 > SIZE_MAX-next.calls) return false;
+            next.calls+=submitted-1;
         }
         if (!transfer && count) ggml_backend_synchronize(backend);
     } catch (...) {

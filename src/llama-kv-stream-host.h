@@ -21,6 +21,10 @@ struct llama_kv_stream_host_layer {
     void * v = nullptr;
 };
 
+class llama_kv_stream_host_reservation;
+struct llama_kv_stream_host_range;
+struct ggml_backend_execution_ops;
+
 // Optional CUDA adapters. Registration retains the caller's buffer until after unregistration.
 // Neither adapter falls back to pageable storage or changes an existing registration's ownership.
 // The owner must keep its bytes alive; do not externally unregister a successful wrapper.
@@ -41,13 +45,29 @@ public:
     // Retain existing storage without clearing its contents; reject a different buffer type or insufficient space.
     static std::shared_ptr<llama_kv_stream_host> from_buffer(
             const llama_kv_stream_host_config & config, ggml_backend_buffer_type_t expected_type, ggml_backend_buffer_t buffer);
+    static std::shared_ptr<llama_kv_stream_host> from_reservation(
+            std::shared_ptr<llama_kv_stream_host_reservation> reservation);
 
     uint64_t cache_id() const noexcept;
     const llama_kv_stream_host_config & config() const noexcept;
     const ggml_kv_stream_layout & layout() const noexcept;
     size_t stride() const noexcept;
     size_t bytes() const noexcept;
+    size_t committed_bytes() const noexcept;
+    ggml_backend_buffer_type_t buffer_type() const noexcept;
     ggml_backend_buffer_t buffer() const noexcept;
+    bool clear(uint8_t value = 0);
+    bool demand_backed() const noexcept;
+    bool valid() const noexcept;
+    bool prepare(size_t rows);
+    bool ranges(uint32_t layer, ggml_kv_stream_operand operand, size_t offset, size_t bytes,
+            std::vector<llama_kv_stream_host_range> & output) const;
+    bool address_ranges(const void * data, size_t bytes, std::vector<llama_kv_stream_host_range> & output) const;
+    // Retain this owner and immutable source bytes until backend completion, as for native async uploads.
+    bool upload(ggml_backend_t backend, ggml_tensor * target, size_t offset, const void * data, size_t bytes, size_t & calls) const;
+    // The execution context must retain this owner until its destruction callback runs.
+    ggml_backend_buffer_t execution_buffer(ggml_backend_dev_t device,
+            const ggml_backend_execution_ops & ops, void * context);
     // Layer ordinals follow full-attention execution order. Failure leaves output unchanged.
     bool layer(uint32_t index, llama_kv_stream_host_layer & output) const noexcept;
 
@@ -58,6 +78,11 @@ private:
     size_t layer_stride = 0, storage_bytes = 0;
     void * base = nullptr;
     ggml_backend_buffer_t storage = nullptr;
+    std::shared_ptr<llama_kv_stream_host_reservation> demand;
+    bool access(const ggml_tensor * tensor, size_t offset, size_t bytes, bool write,
+            std::vector<llama_kv_stream_host_range> & output);
+    bool locate(const void * data, size_t offset, size_t bytes, uint32_t & layer,
+            ggml_kv_stream_operand & operand, size_t & in_plane) const noexcept;
 };
 
 struct llama_kv_stream_host_range {
@@ -82,6 +107,8 @@ public:
             register_range registrar, size_t chunk_bytes);
 
     const ggml_kv_stream_layout & layout() const noexcept;
+    const llama_kv_stream_host_config & config() const noexcept;
+    ggml_backend_buffer_type_t buffer_type() const noexcept;
     size_t bytes() const noexcept;
     size_t reserved_bytes() const noexcept;
     size_t committed_bytes() const noexcept;
@@ -92,7 +119,8 @@ public:
     // Serialize mutation against all readers/writers. Failed growth preserves prior coverage and bytes.
     bool prepare(size_t rows);
     bool truncate(size_t rows);
-    void clear();
+    // Clear materialized bytes without releasing physical coverage or publishing logical state.
+    void clear(uint8_t value = 0);
     // Split at registration boundaries. Each retained buffer keeps its reservation alive for queued users.
     // Failure leaves output unchanged. Device aliases must be resolved per range, never across registrations.
     bool ranges(uint32_t layer, ggml_kv_stream_operand operand, size_t offset, size_t bytes,

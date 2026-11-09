@@ -3,8 +3,11 @@
 #include "llama-kv-stream-content.h"
 #include "llama-kv-stream-writer.h"
 #include "llama-kv-stream-publication.h"
+#include "llama-kv-stream-selection.h"
 
 #include <functional>
+
+class llama_kv_cells;
 
 struct llama_kv_stream_logical_identity {
     uint64_t id = 0;
@@ -64,4 +67,40 @@ private:
     std::shared_ptr<llama_kv_stream_writer> active_writer;
     llama_kv_stream_writer_completion generated[2];
     llama_kv_stream_write generated_write;
+};
+
+struct llama_kv_stream_slot_handle {
+    uint32_t slot = 0;
+    uint64_t generation = 0;
+};
+
+// Owner-thread metadata for stable canonical histories. Read aliases resolve through their source.
+// The common memory owner must retire GPU users before advancing a request namespace.
+class llama_kv_stream_slot_table {
+public:
+    static std::unique_ptr<llama_kv_stream_slot_table> create(const llama_kv_stream_context_limits & limits);
+    // Bind once at startup. A request change never replaces these stable host addresses.
+    bool bind(uint32_t slot, std::vector<std::shared_ptr<llama_kv_stream_logical_cache>> caches,
+            llama_kv_stream_slot_handle & output);
+    bool get(const llama_kv_stream_slot_handle & handle, uint32_t role,
+            std::shared_ptr<llama_kv_stream_logical_cache> & output) const noexcept;
+    // Owner-thread native cells keep their original positions/sequence IDs; revalidate handles before execution.
+    bool get_cells(const llama_kv_stream_slot_handle & handle, uint32_t role,
+            std::shared_ptr<llama_kv_cells> & output) const noexcept;
+    // Pending is an accepted next-input anchor, not unaccepted draft rows or network buffering.
+    bool logical_used(const llama_kv_stream_slot_handle & handle, size_t pending, size_t & output) const noexcept;
+    // Retain prefix bytes/frontiers while invalidating handles from the previous request.
+    bool advance(const llama_kv_stream_slot_handle & handle, llama_kv_stream_slot_handle & output) noexcept;
+    const llama_kv_stream_context_limits & limits() const noexcept;
+
+private:
+    struct slot {
+        uint64_t generation = 0;
+        std::vector<std::shared_ptr<llama_kv_stream_logical_cache>> caches;
+        std::vector<std::shared_ptr<llama_kv_stream_host>> backing;
+        std::vector<std::shared_ptr<llama_kv_cells>> cells;
+    };
+    llama_kv_stream_slot_table() = default;
+    llama_kv_stream_context_limits capacity;
+    std::vector<slot> slots;
 };

@@ -36,7 +36,8 @@ static bool bitmap(const llama_kv_stream_host & host, size_t & words, std::vecto
 
 // Reject invalid selectors before deriving plane offsets.
 static bool plane_valid(const llama_kv_stream_content_state & s, uint32_t layer, ggml_kv_stream_operand operand) {
-    return layer < s.host->config().layers && (operand == ggml_kv_stream_operand::k || operand == ggml_kv_stream_operand::v);
+    return s.host->valid() && layer < s.host->config().layers &&
+        (operand == ggml_kv_stream_operand::k || operand == ggml_kv_stream_operand::v);
 }
 // A tracked row includes all heads in the selected encoded plane.
 static size_t token_bytes(const llama_kv_stream_content_state & s, ggml_kv_stream_operand operand) {
@@ -118,7 +119,7 @@ bool llama_kv_stream_content::prepare(const std::vector<llama_kv_stream_write_sp
 }
 bool llama_kv_stream_content::prepare_direct_generated(const std::vector<llama_kv_stream_write_span> & spans,
         const std::function<bool(const llama_kv_stream_write_span &, void *)> & fill, llama_kv_stream_write & output) const {
-    if (!fill || state->busy || output.pending()) return false;
+    if (!fill || state->busy || output.pending() || !state->host->valid()) return false;
     state->busy = true;
     content_operation operation{state->busy};
     try {
@@ -129,6 +130,15 @@ bool llama_kv_stream_content::prepare_direct_generated(const std::vector<llama_k
             if (!plane_valid(*state,span.layer,span.operand)) return false;
             const size_t bytes=span.operand == ggml_kv_stream_operand::k ? state->host->layout().k_bytes : state->host->layout().v_bytes;
             if (span.offset > bytes || span.bytes > bytes-span.offset || span.data || !span.bytes) return false;
+        }
+        if (state->host->demand_backed()) {
+            size_t prepared = 0;
+            for (const auto & span : spans) {
+                const size_t stride = token_bytes(*state, span.operand);
+                const size_t end = span.offset + span.bytes;
+                prepared = std::max(prepared, end/stride + (end%stride != 0));
+            }
+            if (!state->host->prepare(prepared)) return false;
         }
         next.owner=state;
         next.backing=state->host;
@@ -150,7 +160,7 @@ bool llama_kv_stream_content::prepare_direct_generated(const std::vector<llama_k
 // Both CPU snapshots and generated payloads share validation, ownership, and atomic publication.
 bool llama_kv_stream_content::prepare_internal(const std::vector<llama_kv_stream_write_span> & spans, llama_kv_stream_write & output,
         const std::function<bool(const llama_kv_stream_write_span &, void *)> * fill) const {
-    if (state->busy) return false;
+    if (state->busy || !state->host->valid()) return false;
     state->busy = true;
     content_operation operation{state->busy};
     try {
@@ -192,7 +202,7 @@ bool llama_kv_stream_content::commit(llama_kv_stream_write & write) {
 }
 
 bool llama_kv_stream_content::commit(std::vector<llama_kv_stream_write *> writes) {
-    if (state->busy || writes.empty()) return false;
+    if (state->busy || writes.empty() || !state->host->valid()) return false;
     bool changed=false;
     for (size_t i=0;i<writes.size();++i) {
         const auto * write=writes[i];
@@ -204,6 +214,15 @@ bool llama_kv_stream_content::commit(std::vector<llama_kv_stream_write *> writes
     if (changed && state->generation == UINT64_MAX) return false;
     state->busy = true;
     content_operation operation{state->busy};
+    if (state->host->demand_backed()) {
+        size_t prepared = 0;
+        for (const auto * write : writes) for (const auto & part : write->parts) {
+            const size_t stride = token_bytes(*state, part.operand);
+            const size_t end = part.offset + part.bytes;
+            prepared = std::max(prepared, end/stride + (end%stride != 0));
+        }
+        if (!state->host->prepare(prepared)) return false;
+    }
     for (auto * write : writes) {
         for (const auto & part : write->parts) {
             if (!write->direct) std::memcpy(plane_data(*state,part.layer,part.operand)+part.offset,
@@ -221,7 +240,7 @@ bool llama_kv_stream_content::commit(std::vector<llama_kv_stream_write *> writes
 
 // Prepare the new bitmap first; failed replacement leaves backing and pending writes untouched.
 bool llama_kv_stream_content::replace(std::shared_ptr<llama_kv_stream_host> host) {
-    if (state->busy || !host || state->generation == UINT64_MAX || state->mirror_epoch == UINT64_MAX) return false;
+    if (state->busy || !host || !host->valid() || state->generation == UINT64_MAX || state->mirror_epoch == UINT64_MAX) return false;
     state->busy = true;
     content_operation operation{state->busy};
     try {
@@ -268,7 +287,7 @@ bool llama_kv_stream_content::reset_mirror() {
 // This correctness baseline never acknowledges data while a copy can still reference it.
 bool llama_kv_stream_content::flush(const std::vector<llama_kv_stream_rows> & ranges,
         const std::function<bool(const llama_kv_stream_copy_span &)> & copy) {
-    if (state->busy) return false;
+    if (state->busy || !state->host->valid()) return false;
     for (const auto & r : ranges) if (!rows_valid(*state, r)) return false;
     state->busy = true;
     content_operation operation{state->busy};

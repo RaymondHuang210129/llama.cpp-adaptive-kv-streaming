@@ -1,8 +1,26 @@
 #include "llama-kv-stream-selection.h"
+#include "llama-cparams.h"
 
 #include <algorithm>
 #include <new>
 #include <utility>
+
+bool llama_kv_stream_context_limits_make(size_t logical_tokens, size_t padded_tokens, size_t slots,
+        llama_kv_stream_context_limits & output) noexcept {
+    if (!logical_tokens || padded_tokens < logical_tokens || padded_tokens > size_t(INT32_MAX) ||
+            !slots || slots > LLAMA_MAX_SEQ || padded_tokens > UINT32_MAX/slots) return false;
+    output = {uint32_t(logical_tokens), uint32_t(logical_tokens), uint32_t(padded_tokens),
+        uint32_t(padded_tokens*slots), uint32_t(slots)};
+    return true;
+}
+
+bool llama_kv_stream_generation_budget_make(size_t headroom, uint32_t maximum_proposals, size_t remaining_outputs,
+        llama_kv_stream_generation_budget & output) noexcept {
+    if (!headroom || !remaining_outputs || maximum_proposals > 7) return false;
+    const size_t rows=std::min({headroom,remaining_outputs,size_t(maximum_proposals)+1});
+    output={uint32_t(rows),uint32_t(rows-1)};
+    return true;
+}
 
 namespace {
 struct selection_search {

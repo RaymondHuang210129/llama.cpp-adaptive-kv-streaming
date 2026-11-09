@@ -1,6 +1,7 @@
 #include "../src/llama-kv-stream-host.h"
 #include "../src/llama-kv-stream-binding.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-execution.h"
 #include "ggml-cpp.h"
 #include "ggml-cpu.h"
 #include "testing.h"
@@ -72,6 +73,65 @@ struct registration_probe {
 
 int main(int argc, char ** argv) {
     testing t;
+    t.test("reserved_history_uses_checked_io_without_a_whole_host_buffer", [](testing & t) {
+        registration_probe probe;
+        auto c = config(); c.context_tokens = 8192;
+        auto sparse = llama_kv_stream_host_reservation::create(c, &probe.type,
+            [&](ggml_backend_buffer_t b) { return probe.pin(b); }, 65536);
+        auto host = llama_kv_stream_host::from_reservation(std::move(sparse));
+        if (!t.assert_true(host && host->buffer() == nullptr)) return;
+        struct owner { std::shared_ptr<llama_kv_stream_host> host; size_t modified = 0, destroyed = 0; } state{host};
+        ggml_backend_execution_ops ops{
+            [](void *, const ggml_tensor *) { return false; },
+            [](void *, ggml_backend_t, ggml_tensor *) { return GGML_STATUS_FAILED; },
+            [](void *) { return true; },
+            [](void * p) { ++static_cast<owner *>(p)->modified; },
+            [](void * p) { ++static_cast<owner *>(p)->destroyed; },
+        };
+        ggml_backend_ptr backend(ggml_backend_cpu_init());
+        ggml_backend_buffer_ptr managed(host->execution_buffer(ggml_backend_get_device(backend.get()), ops, &state));
+        if (!t.assert_true(managed && !ggml_backend_buffer_is_host(managed.get()))) return;
+        llama_kv_stream_host_layer plane;
+        t.assert_true(host->layer(1, plane));
+        ggml_context_ptr metadata(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+        auto * tensor = ggml_new_tensor_1d(metadata.get(), GGML_TYPE_I8, int64_t(host->layout().v_bytes));
+        t.assert_equal(GGML_STATUS_SUCCESS, ggml_backend_tensor_alloc(managed.get(), tensor, plane.v));
+        const size_t offset = 200*host->layout().v_token_bytes + 3;
+        std::vector<uint8_t> input(67, 0x51), output(input.size());
+        ggml_backend_tensor_set(tensor, input.data(), offset, input.size());
+        ggml_backend_tensor_get(tensor, output.data(), offset, output.size());
+        t.assert_true(input == output);
+        t.assert_equal(size_t(1), state.modified);
+        ggml_backend_tensor_memset(tensor, 0x19, offset + 5, 11);
+        ggml_backend_tensor_get(tensor, output.data(), offset, output.size());
+        std::fill(input.begin() + 5, input.begin() + 16, 0x19);
+        t.assert_true(input == output);
+        std::vector<llama_kv_stream_host_range> pieces;
+        const auto * source = static_cast<const char *>(plane.v) + offset;
+        t.assert_true(host->address_ranges(source, input.size(), pieces));
+        const size_t piece_count = pieces.size();
+        t.assert_true(!host->address_ranges(static_cast<const char *>(plane.v) + host->layout().v_bytes - 1,
+            input.size(), pieces));
+        t.assert_equal(piece_count, pieces.size());
+        ggml_context_ptr copy_metadata(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+        auto * copied = ggml_new_tensor_1d(copy_metadata.get(), GGML_TYPE_I8, 128);
+        ggml_backend_buffer_ptr copy_buffer(ggml_backend_alloc_ctx_tensors(copy_metadata.get(), backend.get()));
+        size_t calls = 0;
+        t.assert_true(host->upload(backend.get(), copied, 7, source, input.size(), calls));
+        t.assert_equal(size_t(1), calls);
+        ggml_backend_synchronize(backend.get());
+        ggml_backend_tensor_get(copied, output.data(), 7, output.size());
+        t.assert_true(input == output);
+        t.assert_true(!host->upload(backend.get(), copied, 100, source, input.size(), calls));
+        t.assert_equal(size_t(1), calls);
+        t.assert_equal(size_t(2), state.modified);
+        ggml_backend_buffer_clear(managed.get(), 0);
+        ggml_backend_tensor_get(tensor, output.data(), offset, output.size());
+        t.assert_true(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0; }));
+        t.assert_equal(size_t(3), state.modified);
+        managed.reset();
+        t.assert_equal(size_t(1), state.destroyed);
+    });
     t.test("demand_backing_reserves_all_planes_without_committing_them", [](testing & t) {
         registration_probe probe;
         auto c = config(); c.context_tokens = 65536;

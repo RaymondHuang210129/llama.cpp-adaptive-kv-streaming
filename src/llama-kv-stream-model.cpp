@@ -4,6 +4,7 @@
 #include "llama-context-memory.h"
 #include "../ggml/src/ggml-backend-execution.h"
 #include "../ggml/src/ggml-kv-stream-device.h"
+#include "../ggml/src/ggml-kv-stream-registered-copy.h"
 #include "ggml-cpp.h"
 #include "llama-impl.h"
 #include <array>
@@ -17,6 +18,16 @@ using mtp_lease_ptr = std::unique_ptr<llama_kv_stream_complete_layer_lease,
     decltype(&llama_kv_stream_complete_layer_lease_free)>;
 using model_lease_ptr = std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)>;
 static std::atomic<uint64_t> model_cache_id{1};
+
+uint64_t llama_kv_stream_cache_ids_reserve(std::atomic<uint64_t> & next, uint32_t count) noexcept {
+    const uint64_t limit = (UINT64_MAX - 3)/4;
+    if (!count) return 0;
+    uint64_t first = next.load(std::memory_order_relaxed);
+    for (;;) {
+        if (!first || first > limit || uint64_t(count) > limit - first + 1) return 0;
+        if (next.compare_exchange_weak(first, first + count, std::memory_order_relaxed)) return first;
+    }
+}
 
 // Strict prefill uses native attention even when decode has a compiled streamed implementation.
 static bool native_attention_available(const llama_kv_stream_model_config & config,uint32_t & unavailable) {
@@ -137,7 +148,7 @@ std::unique_ptr<llama_kv_stream_read_proxy> llama_kv_stream_read_proxy::create(l
         auto state=std::make_shared<implementation>();
         state->source=&source; state->parent=&parent; state->host=host; state->device=device;
         state->layer=layer; state->heads=heads; state->queries=queries;
-        state->alias_id=model_cache_id.fetch_add(1,std::memory_order_relaxed);
+        state->alias_id=llama_kv_stream_cache_ids_reserve(model_cache_id,1);
         if (!state->alias_id || state->alias_id > (UINT64_MAX-3)/4) return {};
         state->metadata.reset(ggml_init({4096+2*ggml_tensor_overhead(),nullptr,true}));
         if (!state->metadata) return {};
@@ -155,7 +166,7 @@ std::unique_ptr<llama_kv_stream_read_proxy> llama_kv_stream_read_proxy::create(l
         auto context=std::make_unique<std::shared_ptr<implementation>>(state);
         std::unique_ptr<llama_kv_stream_read_proxy> result(new llama_kv_stream_read_proxy);
         result->impl=state;
-        result->proxy=ggml_backend_execution_buffer_new(device,host->buffer(),ops,context.get());
+        result->proxy=host->execution_buffer(device,ops,context.get());
         if (!result->proxy) return {};
         context.release();
         llama_kv_stream_host_layer planes;
@@ -556,7 +567,7 @@ struct llama_kv_stream_model::implementation {
     bool reset(bool clear) {
         if (session && session->device_suspended()) return false;
         abort();
-        if (clear) ggml_backend_buffer_clear(host->buffer(),0);
+        if (clear && !host->clear()) return false;
         if (!content->invalidate()) return false;
         external_mutation = false;
         suspended_tokens = 0;
@@ -608,6 +619,15 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
     auto * type = llama_kv_stream_device_buffer_type(dev);
     auto * host_type = llama_kv_stream_host_buffer_type(dev);
     if (!type || !host_type) return {};
+    if (config.demand_host) {
+        const auto get_registered = reinterpret_cast<ggml_kv_stream_registered_copy_ops_get>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev),"ggml_backend_kv_stream_registered_copy_ops"));
+        const auto * registered = get_registered ? get_registered() : nullptr;
+        if (!registered || !registered->version || !registered->create || !registered->enqueue) {
+            LLAMA_LOG_ERROR("%s: missing registered host-range transport for demand-backed KV\n",__func__);
+            return {};
+        }
+    }
     uint32_t unavailable = 0;
     if (!native_attention_available(config,unavailable)) {
         if (unavailable_queries) *unavailable_queries = unavailable;
@@ -640,7 +660,8 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
     try {
         auto s = std::make_shared<implementation>(); s->config = config;
         if (!llama_kv_stream_writer::requirements(type,config.host.shape,config.max_batch_rows,s->writer_bytes)) return {};
-        s->config.host.cache_id = model_cache_id.fetch_add(config.auxiliary_cache_layers ? 2 : 1, std::memory_order_relaxed);
+        // The second identity belongs to auxiliary full KV or the target's bounded cache.
+        s->config.host.cache_id = llama_kv_stream_cache_ids_reserve(model_cache_id,2);
         if (!s->config.host.cache_id ||
                 s->config.host.cache_id > (UINT64_MAX-3)/4 - config.auxiliary_cache_layers) return {};
         const uint64_t auxiliary_id = s->config.host.cache_id + config.auxiliary_cache_layers;
@@ -655,14 +676,18 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
         llama_kv_stream_policy_state initial;
         if (llama_kv_stream_policy_initialize(s->physical_policy, initial).status !=
                 llama_kv_stream_policy_status::success) return {};
-        s->host = llama_kv_stream_host::create(s->config.host,host_type);
+        const auto make_host = [&](const llama_kv_stream_host_config & host) {
+            return config.demand_host ? llama_kv_stream_host::from_reservation(
+                llama_kv_stream_host_reservation::create(host,dev)) : llama_kv_stream_host::create(host,host_type);
+        };
+        s->host = make_host(s->config.host);
         if (!s->host) { LLAMA_LOG_ERROR("%s: authoritative host KV allocation/registration failed\n",__func__); return {}; }
         s->content = std::make_shared<llama_kv_stream_content>(s->host);
         if (config.auxiliary_cache_layers) {
             auto auxiliary_host_config = s->config.host;
             auxiliary_host_config.cache_id = auxiliary_id;
             auxiliary_host_config.layers = config.auxiliary_cache_layers;
-            auto auxiliary_host = llama_kv_stream_host::create(auxiliary_host_config, host_type);
+            auto auxiliary_host = make_host(auxiliary_host_config);
             if (!auxiliary_host) { LLAMA_LOG_ERROR("%s: auxiliary host KV allocation/registration failed\n",__func__); return {}; }
             auto auxiliary = llama_kv_stream_logical_cache::create(std::move(auxiliary_host));
             if (!auxiliary) return {};
@@ -755,7 +780,7 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
         auto owner = std::make_unique<std::shared_ptr<implementation>>(s);
         std::unique_ptr<llama_kv_stream_model> result(new llama_kv_stream_model);
         result->impl = s;
-        result->proxy = ggml_backend_execution_buffer_new(dev,s->host->buffer(),ops,owner.get());
+        result->proxy = s->host->execution_buffer(dev,ops,owner.get());
         if (!result->proxy) return {};
         owner.release(); return result;
     } catch (const std::bad_alloc &) { LLAMA_LOG_ERROR("%s: host KV metadata allocation failed\n",__func__); return {}; }
@@ -1086,6 +1111,7 @@ bool llama_kv_stream_model::begin(size_t active,uint32_t queries,bool decode) {
     if (!s.session || s.session->device_suspended() || s.external_mutation || s.session->active() || s.session->failed() || !queries || queries > s.config.max_batch_rows ||
             (decode && queries > s.config.max_decode_rows) || active < s.session->tokens() || active-s.session->tokens() != queries ||
             active > s.host->config().context_tokens) return false;
+    if (s.host->demand_backed() && !s.host->prepare(active)) return false;
     // A new KV page can require physical repartition; retire the MTP guard
     // before admitting that page, never after an already submitted target copy.
     const size_t page = s.config.host.shape.page_tokens;

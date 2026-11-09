@@ -622,7 +622,7 @@ std::unique_ptr<llama_kv_stream_session> llama_kv_stream_session::create(ggml_ba
             config.policy.shape.head_dim_v > INT32_MAX || config.policy.shape.heads <= 0 ||
             config.query_heads%config.policy.shape.heads) return {};
     auto * type = llama_kv_stream_device_buffer_type(ggml_backend_get_device(backend));
-    if (!type || ggml_backend_buffer_get_type(content->host()->buffer()) != llama_kv_stream_host_buffer_type(ggml_backend_get_device(backend))) return {};
+    if (!type || !content->host()->valid() || content->host()->buffer_type() != llama_kv_stream_host_buffer_type(ggml_backend_get_device(backend))) return {};
     llama_kv_stream_policy_state state;
     if (llama_kv_stream_policy_initialize(config.policy,state).status != llama_kv_stream_policy_status::success) return {};
     ggml_kv_stream_block_layout work;

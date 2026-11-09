@@ -4,6 +4,23 @@
 #include <cstdint>
 #include <vector>
 
+struct llama_kv_stream_context_limits {
+    uint32_t slot_limit = 0, group_limit = 0;
+    uint32_t slot_storage = 0, history_storage = 0, slots = 0;
+};
+
+// Native padding is storage only. Failure preserves output; ordinary context semantics are not changed here.
+bool llama_kv_stream_context_limits_make(size_t logical_tokens, size_t padded_tokens, size_t slots,
+        llama_kv_stream_context_limits & output) noexcept;
+
+struct llama_kv_stream_generation_budget {
+    uint32_t query_rows = 0, proposal_tokens = 0;
+};
+
+// The old sampled anchor already occupies logical history. Acceptance can emit proposals plus one bonus/correction.
+bool llama_kv_stream_generation_budget_make(size_t headroom, uint32_t maximum_proposals, size_t remaining_outputs,
+        llama_kv_stream_generation_budget & output) noexcept;
+
 struct llama_kv_stream_selection_config {
     size_t context_tokens = 0;
     size_t maximum_slots = 0;

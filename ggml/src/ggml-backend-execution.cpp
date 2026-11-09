@@ -108,6 +108,11 @@ struct execution_storage {
     ggml_backend_execution_ops ops;
     void * context;
 };
+struct execution_address_storage : execution_storage {
+    void * address = nullptr;
+    size_t alignment = 0;
+    ggml_backend_execution_io io{};
+};
 static execution_storage & storage(ggml_backend_buffer_t buffer) { return *static_cast<execution_storage *>(buffer->context); }
 static const char * execution_name(ggml_backend_buffer_type_t) { return "Execution_Host"; }
 static bool metadata_only(const ggml_tensor * op) {
@@ -120,6 +125,16 @@ static ggml_tensor backing_tensor(ggml_backend_buffer_t buffer, const ggml_tenso
     // Byte I/O resolves view_src before buffer; detach the routing alias while preserving its absolute address.
     result.view_src = nullptr; result.view_offs = 0;
     return result;
+}
+
+static execution_address_storage & address_storage(ggml_backend_buffer_t buffer) {
+    return static_cast<execution_address_storage &>(storage(buffer));
+}
+static bool address_space_range(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, size_t offset, size_t bytes) {
+    const auto base = reinterpret_cast<uintptr_t>(address_storage(buffer).address);
+    const auto data = reinterpret_cast<uintptr_t>(tensor->data);
+    return data >= base && data - base <= buffer->size && offset <= buffer->size - (data - base) &&
+        bytes <= buffer->size - (data - base) - offset;
 }
 
 // The wrapper is deliberately not a host fallback: only opted-in device dispatch may execute its tensors.
@@ -159,6 +174,55 @@ ggml_backend_buffer_t ggml_backend_execution_buffer_new(ggml_backend_dev_t devic
             ggml_backend_buffer_clear(s.backing.get(),value); s.ops.modified(s.context);
         };
         auto * result = ggml_backend_buffer_init(&s->type,iface,s.get(),ggml_backend_buffer_get_size(backing));
+        execution_buffers.fetch_add(1,std::memory_order_release);
+        s.release(); return result;
+    } catch (const std::bad_alloc &) { return nullptr; }
+}
+
+ggml_backend_buffer_t ggml_backend_execution_buffer_new_address_space(ggml_backend_dev_t device,
+        void * base, size_t size, size_t alignment, const ggml_backend_execution_ops & ops,
+        const ggml_backend_execution_io & io, void * context) {
+    const auto address = reinterpret_cast<uintptr_t>(base);
+    if (!device || !base || !size || size > size_t(PTRDIFF_MAX) || size > UINTPTR_MAX - address ||
+            alignment < 128 || (alignment & (alignment - 1)) || address%alignment ||
+            !ops.supports || !ops.compute || !ops.can_write || !ops.modified || !ops.destroy ||
+            !io.read || !io.write || !io.memset || !io.clear) return nullptr;
+    try {
+        auto s = std::make_unique<execution_address_storage>();
+        s->ops = ops; s->context = context;
+        s->address = base; s->alignment = alignment; s->io = io;
+        s->type.device = device; s->type.context = static_cast<execution_storage *>(s.get());
+        s->type.iface.get_name = execution_name;
+        s->type.iface.alloc_buffer = [](ggml_backend_buffer_type_t,size_t) -> ggml_backend_buffer_t { return nullptr; };
+        s->type.iface.get_alignment = [](ggml_backend_buffer_type_t type) {
+            return static_cast<execution_address_storage *>(static_cast<execution_storage *>(type->context))->alignment;
+        };
+        ggml_backend_buffer_i iface{};
+        iface.free_buffer = [](ggml_backend_buffer_t b) {
+            auto * s = &address_storage(b); s->ops.destroy(s->context); delete s;
+            execution_buffers.fetch_sub(1,std::memory_order_release);
+        };
+        iface.get_base = [](ggml_backend_buffer_t b) { return address_storage(b).address; };
+        iface.init_tensor = [](ggml_backend_buffer_t,ggml_tensor *) { return GGML_STATUS_SUCCESS; };
+        iface.set_tensor = [](ggml_backend_buffer_t b,ggml_tensor * t,const void * p,size_t offset,size_t bytes) {
+            auto & s = address_storage(b); GGML_ASSERT(s.ops.can_write(s.context));
+            GGML_ASSERT(address_space_range(b,t,offset,bytes) && s.io.write(s.io.context,t,p,offset,bytes));
+            s.ops.modified(s.context);
+        };
+        iface.get_tensor = [](ggml_backend_buffer_t b,const ggml_tensor * t,void * p,size_t offset,size_t bytes) {
+            auto & s = address_storage(b);
+            GGML_ASSERT(address_space_range(b,t,offset,bytes) && s.io.read(s.io.context,t,p,offset,bytes));
+        };
+        iface.memset_tensor = [](ggml_backend_buffer_t b,ggml_tensor * t,uint8_t value,size_t offset,size_t bytes) {
+            auto & s = address_storage(b); GGML_ASSERT(s.ops.can_write(s.context));
+            GGML_ASSERT(address_space_range(b,t,offset,bytes) && s.io.memset(s.io.context,t,value,offset,bytes));
+            s.ops.modified(s.context);
+        };
+        iface.clear = [](ggml_backend_buffer_t b,uint8_t value) {
+            auto & s = address_storage(b); GGML_ASSERT(s.ops.can_write(s.context));
+            GGML_ASSERT(s.io.clear(s.io.context,value)); s.ops.modified(s.context);
+        };
+        auto * result = ggml_backend_buffer_init(&s->type,iface,static_cast<execution_storage *>(s.get()),size);
         execution_buffers.fetch_add(1,std::memory_order_release);
         s.release(); return result;
     } catch (const std::bad_alloc &) { return nullptr; }

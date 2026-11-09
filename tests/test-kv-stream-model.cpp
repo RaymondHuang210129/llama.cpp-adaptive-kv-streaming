@@ -7,6 +7,9 @@
 #include "../src/llama-context-memory.h"
 #include "../src/llama-memory-bounded-kv.h"
 #include <random>
+#ifdef KV_MODEL_CUDA_TEST
+#include "ggml-cuda.h"
+#endif
 
 // Quantization error is not adapter error: compare the exact bytes from an ordinary CUDA producer graph.
 static std::vector<uint8_t> reference_bytes(ggml_backend_t backend,const std::vector<float> & data,ggml_type type,float scale,
@@ -140,6 +143,7 @@ struct resident_upload_probe {
 
 // Small real shared parent; the target and each borrower have independent schedulers.
 struct serial_workspace_fixture {
+    inline static bool demand_host = false;
     fixture host;
     ggml_backend_ptr cpu{ggml_backend_cpu_init()};
     ggml_backend_buffer_type_t type;
@@ -165,6 +169,7 @@ struct serial_workspace_fixture {
         size_t minimum = 0;
         GGML_ASSERT(llama_kv_stream_policy_minimum_pool_bytes(bootstrap,minimum).status == llama_kv_stream_policy_status::success);
         llama_kv_stream_model_config config{backend,host.host->config(),minimum,256,query_heads};
+        config.demand_host=demand_host;
         config.shared_device_memory_bytes = arena_mib*1048576;
         model = llama_kv_stream_model::create(config);
         plan.groups = {{type,2*1048576,alignment,0}};
@@ -290,6 +295,10 @@ struct kv_allocation_probe {
 };
 
 int main(int argc,char ** argv) {
+    const bool demand_only = argc > 1 && std::strcmp(argv[1], "--cuda-demand-host") == 0;
+    serial_workspace_fixture::demand_host=demand_only;
+    const bool demand_gemma_target = argc > 1 && std::strcmp(argv[1], "--cuda-demand-gemma-target") == 0;
+    const bool demand_target = demand_gemma_target || (argc > 1 && std::strcmp(argv[1], "--cuda-demand-target") == 0);
     const bool native_only = argc > 1 && std::strcmp(argv[1], "--cuda-native-admission") == 0;
     const bool native_reduced = argc > 1 && std::strcmp(argv[1], "--cuda-native-reduced") == 0;
     const bool auxiliary_only = argc > 1 && std::strcmp(argv[1], "--cuda-auxiliary-cache") == 0;
@@ -304,10 +313,11 @@ int main(int argc,char ** argv) {
     const bool vision_suspend_only = argc > 1 && std::strcmp(argv[1], "--cuda-vision-suspend") == 0;
     const bool phase_loan_only = argc > 1 && std::strcmp(argv[1], "--cuda-phase-loan") == 0;
     const bool serial_scratch_only = argc > 1 && std::strcmp(argv[1], "--cuda-serial-scratch") == 0;
-    const bool gemma_target_only = argc > 1 && std::strcmp(argv[1], "--cuda-gemma-target") == 0;
+    const bool gemma_target_only = demand_gemma_target || (argc > 1 && std::strcmp(argv[1], "--cuda-gemma-target") == 0);
     const bool read_proxy_only = argc > 1 && std::strcmp(argv[1], "--cuda-read-proxy") == 0;
-    const bool wide_target_only = gemma_target_only || (argc > 1 && std::strcmp(argv[1], "--cuda-wide-target") == 0);
+    const bool wide_target_only = demand_target || gemma_target_only || (argc > 1 && std::strcmp(argv[1], "--cuda-wide-target") == 0);
     testing t;
+    if (demand_only) t.set_filter("read_only_layer_proxy_routes_native_graphs_to_committed_sources");
     if (native_only) t.set_filter("native_attention_admission_.*");
     if (read_proxy_only) t.set_filter("read_only_layer_proxy_routes_native_graphs_to_committed_sources");
     if (wide_target_only) t.set_filter("ordinary_graph_dispatches_kv_producers_and_streamed_attention");
@@ -324,10 +334,14 @@ int main(int argc,char ** argv) {
     if (lease_only) t.set_filter("populated_mtp_lease_reuses_one_upload_for_tg1_to_tg4");
     if (cancel_only) t.set_filter("mtp_proxy_cancellation_drains_pending_writes");
     if (phase_prefetch_only) t.set_filter("phase_prefetch_.*");
-    if (argc < 2 || (!read_proxy_only && !phase_prefetch_only && !wide_target_only && !native_reduced && !native_only && !serial_scratch_only && !phase_loan_only && !vision_suspend_only && !resume_only && !suspend_only && !auxiliary_only && !lease_only && !cancel_only && !admission_only && !phase_admission_only && !wide_ubatch_only && std::strcmp(argv[1],"--cuda"))) {
+    if (argc < 2 || (!demand_only && !read_proxy_only && !phase_prefetch_only && !wide_target_only && !native_reduced && !native_only && !serial_scratch_only && !phase_loan_only && !vision_suspend_only && !resume_only && !suspend_only && !auxiliary_only && !lease_only && !cancel_only && !admission_only && !phase_admission_only && !wide_ubatch_only && std::strcmp(argv[1],"--cuda"))) {
         t.assert_true(!llama_kv_stream_model::create({})); return t.summary();
     }
-    ggml_backend_load_all(); auto * dev = ggml_backend_dev_by_name("CUDA0"); if (!dev) return phase_admission_only ? 77 : 1;
+    ggml_backend_load_all();
+#ifdef KV_MODEL_CUDA_TEST
+    if (!ggml_backend_reg_by_name("CUDA")) ggml_backend_register(ggml_backend_cuda_reg());
+#endif
+    auto * dev = ggml_backend_dev_by_name("CUDA0"); if (!dev) return phase_admission_only ? 77 : 1;
     ggml_backend_ptr backend(ggml_backend_dev_init(dev,nullptr)), cpu(ggml_backend_cpu_init());
     t.test("serial_draft_growth_replans_target_workspace_without_moving_persistent_cache",[&](testing & t) {
         serial_workspace_fixture f(backend.get());
@@ -1610,6 +1624,7 @@ int main(int argc,char ** argv) {
         fixture f(backend.get(),true,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,wide_target_only ? 6144 : 513,false,layers,heads,0,width,width);
         ggml_kv_stream_layout page; ggml_kv_stream_layout_make(f.policy.shape,256,page);
         llama_kv_stream_model_config config{backend.get(),f.host->config(),page.bytes*(layers+3),256,query_heads};
+        config.demand_host=demand_target;
         if (wide_target_only) config.max_decode_rows=8;
         auto model = llama_kv_stream_model::create(config);
         if (!t.assert_true(bool(model))) return;
@@ -1687,8 +1702,9 @@ int main(int argc,char ** argv) {
                 t.assert_true(!std::memcmp(static_cast<const char *>(planes.v)+first*f.host->layout().v_token_bytes,expected_v.data(),expected_v.size()));
             }
             std::vector<float> actual(ggml_nelements(output)); ggml_backend_tensor_get(output,actual.data(),0,actual.size()*sizeof(float));
+            if (demand_target) t.assert_true(std::all_of(actual.begin(),actual.end(),[](float value) { return std::isfinite(value); }));
             if (gemma_target_only) outputs.push_back(std::move(actual));
-            else if (wide_target_only && decode)
+            else if (wide_target_only && (decode || demand_target))
                 t.assert_true(same_float_bits(stock_attention(f,attn,layer),actual));
             if (!gemma_target_only) close_values(t,oracle(f,0,active,rows,attn.qdata),actual,1e-3f);
             }

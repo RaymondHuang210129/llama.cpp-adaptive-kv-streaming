@@ -53,6 +53,9 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+    uint32_t stream_group_n_ctx;
+    uint64_t stream_history_n_ctx;
+    uint32_t stream_storage_n_ctx;
 };
 
 enum server_state {

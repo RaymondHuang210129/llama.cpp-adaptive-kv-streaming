@@ -3,6 +3,11 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend-execution.h"
+#include "ggml-kv-stream-registered-copy.h"
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+const ggml_kv_stream_registered_copy_ops * ggml_cuda_kv_stream_registered_copy_ops();
+#endif
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -6835,6 +6840,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_kv_stream_partial_ops") == 0) return (void *)ggml_cuda_kv_stream_partial_ops;
     if (strcmp(name, "ggml_backend_cuda_kv_stream_attention_plan") == 0) return (void *)ggml_cuda_kv_stream_attention_plan_query;
     if (strcmp(name, "ggml_backend_kv_stream_copy_ops") == 0) return (void *)ggml_cuda_kv_stream_copy_ops;
+    if (strcmp(name, "ggml_backend_kv_stream_registered_copy_ops") == 0) return (void *)ggml_cuda_kv_stream_registered_copy_ops;
     if (strcmp(name, "ggml_backend_cuda_kv_host_buffer_type") == 0) return (void *)ggml_backend_cuda_kv_host_buffer_type;
     if (strcmp(name, "ggml_backend_cuda_kv_host_buffer_register") == 0) return (void *)ggml_backend_cuda_kv_host_buffer_register;
     const bool release_graph = strcmp(name, "ggml_backend_cuda_graph_release") == 0;

@@ -22,6 +22,12 @@ public:
     bool generate_async(const ggml_tensor * source, bool value, void * host,
             const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
             llama_kv_stream_writer_completion & completion);
+    // Preserve native encoding tiles; split only downloads across consecutive registrations of one host plane.
+    // Destination owners remain retained until release_completed() or draining destruction.
+    bool generate_async_registered(const ggml_tensor * source, bool value,
+            const std::vector<llama_kv_stream_host_range> & destinations,
+            const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
+            llama_kv_stream_writer_completion & completion);
     // Queue private-host download and optional D2D publication; drain before scratch reuse.
     bool generate(const ggml_tensor * source, bool value, void * host,
             const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish);
@@ -33,4 +39,8 @@ private:
     llama_kv_stream_writer() = default;
     struct implementation;
     std::unique_ptr<implementation> impl;
+    bool generate_async_impl(const ggml_tensor * source, bool value, void * host,
+            const std::vector<llama_kv_stream_host_range> * destinations,
+            const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
+            llama_kv_stream_writer_completion & completion);
 };

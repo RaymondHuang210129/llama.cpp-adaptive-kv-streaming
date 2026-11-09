@@ -1,5 +1,6 @@
 #include "llama-kv-stream-host.h"
 #include "../ggml/src/ggml-backend-memory.h"
+#include "../ggml/src/ggml-backend-execution.h"
 
 #include <algorithm>
 #include <cstring>
@@ -111,6 +112,174 @@ std::shared_ptr<llama_kv_stream_host> llama_kv_stream_host::from_buffer(
     }
 }
 
+std::shared_ptr<llama_kv_stream_host> llama_kv_stream_host::from_reservation(
+        std::shared_ptr<llama_kv_stream_host_reservation> reservation) {
+    if (!reservation) return {};
+    try {
+        std::shared_ptr<llama_kv_stream_host> host(new llama_kv_stream_host);
+        const auto & config = reservation->config();
+        if (!host_plan(config, host->planes, host->layer_stride, host->storage_bytes)) return {};
+        llama_kv_stream_host_layer first;
+        if (!reservation->layer(0, first)) return {};
+        host->cfg = config;
+        host->base = first.k;
+        host->demand = std::move(reservation);
+        return host;
+    } catch (const std::bad_alloc &) {
+        return {};
+    }
+}
+
+bool llama_kv_stream_host::demand_backed() const noexcept { return bool(demand); }
+
+bool llama_kv_stream_host::valid() const noexcept {
+    if (!base) return false;
+    llama_kv_stream_host_layer first;
+    return !demand || demand->layer(0, first);
+}
+
+bool llama_kv_stream_host::prepare(size_t rows) {
+    return demand ? demand->prepare(rows) : rows <= planes.tokens;
+}
+
+bool llama_kv_stream_host::ranges(uint32_t layer, ggml_kv_stream_operand operand, size_t offset, size_t bytes,
+        std::vector<llama_kv_stream_host_range> & output) const {
+    if (demand) return demand->ranges(layer, operand, offset, bytes, output);
+    if (layer >= cfg.layers || !bytes || (operand != ggml_kv_stream_operand::k && operand != ggml_kv_stream_operand::v)) return false;
+    const size_t capacity = operand == ggml_kv_stream_operand::k ? planes.k_bytes : planes.v_bytes;
+    if (offset > capacity || bytes > capacity - offset) return false;
+    try {
+        const size_t leading = size_t(static_cast<const char *>(base) -
+            static_cast<const char *>(ggml_backend_buffer_get_base(storage)));
+        const size_t first = leading + layer*layer_stride +
+            (operand == ggml_kv_stream_operand::v ? planes.v_offset : 0) + offset;
+        std::vector<llama_kv_stream_host_range> ranges;
+        ranges.push_back({ggml_backend_buffer_ptr(ggml_backend_buffer_retain(storage)), first, bytes});
+        output = std::move(ranges);
+        return true;
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+}
+
+bool llama_kv_stream_host::locate(const void * data, size_t offset, size_t bytes, uint32_t & layer,
+        ggml_kv_stream_operand & operand, size_t & in_plane) const noexcept {
+    if (!valid() || !data || !bytes) return false;
+    const auto address = reinterpret_cast<uintptr_t>(data);
+    const auto first = reinterpret_cast<uintptr_t>(base);
+    if (address < first || address - first > storage_bytes || offset > storage_bytes - (address - first) ||
+            bytes > storage_bytes - (address - first) - offset) return false;
+    const size_t relative = address - first + offset;
+    const size_t ordinal = relative/layer_stride;
+    if (ordinal >= cfg.layers) return false;
+    const size_t within = relative%layer_stride;
+    size_t capacity;
+    if (within < planes.k_bytes) {
+        operand = ggml_kv_stream_operand::k;
+        in_plane = within; capacity = planes.k_bytes;
+    } else if (within >= planes.v_offset && within - planes.v_offset < planes.v_bytes) {
+        operand = ggml_kv_stream_operand::v;
+        in_plane = within - planes.v_offset; capacity = planes.v_bytes;
+    } else {
+        return false;
+    }
+    if (bytes > capacity - in_plane) return false;
+    layer = uint32_t(ordinal);
+    return true;
+}
+
+bool llama_kv_stream_host::address_ranges(const void * data, size_t bytes,
+        std::vector<llama_kv_stream_host_range> & output) const {
+    uint32_t layer;
+    ggml_kv_stream_operand operand;
+    size_t in_plane;
+    return locate(data,0,bytes,layer,operand,in_plane) && ranges(layer,operand,in_plane,bytes,output);
+}
+
+bool llama_kv_stream_host::upload(ggml_backend_t backend, ggml_tensor * target, size_t offset,
+        const void * data, size_t bytes, size_t & calls) const {
+    if (!backend || !target || !target->data || !target->buffer || !bytes) return false;
+    const size_t capacity = ggml_nbytes(target);
+    if (offset > capacity || bytes > capacity-offset) return false;
+    uint32_t layer;
+    ggml_kv_stream_operand operand;
+    size_t in_plane;
+    if (!locate(data,0,bytes,layer,operand,in_plane)) return false;
+    if (!demand) {
+        if (calls == SIZE_MAX) return false;
+        ++calls;
+        ggml_backend_tensor_set_async(backend,target,data,offset,bytes);
+        return true;
+    }
+    std::vector<llama_kv_stream_host_range> pieces;
+    if (!ranges(layer,operand,in_plane,bytes,pieces) || pieces.size() > SIZE_MAX-calls) return false;
+    for (const auto & piece : pieces) {
+        const auto * source = static_cast<const char *>(ggml_backend_buffer_get_base(piece.buffer.get()))+piece.offset;
+        ++calls;
+        ggml_backend_tensor_set_async(backend,target,source,offset,piece.bytes);
+        offset += piece.bytes;
+    }
+    return true;
+}
+
+bool llama_kv_stream_host::access(const ggml_tensor * tensor, size_t offset, size_t bytes, bool write,
+        std::vector<llama_kv_stream_host_range> & output) {
+    uint32_t layer;
+    ggml_kv_stream_operand operand;
+    size_t in_plane;
+    if (!tensor || !locate(tensor->data,offset,bytes,layer,operand,in_plane)) return false;
+    const size_t stride = operand == ggml_kv_stream_operand::k ? planes.k_token_bytes : planes.v_token_bytes;
+    const size_t end = in_plane + bytes;
+    if (write && !prepare(end/stride + (end%stride != 0))) return false;
+    return ranges(layer, operand, in_plane, bytes, output);
+}
+
+ggml_backend_buffer_t llama_kv_stream_host::execution_buffer(ggml_backend_dev_t device,
+        const ggml_backend_execution_ops & ops, void * context) {
+    if (!demand) return ggml_backend_execution_buffer_new(device, storage, ops, context);
+    ggml_backend_execution_io io{
+        this,
+        [](void * p, const ggml_tensor * tensor, void * data, size_t offset, size_t bytes) {
+            auto & host = *static_cast<llama_kv_stream_host *>(p);
+            std::vector<llama_kv_stream_host_range> ranges;
+            if (!host.access(tensor, offset, bytes, false, ranges)) return false;
+            size_t copied = 0;
+            for (const auto & range : ranges) {
+                std::memcpy(static_cast<char *>(data) + copied,
+                    static_cast<const char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset, range.bytes);
+                copied += range.bytes;
+            }
+            return true;
+        },
+        [](void * p, const ggml_tensor * tensor, const void * data, size_t offset, size_t bytes) {
+            auto & host = *static_cast<llama_kv_stream_host *>(p);
+            std::vector<llama_kv_stream_host_range> ranges;
+            if (!host.access(tensor, offset, bytes, true, ranges)) return false;
+            size_t copied = 0;
+            for (const auto & range : ranges) {
+                std::memcpy(static_cast<char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset,
+                    static_cast<const char *>(data) + copied, range.bytes);
+                copied += range.bytes;
+            }
+            return true;
+        },
+        [](void * p, const ggml_tensor * tensor, uint8_t value, size_t offset, size_t bytes) {
+            auto & host = *static_cast<llama_kv_stream_host *>(p);
+            std::vector<llama_kv_stream_host_range> ranges;
+            if (!host.access(tensor, offset, bytes, true, ranges)) return false;
+            for (const auto & range : ranges) std::memset(
+                static_cast<char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset, value, range.bytes);
+            return true;
+        },
+        [](void * p, uint8_t value) {
+            auto & host = *static_cast<llama_kv_stream_host *>(p);
+            return host.clear(value);
+        },
+    };
+    return ggml_backend_execution_buffer_new_address_space(device, base, storage_bytes,
+        std::max(size_t(128),cfg.shape.alignment), ops, io, context);
+}
+
 // Stable host identity does not change when a device mirror is rebound.
 uint64_t llama_kv_stream_host::cache_id() const noexcept { return cfg.cache_id; }
 // The validated shape and original context capacity belong to the authoritative storage.
@@ -121,10 +290,21 @@ const ggml_kv_stream_layout & llama_kv_stream_host::layout() const noexcept { re
 size_t llama_kv_stream_host::stride() const noexcept { return layer_stride; }
 // Exclude leading/trailing allocation slack from the canonical storage size.
 size_t llama_kv_stream_host::bytes() const noexcept { return storage_bytes; }
+size_t llama_kv_stream_host::committed_bytes() const noexcept { return demand ? demand->committed_bytes() : storage_bytes; }
+ggml_backend_buffer_type_t llama_kv_stream_host::buffer_type() const noexcept {
+    return demand ? demand->buffer_type() : ggml_backend_buffer_get_type(storage);
+}
+bool llama_kv_stream_host::clear(uint8_t value) {
+    if (!valid()) return false;
+    if (demand) demand->clear(value);
+    else ggml_backend_buffer_clear(storage,value);
+    return true;
+}
 // Borrowed buffer access requires retaining this storage owner.
 ggml_backend_buffer_t llama_kv_stream_host::buffer() const noexcept { return storage; }
 // All products and offsets were bounded when the owner was created.
 bool llama_kv_stream_host::layer(uint32_t index, llama_kv_stream_host_layer & output) const noexcept {
+    if (demand) return demand->layer(index, output);
     if (index >= cfg.layers) return false;
     auto * k = static_cast<char *>(base) + size_t(index)*layer_stride;
     output = {k, k + planes.v_offset};
@@ -197,6 +377,8 @@ std::unique_ptr<llama_kv_stream_host_reservation> llama_kv_stream_host_reservati
 }
 
 const ggml_kv_stream_layout & llama_kv_stream_host_reservation::layout() const noexcept { return state->planes; }
+const llama_kv_stream_host_config & llama_kv_stream_host_reservation::config() const noexcept { return state->config; }
+ggml_backend_buffer_type_t llama_kv_stream_host_reservation::buffer_type() const noexcept { return state->type; }
 size_t llama_kv_stream_host_reservation::bytes() const noexcept { return state->bytes; }
 size_t llama_kv_stream_host_reservation::reserved_bytes() const noexcept {
     return ggml_backend_host_reservation_size(state->reservation.get());
@@ -282,14 +464,12 @@ bool llama_kv_stream_host_reservation::truncate(size_t rows) {
         const size_t first = s.base_offset + layer*s.stride + (value ? s.planes.v_offset : 0);
         s.zero(first + rows*token_bytes, (s.rows - rows)*token_bytes);
     }
-    s.rows = rows;
     return true;
 }
 
-void llama_kv_stream_host_reservation::clear() {
+void llama_kv_stream_host_reservation::clear(uint8_t value) {
     auto & s = *state;
-    for (const auto & chunk : s.chunks) ggml_backend_buffer_clear(chunk.buffer.get(), 0);
-    s.rows = 0;
+    for (const auto & chunk : s.chunks) ggml_backend_buffer_clear(chunk.buffer.get(), value);
 }
 
 bool llama_kv_stream_host_reservation::ranges(uint32_t layer, ggml_kv_stream_operand operand,

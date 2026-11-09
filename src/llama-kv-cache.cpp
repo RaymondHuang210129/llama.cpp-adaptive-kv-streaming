@@ -1128,10 +1128,10 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     if (kv_stream) {
-        ret[ggml_backend_buffer_get_type(kv_stream->host()->buffer())] = kv_stream->host()->bytes();
+        ret[kv_stream->host()->buffer_type()] = kv_stream->host()->committed_bytes();
         if (const auto auxiliary = kv_stream->auxiliary_cache()) {
             const auto auxiliary_host = auxiliary->host();
-            ret[ggml_backend_buffer_get_type(auxiliary_host->buffer())] += auxiliary_host->bytes();
+            ret[auxiliary_host->buffer_type()] += auxiliary_host->committed_bytes();
         }
         ret[llama_kv_stream_device_buffer_type(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(kv_stream->buffer())))] = kv_stream->granted_bytes();
         return ret;

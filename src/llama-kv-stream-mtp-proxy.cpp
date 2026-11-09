@@ -340,7 +340,7 @@ std::unique_ptr<llama_kv_stream_mtp_proxy> llama_kv_stream_mtp_proxy::create(
         [](void * p) { delete static_cast<std::shared_ptr<implementation> *>(p); },
     };
     auto holder = std::make_unique<std::shared_ptr<implementation>>(result->impl);
-    result->proxy.reset(ggml_backend_execution_buffer_new(device, state.cache->host()->buffer(),
+    result->proxy.reset(state.cache->host()->execution_buffer(device,
         ops, holder.get()));
     if (!result->proxy) return {};
     holder.release();

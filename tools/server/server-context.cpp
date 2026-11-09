@@ -4910,6 +4910,9 @@ server_context_meta server_context::get_meta() const {
     auto eos_token_str = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, eos_id, true) : "";
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
+    const bool stream_multi = impl->params_base.n_parallel == 2 &&
+        (impl->params_base.kv_stream_pool_bytes || impl->params_base.shared_device_memory_bytes);
+    const uint32_t stream_group = stream_multi ? llama_n_ctx_seq(impl->ctx_tgt) : 0;
 
     return server_context_meta {
         /* build_info              */ std::string(llama_build_info()),
@@ -4947,6 +4950,9 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params          */ llama_model_n_params(impl->model_tgt),
         /* model_size              */ llama_model_size(impl->model_tgt),
         /* model_ftype             */ ftype_name,
+        /* stream_group_n_ctx      */ stream_group,
+        /* stream_history_n_ctx    */ uint64_t(stream_group) * impl->params_base.n_parallel,
+        /* stream_storage_n_ctx    */ stream_multi ? llama_n_ctx(impl->ctx_tgt) : 0,
     };
 }
 
@@ -5361,6 +5367,14 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
     };
+    if (meta.stream_group_n_ctx) {
+        props["stream_context_limits"] = {
+            {"per_slot", meta.stream_group_n_ctx},
+            {"selected_group", meta.stream_group_n_ctx},
+            {"all_histories", meta.stream_history_n_ctx},
+            {"selected_storage", meta.stream_storage_n_ctx},
+        };
+    }
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
             props["chat_template_tool_use"] = tmpl_tools;

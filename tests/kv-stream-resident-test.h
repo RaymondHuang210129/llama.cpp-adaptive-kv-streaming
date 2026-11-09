@@ -20,6 +20,7 @@ using lease_ptr = std::unique_ptr<ggml_backend_memory_lease, decltype(&ggml_back
 
 // Encode deterministic token-major data; the independent oracle reads back the actual quantized values.
 static void populate(const std::shared_ptr<llama_kv_stream_host> & host) {
+    GGML_ASSERT(host->prepare(host->layout().tokens));
     const auto & c = host->config();
     const size_t rows = host->layout().tokens*size_t(c.shape.heads);
     for (uint32_t layer = 0; layer < c.layers; ++layer) {
@@ -88,11 +89,13 @@ struct fixture {
 };
 
 // Decode exact GGML rows, without assuming that quantized values equal their original float inputs.
-static std::vector<float> unpack(const fixture & f, uint32_t layer, bool value) {
+static std::vector<float> unpack(const fixture & f,uint32_t layer,bool value,size_t tokens=SIZE_MAX) {
     const auto & shape = f.host->config().shape;
     const auto type = ggml_type(value ? shape.type_v : shape.type_k);
     const size_t dim = size_t(value ? shape.head_dim_v : shape.head_dim_k);
-    const size_t rows = f.host->layout().tokens*size_t(shape.heads);
+    if (tokens == SIZE_MAX) tokens=f.host->layout().tokens;
+    GGML_ASSERT(tokens <= f.host->layout().tokens);
+    const size_t rows = tokens*size_t(shape.heads);
     const size_t stride = ggml_row_size(type, int64_t(dim));
     llama_kv_stream_host_layer planes; f.host->layer(layer, planes);
     auto * source = static_cast<const uint8_t *>(value ? planes.v : planes.k);
@@ -107,7 +110,8 @@ static std::vector<float> unpack(const fixture & f, uint32_t layer, bool value) 
 // Scalar causal softmax oracle, independent of GGML graph strides and attention dispatch.
 static std::vector<float> oracle(const fixture & f, uint32_t layer, size_t active, size_t queries, const std::vector<float> & q) {
     constexpr size_t dim = 256, heads = 4, kv_heads = 2;
-    auto k = unpack(f, layer, false), v = unpack(f, layer, true);
+    const size_t tokens=f.host->demand_backed() ? active : SIZE_MAX;
+    auto k = unpack(f,layer,false,tokens), v = unpack(f,layer,true,tokens);
     std::vector<float> result(dim*heads*queries);
     for (size_t h = 0; h < heads; ++h) for (size_t query = 0; query < queries; ++query) {
         const size_t visible = active - queries + query + 1;
