@@ -136,8 +136,9 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 bool ggml_cuda_mmq_workspace_plan(const ggml_tensor * a,const ggml_tensor * b,const ggml_tensor * dst,
         int cc,size_t shared_bytes,int nsm,ggml_backend_operator_workspace & output,int * selected_columns,int * selected_threads) {
     size_t na,nb,nd;
-    if (!ggml_cuda_operator_elements(a,na) || !ggml_cuda_operator_elements(b,nb) ||
-            !ggml_cuda_operator_elements(dst,nd) || a->type!=GGML_TYPE_Q8_0 || b->type!=GGML_TYPE_F32 ||
+    if (!a || !b || !dst || !ggml_cuda_should_use_mmq(a->type,cc,b->ne[1],0) ||
+            !ggml_cuda_operator_elements(a,na) || !ggml_cuda_operator_elements(b,nb) ||
+            !ggml_cuda_operator_elements(dst,nd) || b->type!=GGML_TYPE_F32 ||
             dst->type!=GGML_TYPE_F32 || a->nb[0]!=ggml_type_size(a->type) || b->nb[0]!=sizeof(float) ||
             a->ne[0]!=b->ne[0] || dst->ne[0]!=a->ne[1] || dst->ne[1]!=b->ne[1] ||
             dst->ne[2]!=b->ne[2] || dst->ne[3]!=b->ne[3]) return false;
