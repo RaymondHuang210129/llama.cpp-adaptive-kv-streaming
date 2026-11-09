@@ -384,6 +384,15 @@ llama_test_cmd(${CMAKE_COMMAND} NAME test-cuda-architecture-config
 llama_test_cmd(${CMAKE_COMMAND} NAME test-cuda-kv-runtime-config
     ARGS -DPROJECT_SOURCE_DIR=${PROJECT_SOURCE_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-cuda-kv-runtime-config.cmake)
 
+if (MSVC AND CMAKE_C_COMPILER_ARCHITECTURE_ID MATCHES "^(x64|X86)$" AND NOT CMAKE_CROSSCOMPILING)
+    llama_test_cmd(${CMAKE_COMMAND} NAME test-msvc-simd-config
+        ARGS "-DSIMD_MODULE=${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu/cmake/FindSIMD.cmake"
+            "-DTEST_GENERATOR=${CMAKE_GENERATOR}" "-DTEST_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+            "-DTEST_TOOLSET=${CMAKE_GENERATOR_TOOLSET}" "-DTEST_C_COMPILER=${CMAKE_C_COMPILER}"
+            "-DTEST_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-msvc-simd-config.cmake)
+endif()
+
 if (GGML_CUDA AND GGML_CUDA_FA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
