@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-context.h"
+#include "../src/llama-batch.h"
 #include "../src/llama-model.h"
 #include "../src/llama-kv-stream-model.h"
 #include "../src/llama-kv-stream-logical-cache.h"
@@ -2060,21 +2061,345 @@ static void test_gemma_phase_parent(testing & t, llama_model * model, bool share
     local_reader.release_shared_bounded_reader();
 }
 
-static void test_gemma_deferred_local(testing & t, llama_model * model) {
+static void test_measurement_context(testing & t, llama_model * model) {
+    if (!t.assert_true(model && !model->hparams.no_alloc)) return;
+    const auto params_before=model->hparams.no_alloc;
+    for (uint32_t capacity : {4096u,131072u}) for (uint32_t selected : {1u,2u}) {
+        auto cp=llama_context_default_params();
+        cp.n_ctx=capacity; cp.n_batch=cp.n_ubatch=256; cp.n_seq_max=selected;
+        cp.kv_unified=true; cp.swa_full=false; cp.n_rs_seq=0;
+        cp.type_k=GGML_TYPE_Q8_0; cp.type_v=GGML_TYPE_Q4_0;
+        cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        llama_context context(*model,cp,llama_context_mode::measurement);
+        t.assert_true(context.is_measurement_only());
+        t.assert_equal(params_before,model->hparams.no_alloc);
+        auto * memory=context.get_memory();
+        if (!t.assert_true(memory != nullptr)) return;
+        for (const auto & entry : memory->memory_breakdown()) {
+            t.assert_equal(size_t(0),entry.second);
+            auto * device=ggml_backend_buft_get_device(entry.first);
+            if (device && ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    !t.assert_true("cache metadata uses the arena's device-local class",
+                        entry.first==llama_kv_stream_device_buffer_type(device))) return;
+        }
+        const auto resources=context.get_kv_resources();
+        if (resources.bounded && !t.assert_true("unallocated bounded metadata stays pending",resources.bounded->bounded_storage_pending())) return;
+        if (resources.recurrent) t.assert_true(resources.recurrent->current_storage_pending());
+        auto full=memory->init_full();
+        if (!t.assert_true(full != nullptr)) return;
+        auto * sched=context.get_sched();
+        for (int i=0;i<ggml_backend_sched_get_n_backends(sched);++i) {
+            auto * device=ggml_backend_get_device(ggml_backend_sched_get_backend(sched,i));
+            if (ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    !t.assert_true("measure the arena's device-local buffer class",
+                        ggml_backend_sched_get_buffer_type(sched,ggml_backend_sched_get_backend(sched,i))==llama_kv_stream_device_buffer_type(device))) return;
+        }
+        std::vector<size_t> sizes(ggml_backend_sched_get_n_backends(sched),SIZE_MAX);
+        auto * graph=context.graph_reserve(selected*4,selected,selected*4,full.get(),true,sizes.data());
+        if (!t.assert_true(graph != nullptr)) return;
+        t.assert_true(std::any_of(sizes.begin(),sizes.end(),[](size_t bytes) {return bytes && bytes != SIZE_MAX;}));
+        for (int i=0;i<ggml_backend_sched_get_n_backends(sched);++i)
+            t.assert_equal(size_t(0),ggml_backend_sched_get_buffer_size(sched,ggml_backend_sched_get_backend(sched,i)));
+        t.assert_true("measurement cannot allocate graph storage",context.graph_reserve(selected,selected,selected,full.get()) == nullptr);
+        t.assert_equal(GGML_STATUS_FAILED,context.graph_compute(graph,false));
+        llama_token token=1;
+        t.assert_equal(-1,context.decode(llama_batch_get_one(&token,1)));
+        t.assert_equal(-1,context.encode(llama_batch_get_one(&token,1)));
+        t.assert_equal(params_before,model->hparams.no_alloc);
+        const auto before=memory->memory_breakdown();
+        std::vector<size_t> native_bytes,managed_bytes;
+        t.assert_true("native size measurement completes",context.measure_workspace(selected*4,selected,selected*4,false,native_bytes));
+        t.assert_true("managed size measurement completes",context.measure_workspace(selected*4,selected,selected*4,true,managed_bytes));
+        if (!t.assert_equal(native_bytes.size(),managed_bytes.size())) return;
+        bool reduced=false;
+        for (size_t i=0;i<managed_bytes.size();++i) {
+            t.out << "measured capacity=" << capacity << " selected=" << selected << " backend=" << i << " native=" << native_bytes[i] << " managed=" << managed_bytes[i] << std::endl;
+            t.assert_true("managed scratch does not exceed the native quote",managed_bytes[i]<=native_bytes[i]);
+            reduced=reduced || managed_bytes[i]<native_bytes[i];
+        }
+        // At short histories the native local attention can already set the graph peak.
+        if (capacity == 131072) t.assert_true("long-history managed attention scratch is not counted twice",reduced);
+        t.assert_true(before == memory->memory_breakdown());
+        const auto saved=managed_bytes;
+        t.assert_true(!context.measure_workspace(3,2,3,true,managed_bytes));
+        t.assert_true(saved == managed_bytes);
+        t.assert_true(!context.measure_workspace(0,1,1,true,managed_bytes));
+        t.assert_true(!context.measure_workspace(1,0,1,true,managed_bytes));
+        t.assert_true(!context.measure_workspace(257,1,1,true,managed_bytes));
+        t.assert_true(!context.measure_workspace(1,1,2,true,managed_bytes));
+        t.assert_true(saved == managed_bytes);
+    }
+}
+
+static void test_native_measurement_batches(testing & t,llama_model * model) {
+    if (!t.assert_true(model != nullptr)) return;
+    auto cp=llama_context_default_params();
+    cp.n_ctx=4096; cp.n_batch=cp.n_ubatch=256; cp.n_seq_max=2;
+    cp.kv_unified=true; cp.swa_full=false; cp.type_k=GGML_TYPE_Q8_0; cp.type_v=GGML_TYPE_Q4_0;
+    cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context context(*model,cp,llama_context_mode::measurement);
+    for (auto counts : {std::pair<int,int>{1,3},{2,4},{4,4},{8,8}}) for (int outputs : {0,1,2}) {
+        auto batch=llama_batch_init(counts.first+counts.second,0,1);
+        struct batch_guard {llama_batch & batch;~batch_guard() {llama_batch_free(batch);}} release{batch};
+        batch.n_tokens=counts.first+counts.second;
+        for (int i=0;i<batch.n_tokens;++i) {
+            const bool second=i>=counts.first;
+            batch.token[i]=100+i; batch.pos[i]=second ? 17+i-counts.first : 100+i;
+            batch.n_seq_id[i]=1; batch.seq_id[i][0]=second ? 1 : 0;
+            batch.logits[i]=outputs==2 || (outputs==1 && (i==counts.first-1 || i==batch.n_tokens-1));
+        }
+        llama_batch_compat compat(&context,batch);
+        llama_batch_allocr allocator(model->hparams.n_pos_per_embd());
+        if (!t.assert_true(allocator.init(*compat.batch_ext,model->vocab,false))) return;
+        size_t tokens=0,batches=0;
+        while (true) {
+            auto native=model->arch == LLM_ARCH_QWEN35 ? allocator.split_equal(256,false,0) : allocator.split_simple(256);
+            if (!native.n_tokens) break;
+            const auto positions=native.data->pos,ids=native.data->seq_id_data;
+            const auto flags=native.data->output;
+            std::vector<size_t> measured;
+            if (!t.assert_true("native ragged topology is measured without padded fake queries",
+                    context.measure_workspace(native,true,measured))) return;
+            t.assert_true(std::any_of(measured.begin(),measured.end(),[](size_t bytes) {return bytes != 0;}));
+            t.assert_true(positions==native.data->pos && ids==native.data->seq_id_data && flags==native.data->output);
+            t.out << "native measurement members=" << counts.first << '+' << counts.second << " output_mode=" << outputs
+                << " rows=" << native.n_tokens << " sequence_sets=" << native.n_seqs << " unique=" << native.n_seqs_unq << std::endl;
+            tokens+=native.n_tokens; ++batches;
+        }
+        t.assert_equal(size_t(batch.n_tokens),tokens);
+        t.assert_true(batches != 0);
+    }
+}
+
+static void test_rollback_measurement_batches(testing & t,llama_model * model) {
+    for (uint32_t depth : {3u,7u}) for (uint32_t selected : {1u,2u}) {
+        auto cp=llama_context_default_params();
+        cp.n_ctx=4096; cp.n_batch=cp.n_ubatch=256; cp.n_seq_max=selected; cp.n_rs_seq=depth;
+        cp.kv_unified=true; cp.swa_full=false; cp.type_k=GGML_TYPE_Q8_0; cp.type_v=GGML_TYPE_Q4_0;
+        cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        std::unique_ptr<llama_context> context;
+        try {context=std::make_unique<llama_context>(*model,cp,llama_context_mode::measurement);}
+        catch (const std::exception & error) {
+            t.out << error.what() << std::endl;
+            t.assert_true("staged rollback graph can be measured before payload allocation",false); return;
+        }
+        auto * recurrent=context->get_kv_resources().recurrent;
+        const auto * bank=recurrent ? recurrent->spill_bank() : nullptr;
+        if (!t.assert_true(bank && bank->staged_publication_enabled())) return;
+        t.assert_equal(size_t(156893184)*selected*depth,bank->host_bytes());
+        t.assert_equal(size_t(0),bank->allocated_host_bytes());
+        t.assert_equal(size_t(3268608)*2*selected*depth,bank->staged_device_bytes());
+        const uint32_t maximum=depth+1;
+        for (auto counts : {std::pair<uint32_t,uint32_t>{1,maximum},{2,maximum},{maximum,maximum}}) {
+            const auto total=counts.first+(selected==2 ? counts.second : 0);
+            auto batch=llama_batch_init(int32_t(total),0,1);
+            struct batch_guard {llama_batch & batch;~batch_guard() {llama_batch_free(batch);}} release{batch};
+            batch.n_tokens=int32_t(total);
+            for (uint32_t row=0;row<total;++row) {
+                const bool second=selected==2 && row>=counts.first;
+                batch.token[row]=100+int32_t(row); batch.pos[row]=int32_t(second ? row-counts.first : row);
+                batch.n_seq_id[row]=1; batch.seq_id[row][0]=second ? 1 : 0; batch.logits[row]=1;
+            }
+            llama_batch_compat compat(context.get(),batch);
+            llama_batch_allocr allocator(model->hparams.n_pos_per_embd());
+            if (!t.assert_true(allocator.init(*compat.batch_ext,model->vocab,false))) return;
+            size_t measured=0;
+            while (true) {
+                auto native=allocator.split_equal(256,false,depth+1);
+                if (!native.n_tokens) break;
+                std::vector<size_t> bytes;
+                if (!t.assert_true("staged publication uses the native active sequence count",
+                        context->measure_workspace(native,true,bytes))) return;
+                t.assert_equal(size_t(0),recurrent->spill_bank()->allocated_host_bytes());
+                t.out << "rollback measurement depth=" << depth << " selected=" << selected << " rows=" << native.n_tokens
+                    << " native_sequences=" << native.n_seqs << " stage=" << recurrent->spill_bank()->staged_device_bytes() << std::endl;
+                measured+=native.n_tokens;
+            }
+            t.assert_equal(size_t(total),measured);
+        }
+    }
+}
+
+static void test_target_workload_quote(testing & t,llama_model * model) {
+    auto cp=llama_context_default_params();
+    cp.n_ctx=4096; cp.n_batch=cp.n_ubatch=256; cp.n_seq_max=2;
+    cp.kv_unified=true; cp.swa_full=false; cp.type_k=GGML_TYPE_Q8_0; cp.type_v=GGML_TYPE_Q4_0;
+    cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context context(*model,cp,llama_context_mode::measurement);
+    auto batch=llama_batch_init(6,0,1);
+    struct batch_guard {llama_batch & batch;~batch_guard() {llama_batch_free(batch);}} release{batch};
+    batch.n_tokens=6;
+    for (int row=0;row<6;++row) {
+        batch.token[row]=100+row; batch.pos[row]=row<2 ? row+10 : row+20;
+        batch.n_seq_id[row]=1; batch.seq_id[row][0]=row<2 ? 0 : 1; batch.logits[row]=1;
+    }
+    const std::vector<llama_memory_phase_cache_identity> sources={{4101,1},{4102,2}};
+    llama_context_group_workload_quote quote;
+    if (!t.assert_true(context.measure_target_workload(batch,sources,llama_memory_work_phase::target_verify,91,quote))) return;
+    const auto & measured=quote.measurement;
+    t.assert_equal(uint64_t(91),measured.workload.id);
+    t.assert_equal(uint32_t(2),measured.workload.selected_count);
+    t.assert_equal(size_t(2),measured.workload.members.size());
+    t.assert_equal(uint32_t(2),measured.workload.members[0].input_rows);
+    t.assert_equal(uint32_t(4),measured.workload.members[1].input_rows);
+    t.assert_equal(measured.workload.native_batches.size(),measured.graph_bytes.size());
+    t.assert_true(quote.writer_bytes && quote.attention_bytes && quote.encoded_stage_bytes && quote.pool_minimum_bytes);
+    t.assert_equal(quote.writer_bytes+quote.attention_bytes+quote.encoded_stage_bytes+quote.publication_bytes+
+        quote.pool_minimum_bytes+quote.alignment_slack_bytes,measured.live_device_bytes);
+    size_t rows=0;
+    for (const auto & native : measured.workload.native_batches)
+        for (const auto & range : native) rows+=range.rows;
+    t.assert_equal(size_t(6),rows);
+    if (model->arch==LLM_ARCH_QWEN35) {
+        t.assert_equal(size_t(2),measured.workload.native_batches.size());
+        t.assert_equal(uint32_t(2),measured.workload.native_batches[1][0].first_row);
+    } else t.assert_equal(size_t(1),measured.workload.native_batches.size());
+    auto bad=sources; bad[1]=bad[0];
+    t.assert_true(!context.measure_target_workload(batch,bad,llama_memory_work_phase::target_verify,92,quote));
+    t.assert_equal(uint64_t(91),quote.measurement.workload.id);
+    t.assert_true(!context.measure_target_workload(batch,sources,llama_memory_work_phase::none,92,quote));
+    t.assert_true(!context.measure_target_workload(batch,sources,llama_memory_work_phase::target_verify,0,quote));
+    t.assert_equal(uint64_t(91),quote.measurement.workload.id);
+    llama_context_group_plan plan;
+    const auto planned=context.quote_target_group(batch,sources,{4201,1},llama_memory_work_phase::target_verify,91,SIZE_MAX,plan);
+    if (!t.assert_true(planned.status==llama_context_memory_create_status::success)) return;
+    t.assert_equal(plan.budget.parent_minimum_bytes,planned.required_bytes);
+    const auto minimum=planned.required_bytes;
+    t.assert_true(minimum>0);
+    const auto rejected=context.quote_target_group(batch,sources,{4201,1},llama_memory_work_phase::target_verify,91,minimum-1,plan);
+    t.assert_true(rejected.status==llama_context_memory_create_status::insufficient_budget);
+    t.assert_equal(minimum,rejected.required_bytes);
+    t.assert_equal(size_t(1),rejected.additional_bytes);
+    t.assert_equal(minimum,plan.budget.parent_minimum_bytes);
+    const auto resources=context.get_kv_resources();
+    if (resources.recurrent) t.assert_true(resources.recurrent->current_storage_pending());
+    if (resources.bounded) t.assert_true(resources.bounded->bounded_storage_pending());
+    t.out << "group minimum current=" << plan.current_state_bytes << " bounded=" << plan.bounded.allocation.bytes
+        << " graph=" << plan.budget.workspace_peak_bytes << " total=" << minimum << std::endl;
+    auto * sched=context.get_sched();
+    ggml_backend_t backend=nullptr;
+    for (int i=0;i<ggml_backend_sched_get_n_backends(sched);++i) {
+        auto * candidate=ggml_backend_sched_get_backend(sched,i);
+        if (ggml_backend_get_device(candidate)==model->devices.front().dev) backend=candidate;
+    }
+    if (!t.assert_true(backend != nullptr)) return;
+    const auto get_copy=reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)),"ggml_backend_kv_stream_copy_ops"));
+    const auto * copy=get_copy ? get_copy() : nullptr;
+    if (!t.assert_true(copy && copy->version>=12 && copy->prepare && copy->free_prepared)) return;
+    std::vector<std::shared_ptr<void>> prepared;
+    for (size_t slot=0;slot<sources.size();++slot) {
+        auto * bank=copy->prepare(backend,minimum/plan.target.encoded_stage_bytes,true);
+        if (!t.assert_true(bank != nullptr)) return;
+        prepared.emplace_back(bank,copy->free_prepared);
+    }
+    llama_compute_arena_ptr parent(ggml_backend_memory_arena_new(plan.target.buffer_type,minimum));
+    if (!t.assert_true(parent && ggml_backend_memory_arena_begin(parent.get(),0))) return;
+    size_t offset=plan.current_state_bytes;
+    if (offset && !t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),101,0,offset,
+            plan.target.measurement.alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr))) return;
+    if (plan.bounded.allocation.bytes) {
+        const auto alignment=plan.bounded.allocation.alignment;
+        offset=(offset+alignment-1)&~(alignment-1);
+        if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),102,offset,plan.bounded.allocation.bytes,
+                alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr))) return;
+        offset+=plan.bounded.allocation.bytes;
+    }
+    const auto alignment=plan.target.measurement.alignment;
+    offset=(offset+alignment-1)&~(alignment-1);
+    if (!t.assert_equal(minimum,offset+plan.budget.workspace_peak_bytes)) return;
+    if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),103,offset,plan.budget.workspace_peak_bytes,
+            alignment,0,nullptr) && ggml_backend_memory_arena_commit(parent.get()))) return;
+    using group_lease=std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)>;
+    group_lease current(plan.current_state_bytes ? ggml_backend_memory_arena_acquire(parent.get(),101) : nullptr,ggml_backend_memory_lease_free);
+    group_lease bounded(plan.bounded.allocation.bytes ? ggml_backend_memory_arena_acquire(parent.get(),102) : nullptr,ggml_backend_memory_lease_free);
+    group_lease workspace(ggml_backend_memory_arena_acquire(parent.get(),103),ggml_backend_memory_lease_free);
+    llama_compute_arena_ptr transient(ggml_backend_memory_arena_new_from_buffer(ggml_backend_memory_lease_buffer(workspace.get())));
+    if (!t.assert_true(transient && ggml_backend_memory_arena_begin(transient.get(),0))) return;
+    size_t cursor=0;
+    uint64_t region=1;
+    std::vector<size_t> live={*std::max_element(plan.target.measurement.graph_bytes.begin(),plan.target.measurement.graph_bytes.end()),
+        plan.target.writer_bytes,plan.target.attention_bytes,plan.target.encoded_stage_bytes,plan.target.publication_bytes};
+    for (size_t source=0;source<sources.size();++source) live.push_back(plan.target.pool_minimum_bytes/sources.size());
+    for (auto bytes : live) {
+        if (!bytes) continue;
+        cursor=(cursor+alignment-1)&~(alignment-1);
+        if (!t.assert_true(ggml_backend_memory_arena_reserve_at(transient.get(),region++,cursor,bytes,alignment,0,nullptr))) return;
+        cursor+=bytes;
+    }
+    t.assert_true(cursor<=plan.budget.workspace_peak_bytes);
+    if (!t.assert_true(ggml_backend_memory_arena_commit(transient.get()))) return;
+    t.assert_true(ggml_backend_buffer_get_base(ggml_backend_memory_arena_parent(transient.get()))==
+        ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(workspace.get())));
+    ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(parent.get()),0xa5);
+    if (resources.recurrent && !t.assert_true(current && resources.recurrent->bind_current_storage(current.get()))) return;
+    if (resources.bounded && !t.assert_true(bounded && resources.bounded->bind_bounded_storage(bounded.get()))) return;
+    llama_context_group_plan bound_plan;
+    if (!t.assert_true(context.quote_target_group(batch,sources,{4201,1},llama_memory_work_phase::target_verify,91,
+            minimum,bound_plan).status==llama_context_memory_create_status::success)) return;
+    t.assert_equal(plan.budget.parent_minimum_bytes,bound_plan.budget.parent_minimum_bytes);
+    t.assert_true(plan.target.measurement.graph_bytes==bound_plan.target.measurement.graph_bytes);
+    auto * buffer=ggml_backend_memory_lease_buffer(workspace.get());
+    ggml_tensor raw{}; raw.type=GGML_TYPE_I8; raw.ne[0]=int64_t(ggml_backend_buffer_get_size(buffer));
+    raw.ne[1]=raw.ne[2]=raw.ne[3]=1; raw.nb[0]=1; raw.nb[1]=raw.nb[2]=raw.nb[3]=size_t(raw.ne[0]);
+    raw.buffer=buffer; raw.data=ggml_backend_buffer_get_base(buffer);
+    for (size_t position : {size_t(0),size_t(raw.ne[0])-128}) {
+        std::array<uint8_t,128> guard{}; ggml_backend_tensor_get(&raw,guard.data(),position,guard.size());
+        t.assert_true(std::all_of(guard.begin(),guard.end(),[](uint8_t value) {return value==0xa5;}));
+    }
+    if (resources.bounded) t.assert_true(resources.bounded->release_bounded_storage());
+    if (resources.recurrent) t.assert_true(resources.recurrent->release_current_storage());
+    // Compare the catalog to native unified splitting, including reversed sequence order.
+    for (bool reversed : {false,true}) for (auto counts : {std::pair<int,int>{1,3},{2,4},{4,4},{8,8}}) {
+        auto reordered=llama_batch_init(counts.first+counts.second,0,1);
+        batch_guard release_reordered{reordered};
+        reordered.n_tokens=counts.first+counts.second;
+        for (int row=0;row<reordered.n_tokens;++row) {
+            const bool second=row>=counts.first;
+            reordered.token[row]=100+row; reordered.pos[row]=second ? row-counts.first : row;
+            reordered.n_seq_id[row]=1; reordered.seq_id[row][0]=int(second)!=int(reversed);
+            reordered.logits[row]=1;
+        }
+        llama_batch_compat compat(&context,reordered);
+        llama_batch_allocr allocator(model->hparams.n_pos_per_embd());
+        if (!t.assert_true(allocator.init(*compat.batch_ext,model->vocab,false))) return;
+        std::vector<std::vector<llama_memory_group_member_range>> expected;
+        std::array<uint32_t,2> consumed{};
+        while (true) {
+            auto native=model->arch==LLM_ARCH_QWEN35 ? allocator.split_equal(cp.n_ubatch,false,0) : allocator.split_simple(cp.n_ubatch);
+            if (!native.n_tokens) break;
+            std::vector<llama_memory_group_member_range> ranges;
+            for (uint32_t row=0;row<native.n_tokens;++row) {
+                const auto member=uint32_t(native.seq_id[row][0]);
+                if (ranges.empty() || ranges.back().member!=member) ranges.push_back({member,consumed[member],0,0});
+                ++ranges.back().rows; ++ranges.back().output_rows; ++consumed[member];
+            }
+            expected.push_back(std::move(ranges));
+        }
+        llama_context_group_workload_quote ordered_quote;
+        if (!t.assert_true(context.measure_target_workload(reordered,sources,llama_memory_work_phase::target_verify,93,ordered_quote))) return;
+        t.out << "native catalog reversed=" << reversed << " members=" << counts.first << '+' << counts.second << std::endl;
+        if (!t.assert_true("catalog retains native unified query order and microbatch boundaries",
+                expected==ordered_quote.measurement.workload.native_batches)) return;
+    }
+
+}
+
+static void test_gemma_deferred_local(testing & t, llama_model * model,uint32_t selected=1) {
     if (!t.assert_true(model && model->arch == LLM_ARCH_GEMMA4)) return;
     auto * dev=ggml_backend_dev_by_name("CUDA0");
     if (!t.assert_true(dev != nullptr)) return;
     ggml_backend_ptr backend(ggml_backend_dev_init(dev,nullptr));
     llama_memory_params params{};
     params.type_k=GGML_TYPE_Q8_0; params.type_v=GGML_TYPE_Q4_0;
-    params.kv_stream_pool_bytes=64u*1024u*1024u;
+    params.kv_stream_pool_bytes=selected==1 ? 64u*1024u*1024u : 0;
     params.kv_stream_max_rows=256; params.kv_stream_max_decode_rows=4;
     params.kv_stream_backend=backend.get(); params.defer_bounded_cache=true;
     const auto no_reuse=[](int32_t) { return int32_t(-1); };
     llama_kv_cache_iswa cache(*model,params.type_k,params.type_v,false,true,false,true,
-        8192,1,256,256,nullptr,nullptr,no_reuse,nullptr,&params);
+        8192,selected,256,256,nullptr,nullptr,no_reuse,nullptr,&params);
     auto * local=cache.get_swa();
-    if (!t.assert_true(local->bounded_storage_pending() && cache.get_base()->get_kv_stream())) return;
+    if (!t.assert_true(local->bounded_storage_pending() && bool(cache.get_base()->get_kv_stream())==(selected==1))) return;
     auto * placeholder=local->get_k_storage(0);
     t.assert_true(placeholder && !placeholder->data && ggml_backend_buffer_get_size(placeholder->buffer) == 0);
     local->clear(true);
@@ -2082,7 +2407,7 @@ static void test_gemma_deferred_local(testing & t, llama_model * model) {
         local->init_update(nullptr,false)->get_status() == LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     for (auto id : local->get_layer_ids()) t.assert_true(!local->get_k_storage(int32_t(id))->data &&
         !local->get_v_storage(int32_t(id))->data);
-    llama_cparams cp{}; cp.n_ctx_seq=8192; cp.n_ubatch=256; cp.n_seq_max=1; cp.flash_attn=true;
+    llama_cparams cp{}; cp.n_ctx=8192; cp.n_ctx_seq=8192/selected; cp.n_ubatch=256; cp.n_seq_max=selected; cp.flash_attn=true; cp.kv_unified=true;
     auto * buft=llama_kv_stream_device_buffer_type(dev);
     llama_memory_bounded_kv_layout quote;
     if (!t.assert_true(llama_kv_cache_iswa::bounded_storage_requirements(model->hparams,params,cp,buft,{608,1},quote))) return;
@@ -2132,7 +2457,7 @@ static void test_gemma_deferred_local(testing & t, llama_model * model) {
     cells.pos_set(0,17);cells.seq_add(0,0);
     image_writer image;
     local->state_write(image,0,0);
-    const auto full_generation=cache.get_base()->get_kv_stream()->tokens();
+    const auto full_generation=(cache.get_base()->get_kv_stream() ? cache.get_base()->get_kv_stream()->tokens() : 0);
     if (!t.assert_true(local->release_bounded_storage())) return;
     t.assert_true(local->bounded_storage_pending() && local->get_cells(0).get_used()==0);
     t.assert_true(!local->get_k_storage(0)->data && !local->get_v_storage(0)->data);
@@ -2152,9 +2477,13 @@ static void test_gemma_deferred_local(testing & t, llama_model * model) {
     t.assert_equal(uint32_t(1),local->get_cells(0).get_used());
     ggml_backend_tensor_get(local->get_k_storage(0),after.data(),0,after.size());
     t.assert_true(marker==after);
-    t.assert_equal(full_generation,cache.get_base()->get_kv_stream()->tokens());
+    t.assert_equal(full_generation,(cache.get_base()->get_kv_stream() ? cache.get_base()->get_kv_stream()->tokens() : 0));
     cells.pos_set(511,18);cells.seq_add(511,0);cells.pos_set(1250,19);cells.seq_add(1250,0);
     cells.ext_set(511,{31,12,4097});cells.ext_set(1250,{5,7,LLAMA_TOKEN_NULL});
+    if (selected==2) {
+        cells.pos_set(1800,513);cells.seq_add(1800,1);cells.ext_set(1800,{23,41,199});
+        t.assert_equal(llama_pos(513),local->seq_pos_max(1));
+    }
     const auto physical_cells=local->get_cells(0);
     kv_stream_bit_oracle physical;
     for (const auto & layer : quote.layers) for (bool value : {false,true}) {
@@ -2207,7 +2536,7 @@ static void test_gemma_deferred_local(testing & t, llama_model * model) {
         }
     }
     t.assert_equal(physical_cells.get_used(),local->get_cells(0).get_used());
-    t.assert_equal(full_generation,cache.get_base()->get_kv_stream()->tokens());
+    t.assert_equal(full_generation,(cache.get_base()->get_kv_stream() ? cache.get_base()->get_kv_stream()->tokens() : 0));
     if (!t.assert_true(local->park_bounded_storage())) return;
     local->clear(true);
     if (!t.assert_true(local->restore_bounded_storage(lease.get()))) return;
@@ -3970,15 +4299,36 @@ int main(int argc,char ** argv) {
     auto mparams = llama_model_default_params(); mparams.n_gpu_layers = 999;
     const llama_model_tensor_buft_override cache_only_weights[]={{".*",ggml_backend_cpu_buffer_type()},{nullptr,nullptr}};
     const bool deferred_local_cache_only=std::any_of(argv+3,argv+argc,[](const char * arg) {
-        return !std::strcmp(arg,"--gemma-deferred-local-cache-only");
+        return !std::strcmp(arg,"--gemma-deferred-local-cache-only") || !std::strcmp(arg,"--gemma-selected-local-cache-only");
     });
+    const bool measurement_only=std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--measure-graphs-only"); });
+    const bool measurement_gpu_weights=std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--measure-gpu-weights"); });
     const bool recurrent_cache_only=std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--qwen-current-cache-only"); });
-    if (recurrent_cache_only || deferred_local_cache_only || std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-read-source-cache"); })) {
+    if ((measurement_only && !measurement_gpu_weights) || recurrent_cache_only || deferred_local_cache_only || std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-read-source-cache"); })) {
         // Cache-only oracles compute no weights; preserve device memory for their native cache/control graphs.
         mparams.tensor_buft_overrides=cache_only_weights;
     }
     mparams.load_mtp = embedded_mtp_control || mtp_memory_probe || mtp_sustained_control || target_drift_control || rollback_probe || serial_workspace_growth || mtp_bit_exact_control;
     model_ptr model(llama_model_load_from_file(argv[2],mparams),llama_model_free);
+    if (measurement_only) {
+        if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--measure-gpu-weights");})) {
+            bool placed=false;
+            if (model) for (const auto & allocation : model->memory_breakdown()) {
+                auto * device=ggml_backend_buft_get_device(allocation.first);
+                placed=placed || (device && ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    allocation.second>size_t(1024)*1024*1024);
+            }
+            t.test("Measurement_uses_the_actual_GPU_weight_placement",[&](testing & t) {t.assert_true(placed);});
+            if (!placed) return t.summary();
+        }
+        t.test("Graph_measurement_context_cannot_allocate_or_execute_and_does_not_mutate_model",[&](testing & t) {test_measurement_context(t,model.get());});
+        t.test("Graph_measurement_preserves_native_unequal_microbatches_and_output_rows",[&](testing & t) {test_native_measurement_batches(t,model.get());});
+        if (model) t.test("Target_workload_quote_combines_real_native_graph_and_transport_requirements",
+            [&](testing & t) {test_target_workload_quote(t,model.get());});
+        if (model && model->arch==LLM_ARCH_QWEN35) t.test("Graph_measurement_includes_staged_K3_K7_publication_without_allocating_payload",
+            [&](testing & t) {test_rollback_measurement_batches(t,model.get());});
+        return t.summary();
+    }
     if (recurrent_cache_only) {
         t.test("Qwen_real_geometry_native_current_banks_park_and_restore",[&](testing & t) { test_qwen_current_cache_parking(t,model.get()); });
         return t.summary();
@@ -4092,6 +4442,16 @@ int main(int argc,char ** argv) {
     if (std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-read-source-cache"); })) {
         t.test("Gemma_shared_full_cache_reads_use_progressive_target_storage",
             [&](testing & t) { test_gemma_phase_parent(t,model.get(),true); });
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-selected-local-cache-only"); })) {
+        t.test("Gemma_selected_native_local_groups_bind_park_and_restore_without_private_storage",[&](testing & t) {
+            for (uint32_t selected : {1u,2u}) {
+                t.out << "selected native SWA group=" << selected << std::endl;
+                try {test_gemma_deferred_local(t,model.get(),selected);}
+                catch (const std::exception & error) {t.out << error.what() << std::endl;t.assert_true("selected unified bounded cache admits native geometry",false);return;}
+            }
+        });
         return t.summary();
     }
     if (deferred_local_cache_only || std::any_of(argv+3,argv+argc,[](const char * arg) { return !std::strcmp(arg,"--gemma-deferred-local"); })) {

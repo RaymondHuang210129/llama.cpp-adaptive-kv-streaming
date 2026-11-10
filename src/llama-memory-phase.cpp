@@ -20,7 +20,7 @@ bool llama_memory_cache_format_equal(const llama_memory_cache_format & a, const 
 
 bool llama_memory_cache_bound_make(const llama_memory_cache_requirement & r,
         const llama_memory_cache_requirement * source, llama_memory_cache_bound & output) noexcept {
-    if (!r.identity.id || !r.identity.generation || !r.layers || !r.history_rows || !r.row_bytes ||
+    if (!r.identity.id || !r.identity.generation || !r.sequence_capacity || !r.layers || !r.history_rows || !r.row_bytes ||
             !r.row_padding || (r.row_padding & (r.row_padding-1)) ||
             cache_type_code(r.format.key_type) < GGML_TYPE_F32 || cache_type_code(r.format.key_type) >= GGML_TYPE_COUNT ||
             cache_type_code(r.format.value_type) < GGML_TYPE_F32 || cache_type_code(r.format.value_type) >= GGML_TYPE_COUNT ||
@@ -32,6 +32,7 @@ bool llama_memory_cache_bound_make(const llama_memory_cache_requirement & r,
                 r.layers > source->layers-r.source_first_layer || r.row_bytes != source->row_bytes ||
                 r.history_rows != source->history_rows || r.window_rows != source->window_rows ||
                 r.headroom_rows != source->headroom_rows || r.row_padding != source->row_padding ||
+                r.sequence_capacity != source->sequence_capacity ||
                 !llama_memory_cache_format_equal(r.format, source->format)) return false;
         llama_memory_cache_bound bound;
         if (!llama_memory_cache_bound_make(*source, nullptr, bound)) return false;
@@ -42,12 +43,14 @@ bool llama_memory_cache_bound_make(const llama_memory_cache_requirement & r,
     uint32_t rows = r.history_rows;
     switch (r.role) {
         case llama_memory_cache_role::full_history:
-            if (r.window_rows || r.headroom_rows) return false;
+            if (r.window_rows || r.headroom_rows || r.sequence_capacity != 1) return false;
             break;
-        case llama_memory_cache_role::bounded_resident:
-            if (!r.window_rows || !r.headroom_rows || r.headroom_rows > UINT32_MAX-r.window_rows) return false;
-            rows = std::min(rows, r.window_rows+r.headroom_rows);
+        case llama_memory_cache_role::bounded_resident: {
+            const uint64_t window=uint64_t(r.window_rows)*r.sequence_capacity;
+            if (!r.window_rows || !r.headroom_rows || window>UINT32_MAX || r.headroom_rows>UINT32_MAX-window) return false;
+            rows=std::min(rows,uint32_t(window+r.headroom_rows));
             break;
+        }
         default:
             return false;
     }
@@ -81,9 +84,9 @@ bool llama_memory_cache_read_binding_valid(const llama_memory_cache_read_binding
     return llama_memory_cache_read_binding_make(binding.cache,source,first_position,end_position,lease_revision,checked);
 }
 
-bool llama_memory_workload_requirement_valid(const llama_memory_workload_requirement & r,
+static bool workload_fields_valid(const llama_memory_workload_requirement & r,
         const llama_memory_cache_requirement & cache) noexcept {
-    if (!r.serial || !r.input_rows || r.input_rows > r.microbatch_rows || r.output_rows > r.input_rows ||
+    if (!r.input_rows || r.input_rows > r.microbatch_rows || r.output_rows > r.input_rows ||
             !r.cache.id || !r.cache.generation || r.cache.id != cache.identity.id ||
             r.cache.generation != cache.identity.generation ||
             (r.writes_cache && cache.role == llama_memory_cache_role::read_only_source)) return false;
@@ -104,6 +107,16 @@ bool llama_memory_workload_requirement_valid(const llama_memory_workload_require
         default:
             return false;
     }
+}
+
+bool llama_memory_workload_requirement_valid(const llama_memory_workload_requirement & r,
+        const llama_memory_cache_requirement & cache) noexcept {
+    return r.serial && workload_fields_valid(r,cache);
+}
+
+bool llama_memory_workload_group_member_valid(const llama_memory_workload_requirement & r,
+        const llama_memory_cache_requirement & cache) noexcept {
+    return !r.serial && workload_fields_valid(r,cache);
 }
 
 llama_memory_text_phase_result llama_memory_text_phase_tracker::notify(

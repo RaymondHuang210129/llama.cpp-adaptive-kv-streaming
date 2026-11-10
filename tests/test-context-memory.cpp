@@ -6,6 +6,8 @@
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-memory-bounded-kv.h"
+#include "../src/llama-kv-cache-iswa.h"
+#include "../src/llama-hparams.h"
 
 #include <algorithm>
 #include <cstring>
@@ -150,6 +152,34 @@ static void benchmark(ggml_backend_dev_t dev) {
 
 int main(int argc, char ** argv) {
     testing t;
+    t.test("selected_swa_quote_matches_native_group_storage_not_divided_slot_context", [](testing & t) {
+        llama_hparams hp{};
+        hp.n_layer_all=60;hp.n_swa=1024;hp.swa_type=LLAMA_SWA_TYPE_STANDARD;
+        hp.n_embd_head_k_full=hp.n_embd_head_v_full=512;
+        hp.n_embd_head_k_swa=hp.n_embd_head_v_swa=256;
+        for (uint32_t layer=0;layer<60;++layer) {
+            hp.is_swa_impl[layer]=layer%6!=5;
+            hp.n_head_arr[layer]=32;hp.n_head_kv_arr[layer]=hp.is_swa_impl[layer] ? 16 : 4;
+        }
+        llama_memory_params params{};params.type_k=GGML_TYPE_Q8_0;params.type_v=GGML_TYPE_Q4_0;
+        llama_cparams cp{};cp.n_ctx=4096;cp.n_ctx_seq=4096;cp.n_seq_max=1;cp.n_ubatch=256;cp.flash_attn=true;cp.kv_unified=true;
+        llama_memory_bounded_kv_layout result;
+        auto * type=ggml_backend_cpu_buffer_type();
+        if (!t.assert_true(llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,type,{9,1},result))) return;
+        t.assert_equal(size_t(425984000),result.allocation.bytes);
+        cp.n_seq_max=2;cp.n_ctx_seq=2048;
+        if (!t.assert_true("quote two selected native windows",llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,type,{9,2},result))) return;
+        t.assert_equal(uint32_t(2304),result.allocation.capacity_rows);
+        t.assert_equal(size_t(766771200),result.allocation.bytes);
+        t.assert_equal(uint32_t(4096),result.cache.history_rows);
+        t.assert_equal(uint32_t(1024),result.cache.window_rows);
+        t.assert_equal(uint32_t(256),result.cache.headroom_rows);
+        t.assert_equal(uint32_t(2),result.cache.sequence_capacity);
+        const auto bytes=result.allocation.bytes;
+        cp.kv_unified=false;
+        t.assert_true(!llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,type,{9,3},result));
+        t.assert_equal(bytes,result.allocation.bytes);
+    });
     t.test("streamed_context_limits_keep_slot_group_and_storage_independent", [&](testing & t) {
         llama_cparams p{};
         p.n_ctx = 4352;

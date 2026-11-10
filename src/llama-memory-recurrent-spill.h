@@ -79,6 +79,10 @@ public:
     static std::unique_ptr<llama_recurrent_stage_buffer> create(
             const llama_recurrent_spill_layout & snapshots, uint32_t slots,
             ggml_backend_buffer_type_t device_type, ggml_backend_memory_lease_t borrowed = nullptr);
+    // Describe native tensors with a zero-byte buffer; never submit these as storage.
+    static std::unique_ptr<llama_recurrent_stage_buffer> create_measurement(
+            const llama_recurrent_spill_layout & snapshots, uint32_t slots,
+            ggml_backend_buffer_type_t device_type);
     ~llama_recurrent_stage_buffer();
     llama_recurrent_stage_buffer(const llama_recurrent_stage_buffer &) = delete;
     llama_recurrent_stage_buffer & operator=(const llama_recurrent_stage_buffer &) = delete;
@@ -92,6 +96,9 @@ public:
 private:
     struct implementation;
     explicit llama_recurrent_stage_buffer(std::unique_ptr<implementation> impl);
+    static std::unique_ptr<llama_recurrent_stage_buffer> create_impl(
+            const llama_recurrent_spill_layout & snapshots, uint32_t slots,
+            ggml_backend_buffer_type_t device_type, ggml_backend_memory_lease_t borrowed, bool measurement);
     std::unique_ptr<implementation> impl;
 };
 
@@ -106,6 +113,9 @@ public:
     static std::unique_ptr<llama_recurrent_spill_bank> create(
             const llama_recurrent_spill_layout & layout, ggml_backend_buffer_type_t host_type,
             uint64_t cache, uint64_t sequence);
+    static std::unique_ptr<llama_recurrent_spill_bank> create_measurement(
+            const llama_recurrent_spill_layout & layout, ggml_backend_dev_t device,
+            ggml_backend_buffer_type_t stage_type, uint32_t slots, uint64_t cache, uint64_t sequence);
     ~llama_recurrent_spill_bank();
     llama_recurrent_spill_bank(const llama_recurrent_spill_bank &) = delete;
     llama_recurrent_spill_bank & operator=(const llama_recurrent_spill_bank &) = delete;
@@ -141,11 +151,14 @@ public:
     void cancel() noexcept;
     void reset(bool pristine) noexcept;
     size_t host_bytes() const noexcept;
+    size_t allocated_host_bytes() const noexcept;
     uint64_t snapshot_generation(size_t layer, bool value, uint32_t slot) const noexcept;
     bool snapshot_pristine(size_t layer, bool value, uint32_t slot) const noexcept;
     const void * snapshot_data(size_t layer, bool value, uint32_t slot, uint64_t generation) const noexcept;
 private:
     struct implementation;
     explicit llama_recurrent_spill_bank(std::unique_ptr<implementation> impl);
+    static std::unique_ptr<implementation> create_state(
+            const llama_recurrent_spill_layout & layout, uint64_t cache, uint64_t sequence);
     std::unique_ptr<implementation> impl;
 };

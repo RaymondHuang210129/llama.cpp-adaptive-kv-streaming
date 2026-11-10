@@ -1,6 +1,6 @@
 # Multi-slot adaptive KV streaming and phase-arena roadmap
 
-Status: implementation in progress, 2026-11-09. MS1 (CPU planner), MS2 (demand-backed host storage), MS3 (independent histories/native metadata), MS4 (selected-state storage/ownership) MS5 (exclusive page grants/reader ownership) and MS6 (shared native attention/transport) are complete as independent components; runtime multi-slot admission remains disabled. MS7-MS14 are pending. No new server configuration is qualified.
+Status: implementation in progress, 2026-11-10. MS1 (CPU planner), MS2 (demand-backed host storage), MS3 (independent histories/native metadata), MS4 (selected-state storage/ownership), MS5 (exclusive page grants/reader ownership), MS6 (shared native attention/transport) and MS7 (target workload catalog/transactional admission) are complete as independent components; runtime multi-slot admission remains disabled. MS8-MS14 are pending. No new server configuration is qualified.
 
 Inspected baseline: `f6ca3e8a172473578b909a4691e616bb2234fb54`, on `feature/ci-workflow-migration`. Recheck the implementation base and local changes before starting work on a dedicated feature branch. Historical measurements retain their original source, binaries, models and configuration; they are not new multi-slot evidence.
 
@@ -439,12 +439,28 @@ All220 other CUDA objects retained their hashes; only the existing host adapters
 
 ### MS7 - Arena catalog and multi-slot admission
 
-- [ ] Measure target prefill/decode, selected counts one/two, output counts, descriptor storage, conversion, transfer, current-state and rollback-publication requirements before arena allocation.
-- [ ] Reuse the phase owner for transactional binding; do not infer phase from token count or number of slots.
-- [ ] Test exact minima and one-byte-short rejection without mutation, illegal overlap, stale generations, graph replay and warmup error propagation.
-- [ ] Reject an arena that cannot support the declared legal two-slot configurations rather than silently replacing joint batches with serial execution.
+- [x] Measure target prefill/decode, selected counts one/two, output counts, descriptor storage, conversion, transfer, current-state and rollback-publication requirements before arena allocation.
+- [x] Reuse the phase owner for transactional binding; do not infer phase from token count or number of slots.
+- [x] Test exact minima and one-byte-short rejection without mutation, illegal overlap, stale generations, graph replay and warmup error propagation.
+- [x] Reject an arena that cannot support the declared legal two-slot configurations rather than silently replacing joint batches with serial execution.
 
 Exit: reproducible phase minima, no private GPU allocation fallback, and correctly scoped handling of external driver resources.
+
+Completed as the target workload catalog and transactional ownership components; public two-slot execution remains disabled until server integration. The private measurement context builds real native graph topology without changing shared model flags, allocating output/cache/state payloads or admitting compute. Exact native input order, microbatch partitions and output flags are retained. Managed full-attention scratch is quoted separately while native local attention, graph copies and all other scratch remain in the measured graph peak.
+
+The catalog combines per-source canonical history identities, selected-count native recurrent/SWA storage, bounded writer and conversion/gather storage, per-source minimum pools and staged rollback publication. Each live region has its own alignment. A successful quote does not activate an execution context, prove all startup allocations fit globally, or qualify auxiliary speculation graphs scheduled for MS9/MS10. Missing joint availability rejects the declared shape rather than silently serializing it. Qwen K3/K7 dry publication uses real native tensor geometry and zero committed host/device payload; no K15 configuration is enabled.
+
+The existing phase owner now accepts measured profile IDs, an independent selected-set revision and all source identities. Same-phase reselection follows the existing transactional retire/bind/recover path. CPU tests cover stale/missing/duplicate identities, exact native member-range coverage, overflow, one-byte-short rejection without output mutation, failed activation and retry. Legacy serial validators and default owner calls preserve their original behavior.
+
+Native component qualification covers all64 reader pairs at D256/D512, geometry-aware query quotes through aggregate16 (4,096 profiles/13,315 assertions/strict zero errors), and TG16 joint native vectors (128 profiles/245,891 assertions/768 complete native vector comparisons in both normal and strict runs). Legacy D512 spans and all64 D256 controls also pass. Only the existing partial-attention host adapter object changed; all222 other CUDA objects retain their hashes. Native kernels, arithmetic and the serial width limits are unchanged.
+
+Actual Qwen/Gemma GPU model placement and CPU-weight/GPU-storage strict controls quote and bind one physical parent at the exact target-profile minimum. Native current/SWA storage and disjoint graph/writer/attention/gather/private-pool regions fit; one byte less is rejected before binding and byte canaries survive metadata remeasurement. Full host and ASAN/UBSAN inventories each execute54 tests with two expected CUDA-only skips. ASAN/CUDA metadata tests use the NVIDIA documented shadow-gap compatibility setting with leak checks retained; a deliberate overflow self-test is still detected. Strict memchecks retain default PDL, API reporting all, exit99, no filters and zero errors; eager loading is tool-only. These cache/binding controls do no neural arithmetic and are explicitly distinct from ordinary GPU-weight neural controls.
+
+Fresh neural controls retain full native vectors/state through Qwen/Gemma parking, Qwen MTP, DFlash shared workspace and Gemma assistant source/verification widths/quotas. Performance evidence is a scoped existing-mode short-context screen against the immutable placement-base V2 runtime, using each variant's own libraries, exact model/prompt identities and output/draft counters. The six-mode screen covers 36 processes/144 requests/9,216 exact IDs. Small consistent decreases prompted a separate 256-output follow-up for Qwen DFlash7 and Gemma target-only/MTP3: 18 processes/72 requests/18,432 exact IDs. Their paired decode median changes were +0.185%, -0.084% and -0.295%, with observed variation and mixed-sign pairs; these are not speedup or exact timing-parity claims. Full long-context/vision/per-mode release qualification remains required at MS13.
+
+A final review found that the new Qwen measurement adapter requested sequential IDs, whereas native unified batching accepts other query orders. A reversed-order fixture produced exactly one failure after the existing controls passed. The one-line measurement-only correction now uses the native unified split policy. Both real models passed the corrected native-order, exact-binding, strict memcheck and ASAN/UBSAN controls, followed by the complete host inventories. Current-source common warmup fault injection/retry passed 25 tests/1,569 assertions. Earlier neural/performance measurements retain their immutable runtime cohort; every other runtime source is byte-identical and the sole corrected method rejects execution contexts and has no legacy one-slot execution caller. This scope and source mapping are explicit rather than calling the earlier binaries rebuilt.
+
+Failures, red fixtures, source patches, runtime/library/input hashes, loader evidence, all logs and resource cleanup remain local under `benchmarks/results/multi-slot-20261109/` (notably `ms7-qualified-source-review.json`, `ms7-native-order-green/` and `ms7-performance-audit.json`). No raw artifacts are committed and old binaries are not relabelled as rebuilt by a later stage commit.
 
 ### MS8 - Server groups, reselection and continuous responses
 

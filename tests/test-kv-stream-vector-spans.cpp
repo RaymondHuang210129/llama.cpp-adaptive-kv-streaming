@@ -1107,7 +1107,7 @@ static void check_slot_page_queues(testing & t) {
     t.assert_equal(size_t(42),profiles);
 }
 
-static void check_slot_joint_attention(testing & t,bool small) {
+static void check_slot_joint_attention(testing & t,bool small,bool wide_only=false) {
     ggml_backend_load_all();auto * device=ggml_backend_dev_by_name("CUDA0");
     if (!t.assert_true(device!=nullptr)) return;
     ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
@@ -1127,30 +1127,37 @@ static void check_slot_joint_attention(testing & t,bool small) {
         ggml_kv_stream_layout tile;
         if (!t.assert_true(ggml_kv_stream_layout_make(shape,256,tile).status==ggml_kv_stream_status::success)) return;
         for (size_t selected : {size_t(1),size_t(2)}) {
+            if (wide_only && selected!=2) continue;
             std::vector<std::pair<uint32_t,uint32_t>> widths={{1,1}};
             if (extended) {
                 widths.push_back({4,4});widths.push_back({8,8});
                 if (selected==2) {widths.push_back({1,3});widths.push_back({2,4});}
             }
+            if (wide_only) widths={{8,8}};
             for (auto query_counts : widths) for (size_t layout=0;layout<(selected==1 ? 1u : 5u);++layout)
             for (bool compact : {false,true}) {
                 if (compact && layout!=0) continue;
+                if (wide_only && layout!=4) continue;
                 const uint32_t own_queries[]={query_counts.first,query_counts.second};
                 const uint32_t queries=own_queries[0]+(selected==2 ? own_queries[1] : 0),heads=width==256 ? 24 : 32;
                 const size_t lengths[]={2049,769},gap=layout==3 ? 256 : 0;
                 const size_t active=gap+lengths[0]+(selected==2 ? lengths[1] : 0),padded=(active+255)/256*256;
                 ggml_kv_stream_resume_plan plan;
                 if (!t.assert_true(ggml_kv_stream_resume_plan_query(partial,backend.get(),{shape,heads,queries,padded},plan))) return;
+                size_t scratch_bytes=plan.bytes;
+                if (wide_only && !t.assert_true(ggml_kv_stream_workspace_query(partial,backend.get(),
+                        {shape,heads,queries,padded},ggml_kv_stream_workspace_kind::decode,scratch_bytes))) return;
+                if (wide_only && !t.assert_true(scratch_bytes>=plan.bytes)) return;
                 const size_t alignment=ggml_backend_buft_get_alignment(llama_kv_stream_device_buffer_type(device));
                 const size_t guard=(alignment+127)/128*128,kv_end=guard+selected*3*tile.bytes;
                 const size_t stage_offset=(kv_end+guard+alignment-1)/alignment*alignment;
                 const size_t partial_offset=(stage_offset+tile.bytes+guard+alignment-1)/alignment*alignment;
-                arena_ptr parent(ggml_backend_memory_arena_new(llama_kv_stream_device_buffer_type(device),partial_offset+plan.bytes+guard),ggml_backend_memory_arena_free);
+                arena_ptr parent(ggml_backend_memory_arena_new(llama_kv_stream_device_buffer_type(device),partial_offset+scratch_bytes+guard),ggml_backend_memory_arena_free);
                 if (!t.assert_true(parent && ggml_backend_memory_arena_begin(parent.get(),0))) return;
                 for (size_t slot=0;slot<selected;++slot) if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),101+slot,
                         guard+slot*3*tile.bytes,3*tile.bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr))) return;
                 if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),201,stage_offset,tile.bytes,alignment,0,nullptr) &&
-                        ggml_backend_memory_arena_reserve_at(parent.get(),202,partial_offset,plan.bytes,alignment,0,nullptr) && ggml_backend_memory_arena_commit(parent.get()))) return;
+                        ggml_backend_memory_arena_reserve_at(parent.get(),202,partial_offset,scratch_bytes,alignment,0,nullptr) && ggml_backend_memory_arena_commit(parent.get()))) return;
                 ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(parent.get()),0xa5);
                 lease_ptr source_lease[2]={{nullptr,ggml_backend_memory_lease_free},{nullptr,ggml_backend_memory_lease_free}};
                 std::unique_ptr<fixture> sources[2];
@@ -1311,7 +1318,7 @@ static void check_slot_joint_attention(testing & t,bool small) {
                 ggml_tensor raw{};auto * buffer=ggml_backend_memory_arena_parent(parent.get());
                 raw.type=GGML_TYPE_I8;raw.ne[0]=int64_t(ggml_backend_buffer_get_size(buffer));raw.ne[1]=raw.ne[2]=raw.ne[3]=1;
                 raw.nb[0]=1;raw.nb[1]=raw.nb[2]=raw.nb[3]=size_t(raw.ne[0]);raw.buffer=buffer;raw.data=ggml_backend_buffer_get_base(buffer);
-                for (auto offset : {size_t(0),kv_end,stage_offset+tile.bytes,partial_offset+plan.bytes}) {
+                for (auto offset : {size_t(0),kv_end,stage_offset+tile.bytes,partial_offset+scratch_bytes}) {
                     std::vector<uint8_t> bytes(guard);ggml_backend_tensor_get(&raw,bytes.data(),offset,bytes.size());
                     t.assert_true(std::all_of(bytes.begin(),bytes.end(),[](uint8_t x) {return x==0xa5;}));
                 }
@@ -1322,10 +1329,57 @@ static void check_slot_joint_attention(testing & t,bool small) {
             }
         }
     }
-    t.assert_equal(size_t(small ? 216 : 1192),profiles);
+    t.assert_equal(size_t(wide_only ? 128 : small ? 216 : 1192),profiles);
 }
 
 int main(int argc, char ** argv) {
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-selected-workspace")) {
+        testing t;
+        t.test("aggregate_K7_verification_workspace_covers_all_native_widths_without_enabling_K15",[&](testing & t) {
+            ggml_backend_load_all();auto * device=ggml_backend_dev_by_name("CUDA0");
+            if (!t.assert_true(device != nullptr)) return;
+            ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
+            const auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(device),"ggml_backend_kv_stream_partial_ops"));
+            const auto * ops=get ? get() : nullptr;
+            if (!t.assert_true(backend && ops && ops->version>=15)) return;
+            const ggml_type formats[]={GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16,GGML_TYPE_Q8_0,
+                GGML_TYPE_Q5_0,GGML_TYPE_Q5_1,GGML_TYPE_Q4_0,GGML_TYPE_Q4_1};
+            size_t profiles=0;
+            for (uint32_t dimension : {256u,512u}) for (auto key : formats) for (auto value : formats)
+            for (size_t tokens : {size_t(2304),size_t(131072)}) {
+                size_t previous=0;
+                for (uint32_t queries=1;queries<=16;++queries) {
+                    const ggml_kv_stream_attention_request request{{key,value,dimension,dimension,4,256,128},
+                        dimension==256 ? 24u : 32u,queries,tokens,3};
+                    ggml_kv_stream_resume_plan native;
+                    if (!t.assert_true("the native aggregate continuation plan is available",
+                            ggml_kv_stream_resume_plan_query(ops,backend.get(),request,native))) return;
+                    size_t bytes=73;
+                    if (!t.assert_true("aggregate decode quote covers two eight-row verification members",
+                            ggml_kv_stream_workspace_query(ops,backend.get(),request,ggml_kv_stream_workspace_kind::decode,bytes))) return;
+                    t.assert_true(bytes>=native.bytes && bytes>=previous);
+                    previous=bytes; ++profiles;
+                }
+                size_t untouched=73;
+                const ggml_kv_stream_attention_request invalid{{key,value,dimension,dimension,4,256,128},
+                    dimension==256 ? 24u : 32u,17,tokens,3};
+                t.assert_true(!ggml_kv_stream_workspace_query(ops,backend.get(),invalid,
+                    ggml_kv_stream_workspace_kind::decode,untouched));
+                t.assert_equal(size_t(73),untouched);
+                t.assert_true(!ops->decode_workspace(backend.get(),key,value,24,4,16,tokens,untouched));
+                t.assert_equal(size_t(73),untouched);
+            }
+            t.assert_equal(size_t(4096),profiles);
+        });
+        return t.summary();
+    }
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-joint-wide")) {
+        testing t;t.test("all_formats_use_quoted_aggregate_K7_workspace_with_native_query_order",[&](testing & t) {
+            check_slot_joint_attention(t,false,true);
+        });
+        return t.summary();
+    }
     if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-joint")) {
         testing t;t.test("projected_native_batches_share_attention_with_exclusive_slot_pages",[&](testing & t) {
             check_slot_joint_attention(t,argc>2 && !std::strcmp(argv[2],"--small"));

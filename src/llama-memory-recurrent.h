@@ -27,6 +27,11 @@ public:
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter, bool stream_host_spill = false, bool defer_current = false);
 
+    llama_memory_recurrent(const llama_model & model, ggml_type type_r, ggml_type type_s, bool offload,
+            uint32_t mem_size, uint32_t n_seq_max, uint32_t n_rs_seq,
+            const layer_filter_cb & filter, bool stream_host_spill, bool defer_current, bool measurement);
+    bool prepare_measurement_publication(uint32_t active_cells);
+
     ~llama_memory_recurrent() override;
 
     //

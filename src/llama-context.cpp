@@ -19,6 +19,10 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "../ggml/src/ggml-backend-execution.h"
+#include "../ggml/src/ggml-kv-stream-device.h"
+#include "../ggml/src/ggml-kv-stream-copy.h"
+#include "llama-kv-stream-writer.h"
 
 #include <cinttypes>
 #include <algorithm>
@@ -109,10 +113,19 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 llama_context::llama_context(const llama_model & model, llama_context_params params,
         uint32_t serial_prediction_rows) : llama_context(model, params, serial_prediction_rows, false) {}
 
+llama_context::llama_context(const llama_model & model, llama_context_params params, llama_context_mode mode) :
+    llama_context(model, params, 0, false, mode) {}
+
+llama_context::llama_context(const llama_model & model, llama_context_params params,
+        uint32_t serial_prediction_rows, bool serial_image_inputs) :
+    llama_context(model, params, serial_prediction_rows, serial_image_inputs, llama_context_mode::execution) {}
+
+bool llama_context::no_alloc() const { return measurement_only || model.hparams.no_alloc; }
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params,
-              uint32_t serial_prediction_rows, bool serial_image_inputs) :
+              uint32_t serial_prediction_rows, bool serial_image_inputs, llama_context_mode mode) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -127,6 +140,16 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+    measurement_only=mode == llama_context_mode::measurement;
+    if (measurement_only && ((model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_GEMMA4) ||
+            hparams.vocab_only || params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other ||
+            params.kv_stream_pool_bytes || params.shared_device_memory_bytes ||
+            (model.arch==LLM_ARCH_QWEN35 && params.n_rs_seq>7) ||
+            params.moe_cache_size || serial_prediction_rows || serial_image_inputs ||
+            (std::getenv("LLAMA_RS_HOST_SPILL") && std::strcmp(std::getenv("LLAMA_RS_HOST_SPILL"),"1") == 0))) {
+        throw std::runtime_error("graph measurement requires an unattached target with supported rollback geometry and no execution grants");
+    }
+
 
     if (serial_image_inputs && !serial_prediction_rows) {
         throw std::runtime_error("image feature preparation requires an attached serial block drafter");
@@ -570,7 +593,7 @@ llama_context::llama_context(
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
         // graph outputs buffer
-        {
+        if (!measurement_only) {
             if (output_reserve(params.n_seq_max) < params.n_seq_max) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
@@ -590,6 +613,8 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
+        params_mem.measure_only=measurement_only;
+        params_mem.kv_stream_rs_rollback=measurement_only && cparams.n_rs_seq!=0;
         if (model.arch == LLM_ARCH_GEMMA4 && cparams.shared_device_memory_bytes) {
             if (params.swa_full) throw std::runtime_error("Gemma arena streaming requires bounded SWA storage (swa_full=false)");
             params_mem.defer_bounded_cache=true;
@@ -687,8 +712,8 @@ llama_context::llama_context(
                 }
             }
 
-            if ((cparams.kv_streaming() || cparams.mtp_publish_host || cparams.serial_block_rows || cparams.kv_shared_read) &&
-                    ggml_backend_get_device(backend.get()) == model.devices.front().dev) {
+            if ((measurement_only || cparams.kv_streaming() || cparams.mtp_publish_host || cparams.serial_block_rows || cparams.kv_shared_read) &&
+                    !model.devices.empty() && ggml_backend_get_device(backend.get()) == model.devices.front().dev) {
                 buft = llama_kv_stream_device_buffer_type(model.devices.front().dev);
                 if (!buft) throw std::runtime_error("missing device-local KV/compute buffer type");
             }
@@ -766,7 +791,7 @@ llama_context::~llama_context() {
     if (cparams.kv_shared_read) finish_shared_kv_read();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.hparams.no_alloc && !opt_ctx) {
+    if (!no_alloc() && !opt_ctx) {
         llama_context_memory_diagnostics shared;
         const bool shared_grant = compute_memory && compute_memory->diagnostics(shared);
 
@@ -1203,7 +1228,7 @@ void llama_context::sched_reserve() {
         return prepare_compute_arenas(measurements, 2);
     };
 
-    if (!model.hparams.no_alloc && !prepare_arenas()) {
+    if (!no_alloc() && !prepare_arenas()) {
         throw std::runtime_error("failed to prepare compute arenas");
     }
     llama_log_memory_phase(compute_memory.get());
@@ -1211,7 +1236,7 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+                no_alloc(), no_alloc() ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -1221,7 +1246,7 @@ void llama_context::sched_reserve() {
                 compute_arenas.clear();
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-                if (model.hparams.no_alloc || prepare_arenas()) {
+                if (no_alloc() || prepare_arenas()) {
                     gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
                 }
             }
@@ -1242,7 +1267,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), no_alloc());
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -1257,7 +1282,7 @@ void llama_context::sched_reserve() {
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
-        ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), no_alloc());
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1267,7 +1292,7 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.hparams.no_alloc) {
+        if (!no_alloc()) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -2340,6 +2365,7 @@ llm_graph_result * llama_context::process_ubatch(
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (measurement_only) return -1;
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2614,6 +2640,7 @@ int llama_decode_mtp_embeddings(llama_context * ctx, const llama_batch_ext & bat
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (measurement_only) return -1;
     if (serial_feature_producer) clear_serial_features();
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.arch == LLM_ARCH_QWEN35 && !mtp_visual_hidden &&
             std::any_of(batch_inp.tokens.begin(), batch_inp.tokens.end(), [](const auto & token) {
@@ -3572,8 +3599,347 @@ static void ubatch_prepare_reserve(
     }
 }
 
+llama_context_memory_create_result llama_context::quote_target_group(const llama_batch & batch,
+        const std::vector<llama_memory_phase_cache_identity> & sources,
+        llama_memory_phase_cache_identity bounded_identity,llama_memory_work_phase phase,
+        uint64_t id,size_t capacity,llama_context_group_plan & output) {
+    llama_context_memory_create_result result;
+    result.available_bytes=capacity;
+    try {
+        llama_context_group_plan next;
+        if (!measure_target_workload(batch,sources,phase,id,next.target)) return result;
+        const auto layers=kv_resources.full->get_layer_ids();
+        if (layers.empty()) return result;
+        const auto first=layers.front();
+        for (auto identity : sources) {
+            llama_memory_cache_requirement cache;
+            cache.identity=identity; cache.layers=uint32_t(layers.size()); cache.history_rows=cparams.n_ctx;
+            cache.row_padding=256;
+            cache.format={kv_resources.full->get_k_storage(first)->type,kv_resources.full->get_v_storage(first)->type,
+                model.hparams.n_embd_head_k(first),model.hparams.n_embd_head_v(first),model.hparams.n_head_kv(first),false};
+            const auto key=ggml_row_size(cache.format.key_type,int64_t(cache.format.key_head_dim)*cache.format.kv_heads);
+            const auto value=ggml_row_size(cache.format.value_type,int64_t(cache.format.value_head_dim)*cache.format.kv_heads);
+            if (key>SIZE_MAX-value) return result;
+            cache.row_bytes=key+value;
+            llama_memory_cache_bound bound;
+            if (!llama_memory_cache_bound_make(cache,nullptr,bound)) return result;
+            next.caches.push_back(cache);
+            next.cache_allocations.push_back({identity,0,next.target.measurement.alignment,bound.capacity_rows,cache.format});
+        }
+        if (kv_resources.bounded) {
+            llama_memory_params params{};
+            params.type_k=kv_resources.bounded->type_k(); params.type_v=kv_resources.bounded->type_v(); params.swa_full=false;
+            if (!llama_kv_cache_iswa::bounded_storage_requirements(model.hparams,params,cparams,
+                    next.target.buffer_type,bounded_identity,next.bounded)) return result;
+            next.caches.push_back(next.bounded.cache);
+            next.cache_allocations.push_back(next.bounded.allocation);
+        }
+        if (kv_resources.recurrent) {
+            ggml_backend_buffer_type_t type=nullptr;
+            if (!kv_resources.recurrent->current_storage_requirements(type,next.current_state_bytes) ||
+                    type!=next.target.buffer_type) return result;
+        }
+        const auto budget=llama_memory_group_workload_budget_make(next.caches,next.cache_allocations,
+            {next.target.measurement.workload},{next.target.measurement},next.current_state_bytes,capacity,next.budget);
+        if (budget.status==llama_memory_workload_budget_status::insufficient_budget) {
+            result.status=llama_context_memory_create_status::insufficient_budget;
+            result.required_bytes=capacity+budget.additional_bytes; result.additional_bytes=budget.additional_bytes;
+            result.stage=id;
+            return result;
+        }
+        if (budget.status!=llama_memory_workload_budget_status::success) return result;
+        result.status=llama_context_memory_create_status::success;
+        result.required_bytes=next.budget.parent_minimum_bytes;
+        output=std::move(next);
+        return result;
+    } catch (const std::bad_alloc &) {
+        result.status=llama_context_memory_create_status::allocation_failed;
+        return result;
+    }
+}
+
+bool llama_context::measure_target_workload(const llama_batch & input,
+        const std::vector<llama_memory_phase_cache_identity> & sources,
+        llama_memory_work_phase phase,uint64_t id,llama_context_group_workload_quote & output) {
+    if (!measurement_only || !id || !cparams.kv_unified || cparams.n_seq_max>2 ||
+            sources.size()!=cparams.n_seq_max || input.n_tokens<=0 || uint32_t(input.n_tokens)>cparams.n_ubatch ||
+            model.devices.size()!=1 || !kv_resources.full ||
+            (phase!=llama_memory_work_phase::target_prefill && phase!=llama_memory_work_phase::target_verify)) return false;
+    for (size_t i=0;i<sources.size();++i) {
+        if (!sources[i].id || !sources[i].generation) return false;
+        for (size_t j=0;j<i;++j) if (sources[i].id==sources[j].id) return false;
+    }
+    try {
+        llama_context_group_workload_quote next;
+        auto * device=model.devices.front().dev;
+        size_t domain=backend_ptrs.size();
+        for (size_t i=0;i<backend_ptrs.size();++i)
+            if (ggml_backend_get_device(backend_ptrs[i])==device) domain=i;
+        if (domain==backend_ptrs.size()) return false;
+        auto * backend=backend_ptrs[domain];
+        next.buffer_type=llama_kv_stream_device_buffer_type(device);
+        if (!next.buffer_type) return false;
+        const auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(device),"ggml_backend_kv_stream_partial_ops"));
+        const auto * ops=get ? get() : nullptr;
+        if (!ops || !ops->capabilities) return false;
+        const auto layers=kv_resources.full->get_layer_ids();
+        if (layers.empty()) return false;
+        const auto first=layers.front();
+        const auto & hp=model.hparams;
+        const ggml_kv_stream_shape shape{kv_resources.full->get_k_storage(first)->type,
+            kv_resources.full->get_v_storage(first)->type,hp.n_embd_head_k(first),hp.n_embd_head_v(first),
+            hp.n_head_kv(first),256,128};
+        const auto heads=hp.n_head(first);
+        for (auto layer : layers)
+            if (hp.n_embd_head_k(layer)!=shape.head_dim_k || hp.n_embd_head_v(layer)!=shape.head_dim_v ||
+                    hp.n_head_kv(layer)!=shape.heads || hp.n_head(layer)!=heads ||
+                    kv_resources.full->get_k_storage(layer)->type!=shape.type_k ||
+                    kv_resources.full->get_v_storage(layer)->type!=shape.type_v) return false;
+        if (!llama_kv_stream_writer::requirements(next.buffer_type,shape,cparams.n_ubatch,next.writer_bytes)) return false;
+        ggml_kv_stream_layout encoded;
+        if (ggml_kv_stream_layout_make(shape,256,encoded).status!=ggml_kv_stream_status::success) return false;
+        next.encoded_stage_bytes=encoded.bytes;
+        llama_kv_stream_policy_config policy;
+        policy.shape=shape; policy.capabilities=ops->capabilities(backend,shape.type_k,shape.type_v);
+        policy.layers=uint32_t(layers.size());
+        size_t one_pool=0;
+        if (llama_kv_stream_policy_minimum_pool_bytes(policy,one_pool).status!=llama_kv_stream_policy_status::success ||
+                one_pool>SIZE_MAX/cparams.n_seq_max) return false;
+        next.pool_minimum_bytes=one_pool*cparams.n_seq_max;
+        auto & measurement=next.measurement;
+        auto & group=measurement.workload;
+        group.id=id; group.selected_count=cparams.n_seq_max; group.microbatch_rows=cparams.n_ubatch;
+        llama_batch_compat compat(this,input);
+        llama_batch_allocr allocator(hp.n_pos_per_embd());
+        if (!allocator.init(*compat.batch_ext,model.vocab,false)) return false;
+        const auto & batch=allocator.get_batch();
+        std::array<uint32_t,LLAMA_MAX_SEQ> rows{},outputs{},member_index{},consumed{};
+        member_index.fill(UINT32_MAX);
+        for (int32_t row=0;row<batch.n_tokens;++row) {
+            if (batch.n_seq_id[row]!=1 || !batch.seq_id[row] || batch.seq_id[row][0]<0 ||
+                    uint32_t(batch.seq_id[row][0])>=cparams.n_seq_max) return false;
+            const auto slot=uint32_t(batch.seq_id[row][0]);
+            ++rows[slot]; outputs[slot]+=uint32_t(batch.logits[row]!=0);
+        }
+        for (uint32_t slot=0;slot<cparams.n_seq_max;++slot) if (rows[slot]) {
+            llama_memory_workload_requirement member;
+            member.phase=phase; member.cache=sources[slot]; member.input_rows=member.query_rows=rows[slot];
+            member.output_rows=outputs[slot]; member.microbatch_rows=cparams.n_ubatch;
+            member.rollback_depth=phase==llama_memory_work_phase::target_verify ? cparams.n_rs_seq : 0;
+            member.writes_cache=true; member.causal=cparams.causal_attn;
+            member_index[slot]=uint32_t(group.members.size()); group.members.push_back(member);
+        }
+        if (group.members.empty()) return false;
+        std::vector<size_t> host_peaks(backend_ptrs.size());
+        while (true) {
+            auto native=model.arch==LLM_ARCH_QWEN35 ? allocator.split_equal(cparams.n_ubatch,!cparams.kv_unified,
+                cparams.n_rs_seq ? cparams.n_rs_seq+1 : 0) : allocator.split_simple(cparams.n_ubatch);
+            if (!native.n_tokens) break;
+            std::vector<llama_memory_group_member_range> ranges;
+            for (uint32_t row=0;row<native.n_tokens;++row) {
+                if (native.n_seq_id[row]!=1 || !native.seq_id[row]) return false;
+                const auto slot=uint32_t(native.seq_id[row][0]);
+                if (slot>=cparams.n_seq_max || member_index[slot]==UINT32_MAX) return false;
+                const auto member=member_index[slot];
+                if (ranges.empty() || ranges.back().member!=member)
+                    ranges.push_back({member,consumed[slot],0,0});
+                ++ranges.back().rows; ranges.back().output_rows+=uint32_t(native.output[row]!=0); ++consumed[slot];
+            }
+            std::vector<size_t> graph;
+            if (!measure_workspace(native,true,graph) || graph.size()!=backend_ptrs.size() || !graph[domain]) return false;
+            measurement.graph_bytes.push_back(graph[domain]); measurement.execution_available.push_back(true);
+            group.native_batches.push_back(std::move(ranges));
+            for (size_t i=0;i<graph.size();++i) if (i!=domain) host_peaks[i]=std::max(host_peaks[i],graph[i]);
+            size_t attention=0;
+            const auto kind=phase==llama_memory_work_phase::target_verify ?
+                ggml_kv_stream_workspace_kind::decode : ggml_kv_stream_workspace_kind::prefill;
+            if (!ggml_kv_stream_workspace_query(ops,backend,{shape,heads,native.n_tokens,cparams.n_ctx},kind,attention)) return false;
+            next.attention_bytes=std::max(next.attention_bytes,attention);
+        }
+        for (uint32_t slot=0;slot<cparams.n_seq_max;++slot) if (consumed[slot]!=rows[slot]) return false;
+        if (group.native_batches.empty()) return false;
+        if (cparams.n_rs_seq && kv_resources.recurrent) {
+            if (!kv_resources.recurrent->prepare_measurement_publication(cparams.n_seq_max)) return false;
+            next.publication_bytes=kv_resources.recurrent->spill_bank()->staged_device_bytes();
+        }
+        measurement.alignment=ggml_backend_buft_get_alignment(next.buffer_type);
+        const auto alignment=measurement.alignment;
+        if (!alignment || (alignment&(alignment-1))) return false;
+        const auto add_region=[&](size_t bytes) {
+            if (bytes>SIZE_MAX-(alignment-1)) return false;
+            const size_t padded=(bytes+alignment-1)&~(alignment-1);
+            if (padded>SIZE_MAX-measurement.live_device_bytes) return false;
+            next.alignment_slack_bytes+=padded-bytes;
+            measurement.live_device_bytes+=padded;
+            return true;
+        };
+        for (size_t bytes : {next.writer_bytes,next.attention_bytes,next.encoded_stage_bytes,next.publication_bytes})
+            if (!add_region(bytes)) return false;
+        for (uint32_t slot=0;slot<cparams.n_seq_max;++slot) if (!add_region(one_pool)) return false;
+        for (auto bytes : host_peaks) {
+            if (bytes>SIZE_MAX-next.host_compute_bytes) return false;
+            next.host_compute_bytes+=bytes;
+        }
+        const size_t packets=256*sizeof(ggml_kv_stream_gather_row)+512*sizeof(ggml_kv_stream_copy_rectangle);
+        if (cparams.n_ctx>(SIZE_MAX-packets)/sizeof(ggml_kv_stream_gather_row)) return false;
+        next.host_descriptor_bytes=size_t(cparams.n_ctx)*sizeof(ggml_kv_stream_gather_row)+packets;
+        measurement.alignment=ggml_backend_buft_get_alignment(next.buffer_type);
+        output=std::move(next);
+        return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+bool llama_context::measure_workspace(uint32_t tokens, uint32_t sequences, uint32_t outputs,
+        bool managed_full_attention, std::vector<size_t> & sizes) {
+    if (!measurement_only || !memory || !sequences || sequences>cparams.n_seq_max || !tokens ||
+            tokens>cparams.n_ubatch || tokens%sequences || !outputs || outputs>tokens) return false;
+    return measure_workspace_impl(nullptr,tokens,sequences,outputs,managed_full_attention,sizes);
+}
+
+bool llama_context::measure_workspace(const llama_ubatch & batch, bool managed_full_attention,
+        std::vector<size_t> & sizes) {
+    if (!measurement_only || !memory || !batch.n_tokens || batch.n_tokens>cparams.n_ubatch ||
+            !batch.n_seqs || !batch.n_seqs_unq || batch.n_seqs_unq>cparams.n_seq_max ||
+            batch.n_pos!=model.hparams.n_pos_per_embd() || !batch.n_seq_id || !batch.seq_id || !batch.output)
+        return false;
+    std::array<bool,LLAMA_MAX_SEQ> seen{};
+    uint32_t outputs=0,unique=0;
+    for (uint32_t row=0;row<batch.n_tokens;++row) {
+        if (batch.n_seq_id[row]!=1 || !batch.seq_id[row] || batch.seq_id[row][0]<0 ||
+                uint32_t(batch.seq_id[row][0])>=cparams.n_seq_max || batch.output[row]<0 || batch.output[row]>1) return false;
+        const auto id=uint32_t(batch.seq_id[row][0]);
+        if (!seen[id]) {seen[id]=true; ++unique;}
+        outputs+=uint32_t(batch.output[row]);
+    }
+    if (unique!=batch.n_seqs_unq) return false;
+    return measure_workspace_impl(&batch,batch.n_tokens,batch.n_seqs,outputs,managed_full_attention,sizes);
+}
+
+bool llama_context::measure_workspace_impl(const llama_ubatch * native_batch, uint32_t tokens, uint32_t sequences,
+        uint32_t outputs, bool managed_full_attention, std::vector<size_t> & sizes) {
+    try {
+        std::vector<size_t> measured(backend_ptrs.size());
+        if (cparams.n_rs_seq && kv_resources.recurrent) {
+            ggml_backend_sched_reset(sched.get());
+            for (auto & previous : gf_res_prev) if (previous) previous->reset();
+            gf_res_reserve->reset();
+            const auto active=native_batch ? native_batch->n_seqs : sequences;
+            if (!kv_resources.recurrent->prepare_measurement_publication(active)) return false;
+        }
+        auto full=memory->init_full();
+        if (!full) return false;
+        if (!managed_full_attention) {
+            auto * graph=graph_build_reserve(tokens,sequences,outputs,full.get(),false,native_batch);
+            if (!graph) return false;
+            ggml_backend_sched_reserve_size(sched.get(),graph,measured.data());
+            ggml_backend_sched_reset(sched.get());
+            gf_res_reserve->reset();
+            sizes=std::move(measured);
+            return true;
+        }
+        if (!cparams.kv_unified || model.devices.size()!=1 || !kv_resources.full) return false;
+        ggml_backend_t backend=nullptr;
+        for (auto * candidate : backend_ptrs)
+            if (ggml_backend_get_device(candidate) == model.devices.front().dev) backend=candidate;
+        if (!backend) return false;
+        auto * device=ggml_backend_get_device(backend);
+        auto * registry=ggml_backend_dev_backend_reg(device);
+        auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(
+            ggml_backend_reg_get_proc_address(registry,"ggml_backend_kv_stream_partial_ops"));
+        const auto * partial=get ? get() : nullptr;
+        if (!partial || !partial->capabilities) return false;
+
+        std::vector<std::pair<ggml_tensor *,ggml_backend_buffer_t>> roots;
+        size_t bytes=0;
+        for (auto layer : kv_resources.full->get_layer_ids()) {
+            for (auto * tensor : {kv_resources.full->get_k_storage(layer),kv_resources.full->get_v_storage(layer)}) {
+                if (!tensor || tensor->view_src) return false;
+                if (std::any_of(roots.begin(),roots.end(),[&](const auto & item) {return item.first == tensor;})) continue;
+                const size_t payload=ggml_nbytes(tensor);
+                if (!payload || payload>SIZE_MAX-bytes) return false;
+                bytes+=payload;
+                roots.emplace_back(tensor,tensor->buffer);
+            }
+        }
+        if (roots.empty()) return false;
+        for (auto * cache : {kv_resources.full,kv_resources.bounded}) if (cache) {
+            for (auto layer : cache->get_layer_ids()) {
+                auto * tensor=cache->get_k_storage(layer);
+                if (!tensor || !tensor->buffer ||
+                        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer))!=device) return false;
+            }
+        }
+        std::unique_ptr<ggml_backend_host_reservation,decltype(&ggml_backend_host_reservation_free)> address(
+            ggml_backend_host_reservation_new(bytes),ggml_backend_host_reservation_free);
+        if (!address) return false;
+        struct measurement_owner {
+            ggml_backend_t backend;
+            const ggml_kv_stream_partial_ops * partial;
+        } owner{backend,partial};
+        const ggml_backend_execution_ops ops{
+            [](void * data,const ggml_tensor * op) {
+                const auto & state=*static_cast<measurement_owner *>(data);
+                if (op->op == GGML_OP_SET_ROWS)
+                    return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->src[1] && op->src[1]->type == GGML_TYPE_I64;
+                if (op->op != GGML_OP_FLASH_ATTN_EXT || !op->src[0] || !op->src[1] || !op->src[2]) return false;
+                const auto * k=op->src[1],*v=op->src[2];
+                ggml_kv_stream_execution execution;
+                const auto caps=state.partial->capabilities(state.backend,k->type,v->type);
+                return ggml_kv_stream_attention_validate(op,{k->ne[0],v->ne[0],256,256,128},caps,256,execution).status ==
+                    ggml_kv_stream_status::success;
+            },
+            [](void *,ggml_backend_t,ggml_tensor *) {return GGML_STATUS_FAILED;},
+            [](void *) {return true;},[](void *) {},[](void *) {}};
+        const ggml_backend_execution_io io{&owner,
+            [](void *,const ggml_tensor *,void *,size_t,size_t) {return false;},
+            [](void *,const ggml_tensor *,const void *,size_t,size_t) {return false;},
+            [](void *,const ggml_tensor *,uint8_t,size_t,size_t) {return false;},
+            [](void *,uint8_t) {return false;}};
+        ggml_backend_buffer_ptr buffer(ggml_backend_execution_buffer_new_address_space(device,
+            ggml_backend_host_reservation_base(address.get()),bytes,128,ops,io,&owner));
+        if (!buffer) return false;
+        struct restore_roots {
+            llama_context & context;
+            std::vector<std::pair<ggml_tensor *,ggml_backend_buffer_t>> & roots;
+            ~restore_roots() {
+                ggml_backend_sched_reset(context.sched.get());
+                context.gf_res_reserve->reset();
+                for (auto & item : roots) item.first->buffer=item.second;
+            }
+        } restore{*this,roots};
+        for (auto & item : roots) item.first->buffer=buffer.get();
+        auto * graph=graph_build_reserve(tokens,sequences,outputs,full.get(),false,native_batch);
+        if (!graph) return false;
+        size_t managed=0;
+        for (int i=0;i<ggml_graph_n_nodes(graph);++i) {
+            auto * op=ggml_graph_node(graph,i);
+            if (op->op != GGML_OP_FLASH_ATTN_EXT) continue;
+            auto * root=op->src[1];
+            while (root->view_src) root=root->view_src;
+            if (root->buffer != buffer.get()) continue;
+            const auto * q=op->src[0],*k=op->src[1],*v=op->src[2];
+            if (q->ne[3]!=1 || k->ne[2]>INT32_MAX || q->ne[2]>UINT32_MAX || q->ne[1]>UINT32_MAX) return false;
+            ggml_kv_stream_resume_plan plan;
+            const ggml_kv_stream_attention_request request{
+                {k->type,v->type,int32_t(k->ne[0]),int32_t(v->ne[0]),int32_t(k->ne[2]),256,128},
+                uint32_t(q->ne[2]),uint32_t(q->ne[1]),size_t(k->ne[1]),3};
+            if (!ggml_kv_stream_resume_plan_query(partial,backend,request,plan)) return false;
+            ggml_backend_execution_set_external_workspace(op,true);
+            ggml_backend_execution_set_verified_workspace(op);
+            if (!ggml_backend_execution_supports(buffer.get(),device,op)) return false;
+            ++managed;
+        }
+        if (!managed) return false;
+        ggml_backend_sched_reserve_size(sched.get(),graph,measured.data());
+        sizes=std::move(measured);
+        return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, bool feature_input) {
+    if (measurement_only && !split_only) return nullptr;
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3592,7 +3958,28 @@ ggml_cgraph * llama_context::graph_reserve(
         sched=std::move(temporary);
     }
 
-    if (n_tokens % n_seqs != 0) {
+    auto * gf=graph_build_reserve(n_tokens,n_seqs,n_outputs,mctx,feature_input);
+    if (!gf) return nullptr;
+
+    // initialize scheduler with the specified graph
+    if (split_only) {
+        if (sizes) {
+            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+        } else {
+            ggml_backend_sched_split_graph(sched.get(), gf);
+        }
+    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+        GGML_ASSERT(!sizes);
+        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        return nullptr;
+    }
+
+    return gf;
+}
+
+ggml_cgraph * llama_context::graph_build_reserve(uint32_t n_tokens, uint32_t n_seqs,
+        uint32_t n_outputs, const llama_memory_context_i * mctx, bool feature_input, const llama_ubatch * native_batch) {
+    if (!native_batch && n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
@@ -3614,7 +4001,7 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_outputs = n_outputs;
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
-    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+    llama_ubatch ubatch = native_batch ? *native_batch : balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
     // Reservation builds topology only; it does not read the dummy embedding value.
     float dummy_feature = 0;
@@ -3623,7 +4010,7 @@ ggml_cgraph * llama_context::graph_reserve(
         ubatch.embd = &dummy_feature;
     }
 
-    ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
+    if (!native_batch) ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
     auto * res = gf_res_reserve.get();
 
@@ -3635,19 +4022,6 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
-
-    // initialize scheduler with the specified graph
-    if (split_only) {
-        if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
-        } else {
-            ggml_backend_sched_split_graph(sched.get(), gf);
-        }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-        GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
-    }
 
     return gf;
 }
@@ -3681,6 +4055,7 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    if (measurement_only) return GGML_STATUS_FAILED;
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -4687,7 +5062,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (model.hparams.no_alloc) {
+    if (no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);

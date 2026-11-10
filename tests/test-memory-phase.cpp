@@ -13,6 +13,51 @@ static llama_memory_text_phase_signal signal(text_phase phase, uint32_t tokens =
 
 int main() {
     testing t;
+    t.test("bounded_selected_windows_match_native_unified_geometry", [](testing & t) {
+        struct measured { uint32_t selected,context,batch,rows;size_t bytes; };
+        const measured native[]={
+            {1,512,1,512,170393600},{2,512,1,512,170393600},
+            {1,512,16,512,170393600},{2,512,16,512,170393600},
+            {1,512,256,512,170393600},{2,512,256,512,170393600},
+            {1,4096,1,1280,425984000},{2,4096,1,2304,766771200},
+            {1,4096,16,1280,425984000},{2,4096,16,2304,766771200},
+            {1,4096,256,1280,425984000},{2,4096,256,2304,766771200}};
+        for (const auto & shape : native) {
+            llama_memory_cache_requirement cache{{101,1},{},llama_memory_cache_role::bounded_resident,
+                50,shape.context,1024,shape.batch,256,6656,0,{GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,256,256,16,false}};
+            cache.sequence_capacity=shape.selected;
+            llama_memory_cache_bound bound;
+            if (!t.assert_true(llama_memory_cache_bound_make(cache,nullptr,bound))) return;
+            t.assert_equal(shape.rows,bound.capacity_rows);
+            t.assert_equal(shape.bytes,bound.storage_bytes);
+            auto alias=cache;alias.identity={102,1};alias.source=cache.identity;alias.role=llama_memory_cache_role::read_only_source;
+            t.assert_true(llama_memory_cache_bound_make(alias,&cache,bound));
+            t.assert_equal(size_t(0),bound.storage_bytes);
+            ++alias.sequence_capacity;
+            t.assert_true(!llama_memory_cache_bound_make(alias,&cache,bound));
+        }
+    });
+    t.test("selected_capacity_defaults_preserve_single_slot_and_reject_overflow", [](testing & t) {
+        llama_memory_cache_requirement cache{{101,1},{},llama_memory_cache_role::bounded_resident,
+            50,4096,1024,256,256,6656,0,{GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,256,256,16,false}};
+        t.assert_equal(uint32_t(1),cache.sequence_capacity);
+        llama_memory_cache_bound bound;
+        t.assert_true(llama_memory_cache_bound_make(cache,nullptr,bound));
+        t.assert_equal(uint32_t(1280),bound.capacity_rows);
+        t.assert_equal(size_t(425984000),bound.storage_bytes);
+        for (int failure=0;failure<6;++failure) {
+            auto invalid=cache;
+            if (failure==0) invalid.sequence_capacity=0;
+            if (failure==1) {invalid.sequence_capacity=UINT32_MAX;invalid.window_rows=UINT32_MAX;}
+            if (failure==2) {invalid.sequence_capacity=2;invalid.window_rows=UINT32_MAX/2+1;}
+            if (failure==3) {invalid.sequence_capacity=2;invalid.window_rows=UINT32_MAX/2;invalid.headroom_rows=2;}
+            if (failure==4) {invalid.history_rows=UINT32_MAX;invalid.window_rows=UINT32_MAX-1;invalid.headroom_rows=1;}
+            if (failure==5) {invalid.role=llama_memory_cache_role::full_history;invalid.window_rows=invalid.headroom_rows=0;invalid.sequence_capacity=2;}
+            const auto previous=bound;
+            t.assert_true(!llama_memory_cache_bound_make(invalid,nullptr,bound));
+            t.assert_true(bound.capacity_rows==previous.capacity_rows && bound.storage_bytes==previous.storage_bytes && bound.writable==previous.writable);
+        }
+    });
     t.test("shared_assistant_bindings_are_read_only_and_versioned", [](testing & t) {
         using role = llama_memory_cache_role;
         llama_memory_cache_requirement local{{101,2},{},role::bounded_resident,50,262144,1024,256,256,6656,

@@ -44,6 +44,8 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+enum class llama_context_mode { execution, measurement };
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -57,6 +59,22 @@ struct llama_context {
             const llama_model & model,
                   llama_context_params params,
                   uint32_t serial_prediction_rows, bool serial_image_inputs);
+
+    // Build topology and size storage without allocating or executing it.
+    llama_context(const llama_model & model, llama_context_params params, llama_context_mode mode);
+    bool is_measurement_only() const { return measurement_only; }
+    // Managed attention storage is quoted separately; failure preserves sizes.
+    bool measure_workspace(uint32_t tokens, uint32_t sequences, uint32_t outputs,
+        bool managed_full_attention, std::vector<size_t> & sizes);
+    bool measure_workspace(const llama_ubatch & native_batch, bool managed_full_attention,
+        std::vector<size_t> & sizes);
+    bool measure_target_workload(const llama_batch & batch,
+        const std::vector<llama_memory_phase_cache_identity> & selected_sources,
+        llama_memory_work_phase phase, uint64_t id, llama_context_group_workload_quote & output);
+    llama_context_memory_create_result quote_target_group(const llama_batch & batch,
+        const std::vector<llama_memory_phase_cache_identity> & selected_sources,
+        llama_memory_phase_cache_identity bounded_identity, llama_memory_work_phase phase,
+        uint64_t id, size_t capacity, llama_context_group_plan & output);
 
     ~llama_context();
 
@@ -254,6 +272,10 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    llama_context(const llama_model & model, llama_context_params params,
+        uint32_t serial_prediction_rows, bool serial_image_inputs, llama_context_mode mode);
+    bool no_alloc() const;
+
     //
     // output
     //
@@ -293,6 +315,10 @@ public:
 
 private:
     llm_graph_result * get_gf_res_prev();
+    ggml_cgraph * graph_build_reserve(uint32_t tokens, uint32_t sequences, uint32_t outputs,
+        const llama_memory_context_i * memory, bool feature_input, const llama_ubatch * native_batch = nullptr);
+    bool measure_workspace_impl(const llama_ubatch * native_batch, uint32_t tokens, uint32_t sequences,
+        uint32_t outputs, bool managed_full_attention, std::vector<size_t> & sizes);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -491,4 +517,6 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    bool measurement_only = false;
+
 };

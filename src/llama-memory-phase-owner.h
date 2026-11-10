@@ -11,6 +11,7 @@ struct llama_memory_phase_target {
     llama_memory_work_phase phase = llama_memory_work_phase::none;
     llama_memory_transition_target target;
     uint32_t max_tokens = UINT32_MAX;
+    uint32_t profile = 0;
 };
 // Byte measurements exclude persistent weights and KV. Extra staging must not be included in graph_bytes.
 struct llama_memory_phase_workspace_measurement {
@@ -98,6 +99,37 @@ llama_memory_workload_budget_result llama_memory_workload_budget_make(
         const std::vector<llama_memory_workload_measurement> & measurements,
         size_t persistent_extra_bytes, size_t capacity, llama_memory_workload_budget & output) noexcept;
 
+struct llama_memory_group_member_range {
+    uint32_t member = 0, first_row = 0, rows = 0, output_rows = 0;
+    bool operator==(const llama_memory_group_member_range & other) const noexcept {
+        return member==other.member && first_row==other.first_row && rows==other.rows && output_rows==other.output_rows;
+    }
+};
+
+struct llama_memory_group_workload {
+    uint64_t id = 0;
+    uint32_t selected_count = 0, microbatch_rows = 0;
+    std::vector<llama_memory_workload_requirement> members;
+    // Ranges follow native query order and cover every member without gaps.
+    std::vector<std::vector<llama_memory_group_member_range>> native_batches;
+};
+
+struct llama_memory_group_workload_measurement {
+    llama_memory_group_workload workload;
+    std::vector<size_t> graph_bytes;
+    std::vector<bool> execution_available;
+    size_t live_device_bytes = 0, host_feature_bytes = 0, alignment = 1;
+};
+
+// Quote one backend/selected-count profile with its measured active cache/state prefix.
+// Native microbatches share graph scratch; retained outputs/stages stay live.
+llama_memory_workload_budget_result llama_memory_group_workload_budget_make(
+        const std::vector<llama_memory_cache_requirement> & caches,
+        const std::vector<llama_memory_cache_allocation_measurement> & cache_allocations,
+        const std::vector<llama_memory_group_workload> & workloads,
+        const std::vector<llama_memory_group_workload_measurement> & measurements,
+        size_t persistent_extra_bytes, size_t capacity, llama_memory_workload_budget & output) noexcept;
+
 enum class llama_memory_phase_owner_status {
     changed,
     unchanged,
@@ -123,12 +155,29 @@ public:
             std::vector<llama_memory_consumer *> consumers,
             llama_memory_phase_cache_identity target,
             llama_memory_phase_cache_identity mtp);
+    static std::unique_ptr<llama_memory_phase_owner> create(
+            std::vector<llama_memory_phase_target> targets,
+            std::vector<llama_memory_transition_arena> arenas,
+            std::vector<llama_memory_consumer *> consumers,
+            std::vector<llama_memory_phase_cache_identity> sources);
     ~llama_memory_phase_owner();
     llama_memory_phase_owner(const llama_memory_phase_owner &) = delete;
     llama_memory_phase_owner & operator=(const llama_memory_phase_owner &) = delete;
 
     llama_memory_phase_owner_result enter(llama_memory_work_phase phase, uint32_t tokens,
             llama_memory_phase_cache_identity target, llama_memory_phase_cache_identity mtp);
+    // Profile selects measured resources; revision identifies the selected logical set.
+    llama_memory_phase_owner_result enter(llama_memory_work_phase phase, uint32_t tokens,
+            llama_memory_phase_cache_identity target, llama_memory_phase_cache_identity mtp,
+            uint32_t profile, uint64_t selection_revision);
+    llama_memory_phase_owner_result enter(llama_memory_work_phase phase, uint32_t tokens,
+            const std::vector<llama_memory_phase_cache_identity> & sources,
+            uint32_t profile, uint64_t selection_revision);
+    bool finish(uint64_t admission, const std::vector<llama_memory_phase_cache_identity> & sources) noexcept;
+    // Owner-thread view; successful finish advances its generations.
+    const std::vector<llama_memory_phase_cache_identity> & source_identities() const noexcept;
+    uint32_t active_profile() const noexcept;
+    uint64_t selection_revision() const noexcept;
     uint64_t admit() noexcept;
     bool finish(uint64_t admission, llama_memory_phase_cache_identity target,
             llama_memory_phase_cache_identity mtp) noexcept;
@@ -136,6 +185,8 @@ public:
     llama_memory_phase_cache_identity target_identity() const noexcept;
     llama_memory_phase_cache_identity mtp_identity() const noexcept;
 private:
+    llama_memory_phase_owner_result enter_profile(llama_memory_work_phase phase, uint32_t tokens,
+            uint32_t profile, uint64_t selection_revision);
     struct implementation;
     explicit llama_memory_phase_owner(std::unique_ptr<implementation> impl);
     std::unique_ptr<implementation> impl;

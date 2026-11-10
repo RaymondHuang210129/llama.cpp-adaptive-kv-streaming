@@ -164,7 +164,18 @@ llama_recurrent_stage_buffer::~llama_recurrent_stage_buffer() = default;
 std::unique_ptr<llama_recurrent_stage_buffer> llama_recurrent_stage_buffer::create(
         const llama_recurrent_spill_layout & snapshots, uint32_t slots,
         ggml_backend_buffer_type_t device_type, ggml_backend_memory_lease_t borrowed) {
-    if (!device_type) return {};
+    return create_impl(snapshots,slots,device_type,borrowed,false);
+}
+
+std::unique_ptr<llama_recurrent_stage_buffer> llama_recurrent_stage_buffer::create_measurement(
+        const llama_recurrent_spill_layout & snapshots,uint32_t slots,ggml_backend_buffer_type_t device_type) {
+    return create_impl(snapshots,slots,device_type,nullptr,true);
+}
+
+std::unique_ptr<llama_recurrent_stage_buffer> llama_recurrent_stage_buffer::create_impl(
+        const llama_recurrent_spill_layout & snapshots,uint32_t slots,
+        ggml_backend_buffer_type_t device_type,ggml_backend_memory_lease_t borrowed,bool measurement) {
+    if (!device_type || (measurement && borrowed)) return {};
     try {
         auto state=std::make_unique<implementation>();
         if (!llama_recurrent_stage_layout_make(
@@ -199,7 +210,8 @@ std::unique_ptr<llama_recurrent_stage_buffer> llama_recurrent_stage_buffer::crea
                 }
             }
         }
-        if (borrowed) {
+        if (measurement) state->backing=ggml_backend_buft_alloc_buffer(device_type,0);
+        else if (borrowed) {
             ggml_backend_memory_region region{};
             auto * buffer=ggml_backend_memory_lease_buffer(borrowed);
             if (!ggml_backend_memory_lease_get_region(borrowed,&region) ||
@@ -209,8 +221,9 @@ std::unique_ptr<llama_recurrent_stage_buffer> llama_recurrent_stage_buffer::crea
             state->lease.reset(ggml_backend_memory_lease_retain(borrowed));
             state->backing=ggml_backend_buffer_retain(buffer);
         } else state->backing=ggml_backend_buft_alloc_buffer(device_type,state->planned.total_bytes);
-        if (!state->backing || ggml_backend_buffer_get_size(state->backing) < state->planned.total_bytes ||
-                !ggml_backend_buffer_get_base(state->backing)) return {};
+        if (!state->backing || (!measurement &&
+                (ggml_backend_buffer_get_size(state->backing) < state->planned.total_bytes ||
+                 !ggml_backend_buffer_get_base(state->backing)))) return {};
         auto * base=static_cast<uint8_t *>(ggml_backend_buffer_get_base(state->backing));
         for (uint32_t slot=0;slot<slots;++slot) {
             for (size_t layer=0;layer<snapshots.layers.size();++layer) {
@@ -220,8 +233,9 @@ std::unique_ptr<llama_recurrent_stage_buffer> llama_recurrent_stage_buffer::crea
                         size_t offset=0,bytes=0;
                         auto * tensor=state->tensors[state->index(layer,value,snapshot,slot)];
                         if (!llama_recurrent_stage_region(state->planned,layer,value,snapshot,slot,offset,bytes) ||
-                                ggml_nbytes(tensor) != bytes ||
-                                ggml_backend_tensor_alloc(state->backing,tensor,base+offset) != GGML_STATUS_SUCCESS) return {};
+                                ggml_nbytes(tensor) != bytes) return {};
+                        if (measurement) tensor->buffer=state->backing;
+                        else if (ggml_backend_tensor_alloc(state->backing,tensor,base+offset) != GGML_STATUS_SUCCESS) return {};
                     }
                 }
                 const auto & part=state->planned.layers[layer];
@@ -232,8 +246,9 @@ std::unique_ptr<llama_recurrent_stage_buffer> llama_recurrent_stage_buffer::crea
                     if (!multiply(row,snapshots.depth,bytes) || bytes > size_t(INT64_MAX) ||
                             !llama_recurrent_stage_region(state->planned,layer,value,1,slot,offset,one) || one != row) return {};
                     auto * span=ggml_new_tensor_1d(state->ctx,GGML_TYPE_I8,int64_t(bytes));
-                    if (ggml_backend_buft_get_alloc_size(device_type,span) > bytes ||
-                            ggml_backend_tensor_alloc(state->backing,span,base+offset) != GGML_STATUS_SUCCESS) continue;
+                    if (ggml_backend_buft_get_alloc_size(device_type,span) > bytes) continue;
+                    if (measurement) span->buffer=state->backing;
+                    else if (ggml_backend_tensor_alloc(state->backing,span,base+offset) != GGML_STATUS_SUCCESS) continue;
                     state->plane_spans[(size_t(slot)*snapshots.layers.size()+layer)*2+size_t(value)]=span;
                 }
             }
@@ -321,6 +336,10 @@ struct llama_recurrent_spill_bank::implementation {
     bool poisoned = false;
     bool submission_failed = false;
     std::unique_ptr<spill_publication_state> parked_publication;
+    bool measurement_only = false;
+    std::unique_ptr<ggml_backend_host_reservation,decltype(&ggml_backend_host_reservation_free)> measurement_address{
+        nullptr,ggml_backend_host_reservation_free};
+    bool describe_publication(spill_publication_state & next);
 
     ~implementation() {
         if (state != spill_transfer_state::idle && publication && publication->producer)
@@ -469,31 +488,80 @@ bool llama_recurrent_spill_bank::implementation::publish_snapshot(
 }
 
 
+bool llama_recurrent_spill_bank::implementation::describe_publication(spill_publication_state & next) {
+    if (!next.execution) return false;
+    size_t count=0,metadata_bytes=0,plane_count=0,total_count=0;
+    if (!multiply(layout.layers.size(),layout.depth,count) ||
+            !multiply(count,2,count) ||
+            !multiply(layout.layers.size(),2,plane_count) || !add(count,plane_count,total_count) ||
+            !multiply(total_count,ggml_tensor_overhead(),metadata_bytes) ||
+            !add(metadata_bytes,4096,metadata_bytes)) return false;
+    next.ctx=ggml_init({metadata_bytes,nullptr,true});
+    if (!next.ctx) return false;
+    next.destinations.resize(count,nullptr);
+    next.planes.resize(plane_count,nullptr);
+    auto * base=static_cast<uint8_t *>(ggml_backend_buffer_get_base(next.execution));
+    for (size_t layer=0;layer<layout.layers.size();++layer) {
+        if (!layout.layers[layer].enabled) continue;
+        const auto & item=layout.layers[layer];
+        for (uint32_t snapshot=1;snapshot<=layout.depth;++snapshot) {
+            for (bool value : {false,true}) {
+                const auto type=value ? item.type_s : item.type_r;
+                const auto width=value ? item.width_s : item.width_r;
+                auto * tensor=ggml_new_tensor_2d(next.ctx,type,int64_t(width),layout.cells);
+                size_t offset=0,bytes=0;
+                if (!tensor || !region(layer,value,snapshot,offset,bytes) ||
+                        ggml_nbytes(tensor) != bytes ||
+                        ggml_backend_tensor_alloc(next.execution,tensor,base+offset) != GGML_STATUS_SUCCESS) {
+                    return false;
+                }
+                next.destinations[next.index(layer,value,snapshot,layout.depth)]=tensor;
+            }
+        }
+        for (bool value : {false,true}) {
+            size_t offset=0,row=0,bytes=0;
+            if (!region(layer,value,1,offset,row) || !multiply(row,layout.depth,bytes) || bytes > size_t(INT64_MAX)) return false;
+            auto * plane=ggml_new_tensor_1d(next.ctx,GGML_TYPE_I8,int64_t(bytes));
+            if (ggml_backend_tensor_alloc(next.execution,plane,base+offset) != GGML_STATUS_SUCCESS) return false;
+            next.planes[layer*2+size_t(value)]=plane;
+        }
+    }
+    return true;
+}
+
 llama_recurrent_spill_bank::llama_recurrent_spill_bank(std::unique_ptr<implementation> impl) : impl(std::move(impl)) {}
 llama_recurrent_spill_bank::~llama_recurrent_spill_bank() = default;
+
+std::unique_ptr<llama_recurrent_spill_bank::implementation> llama_recurrent_spill_bank::create_state(
+        const llama_recurrent_spill_layout & layout,uint64_t cache,uint64_t sequence) {
+    if (!cache ||
+        !layout.cells || !layout.depth || !layout.host_snapshot_bytes || layout.layers.empty() ||
+        layout.layers.size() > SIZE_MAX/size_t(layout.depth)/2) return {};
+    auto state=std::make_unique<implementation>();
+    state->layout=layout;
+    state->cache=cache; state->sequence=sequence;
+    state->generations.resize(layout.layers.size()*size_t(layout.depth)*2);
+    state->touched.resize(state->generations.size());
+    state->invalidated.resize(state->generations.size());
+    for (size_t i=0;i<layout.layers.size();++i) if (layout.layers[i].enabled) {
+        ++state->active_planes;
+        for (bool side : {false,true}) for (uint32_t slot=1;slot<=layout.depth;++slot) {
+            size_t offset=0,bytes=0;
+            if (!state->region(i,side,slot,offset,bytes)) return {};
+        }
+    }
+    if (!state->active_planes) return {};
+    state->active_planes*=2;
+    return state;
+}
 
 std::unique_ptr<llama_recurrent_spill_bank> llama_recurrent_spill_bank::create(
         const llama_recurrent_spill_layout & layout, ggml_backend_buffer_type_t host_type,
         uint64_t cache, uint64_t sequence) {
-    if (!cache || !host_type || !ggml_backend_buft_is_host(host_type) ||
-            !layout.cells || !layout.depth || !layout.host_snapshot_bytes || layout.layers.empty() ||
-            layout.layers.size() > SIZE_MAX/size_t(layout.depth)/2) return {};
+    if (!cache || !host_type || !ggml_backend_buft_is_host(host_type)) return {};
     try {
-        auto state=std::make_unique<implementation>();
-        state->layout=layout;
-        state->cache=cache; state->sequence=sequence;
-        state->generations.resize(layout.layers.size()*size_t(layout.depth)*2);
-        state->touched.resize(state->generations.size());
-        state->invalidated.resize(state->generations.size());
-        for (size_t i=0;i<layout.layers.size();++i) if (layout.layers[i].enabled) {
-            ++state->active_planes;
-            for (bool side : {false,true}) for (uint32_t slot=1;slot<=layout.depth;++slot) {
-                size_t offset=0,bytes=0;
-                if (!state->region(i,side,slot,offset,bytes)) return {};
-            }
-        }
-        if (!state->active_planes) return {};
-        state->active_planes*=2;
+        auto state=create_state(layout,cache,sequence);
+        if (!state) return {};
         state->host=ggml_backend_buft_alloc_buffer(host_type,layout.host_snapshot_bytes);
         if (!state->host || !ggml_backend_buffer_is_host(state->host) ||
                 ggml_backend_buffer_get_size(state->host) < layout.host_snapshot_bytes ||
@@ -505,6 +573,49 @@ std::unique_ptr<llama_recurrent_spill_bank> llama_recurrent_spill_bank::create(
     } catch (const std::length_error &) {
         return {};
     }
+}
+
+std::unique_ptr<llama_recurrent_spill_bank> llama_recurrent_spill_bank::create_measurement(
+        const llama_recurrent_spill_layout & layout,ggml_backend_dev_t device,
+        ggml_backend_buffer_type_t stage_type,uint32_t slots,uint64_t cache,uint64_t sequence) {
+    if (!device || !stage_type || !slots || !ggml_backend_dev_supports_buft(device,stage_type)) return {};
+    try {
+        auto state=create_state(layout,cache,sequence);
+        if (!state) return {};
+        state->measurement_only=true;
+        std::fill(state->invalidated.begin(),state->invalidated.end(),1);
+        state->measurement_address.reset(ggml_backend_host_reservation_new(layout.host_snapshot_bytes));
+        if (!state->measurement_address) return {};
+        auto next=std::make_unique<spill_publication_state>();
+        next->stage_type=stage_type;
+        next->stage=llama_recurrent_stage_buffer::create_measurement(layout,slots,stage_type);
+        if (!next->stage) return {};
+        const ggml_backend_execution_ops ops{
+            [](void * context,const ggml_tensor * op) {
+                const auto * publication=static_cast<implementation *>(context)->publication.get();
+                return publication && op && op->op==GGML_OP_CPY && op->src[0] && op->src[1] &&
+                    (std::find(publication->destinations.begin(),publication->destinations.end(),op->src[1])!=publication->destinations.end() ||
+                     (op->src[1]->view_src && std::find(publication->planes.begin(),publication->planes.end(),op->src[1]->view_src)!=publication->planes.end()));
+            },
+            [](void *,ggml_backend_t,ggml_tensor *) {return GGML_STATUS_FAILED;},
+            [](void *) {return false;},[](void *) {},[](void *) {}};
+        const ggml_backend_execution_io io{state.get(),
+            [](void *,const ggml_tensor *,void *,size_t,size_t) {return false;},
+            [](void *,const ggml_tensor *,const void *,size_t,size_t) {return false;},
+            [](void *,const ggml_tensor *,uint8_t,size_t,size_t) {return false;},
+            [](void *,uint8_t) {return false;}};
+        next->execution=ggml_backend_execution_buffer_new_address_space(device,
+            ggml_backend_host_reservation_base(state->measurement_address.get()),layout.host_snapshot_bytes,128,ops,io,state.get());
+        if (!next->execution || !state->describe_publication(*next)) return {};
+        next->layer_slots.resize(layout.layers.size(),UINT32_MAX);
+        uint32_t ordinal=0;
+        for (size_t layer=0;layer<layout.layers.size();++layer)
+            if (layout.layers[layer].enabled) next->layer_slots[layer]=ordinal++%slots;
+        state->device=device;
+        state->publication=std::move(next);
+        return std::unique_ptr<llama_recurrent_spill_bank>(new llama_recurrent_spill_bank(std::move(state)));
+    } catch (const std::bad_alloc &) {return {};}
+      catch (const std::length_error &) {return {};}
 }
 
 bool llama_recurrent_spill_bank::enable_publication(
@@ -546,42 +657,7 @@ bool llama_recurrent_spill_bank::enable_publication(
         };
         next->execution=ggml_backend_execution_buffer_new(device,s.host,ops,&s);
         if (!next->execution) return false;
-        size_t count=0,metadata_bytes=0,plane_count=0,total_count=0;
-        if (!multiply(s.layout.layers.size(),s.layout.depth,count) ||
-                !multiply(count,2,count) ||
-                !multiply(s.layout.layers.size(),2,plane_count) || !add(count,plane_count,total_count) ||
-                !multiply(total_count,ggml_tensor_overhead(),metadata_bytes) ||
-                !add(metadata_bytes,4096,metadata_bytes)) return false;
-        next->ctx=ggml_init({metadata_bytes,nullptr,true});
-        if (!next->ctx) return false;
-        next->destinations.resize(count,nullptr);
-        next->planes.resize(plane_count,nullptr);
-        auto * base=static_cast<uint8_t *>(ggml_backend_buffer_get_base(next->execution));
-        for (size_t layer=0;layer<s.layout.layers.size();++layer) {
-            if (!s.layout.layers[layer].enabled) continue;
-            const auto & item=s.layout.layers[layer];
-            for (uint32_t snapshot=1;snapshot<=s.layout.depth;++snapshot) {
-                for (bool value : {false,true}) {
-                    const auto type=value ? item.type_s : item.type_r;
-                    const auto width=value ? item.width_s : item.width_r;
-                    auto * tensor=ggml_new_tensor_2d(next->ctx,type,int64_t(width),s.layout.cells);
-                    size_t offset=0,bytes=0;
-                    if (!tensor || !s.region(layer,value,snapshot,offset,bytes) ||
-                            ggml_nbytes(tensor) != bytes ||
-                            ggml_backend_tensor_alloc(next->execution,tensor,base+offset) != GGML_STATUS_SUCCESS) {
-                        return false;
-                    }
-                    next->destinations[next->index(layer,value,snapshot,s.layout.depth)]=tensor;
-                }
-            }
-            for (bool value : {false,true}) {
-                size_t offset=0,row=0,bytes=0;
-                if (!s.region(layer,value,1,offset,row) || !multiply(row,s.layout.depth,bytes) || bytes > size_t(INT64_MAX)) return false;
-                auto * plane=ggml_new_tensor_1d(next->ctx,GGML_TYPE_I8,int64_t(bytes));
-                if (ggml_backend_tensor_alloc(next->execution,plane,base+offset) != GGML_STATUS_SUCCESS) return false;
-                next->planes[layer*2+size_t(value)]=plane;
-            }
-        }
+        if (!s.describe_publication(*next)) return false;
         next->slot_events.resize(slots,nullptr);
         next->slot_busy.resize(slots,0);
         next->layer_slots.resize(s.layout.layers.size(),UINT32_MAX);
@@ -630,6 +706,7 @@ size_t llama_recurrent_spill_bank::staged_device_bytes() const noexcept {
 }
 
 bool llama_recurrent_spill_bank::park_publication_stage() {
+    if (impl->measurement_only) return false;
     auto & s=*impl;
     if (s.state != spill_transfer_state::idle) return false;
     if (s.parked_publication) return true;
@@ -651,6 +728,7 @@ bool llama_recurrent_spill_bank::publication_stage_parked() const noexcept {
 }
 
 bool llama_recurrent_spill_bank::bind_publication_stage(ggml_backend_memory_lease_t lease) {
+    if (impl->measurement_only) return false;
     auto & s=*impl;
     if (s.parked_publication) {
         auto & parked=*s.parked_publication;
@@ -731,6 +809,7 @@ bool llama_recurrent_spill_bank::publish_staged(ggml_context * ctx, ggml_cgraph 
 
 
 bool llama_recurrent_spill_bank::begin_capture(llama_recurrent_spill_identity identity) {
+    if (impl->measurement_only) return false;
     auto & s=*impl;
     if (s.poisoned || s.parked_publication || s.state != spill_transfer_state::idle || !s.identity(identity) ||
             identity.generation <= s.last_generation) return false;
@@ -815,6 +894,7 @@ bool llama_recurrent_spill_bank::complete_capture() {
 }
 
 bool llama_recurrent_spill_bank::begin_restore(llama_recurrent_spill_identity identity, uint32_t slot) {
+    if (impl->measurement_only) return false;
     auto & s=*impl;
     if (s.poisoned || s.state != spill_transfer_state::idle || !s.identity(identity) ||
             slot == 0 || slot > s.layout.depth) return false;
@@ -902,6 +982,7 @@ void llama_recurrent_spill_bank::cancel() noexcept {
 }
 
 void llama_recurrent_spill_bank::reset(bool pristine) noexcept {
+    if (impl->measurement_only) return;
     auto & s=*impl;
     if (s.state != spill_transfer_state::idle && s.publication && s.publication->producer)
         ggml_backend_synchronize(s.publication->producer);
@@ -924,6 +1005,9 @@ void llama_recurrent_spill_bank::reset(bool pristine) noexcept {
 
 
 size_t llama_recurrent_spill_bank::host_bytes() const noexcept { return impl->layout.host_snapshot_bytes; }
+size_t llama_recurrent_spill_bank::allocated_host_bytes() const noexcept {
+    return impl->host ? ggml_backend_buffer_get_size(impl->host) : 0;
+}
 
 uint64_t llama_recurrent_spill_bank::snapshot_generation(size_t layer, bool value, uint32_t slot) const noexcept {
     const auto & s=*impl;

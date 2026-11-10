@@ -15,7 +15,8 @@
 bool llama_kv_cache_iswa::bounded_storage_requirements(const llama_hparams & hp, const llama_memory_params & params,
         const llama_cparams & cp, ggml_backend_buffer_type_t buft,
         llama_memory_phase_cache_identity identity, llama_memory_bounded_kv_layout & output) noexcept {
-    if (!buft || !identity.id || !identity.generation || params.swa_full || cp.n_seq_max != 1 ||
+    if (!buft || !identity.id || !identity.generation || params.swa_full || !cp.n_seq_max || cp.n_seq_max>LLAMA_MAX_SEQ ||
+            (cp.n_seq_max>1 && (!cp.kv_unified || !cp.n_ctx)) ||
             !cp.n_ctx_seq || !cp.n_ubatch || !hp.n_swa || !hp.n_layer_all || hp.n_layer_all > LLAMA_MAX_LAYERS ||
             hp.n_layer_nextn > hp.n_layer_all || hp.swa_type == LLAMA_SWA_TYPE_NONE) return false;
     int32_t kt, vt;
@@ -27,8 +28,9 @@ bool llama_kv_cache_iswa::bounded_storage_requirements(const llama_hparams & hp,
         if (ids.empty()) return false;
         llama_memory_cache_requirement cache;
         cache.identity=identity; cache.role=llama_memory_cache_role::bounded_resident;
-        cache.layers=uint32_t(ids.size()); cache.history_rows=cp.n_ctx_seq;
+        cache.layers=uint32_t(ids.size()); cache.history_rows=cp.n_seq_max==1 ? cp.n_ctx_seq : cp.n_ctx;
         cache.window_rows=hp.n_swa; cache.headroom_rows=cp.n_ubatch; cache.row_padding=256;
+        cache.sequence_capacity=cp.n_seq_max;
         const auto first=ids.front();
         cache.format={params.type_k,params.type_v,hp.n_embd_head_k(first),hp.n_embd_head_v(first),hp.n_head_kv(first),!cp.flash_attn};
         for (auto il : ids) if (hp.n_embd_head_k(il) != cache.format.key_head_dim ||
@@ -89,9 +91,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const  layer_share_cb & share, const llama_memory_params * stream) : unified(unified) {
 
     const bool streaming=stream && (stream->kv_stream_pool_bytes || stream->shared_device_memory_bytes);
+    const bool measure_only=stream && stream->measure_only;
     if (streaming && swa_full) throw std::runtime_error("KV streaming requires bounded SWA storage (swa_full=false)");
     llama_memory_params base_params{};
-    if (streaming) {
+    if (streaming || measure_only) {
         base_params=*stream;
         base_params.bounded_cache_lease=nullptr;
         base_params.defer_bounded_cache=false;
@@ -143,7 +146,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,"",streaming ? &base_params : nullptr);
+            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,"",(streaming || measure_only) ? &base_params : nullptr);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
@@ -151,7 +154,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share,"",
-            stream && (stream->bounded_cache_lease || stream->defer_bounded_cache) ? stream : nullptr);
+            stream && (stream->bounded_cache_lease || stream->defer_bounded_cache || measure_only) ? stream : nullptr);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

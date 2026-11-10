@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-memory-layout.h"
+#include "llama-memory-phase.h"
 
 #include <exception>
 #include <memory>
@@ -11,6 +12,8 @@ struct llama_memory_transition_target {
     llama_memory_stage_id stage = 0;
     std::vector<llama_memory_arena_budget> budgets;
     std::vector<llama_memory_fixed_region> fixed;
+    uint64_t selection_revision = 0;
+    std::vector<llama_memory_phase_cache_identity> source_identities = {};
 };
 
 struct llama_memory_transition_arena {

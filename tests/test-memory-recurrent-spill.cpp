@@ -1294,6 +1294,92 @@ int main(int argc, char ** argv) {
         t.assert_equal(original,stage.total_bytes);
     });
 
+    t.test("stage_metadata_matches_real_storage_without_allocating_payload", [](testing & t) {
+        const std::vector<llama_recurrent_spill_layer> layers={
+            {GGML_TYPE_F32,GGML_TYPE_F32,7,13,true},
+            {GGML_TYPE_F32,GGML_TYPE_F32,0,0,false},
+            {GGML_TYPE_F32,GGML_TYPE_F32,32,64,true}};
+        auto * type=ggml_backend_cpu_buffer_type();
+        for (uint32_t cells : {1u,2u}) for (uint32_t depth : {3u,7u}) {
+            llama_recurrent_spill_layout layout;
+            if (!t.assert_true(llama_recurrent_spill_layout_make(layers,cells,depth,layout))) return;
+            auto real=llama_recurrent_stage_buffer::create(layout,2,type);
+            auto metadata=llama_recurrent_stage_buffer::create_measurement(layout,2,type);
+            if (!t.assert_true(real && metadata)) return;
+            t.assert_equal(real->bytes(),metadata->bytes());
+            t.assert_true(ggml_backend_buffer_get_size(real->buffer())>=real->bytes());
+            t.assert_equal(size_t(0),ggml_backend_buffer_get_size(metadata->buffer()));
+            for (size_t layer=0;layer<layers.size();++layer) for (uint32_t slot=0;slot<2;++slot)
+            for (uint32_t snapshot=1;snapshot<=depth;++snapshot) for (bool value : {false,true}) {
+                const auto * expected=real->tensor(layer,value,snapshot,slot);
+                const auto * actual=metadata->tensor(layer,value,snapshot,slot);
+                t.assert_equal(expected != nullptr,actual != nullptr);
+                if (!expected || !actual) continue;
+                t.assert_equal(expected->type,actual->type);
+                t.assert_true(!std::memcmp(expected->ne,actual->ne,sizeof(expected->ne)));
+                t.assert_true(!std::memcmp(expected->nb,actual->nb,sizeof(expected->nb)));
+                t.assert_true(actual->buffer==metadata->buffer() && actual->data==nullptr);
+                auto * plane=metadata->plane_span(layer,value,slot);
+                t.assert_equal(real->plane_span(layer,value,slot) != nullptr,plane != nullptr);
+                if (plane) t.assert_true(plane->buffer==metadata->buffer() && plane->data==nullptr);
+            }
+        }
+    });
+    t.test("publication_metadata_has_native_shapes_but_cannot_capture_or_restore", [](testing & t) {
+        ggml_backend_ptr producer(ggml_backend_cpu_init());
+        auto * device=ggml_backend_get_device(producer.get());
+        auto * type=ggml_backend_get_default_buffer_type(producer.get());
+        const std::vector<llama_recurrent_spill_layer> layers={
+            {GGML_TYPE_F32,GGML_TYPE_F32,7,13,true},
+            {GGML_TYPE_F32,GGML_TYPE_F32,32,64,true}};
+        for (uint32_t cells : {1u,2u}) for (uint32_t depth : {3u,7u}) {
+            llama_recurrent_spill_layout layout;
+            if (!t.assert_true(llama_recurrent_spill_layout_make(layers,cells,depth,layout))) return;
+            auto real=llama_recurrent_spill_bank::create(layout,type,981,0);
+            if (!t.assert_true(real && real->enable_publication(device,type,2))) return;
+            auto metadata=llama_recurrent_spill_bank::create_measurement(layout,device,type,2,982,0);
+            if (!t.assert_true(metadata != nullptr)) return;
+            t.assert_equal(real->host_bytes(),metadata->host_bytes());
+            t.assert_true(real->allocated_host_bytes()>=real->host_bytes());
+            t.assert_equal(size_t(0),metadata->allocated_host_bytes());
+            t.assert_equal(real->staged_device_bytes(),metadata->staged_device_bytes());
+            for (size_t layer=0;layer<layers.size();++layer) for (uint32_t snapshot=1;snapshot<=depth;++snapshot)
+            for (bool value : {false,true}) {
+                auto * expected=real->publication_tensor(layer,value,snapshot);
+                auto * actual=metadata->publication_tensor(layer,value,snapshot);
+                if (!t.assert_true(expected && actual)) return;
+                t.assert_true(!std::memcmp(expected->ne,actual->ne,sizeof(expected->ne)));
+                t.assert_true(!std::memcmp(expected->nb,actual->nb,sizeof(expected->nb)));
+                auto * stage=metadata->staging_tensor(layer,value,snapshot);
+                if (!t.assert_true(stage != nullptr)) return;
+                t.assert_equal(size_t(0),ggml_backend_buffer_get_size(stage->buffer));
+                t.assert_true(stage->data==nullptr);
+            }
+            t.assert_true(!metadata->begin_capture({982,0,1}));
+            t.assert_true(!metadata->begin_staged_capture({982,0,1},depth+1));
+            t.assert_true(!metadata->begin_restore({982,0,1},1));
+            t.assert_true(!metadata->snapshot_pristine(0,false,1));
+            metadata->reset(true);
+            t.assert_true(!metadata->snapshot_pristine(0,false,1));
+            metadata->cancel();
+            t.assert_true(!metadata->stage_ready());
+            ggml_context_ptr ctx(ggml_init({4096+ggml_graph_overhead_custom(16,false)+8*ggml_tensor_overhead(),nullptr,true}));
+            auto * destination=metadata->publication_tensor(0,false,1);
+            auto * source=ggml_dup_tensor(ctx.get(),destination);
+            auto * copy=ggml_cpy(ctx.get(),source,destination);
+            auto * graph=ggml_new_graph_custom(ctx.get(),16,false);
+            ggml_build_forward_expand(graph,copy);
+            ggml_backend_buffer_ptr backing(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(),type));
+            if (!t.assert_true(backing != nullptr)) return;
+            const std::vector<float> original(size_t(ggml_nelements(source)),3.25f);
+            ggml_backend_tensor_set(source,original.data(),0,original.size()*sizeof(float));
+            t.assert_equal(GGML_STATUS_FAILED,ggml_backend_graph_compute(producer.get(),graph));
+            std::vector<float> after(original.size());
+            ggml_backend_tensor_get(source,after.data(),0,after.size()*sizeof(float));
+            t.assert_true(original==after);
+            t.assert_equal(size_t(0),metadata->allocated_host_bytes());
+        }
+    });
     t.test("typed_stage_tensors_alias_only_their_planned_ring_regions", [](testing & t) {
         llama_recurrent_spill_layout snapshots;
         if (!t.assert_true(llama_recurrent_spill_layout_make(

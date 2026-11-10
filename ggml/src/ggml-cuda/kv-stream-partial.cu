@@ -927,7 +927,7 @@ static bool mma_workspace_for_queries_dimension(ggml_backend_t backend, int32_t 
     if (!backend || !ggml_backend_is_cuda(backend) || capture_active(backend) ||
             key < 0 || key >= GGML_TYPE_COUNT || value < 0 || value >= GGML_TYPE_COUNT ||
             !heads || heads > 65535 || !kv_heads || kv_heads > heads || heads%kv_heads ||
-            (width != 256 && width != 512) || !queries || (queries > 8 && !prefill) || !tokens || tokens > INT32_MAX ||
+            (width != 256 && width != 512) || !queries || (queries > 16 && !prefill) || !tokens || tokens > INT32_MAX ||
             !spans || spans > 3 || !ggml_cuda_kv_stream_kernel(ggml_type(key),ggml_type(value))) return false;
     ggml_tensor q={},k={},v={},mask={},op={};
     q.type=GGML_TYPE_F32;
@@ -1045,7 +1045,9 @@ static bool geometry_resume_plan(ggml_backend_t backend, const ggml_kv_stream_at
 static bool geometry_workspace(ggml_backend_t backend, const ggml_kv_stream_attention_request & request,
         ggml_kv_stream_workspace_kind kind, size_t & output) {
     if (!geometry_valid(request)) return false;
-    if (request.shape.head_dim_k == 256) {
+    const bool aggregate=(kind == ggml_kv_stream_workspace_kind::decode || kind == ggml_kv_stream_workspace_kind::mma) &&
+        request.query_tokens>8;
+    if (request.shape.head_dim_k == 256 && !aggregate) {
         auto legacy=*ggml_cuda_kv_stream_partial_ops();
         legacy.version=14; legacy.geometry=nullptr;
         return ggml_kv_stream_workspace_query(&legacy,backend,request,kind,output);
@@ -1060,15 +1062,23 @@ static bool geometry_workspace(ggml_backend_t backend, const ggml_kv_stream_atte
         output=0; return true;
     }
     if ((kind != ggml_kv_stream_workspace_kind::decode && kind != ggml_kv_stream_workspace_kind::mma) ||
-            !request.query_tokens || request.query_tokens > 8) return false;
+            !request.query_tokens || request.query_tokens > 16) return false;
     size_t required=0;
-    for (uint32_t queries=1;queries<=request.query_tokens;++queries) {
+    uint32_t first=1;
+    if (shape.head_dim_k == 256) {
+        auto legacy=*ggml_cuda_kv_stream_partial_ops();
+        legacy.version=14; legacy.geometry=nullptr;
+        auto lower=request; lower.query_tokens=8;
+        if (!ggml_kv_stream_workspace_query(&legacy,backend,lower,kind,required)) return false;
+        first=9;
+    }
+    for (uint32_t queries=first;queries<=request.query_tokens;++queries) {
         ggml_kv_stream_resume_plan plan;
         size_t ordinary=0;
         if (!resume_plan_dimension(backend,shape.type_k,shape.type_v,request.query_heads,uint32_t(shape.heads),
-                queries,request.tokens,plan,512) ||
+                queries,request.tokens,plan,uint32_t(shape.head_dim_k)) ||
                 !mma_workspace_for_queries_dimension(backend,shape.type_k,shape.type_v,request.query_heads,
-                    uint32_t(shape.heads),queries,request.tokens,request.spans,ordinary,false,512)) return false;
+                    uint32_t(shape.heads),queries,request.tokens,request.spans,ordinary,false,uint32_t(shape.head_dim_k))) return false;
         required=std::max(required,std::max(plan.bytes,ordinary));
     }
     if (!required) return false;

@@ -48,6 +48,8 @@ struct llama_memory_recurrent::current_storage_state {
     std::vector<std::pair<ggml_context_ptr,ggml_backend_buffer_ptr>> retired;
     std::vector<std::vector<uint8_t>> parked_rows;
     ggml_backend_buffer_type_t type = nullptr;
+    bool measurement = false;
+    uint32_t publication_cells = 0, publication_slots = 0;
 };
 
 llama_memory_recurrent::llama_memory_recurrent(
@@ -58,12 +60,21 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter, bool stream_host_spill, bool defer_current) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter, bool stream_host_spill, bool defer_current) :
+    llama_memory_recurrent(model,type_r,type_s,offload,mem_size,n_seq_max,n_rs_seq,filter,stream_host_spill,defer_current,false) {}
+
+llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_type type_r,ggml_type type_s,bool offload,
+        uint32_t mem_size,uint32_t n_seq_max,uint32_t n_rs_seq,const layer_filter_cb & filter,
+        bool stream_host_spill,bool defer_current,bool measurement) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    if (measurement && !defer_current) throw std::runtime_error("recurrent graph measurement requires deferred current storage");
     const int32_t n_layer = hparams.n_layer();
     if (defer_current && (!mem_size || !n_seq_max || n_seq_max>LLAMA_MAX_SEQ ||
             mem_size>uint64_t(n_seq_max)+1 || uint64_t(mem_size)*(uint64_t(n_rs_seq)+1)>INT32_MAX))
         throw std::runtime_error("invalid deferred recurrent state geometry");
-    if (defer_current) selected_storage=std::make_unique<current_storage_state>();
+    if (defer_current) {
+        selected_storage=std::make_unique<current_storage_state>();
+        selected_storage->measurement=measurement;
+    }
 
     head = 0;
     size = mem_size;
@@ -81,7 +92,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         publication_slots=plan.stage_slots;
     }
     if (want_spill && hparams.ple_conv_state() > 0) throw std::runtime_error("recurrent host spill does not support PLE history");
-    if (want_spill && n_seq_max != 1) throw std::runtime_error("recurrent host spill requires one serial sequence");
+    if (want_spill && n_seq_max != 1 && !measurement) throw std::runtime_error("recurrent host spill requires one serial sequence");
 
 
     cells.clear();
@@ -205,21 +216,31 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto * host_type=device ? ggml_backend_dev_host_buffer_type(device) : nullptr;
         if (!host_type) host_type=ggml_backend_cpu_buffer_type();
         spill_cache_id=next_spill_cache_id.fetch_add(1,std::memory_order_relaxed);
-        spill=llama_recurrent_spill_bank::create(layout,host_type,spill_cache_id,0);
-        if (!spill) {
-            LLAMA_LOG_ERROR("%s: host recurrent snapshot allocation failed: buft=%s, bytes=%zu, cells=%u, depth=%u\n",
-                    __func__, host_type ? ggml_backend_buft_name(host_type) : "null", layout.host_snapshot_bytes, mem_size, n_rs_seq);
-            throw std::runtime_error("failed to allocate pinned recurrent snapshots");
-        }
-        const char * staged=std::getenv("LLAMA_RS_STAGED_PUBLICATION");
-        if (stream_host_spill || (staged && std::strcmp(staged,"1") == 0)) {
+        if (measurement) {
             auto * stage_device=device ? device : ggml_backend_dev_by_name("CPU");
             auto * stage_type=recurrent_stage_type(stage_device);
-            if (!stage_type || !spill->enable_publication(stage_device,stage_type,publication_slots,defer_current)) {
-                throw std::runtime_error("failed to create recurrent publication stage");
+            spill=llama_recurrent_spill_bank::create_measurement(layout,stage_device,stage_type,
+                publication_slots,spill_cache_id,0);
+            if (!spill) throw std::runtime_error("failed to describe recurrent publication storage");
+            selected_storage->publication_cells=mem_size;
+            selected_storage->publication_slots=publication_slots;
+        } else {
+            spill=llama_recurrent_spill_bank::create(layout,host_type,spill_cache_id,0);
+            if (!spill) {
+                LLAMA_LOG_ERROR("%s: host recurrent snapshot allocation failed: buft=%s, bytes=%zu, cells=%u, depth=%u\n",
+                        __func__, host_type ? ggml_backend_buft_name(host_type) : "null", layout.host_snapshot_bytes, mem_size, n_rs_seq);
+                throw std::runtime_error("failed to allocate pinned recurrent snapshots");
             }
-            LLAMA_LOG_INFO("%s: %s RS publication stage size = %.2f MiB\n",__func__,
-                ggml_backend_buft_name(stage_type),double(spill->staged_device_bytes())/(1024.0*1024.0));
+            const char * staged=std::getenv("LLAMA_RS_STAGED_PUBLICATION");
+            if (stream_host_spill || (staged && std::strcmp(staged,"1") == 0)) {
+                auto * stage_device=device ? device : ggml_backend_dev_by_name("CPU");
+                auto * stage_type=recurrent_stage_type(stage_device);
+                if (!stage_type || !spill->enable_publication(stage_device,stage_type,publication_slots,defer_current)) {
+                    throw std::runtime_error("failed to create recurrent publication stage");
+                }
+                LLAMA_LOG_INFO("%s: %s RS publication stage size = %.2f MiB\n",__func__,
+                    ggml_backend_buft_name(stage_type),double(spill->staged_device_bytes())/(1024.0*1024.0));
+            }
         }
     }
 
@@ -234,6 +255,29 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
     }
+}
+
+bool llama_memory_recurrent::prepare_measurement_publication(uint32_t active_cells) {
+    if (!selected_storage || !selected_storage->measurement || !n_rs_seq || !active_cells || active_cells>size ||
+            !selected_storage->publication_slots || ctxs_bufs.size()!=1) return false;
+    if (active_cells==selected_storage->publication_cells) return bool(spill);
+    try {
+        std::vector<llama_recurrent_spill_layer> specs(r_l.size());
+        for (size_t layer=0;layer<r_l.size();++layer) if (r_l[layer]) {
+            if (!s_l[layer]) return false;
+            specs[layer]={r_l[layer]->type,s_l[layer]->type,uint64_t(r_l[layer]->ne[0]),uint64_t(s_l[layer]->ne[0]),true};
+        }
+        llama_recurrent_spill_layout layout;
+        if (!llama_recurrent_spill_layout_make(specs,active_cells,n_rs_seq,layout)) return false;
+        auto * type=ggml_backend_buffer_get_type(ctxs_bufs.front().second.get());
+        auto * device=ggml_backend_buft_get_device(type);
+        auto next=llama_recurrent_spill_bank::create_measurement(layout,device,type,
+            selected_storage->publication_slots,spill_cache_id,0);
+        if (!next) return false;
+        spill=std::move(next);
+        selected_storage->publication_cells=active_cells;
+        return true;
+    } catch (const std::bad_alloc &) {return false;}
 }
 
 llama_memory_recurrent::~llama_memory_recurrent() {

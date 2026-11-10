@@ -50,6 +50,7 @@ struct llama_memory_params {
     uint32_t kv_stream_max_decode_rows = 4;
     ggml_backend_memory_lease_t bounded_cache_lease = nullptr;
     bool defer_bounded_cache = false;
+    bool measure_only = false;
 };
 
 enum llama_memory_status {

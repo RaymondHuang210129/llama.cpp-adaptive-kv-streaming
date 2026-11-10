@@ -67,7 +67,9 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr,
-        stream && stream->kv_stream_rs_rollback
+        stream && stream->kv_stream_rs_rollback,
+        stream && stream->measure_only,
+        stream && stream->measure_only
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
