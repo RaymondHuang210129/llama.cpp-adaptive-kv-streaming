@@ -6557,7 +6557,6 @@ static ggml_backend_operator_workspace_status ggml_cuda_operator_workspace_query
                 !ggml_cuda_operator_elements(op->src[1],elements)) return status::invalid;
         const auto * a=op->src[0];const auto * b=op->src[1];
         if (ggml_cuda_op_mul_mat_use_fwht(op)) return status::unsupported;
-        if (a->type!=GGML_TYPE_F16 && a->type!=GGML_TYPE_BF16 && a->type!=GGML_TYPE_F32 && a->type!=GGML_TYPE_Q8_0) return status::unsupported;
         switch (ggml_cuda_matmul_route_for(a,b,op,caps.cc,caps.warp_size)) {
             case ggml_cuda_matmul_route::vector_f:
             case ggml_cuda_matmul_route::vector_transposed:
