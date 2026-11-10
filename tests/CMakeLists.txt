@@ -384,6 +384,10 @@ llama_test_cmd(${CMAKE_COMMAND} NAME test-cuda-architecture-config
 llama_test_cmd(${CMAKE_COMMAND} NAME test-cuda-kv-runtime-config
     ARGS -DPROJECT_SOURCE_DIR=${PROJECT_SOURCE_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-cuda-kv-runtime-config.cmake)
 
+add_executable(test-cuda-mmq-workspace test-cuda-mmq-workspace.cpp)
+target_link_libraries(test-cuda-mmq-workspace PRIVATE ggml)
+llama_test(test-cuda-mmq-workspace)
+
 if (GGML_CUDA AND GGML_CUDA_FA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)

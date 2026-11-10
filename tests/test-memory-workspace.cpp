@@ -824,7 +824,7 @@ int main(int argc, char ** argv) {
         ggml_backend_tensor_set(weights,matrix,0,sizeof(matrix));
         ggml_backend_tensor_set(input,data,0,sizeof(data));
         ggml_backend_tensor_set(output,sentinel,0,sizeof(sentinel));
-        struct state {
+        struct callback_state {
             testing * test;
             ggml_backend_t backend;
             ggml_tensor * input;
@@ -834,7 +834,7 @@ int main(int argc, char ** argv) {
             bool gpu=false;
         } state{&t,compute,input,output,0,false,gpu};
         const auto callback=[](ggml_backend_t backend,ggml_cgraph * split,void * opaque) {
-            auto & s=*static_cast<struct state *>(opaque);
+            auto & s=*static_cast<callback_state *>(opaque);
             ++s.calls;
             s.test->assert_true(backend==s.backend && ggml_graph_n_nodes(split)==1);
             auto * copied=ggml_graph_node(split,0)->src[1];

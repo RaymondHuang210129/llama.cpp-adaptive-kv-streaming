@@ -137,6 +137,42 @@ static inline bool ggml_cuda_cublas_workspace_plan(const ggml_tensor * op,ggml_t
 bool ggml_cuda_mmq_workspace_plan(const ggml_tensor * a,const ggml_tensor * b,const ggml_tensor * dst,
     int cc,size_t shared_bytes,int nsm,ggml_backend_operator_workspace & output,int * selected_columns=nullptr,int * selected_threads=nullptr);
 
+// Plain MMQ keeps the quantized activations and optional NVFP4 row scales live through Stream-K.
+static inline bool ggml_cuda_mmq_activation_workspace(const ggml_tensor & activations, size_t padded_width,
+        int columns, int threads, ggml_type weight_type, ggml_prec precision, ggml_backend_operator_workspace & output) {
+    if (columns <= 0 || threads <= 0 || !padded_width ||
+            (precision != GGML_PREC_Q8 && precision != GGML_PREC_Q4)) return false;
+
+    const bool native_fp4 = precision == GGML_PREC_Q4;
+    // Both MMQ block layouts occupy four Q8_1 blocks, with FP4 packing twice as many values.
+    const size_t block_bytes = 4 * ggml_type_size(GGML_TYPE_Q8_1);
+    const size_t block_values = (native_fp4 ? 8 : 4) * ggml_blck_size(GGML_TYPE_Q8_1);
+    if (padded_width % block_values) return false;
+
+    size_t rows = 1;
+    for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+        if (activations.ne[dim] <= 0 || !ggml_cuda_operator_product(rows, size_t(activations.ne[dim]))) return false;
+    }
+    size_t bytes = padded_width / block_values;
+    size_t load_bytes = size_t(threads);
+    size_t tile_bytes = size_t(columns);
+    if (!ggml_cuda_operator_product(bytes, rows) || !ggml_cuda_operator_product(bytes, block_bytes) ||
+            !ggml_cuda_operator_product(load_bytes, sizeof(int)) || !ggml_cuda_operator_product(tile_bytes, block_bytes) ||
+            tile_bytes > SIZE_MAX - (load_bytes - 1)) return false;
+    const size_t padding = (tile_bytes + load_bytes - 1) / load_bytes * load_bytes;
+    if (bytes > SIZE_MAX - padding) return false;
+
+    ggml_backend_operator_workspace plan;
+    if (!ggml_backend_operator_workspace_add(plan, bytes + padding)) return false;
+    if (native_fp4 && weight_type == GGML_TYPE_NVFP4) {
+        size_t scale_bytes = rows;
+        if (!ggml_cuda_operator_product(scale_bytes, sizeof(float)) ||
+                !ggml_backend_operator_workspace_add(plan, scale_bytes)) return false;
+    }
+    output = plan;
+    return true;
+}
+
 static inline bool ggml_cuda_mmq_fixup_workspace(int64_t rows,int64_t columns,int64_t channels,int64_t samples,
         int tile_rows,int tile_columns,int nsm,bool stream_k,bool nvidia,size_t & output) {
     if (rows<=0 || rows>INT32_MAX || columns<=0 || columns>INT32_MAX || channels<=0 || channels>INT32_MAX ||

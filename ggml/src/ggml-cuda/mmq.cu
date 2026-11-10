@@ -156,16 +156,8 @@ bool ggml_cuda_mmq_workspace_plan(const ggml_tensor * a,const ggml_tensor * b,co
     if (best_columns<=0 || best_threads<=0) return false;
     size_t padded;
     if (!ggml_backend_operator_workspace_align(size_t(b->ne[0]),MATRIX_ROW_PADDING,padded)) return false;
-    size_t bytes=padded;
-    for (int i=1;i<GGML_MAX_DIMS;++i) if (!ggml_cuda_operator_product(bytes,size_t(b->ne[i]))) return false;
-    if (!ggml_cuda_operator_product(bytes,sizeof(block_q8_1_mmq))) return false;
-    bytes/=QK8_1_MMQ;
-    const size_t load=size_t(best_threads)*sizeof(int),raw=size_t(best_columns)*sizeof(block_q8_1_mmq);
-    if (raw>SIZE_MAX-(load-1)) return false;
-    const size_t padding=(raw+load-1)/load*load;
-    if (bytes>SIZE_MAX-padding) return false;
     ggml_backend_operator_workspace next;
-    if (!ggml_backend_operator_workspace_add(next,bytes+padding)) return false;
+    if (!ggml_cuda_mmq_activation_workspace(*b, padded, best_columns, best_threads, a->type, prec, next)) return false;
     const auto config=ggml_cuda_mmq_get_config(a->type,best_columns,fallback,cc,prec);
     size_t fixup;
     if (!ggml_cuda_mmq_fixup_workspace(a->ne[1],b->ne[1],b->ne[2],b->ne[3],config.I,config.J,nsm,
@@ -273,19 +265,15 @@ void ggml_cuda_mul_mat_q(
     }
     GGML_ASSERT(J_best > 0);
 
-    // A tile of size J can read in at most J - 1 extra columns.
-    // For simplicity, round up the padding of a full tile to a multiple of the number of bytes that nthreads can load in parallel.
-    const size_t src1_load_chunk_size = nthreads_best * sizeof(int);
-    const size_t src1_q8_1_padding = ((J_best * sizeof(block_q8_1_mmq) + src1_load_chunk_size - 1) / src1_load_chunk_size)
-        * src1_load_chunk_size;
-
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = measured_q8 ? measured_workspace.requests[0] :
-            ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        if (!measured_q8) {
+            GGML_ASSERT(ggml_cuda_mmq_activation_workspace(*src1, ne10_padded, J_best, nthreads_best,
+                    src0->type, prec_src1, measured_workspace));
+        }
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), measured_workspace.requests[0]);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-            src1_scale.alloc(ne13*ne12*ne11);
+            src1_scale.alloc(measured_workspace.requests[1] / sizeof(float));
         }
 
         {
@@ -326,6 +314,11 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne13 == 1);
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
+
+    // Round a full tile of padding up to the size loaded by one group of threads.
+    const size_t src1_load_chunk_size = nthreads_best * sizeof(int);
+    const size_t src1_q8_1_padding = ((J_best * sizeof(block_q8_1_mmq) + src1_load_chunk_size - 1) / src1_load_chunk_size)
+        * src1_load_chunk_size;
 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
