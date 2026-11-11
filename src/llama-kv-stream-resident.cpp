@@ -10,6 +10,8 @@
 #include "../ggml/src/ggml-cuda-graph.h"
 #include "../ggml/src/ggml-backend-execution.h"
 #include "llama-impl.h"
+#include "llama-hparams.h"
+#include "llama-cparams.h"
 
 #include <cmath>
 #include <chrono>
@@ -1749,4 +1751,429 @@ void llama_kv_stream_resident::release_write_workspace() {
     impl->writer.reset();
     impl->writer_lease.reset();
     impl->writer_base = impl->writer_bytes = 0;
+}
+
+struct llama_kv_stream_group_reader::implementation {
+    struct source {
+        llama_kv_stream_group_reader_source config;
+        resident_lease_ptr lease{nullptr,ggml_backend_memory_lease_free};
+        ggml_kv_stream_layout ring;
+        llama_kv_stream_policy_layout placement;
+        ggml_context_ptr metadata;
+        std::vector<std::pair<ggml_tensor *,ggml_tensor *>> prefix;
+        struct pending_mirror_stamp {uint64_t generation=0,epoch=0;size_t stable=0,tokens=0;};
+        std::vector<pending_mirror_stamp> pending_mirror;
+        llama_kv_stream_ring_cache pending_pages;
+        std::vector<uint8_t> queued;
+        size_t slots=0;
+        bool prefix_ready=false;
+        std::unique_ptr<void,void (*)(void *)> queue{nullptr,[](void *) {}};
+        size_t next=0;
+    };
+    ggml_backend_t backend=nullptr;
+    const ggml_kv_stream_copy_ops * copies=nullptr;
+    const ggml_kv_stream_registered_copy_ops * registered=nullptr;
+    resident_lease_ptr staging{nullptr,ggml_backend_memory_lease_free};
+    std::vector<source> sources;
+    ggml_kv_stream_layout tile;
+    std::function<bool(uint32_t)> current;
+    std::vector<ggml_kv_stream_gather_row> columns;
+    uint32_t layer=0;
+    size_t next=0,resident_bytes=0;
+    bool active=false,wide_prefill=false;
+
+    bool load_page(source & source,size_t page,size_t & physical) {
+        if (page>SIZE_MAX/256) return false;
+        const size_t token=page*256;
+        if (token>=source.config.tokens) return false;
+        const size_t live=std::min(size_t(256),source.config.tokens-token);
+        for (size_t slot=0;slot<source.slots;++slot) if (source.queued[slot] &&
+                source.pending_pages.contains(slot,layer,token,live)) {physical=slot;return true;}
+        size_t slot=source.slots;
+        for (size_t i=0;i<source.slots;++i) {
+            const auto candidate=(source.next+i)%source.slots;
+            if (!source.queued[candidate]) {slot=candidate;break;}
+        }
+        if (slot==source.slots) return false;
+        std::vector<llama_kv_stream_host_range> ranges[2];
+        std::vector<ggml_kv_stream_registered_copy_fragment> fragments[2];
+        for (bool value : {false,true}) {
+            const size_t stride=value ? tile.v_token_bytes : tile.k_token_bytes;
+            if (!source.config.host->ranges(layer,value ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,
+                    token*stride,live*stride,ranges[value])) return false;
+            for (const auto & range : ranges[value]) fragments[value].push_back({range.buffer.get(),range.offset,range.bytes});
+        }
+        if (!registered->enqueue(source.queue.get(),slot,fragments[0].data(),fragments[0].size(),
+                fragments[1].data(),fragments[1].size(),live,256,false) ||
+                !source.pending_pages.record(slot,layer,token,live)) return false;
+        source.queued[slot]=true;source.next=(slot+1)%source.slots;physical=slot;return true;
+    }
+
+    bool prime(size_t first) {
+        if (!active || first!=next || first>=columns.size() || !current(layer)) return false;
+        for (size_t index=0;index<sources.size();++index) {
+            auto & source=sources[index];
+            const size_t prefix=source.config.content ?
+                std::min((source.config.tokens+255)/256*256,source.placement.layers[layer].planes.tokens) : 0;
+            std::vector<size_t> pages;
+            for (size_t col=first;col<first+256;++col) if (columns[col].source==index && columns[col].token>=prefix)
+                pages.push_back(columns[col].token/256);
+            std::sort(pages.begin(),pages.end());pages.erase(std::unique(pages.begin(),pages.end()),pages.end());
+            const size_t ceiling=std::min(size_t(3),wide_prefill ? source.slots/2+source.slots%2 : source.slots);
+            for (size_t i=0;i<std::min(pages.size(),ceiling);++i) {
+                size_t slot=0;if (!load_page(source,pages[i],slot)) return false;
+            }
+        }
+        return true;
+    }
+};
+
+std::unique_ptr<llama_kv_stream_group_reader> llama_kv_stream_group_reader::create(ggml_backend_t backend,
+        const std::vector<llama_kv_stream_group_reader_source> & sources,ggml_backend_memory_lease_t staging,
+        std::function<bool(uint32_t)> source_current) {
+    if (!backend || sources.empty() || sources.size()>LLAMA_MAX_SEQ || !staging || !source_current) return {};
+    auto * device=ggml_backend_get_device(backend);
+    auto * type=llama_kv_stream_device_buffer_type(device);
+    auto * reg=ggml_backend_dev_backend_reg(device);
+    const auto copy_get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_copy_ops"));
+    const auto registered_get=reinterpret_cast<ggml_kv_stream_registered_copy_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_registered_copy_ops"));
+    const auto * copies=copy_get ? copy_get() : nullptr;
+    const auto * registered=registered_get ? registered_get() : nullptr;
+    if (!type || !copies || copies->version<12 || !copies->begin || !copies->drain || !copies->free ||
+            !copies->acquire_span || !copies->release_span || !copies->gather || !registered ||
+            !registered->version || !registered->create || !registered->enqueue) return {};
+    try {
+        auto result=std::unique_ptr<llama_kv_stream_group_reader>(new llama_kv_stream_group_reader);
+        result->impl=std::make_unique<implementation>();auto & s=*result->impl;
+        s.backend=backend;s.copies=copies;s.registered=registered;s.current=std::move(source_current);
+        auto * parent=ggml_backend_memory_lease_parent(staging);
+        const auto generation=ggml_backend_memory_lease_generation(staging);
+        std::vector<ggml_backend_memory_region> regions;
+        const auto accept=[&](ggml_backend_memory_lease_t lease) {
+            ggml_backend_memory_region region;
+            auto * buffer=ggml_backend_memory_lease_buffer(lease);
+            if (!lease || !buffer || !parent || ggml_backend_memory_lease_parent(lease)!=parent ||
+                    !generation || ggml_backend_memory_lease_generation(lease)!=generation ||
+                    ggml_backend_buffer_get_type(buffer)!=type || !ggml_backend_memory_lease_get_region(lease,&region) ||
+                    !region.size || region.offset>SIZE_MAX-region.size) return false;
+            for (const auto & old : regions)
+                if (old.offset<region.offset+region.size && region.offset<old.offset+old.size) return false;
+            regions.push_back(region);return true;
+        };
+        if (!accept(staging) || !sources.front().host) return {};
+        const auto & shape=sources.front().host->config().shape;
+        if (shape.page_tokens!=256 || ggml_kv_stream_layout_make(shape,256,s.tile).status!=ggml_kv_stream_status::success ||
+                ggml_backend_buffer_get_size(ggml_backend_memory_lease_buffer(staging))!=s.tile.bytes) return {};
+        s.staging.reset(ggml_backend_memory_lease_retain(staging));
+        for (const auto & grant : sources) {
+            if (!grant.host || !grant.host->valid() || !grant.prepared_copies || !grant.pages ||
+                    grant.pages>size_t(INT32_MAX)/256 || !grant.tokens || grant.tokens>grant.host->config().context_tokens ||
+                    !accept(grant.pool)) return {};
+            const auto & other=grant.host->config().shape;
+            if (other.type_k!=shape.type_k || other.type_v!=shape.type_v || other.head_dim_k!=shape.head_dim_k ||
+                    other.head_dim_v!=shape.head_dim_v || other.heads!=shape.heads ||
+                    other.page_tokens!=shape.page_tokens || other.alignment!=shape.alignment) return {};
+            for (const auto & previous : s.sources) if (previous.config.host==grant.host) return {};
+            implementation::source source;source.config=grant;
+            if (source.config.stable_tokens==SIZE_MAX) source.config.stable_tokens=grant.tokens;
+            if (source.config.stable_tokens>grant.tokens) return {};
+            source.lease.reset(ggml_backend_memory_lease_retain(grant.pool));source.slots=grant.pages;
+            if (grant.content) {
+                if (grant.content->host()!=grant.host || grant.host->config().layers>LLAMA_MAX_LAYERS) return {};
+                const auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_partial_ops"));
+                const auto * partial=get ? get() : nullptr;
+                if (!partial || !partial->capabilities) return {};
+                llama_kv_stream_policy_config config;
+                config.shape=shape;config.capabilities=partial->capabilities(backend,shape.type_k,shape.type_v);
+                config.layers=grant.host->config().layers;config.pool_bytes=ggml_backend_buffer_get_size(ggml_backend_memory_lease_buffer(grant.pool));
+                llama_kv_stream_policy_state policy;
+                if (llama_kv_stream_policy_initialize(config,policy).status!=llama_kv_stream_policy_status::success ||
+                        policy.budget.pages!=grant.pages ||
+                        llama_kv_stream_policy_layout_make(config,policy,grant.tokens,source.placement).status!=llama_kv_stream_policy_status::success) return {};
+                source.slots=policy.ring_slots;
+                source.metadata.reset(ggml_init({size_t(config.layers)*2*ggml_tensor_overhead()+65536,nullptr,true}));
+                if (!source.metadata) return {};
+                source.prefix.resize(config.layers);source.pending_mirror.resize(config.layers);
+                auto * buffer=ggml_backend_memory_lease_buffer(grant.pool);
+                for (uint32_t layer=0;layer<config.layers;++layer) for (bool value : {false,true}) {
+                    const auto & entry=source.placement.layers[layer];const auto & planes=entry.planes;
+                    const auto bytes=value ? planes.v_bytes : planes.k_bytes;
+                    if (!bytes) continue;
+                    const auto dtype=ggml_type(value ? shape.type_v : shape.type_k);
+                    const size_t size=ggml_type_size(dtype),block=ggml_blck_size(dtype);
+                    if (!size || !block || bytes%size || bytes/size>size_t(INT64_MAX)/block) return {};
+                    auto * tensor=ggml_new_tensor_1d(source.metadata.get(),dtype,int64_t(bytes/size*block));
+                    const size_t offset=entry.offset+(value ? planes.v_offset : 0);
+                    if (ggml_nbytes(tensor)!=bytes || offset>config.pool_bytes || bytes>config.pool_bytes-offset ||
+                            ggml_backend_buffer_get_alloc_size(buffer,tensor)!=bytes ||
+                            ggml_backend_tensor_alloc(buffer,tensor,static_cast<char *>(ggml_backend_buffer_get_base(buffer))+offset)!=GGML_STATUS_SUCCESS) return {};
+                    (value ? source.prefix[layer].second : source.prefix[layer].first)=tensor;
+                }
+            }
+            if (ggml_kv_stream_layout_make(shape,source.slots*256,source.ring).status!=ggml_kv_stream_status::success ||
+                    source.ring.bytes>ggml_backend_buffer_get_size(ggml_backend_memory_lease_buffer(grant.pool))) return {};
+            if (!source.pending_pages.reset(source.slots,256)) return {};
+            source.queued.resize(source.slots);
+            llama_kv_stream_host_layer first;
+            if (!grant.host->layer(0,first)) return {};
+            source.queue={registered->create(backend,grant.prepared_copies.get(),ggml_backend_memory_lease_buffer(grant.pool),
+                {first.k,grant.host->bytes()},shape,source.slots),copies->free};
+            if (!source.queue) return {};
+            s.sources.push_back(std::move(source));
+        }
+        for (const auto & source : s.sources) if (source.config.content && !source.config.content->reset_mirror()) return {};
+        return result;
+    } catch (const std::bad_alloc &) {return {};}
+}
+
+llama_kv_stream_group_reader::~llama_kv_stream_group_reader() {if (impl) finish();}
+
+bool llama_kv_stream_group_reader::update_frontiers(const std::vector<llama_kv_stream_group_frontier> & frontiers) {
+    if (!impl || impl->active || frontiers.size()!=impl->sources.size()) return false;
+    for (size_t i=0;i<frontiers.size();++i) {
+        const auto & next=frontiers[i];const auto & old=impl->sources[i].config;
+        if (!next.tokens || next.tokens>old.host->config().context_tokens || next.tokens<old.tokens ||
+                next.stable_tokens>next.tokens || (next.tokens>old.tokens && next.stable_tokens!=old.tokens) ||
+                (next.tokens==old.tokens && next.stable_tokens!=old.stable_tokens && next.stable_tokens!=next.tokens)) return false;
+    }
+    for (size_t i=0;i<frontiers.size();++i) {
+        impl->sources[i].config.tokens=frontiers[i].tokens;
+        impl->sources[i].config.stable_tokens=frontiers[i].stable_tokens;
+    }
+    return true;
+}
+
+bool llama_kv_stream_group_reader::begin(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns) {
+    auto & s=*impl;
+    if (s.active || columns.empty() || columns.size()>INT32_MAX || columns.size()%256) return false;
+    try {
+        if (!s.current(layer)) return false;
+        for (const auto & source : s.sources) {
+            if (layer>=source.config.host->config().layers) return false;
+            for (bool value : {false,true}) {
+                const auto & layout=source.config.host->layout();
+                const auto stride=value ? layout.v_token_bytes : layout.k_token_bytes;
+                std::vector<llama_kv_stream_host_range> ranges;
+                if (!source.config.host->ranges(layer,value ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,
+                        0,source.config.tokens*stride,ranges)) return false;
+            }
+        }
+        for (const auto & row : columns) if (row.source!=UINT32_MAX &&
+                (row.source>=s.sources.size() || row.token>=s.sources[row.source].config.tokens)) return false;
+        auto next=columns;
+        for (auto & source : s.sources) if (source.config.content && source.config.stable_tokens<source.config.tokens) {
+            auto & stamp=source.pending_mirror[layer];const auto & config=source.config;
+            const auto generation=config.content->generation(),epoch=config.content->mirror_epoch();
+            if (stamp.generation!=generation || stamp.epoch!=epoch || stamp.stable!=config.stable_tokens || stamp.tokens!=config.tokens) {
+                const size_t first=config.stable_tokens,count=config.tokens-first;
+                if (!config.content->invalidate_mirror_rows({{layer,ggml_kv_stream_operand::k,first,count},
+                        {layer,ggml_kv_stream_operand::v,first,count}})) return false;
+                stamp={generation,epoch,first,config.tokens};
+            }
+        }
+        s.layer=layer;s.next=0;s.resident_bytes=0;s.active=true;s.wide_prefill=false;
+        for (auto & source : s.sources) {
+            source.prefix_ready=false;source.pending_pages.clear();std::fill(source.queued.begin(),source.queued.end(),false);
+            if (!s.copies->begin(source.queue.get())) {finish();return false;}
+        }
+        s.columns=std::move(next);return true;
+    } catch (...) {finish();return false;}
+}
+
+bool llama_kv_stream_group_reader::gather(size_t first) {
+    auto & s=*impl;
+    if (!s.active || first!=s.next || first>=s.columns.size()) return false;
+    try {
+        if (!s.current(s.layer)) return false;
+        bool initialize=true;
+        std::vector<ggml_kv_stream_span_plan_view> views(s.sources.size());
+        for (size_t i=0;i<s.sources.size();++i) views[i]={s.sources[i].config.host->config().shape,nullptr,0,
+            (s.sources[i].config.tokens+255)/256*256,1};
+        std::vector<ggml_kv_stream_gather_row> packet(256);
+        std::vector<ggml_kv_stream_copy_rectangle> rectangles;
+        for (size_t i=0;i<s.sources.size();++i) {
+            auto & source=s.sources[i];
+            const auto * resident=source.config.content ? &source.placement.layers[s.layer] : nullptr;
+            const size_t prefix=resident ? std::min((source.config.tokens+255)/256*256,resident->planes.tokens) : 0;
+            if (prefix && !source.prefix_ready) {
+                if (!source.config.host->prepare(prefix) || !source.config.content->flush(
+                        {{s.layer,ggml_kv_stream_operand::k,0,prefix},{s.layer,ggml_kv_stream_operand::v,0,prefix}},
+                        [&](const llama_kv_stream_copy_span & span) {
+                            const bool value=span.rows.operand==ggml_kv_stream_operand::v;
+                            auto * tensor=value ? source.prefix[s.layer].second : source.prefix[s.layer].first;
+                            const size_t stride=value ? resident->planes.v_token_bytes : resident->planes.k_token_bytes;
+                            size_t calls=0;
+                            if (!tensor || !source.config.host->upload(s.backend,tensor,span.rows.first*stride,span.data,span.bytes,calls)) return false;
+                            ggml_backend_synchronize(s.backend);s.resident_bytes+=span.bytes;return true;
+                        })) {finish();return false;}
+                source.prefix_ready=true;
+            }
+            bool resident_packet=false;
+            std::fill(packet.begin(),packet.end(),ggml_kv_stream_gather_row{});
+            for (size_t col=first;col<first+256;++col) if (s.columns[col].source==i && s.columns[col].token<prefix) {
+                packet[col-first]=s.columns[col];resident_packet=true;
+            }
+            if (resident_packet) {
+                auto * buffer=ggml_backend_memory_lease_buffer(source.lease.get());
+                const ggml_kv_stream_span span{buffer,buffer,0,prefix,resident->offset,resident->offset+resident->planes.v_offset};
+                views[i].spans=&span;views[i].count=1;
+                if (!ggml_kv_stream_gather_make(views.data(),views.size(),packet,0,
+                        ggml_backend_memory_lease_buffer(s.staging.get()),rectangles) ||
+                        !s.copies->gather(s.backend,ggml_backend_memory_lease_buffer(s.staging.get()),rectangles.data(),rectangles.size(),initialize)) {
+                    finish();return false;
+                }
+                views[i].spans=nullptr;views[i].count=0;initialize=false;
+            }
+            std::vector<size_t> pages;
+            for (size_t col=first;col<first+256;++col) if (s.columns[col].source==i && s.columns[col].token>=prefix)
+                pages.push_back(s.columns[col].token/256);
+            std::sort(pages.begin(),pages.end());pages.erase(std::unique(pages.begin(),pages.end()),pages.end());
+            for (size_t batch=0;batch<pages.size();) {
+                const size_t ceiling=s.wide_prefill ? source.slots/2+source.slots%2 : source.slots;
+                const size_t count=std::min({size_t(3),ceiling,pages.size()-batch});
+                ggml_kv_stream_span spans[3];
+                size_t physical[3];
+                for (size_t part=0;part<count;++part) {
+                    const size_t token=pages[batch+part]*256;
+                    if (!s.load_page(source,pages[batch+part],physical[part]) ||
+                            !s.copies->acquire_span(source.queue.get(),physical[part],1)) {finish();return false;}
+                    auto * buffer=ggml_backend_memory_lease_buffer(source.lease.get());
+                    spans[part]={buffer,buffer,token,256,physical[part]*s.tile.k_bytes,source.ring.v_offset+physical[part]*s.tile.v_bytes};
+                }
+                views[i].spans=spans;views[i].count=count;
+                std::fill(packet.begin(),packet.end(),ggml_kv_stream_gather_row{});
+                for (size_t col=first;col<first+256;++col) if (s.columns[col].source==i &&
+                        std::binary_search(pages.begin()+batch,pages.begin()+batch+count,s.columns[col].token/256)) packet[col-first]=s.columns[col];
+                if (!ggml_kv_stream_gather_make(views.data(),views.size(),packet,0,
+                        ggml_backend_memory_lease_buffer(s.staging.get()),rectangles) ||
+                        !s.copies->gather(s.backend,ggml_backend_memory_lease_buffer(s.staging.get()),rectangles.data(),rectangles.size(),initialize)) {
+                    finish();return false;
+                }
+                for (size_t part=0;part<count;++part) {
+                    if (!s.copies->release_span(source.queue.get(),physical[part],1)) {finish();return false;}
+                    source.queued[physical[part]]=false;source.pending_pages.invalidate(physical[part],1);
+                }
+                views[i].spans=nullptr;views[i].count=0;
+                initialize=false;batch+=count;
+            }
+        }
+        if (initialize && !s.copies->gather(s.backend,ggml_backend_memory_lease_buffer(s.staging.get()),nullptr,0,true)) {finish();return false;}
+        s.next+=256;return true;
+    } catch (...) {finish();return false;}
+}
+
+bool llama_kv_stream_group_reader::finish() noexcept {
+    if (!impl || !impl->active) return true;
+    auto & s=*impl;
+    try {
+        for (auto & source : s.sources) s.copies->drain(source.queue.get());
+        ggml_backend_synchronize(s.backend);
+        for (auto & source : s.sources) {source.pending_pages.clear();std::fill(source.queued.begin(),source.queued.end(),false);}
+        s.active=false;s.wide_prefill=false;s.columns.clear();return true;
+    } catch (...) {return false;}
+}
+
+size_t llama_kv_stream_group_reader::resident_upload_bytes() const noexcept {return impl ? impl->resident_bytes : 0;}
+
+bool llama_kv_stream_group_reader::attention(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,
+        ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode) {
+    auto & s=*impl;
+    if (s.active || !op || !workspace) return false;
+    try {
+        auto * registry=ggml_backend_dev_backend_reg(ggml_backend_get_device(s.backend));
+        const auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_kv_stream_partial_ops"));
+        const auto * partial=get ? get() : nullptr;
+        if (!partial || !partial->capabilities || !partial->resume || !partial->resume_spans) return false;
+        const auto & shape=s.sources.front().config.host->config().shape;
+        ggml_kv_stream_execution execution;
+        if (ggml_kv_stream_attention_validate(op,{shape.head_dim_k,shape.head_dim_v,256,shape.page_tokens,shape.alignment},
+                partial->capabilities(s.backend,shape.type_k,shape.type_v),256,execution).status!=ggml_kv_stream_status::success ||
+                op->src[1]->type!=shape.type_k || op->src[2]->type!=shape.type_v ||
+                op->src[1]->ne[2]!=shape.heads || size_t(op->src[1]->ne[1])!=columns.size()) return false;
+        auto * scratch=ggml_backend_memory_lease_buffer(workspace);
+        if (!scratch || ggml_backend_memory_lease_parent(workspace)!=ggml_backend_memory_lease_parent(s.staging.get()) ||
+                ggml_backend_memory_lease_generation(workspace)!=ggml_backend_memory_lease_generation(s.staging.get()) ||
+                ggml_backend_buffer_get_type(scratch)!=ggml_backend_buffer_get_type(ggml_backend_memory_lease_buffer(s.staging.get()))) return false;
+        struct range {uintptr_t first,last;};
+        const auto buffer_range=[](ggml_backend_buffer_t buffer,range & output) {
+            if (!buffer) return false;
+            const auto base=uintptr_t(ggml_backend_buffer_get_base(buffer));const auto bytes=ggml_backend_buffer_get_size(buffer);
+            if (!base || !bytes || bytes>UINTPTR_MAX-base) return false;
+            output={base,base+bytes};return true;
+        };
+        const auto overlaps=[](range a,range b) {return a.first<b.last && b.first<a.last;};
+        range work;
+        if (!buffer_range(scratch,work)) return false;
+        std::vector<range> reserved;
+        range staging;
+        if (!buffer_range(ggml_backend_memory_lease_buffer(s.staging.get()),staging) || overlaps(staging,work)) return false;
+        reserved.push_back(staging);
+        for (const auto & source : s.sources) {
+            range pool;
+            if (!buffer_range(ggml_backend_memory_lease_buffer(source.lease.get()),pool) || overlaps(pool,work)) return false;
+            reserved.push_back(pool);
+        }
+        reserved.push_back(work);
+        std::vector<range> inputs;
+        for (const auto * tensor : {op->src[0],op->src[5] ? op->src[5] : op->src[3],op}) {
+            if (!tensor || !tensor->data) return false;
+            auto * buffer=tensor->buffer ? tensor->buffer : tensor->view_src ? tensor->view_src->buffer : nullptr;
+            range backing;
+            if (!buffer_range(buffer,backing) || ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer))!=
+                    ggml_backend_get_device(s.backend)) return false;
+            size_t bytes=ggml_type_size(tensor->type);
+            for (int dimension=0;dimension<4;++dimension) {
+                if (tensor->ne[dimension]<=0 || tensor->ne[dimension]>INT32_MAX) return false;
+                const auto count=size_t(tensor->ne[dimension]-1),stride=tensor->nb[dimension];
+                if (count && stride>(SIZE_MAX-bytes)/count) return false;
+                bytes+=count*stride;
+            }
+            const auto address=uintptr_t(tensor->data);
+            if (address<backing.first || address>backing.last || bytes>backing.last-address) return false;
+            const range value{address,address+bytes};
+            for (const auto old : reserved) if (overlaps(value,old)) return false;
+            for (const auto old : inputs) if (overlaps(value,old)) return false;
+            inputs.push_back(value);
+        }
+        const uint32_t queries=uint32_t(op->src[0]->ne[1]),heads=uint32_t(op->src[0]->ne[2]);
+        const size_t tokens=columns.size();
+        ggml_kv_stream_resume_plan plan;
+        size_t needed=0;
+        const ggml_kv_stream_attention_request request{shape,heads,queries,tokens};
+        if (!ggml_kv_stream_resume_plan_query(partial,s.backend,request,plan) ||
+                !ggml_kv_stream_workspace_query(partial,s.backend,request,decode ?
+                    ggml_kv_stream_workspace_kind::decode : ggml_kv_stream_workspace_kind::prefill,needed) ||
+                needed>ggml_backend_buffer_get_size(scratch) || plan.bytes>ggml_backend_buffer_get_size(scratch)) return false;
+        if (!begin(layer,columns)) return false;
+        s.wide_prefill=!decode && queries>=128;
+        if (!s.prime(0)) {finish();return false;}
+        for (size_t first=0;first<tokens;first+=256) {
+            if (!gather(first) || (first+256<tokens && !s.prime(first+256))) {finish();return false;}
+            auto step=*op;
+            if (plan.span_resume) {
+                auto logical_key=*op->src[1],logical_value=*op->src[2];
+                logical_key.buffer=logical_value.buffer=nullptr;logical_key.data=logical_value.data=nullptr;
+                step.src[1]=&logical_key;step.src[2]=&logical_value;
+                auto * buffer=ggml_backend_memory_lease_buffer(s.staging.get());
+                const ggml_kv_stream_span span{buffer,buffer,first,256,0,s.tile.v_offset};
+                const ggml_kv_stream_span_plan_view wave{shape,&span,1,tokens,queries};
+                if (!partial->resume_spans(s.backend,&step,scratch,plan,wave,first,first+256)) {finish();return false;}
+            } else {
+                ggml_tensor key{},value{};
+                for (auto * tensor : {&key,&value}) {
+                    const bool side=tensor==&value;tensor->type=ggml_type(side ? shape.type_v : shape.type_k);
+                    tensor->ne[0]=side ? shape.head_dim_v : shape.head_dim_k;tensor->ne[1]=256;
+                    tensor->ne[2]=shape.heads;tensor->ne[3]=1;
+                    tensor->nb[0]=ggml_type_size(tensor->type);tensor->nb[1]=side ? s.tile.v_token_bytes : s.tile.k_token_bytes;
+                    tensor->nb[2]=side ? s.tile.v_row_bytes : s.tile.k_row_bytes;tensor->nb[3]=side ? s.tile.v_bytes : s.tile.k_bytes;
+                    tensor->buffer=ggml_backend_memory_lease_buffer(s.staging.get());
+                    tensor->data=static_cast<uint8_t *>(ggml_backend_buffer_get_base(tensor->buffer))+(side ? s.tile.v_offset : 0);
+                }
+                step.src[1]=&key;step.src[2]=&value;ggml_tensor mask;
+                if (op->src[3]) {mask=*op->src[3];mask.ne[0]=256;mask.data=static_cast<uint8_t *>(mask.data)+first*sizeof(ggml_fp16_t);step.src[3]=&mask;}
+                if (!partial->resume(s.backend,&step,scratch,plan,tokens,first,first+256==tokens)) {finish();return false;}
+            }
+        }
+        return finish();
+    } catch (...) {finish();return false;}
 }

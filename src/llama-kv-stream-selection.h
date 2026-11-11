@@ -47,6 +47,9 @@ struct llama_kv_stream_selection {
     std::vector<llama_kv_stream_selection_entry> slots;
 };
 
+// Validate the immutable logical extents and equal append allowances without allocation.
+bool llama_kv_stream_selection_valid(const llama_kv_stream_selection & selection) noexcept;
+
 enum class llama_kv_stream_selection_status {
     success, idle, no_progress, invalid_config, allocation_failed,
 };
@@ -94,3 +97,60 @@ struct llama_kv_stream_page_partition_result {
 llama_kv_stream_page_partition_result llama_kv_stream_partition_pages(
         const llama_kv_stream_selection & selected, uint32_t pages,
         const std::vector<llama_kv_stream_page_minimum> & minima, llama_kv_stream_page_partition & output);
+
+enum class llama_kv_stream_group_phase { idle, vision, prefill, decode, retiring };
+
+struct llama_kv_stream_group_request {
+    uint32_t slot = 0;
+    uint64_t request = 0; // Monotonic per-slot request epoch.
+    size_t history_tokens = 0;
+    uint64_t compatibility = 0;
+    bool needs_vision = false;
+};
+
+struct llama_kv_stream_group_plan {
+    uint64_t epoch = 0, revision = 0;
+    llama_kv_stream_selection selected;
+};
+
+struct llama_kv_stream_group_progress {
+    uint32_t slot = 0;
+    uint64_t request = 0;
+    size_t history_tokens = 0;
+};
+
+// Owner-thread scheduling only. The caller drains and binds GPU resources before activation,
+// and retains samplers, accepted output cursors and response connections with each request.
+class llama_kv_stream_request_group {
+public:
+    explicit llama_kv_stream_request_group(llama_kv_stream_selection_config config) : config(config) {}
+    bool admit(const std::vector<llama_kv_stream_group_request> & requests);
+    llama_kv_stream_group_phase phase() const noexcept;
+    bool next_preparation(llama_kv_stream_group_request & request) const noexcept;
+    bool prepared(uint32_t slot, uint64_t request, llama_kv_stream_group_phase phase, size_t history_tokens) noexcept;
+    bool busy(uint32_t slot, uint64_t request) const noexcept;
+    bool selected(uint32_t slot, uint64_t request) const noexcept;
+    llama_kv_stream_selection_status plan(llama_kv_stream_group_plan & output,
+        llama_kv_stream_selection_admit admit = nullptr, void * user_data = nullptr) const;
+    // Move a validated proposal after the common resource transition succeeds; no allocation here.
+    bool activate(llama_kv_stream_group_plan && plan) noexcept;
+    bool needs_reselection() const noexcept;
+    bool submission(uint32_t slot, uint64_t request, uint32_t maximum_proposals, size_t remaining_outputs,
+        llama_kv_stream_generation_budget & output) const noexcept;
+    bool advance(const std::vector<llama_kv_stream_group_progress> & progress) noexcept;
+    bool finish(uint32_t slot, uint64_t request) noexcept;
+    // Release the frozen group only after its last GPU users are retired.
+    bool release() noexcept;
+private:
+    struct member {
+        llama_kv_stream_group_request request;
+        llama_kv_stream_group_phase pending = llama_kv_stream_group_phase::prefill;
+        bool finished = false;
+    };
+    const member * find(uint32_t slot, uint64_t request) const noexcept;
+    llama_kv_stream_selection_config config;
+    std::vector<member> members;
+    std::vector<uint64_t> request_epochs;
+    llama_kv_stream_selection active;
+    uint64_t epoch = 0, revision = 0;
+};

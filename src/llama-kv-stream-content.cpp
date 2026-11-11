@@ -284,6 +284,13 @@ bool llama_kv_stream_content::reset_mirror() {
     return true;
 }
 
+bool llama_kv_stream_content::invalidate_mirror_rows(const std::vector<llama_kv_stream_rows> & rows) {
+    if (state->busy || !state->host->valid()) return false;
+    for (const auto & range : rows) if (!rows_valid(*state,range)) return false;
+    for (const auto & range : rows) mark(*state,range,true);
+    return true;
+}
+
 // This correctness baseline never acknowledges data while a copy can still reference it.
 bool llama_kv_stream_content::flush(const std::vector<llama_kv_stream_rows> & ranges,
         const std::function<bool(const llama_kv_stream_copy_span &)> & copy) {

@@ -2386,6 +2386,15 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+    if (!params.kv_stream_selected_sequences.empty() &&
+            ((!params.measure_only && !params.defer_full_cache) || !cparams.kv_unified || cparams.n_rs_seq || params.mem_other ||
+             params.ctx_type!=LLAMA_CONTEXT_TYPE_DEFAULT || (arch!=LLM_ARCH_QWEN35 && arch!=LLM_ARCH_GEMMA4) ||
+             !llama_memory_selected_sequences_valid(params,cparams.n_seq_max)))
+        throw std::runtime_error("selected memory factory is restricted to target measurement until group execution is bound");
+
+    if (params.defer_full_cache && (params.measure_only || params.kv_stream_selected_sequences.empty() ||
+            !params.shared_device_memory_bytes || params.kv_stream_pool_bytes))
+        throw std::runtime_error("deferred group execution requires selected targets and one phase arena");
 
     // the non-causal LFM2 decision graph reads the whole prompt in one batch, nothing is kept
     if (arch == LLM_ARCH_LFM2 && !hparams.causal_attn && hparams.n_layer_decision > 0) {
@@ -2815,7 +2824,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_kv_size */ params.kv_stream_selected_sequences.empty() ?
+                                std::max(uint32_t(1),cparams.n_seq_max) : uint32_t(params.kv_stream_selected_sequences.size()),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,

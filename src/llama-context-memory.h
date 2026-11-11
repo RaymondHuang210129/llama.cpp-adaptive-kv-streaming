@@ -10,6 +10,8 @@
 class llama_kv_stream_model;
 struct llama_memory_bounded_kv_layout;
 class llama_context_memory;
+class llama_memory_workspace;
+struct llama_memory_workspace_group;
 
 // Return a persistent cache region after its stock tensors and pending work have been released.
 class llama_context_memory_loan {
@@ -79,6 +81,13 @@ public:
             llama_context_memory * serial_parent = nullptr, bool suspended_workspace = false,
             const std::function<bool()> & before_capture = {}, size_t serial_parent_bytes = 0,
             llama_context_memory_create_result * result = nullptr);
+    // The common group coordinator supplies grants and gates the complete model submission.
+    // This factory creates no parent or backend workspace allocation.
+    static std::unique_ptr<llama_context_memory> create_external_workspace(ggml_backend_sched_t sched,
+        const std::vector<ggml_backend_t> & backends, std::vector<llama_memory_workspace_group> groups,
+        const std::function<bool()> & submission_allowed, const std::function<bool()> & before_capture = {});
+    llama_memory_workspace * external_workspace() noexcept;
+    bool capture_external_workspace() noexcept;
     // Reserve a fixed cache suffix inside the declared parent, not a second backend allocation.
     LLAMA_API std::unique_ptr<llama_context_memory_loan> reserve_bounded_cache(const llama_memory_bounded_kv_layout & layout);
     // Quote all phase minima before mutation; required_bytes describes a restart with movable fixed suffixes.

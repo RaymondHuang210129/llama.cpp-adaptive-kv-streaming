@@ -720,6 +720,127 @@ int main(int argc, char ** argv) {
             t.assert_equal(789u,sentinel.workspace_rows);
         }
     });
+    t.test("selected_current_bank_accepts_logical_id_without_allocating_unchosen_rows", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        llama_memory_recurrent memory(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,1,2,0,nullptr,false,true);
+        if (!t.assert_true(memory.configure_selected_sequences({1}))) return;
+        ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+        if (!t.assert_true(memory.current_storage_requirements(type,bytes))) return;
+        t.assert_equal(int64_t(1),memory.r_l[0]->ne[1]);
+        t.assert_equal(int64_t(1),memory.s_l[0]->ne[1]);
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new(type,bytes),ggml_backend_memory_arena_free);
+        const auto alignment=ggml_backend_buft_get_alignment(type);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),91,0,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> lease(
+            ggml_backend_memory_arena_acquire(arena.get(),91),ggml_backend_memory_lease_free);
+        if (!t.assert_true(lease && memory.bind_current_storage(lease.get()))) return;
+        llama_batch_allocr allocator(1);
+        auto batch=allocator.ubatch_reserve(2,1);
+        llama_seq_id id=1;
+        batch.n_seq_id[0]=batch.n_seq_id[1]=1;
+        batch.seq_id[0]=batch.seq_id[1]=&id;
+        batch.pos[0]=0;batch.pos[1]=1;
+        if (!t.assert_true("selected logical sequence uses the sole physical current row",memory.prepare({batch}) && memory.find_slot(batch))) return;
+        t.assert_equal(uint32_t(1),memory.used);
+        t.assert_equal(llama_pos(-1),memory.seq_pos_max(0));
+        t.assert_equal(llama_pos(1),memory.seq_pos_max(1));
+        t.assert_true(memory.cells[0].has_seq_id(1));
+        std::vector<float> values(ggml_nelements(memory.s_l[0]),-0.125f);values[0]=-0.0f;
+        ggml_backend_tensor_set(memory.s_l[0],values.data(),0,ggml_nbytes(memory.s_l[0]));
+        recurrent_bytes_writer saved;memory.state_write(saved,1,0);
+        if (!t.assert_true(!saved.bytes.empty())) return;
+        id=0;batch.pos[0]=2;batch.pos[1]=3;
+        t.assert_true(!memory.prepare({batch}) && !memory.find_slot(batch));
+        t.assert_equal(llama_pos(1),memory.seq_pos_max(1));
+        t.assert_true(memory.seq_rm(1,0,-1));
+        t.assert_equal(llama_pos(-1),memory.seq_pos_max(1));
+        recurrent_bytes_reader restore(saved.bytes);memory.state_read(restore,1,0);
+        t.assert_equal(saved.bytes.size(),restore.cursor);
+        recurrent_bytes_writer again;memory.state_write(again,1,0);
+        t.assert_true(saved.bytes==again.bytes);
+        t.assert_true(memory.cells[0].has_seq_id(1));
+        t.assert_true(!memory.configure_selected_sequences({0}));
+        memory.clear(false);
+        t.assert_equal(llama_pos(-1),memory.seq_pos_max(1));
+        id=1;batch.pos[0]=0;batch.pos[1]=1;
+        t.assert_true(memory.prepare({batch}) && memory.find_slot(batch));
+    });
+    t.test("compact_selected_current_rows_restore_native_sequence_images_independently", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        std::vector<std::vector<uint8_t>> references;
+        for (uint32_t slot=0;slot<4;++slot) {
+            llama_memory_recurrent native(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,1,1,0,nullptr);
+            llama_batch_allocr allocator(1);auto batch=allocator.ubatch_reserve(2,1);
+            llama_seq_id sequence=0;
+            batch.n_seq_id[0]=batch.n_seq_id[1]=1;batch.seq_id[0]=batch.seq_id[1]=&sequence;
+            batch.pos[0]=llama_pos(10+slot*5);batch.pos[1]=batch.pos[0]+1;
+            if (!t.assert_true(native.find_slot(batch))) return;
+            for (auto * tensor : {native.r_l[0],native.s_l[0]}) {
+                std::vector<float> values(ggml_nelements(tensor),float(slot+1)*-0.125f);values[0]=-0.0f;
+                ggml_backend_tensor_set(tensor,values.data(),0,ggml_nbytes(tensor));
+            }
+            recurrent_bytes_writer saved;native.state_write(saved,0,0);references.push_back(std::move(saved.bytes));
+        }
+        for (const auto & ids : std::vector<std::vector<llama_seq_id>>{{0},{1},{3},{0,3},{3,1},{2,0}}) {
+            llama_memory_recurrent memory(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,uint32_t(ids.size()),4,0,nullptr,false,true);
+            if (!t.assert_true(memory.configure_selected_sequences(ids))) return;
+            t.assert_true(!memory.configure_selected_sequences({-1}));
+            t.assert_true(!memory.configure_selected_sequences({4}));
+            t.assert_true(!memory.configure_selected_sequences({1,1}));
+            ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+            if (!t.assert_true(memory.current_storage_requirements(type,bytes))) return;
+            const size_t alignment=ggml_backend_buft_get_alignment(type);
+            std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+                ggml_backend_memory_arena_new(type,bytes),ggml_backend_memory_arena_free);
+            if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                    ggml_backend_memory_arena_reserve_at(arena.get(),92,0,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                    ggml_backend_memory_arena_commit(arena.get()))) return;
+            std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> lease(
+                ggml_backend_memory_arena_acquire(arena.get(),92),ggml_backend_memory_lease_free);
+            if (!t.assert_true(lease && memory.bind_current_storage(lease.get()))) return;
+            auto load_order=ids;std::sort(load_order.begin(),load_order.end());
+            for (auto id : load_order) {
+                recurrent_bytes_reader source(references[id]);memory.state_read(source,id,0);
+                t.assert_equal(references[id].size(),source.cursor);
+            }
+            const auto exact=[&] {
+                for (auto id : ids) {
+                    recurrent_bytes_writer saved;memory.state_write(saved,id,0);
+                    if (!t.assert_true("selected source image matches its native single-sequence control",saved.bytes==references[id])) return false;
+                    t.assert_equal(llama_pos(11+id*5),memory.seq_pos_max(id));
+                }
+                return true;
+            };
+            if (!exact()) return;
+            for (llama_seq_id id=0;id<4;++id)
+                if (std::find(ids.begin(),ids.end(),id)==ids.end()) t.assert_equal(llama_pos(-1),memory.seq_pos_max(id));
+            llama_batch_allocr allocator(1);auto batch=allocator.ubatch_reserve(2,uint32_t(ids.size()));
+            auto logical_ids=ids;
+            std::fill(batch.data->seq_idx.begin(),batch.data->seq_idx.end(),-1);
+            for (size_t seq=0;seq<ids.size();++seq) {
+                batch.seq_id_unq[seq]=ids[seq];batch.seq_idx[ids[seq]]=int32_t(seq);
+            }
+            for (size_t seq=0;seq<ids.size();++seq) for (size_t row=0;row<2;++row) {
+                const size_t token=seq*2+row;
+                batch.n_seq_id[token]=1;batch.seq_id[token]=&logical_ids[seq];
+                batch.pos[token]=llama_pos(12+ids[seq]*5+llama_pos(row));
+            }
+            if (!t.assert_true(memory.prepare({batch}) && memory.prepare({batch}) && exact())) return;
+            if (!t.assert_true(memory.park_current_storage())) return;
+            ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(arena.get()),0xa5);
+            if (!t.assert_true(memory.restore_current_storage(lease.get()) && exact())) return;
+            if (!t.assert_true(memory.find_slot(batch))) return;
+            t.assert_equal(uint32_t(ids.size()),memory.n);
+            for (auto id : ids) t.assert_equal(llama_pos(13+id*5),memory.seq_pos_max(id));
+        }
+    });
     t.test("deferred_current_geometry_rejects_invalid_rows_before_allocation", [](testing & t) {
         std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
         model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;

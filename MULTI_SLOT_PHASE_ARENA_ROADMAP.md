@@ -1,6 +1,6 @@
 # Multi-slot adaptive KV streaming and phase-arena roadmap
 
-Status: implementation in progress, 2026-11-10. MS1 (CPU planner), MS2 (demand-backed host storage), MS3 (independent histories/native metadata), MS4 (selected-state storage/ownership), MS5 (exclusive page grants/reader ownership), MS6 (shared native attention/transport) and MS7 (target workload catalog/transactional admission) are complete as independent components; runtime multi-slot admission remains disabled. MS8-MS14 are pending. No new server configuration is qualified.
+Status: implementation in progress, 2026-11-10. MS1-MS8 are complete for their declared scopes. MS8 qualifies target-only text requests with two adaptive slots and `--cache-ram 0`; existing single-slot and ordinary-native controls remain protected. MS9-MS14 are pending. Two-slot speculation, vision, persistence and the full release/performance matrix are not yet qualified.
 
 Inspected baseline: `f6ca3e8a172473578b909a4691e616bb2234fb54`, on `feature/ci-workflow-migration`. Recheck the implementation base and local changes before starting work on a dedicated feature branch. Historical measurements retain their original source, binaries, models and configuration; they are not new multi-slot evidence.
 
@@ -464,12 +464,24 @@ Failures, red fixtures, source patches, runtime/library/input hashes, loader evi
 
 ### MS8 - Server groups, reselection and continuous responses
 
-- [ ] Wire explicit admitted/selected/parked states into existing queues, phase selection and output handling.
-- [ ] Test all phase transitions, new arrivals while decoding, different prefill completion times, allowance exhaustion and independently finishing slots.
-- [ ] Preserve the same stream and accepted-output cursor through repeated pauses; test SSE heartbeats, cancellation/disconnect, non-streaming results, stop strings, usage and tool-call fragments.
-- [ ] Keep live parked slots busy to administrative APIs and keep newly queued prefills out of the current decode group.
+- [x] Wire explicit admitted/selected/parked states into existing queues, phase selection and output handling.
+- [x] Test all phase transitions, new arrivals while decoding, different prefill completion times, allowance exhaustion and independently finishing slots.
+- [x] Preserve the same stream and accepted-output cursor through repeated pauses; test SSE heartbeats, cancellation/disconnect, non-streaming results, stop strings, usage and tool-call fragments.
+- [x] Keep live parked slots busy to administrative APIs and keep newly queued prefills out of the current decode group.
 
 Exit: two-slot target-only public API behavior, context-boundary progress and no duplicate/lost/falsely finalized output.
+
+Accepted implementation: an owned group manager reserves both canonical host address ranges before requests, keeps only selected native recurrent/SWA state on the common GPU parent, and parks native checkpoints in RAM between selections. Existing native cell metadata supplies compact shared attention columns; per-source resident prefixes, private page rings and bounded copy waves retain native masks, arithmetic and checkpoint order. Native workspace measurements admit a complete selection before the CPU controller commits it. A genuine joint quota shortage can select one slot; unsupported native geometry does not silently serialize. Logical allowances include the pending sampled anchor. Frontend samplers, response cursors, grammar, tool-parser state and request identities survive pauses.
+
+Qualification covers both targets, all three existing full-server cache pairs, equal/unequal histories, allowance exhaustion, per-slot context ends, busy parked slots, late arrivals, independent stops, cancellation, seeded retry, usage, grammar and tool fragments. Actual native full-vocabulary controls cover selected-state parking/restoration and failed-peer isolation. CPU/GPU sampler chains initialize once and remain frontend-owned. A real compute-failure red on both models exposed an unfinished admission during retirement; explicit abort/discard now drains failed work before releasing frontend chains, and fresh paired requests recover exactly. All three native failure statuses are exercised before and after queued work. Retained KV bytes/frontiers stay correct, while cancellation advances its existing semantic generation exactly once.
+
+A second real red exposed stock response-queue timeout starvation: other-request notifications repeatedly restarted a relative wait, preventing a paused stream's heartbeat/disconnect poll. A fixed steady-clock deadline resolves it. The new CPU queue test failed exactly one of 22 assertions before the fix and passes normally and under ASAN/UBSAN afterward. Actual production SSE generators emit heartbeat comments while a peer is paused, with both streams' 128 token IDs, text and usage matching their non-streaming controls.
+
+The current host and ASAN inventories each pass 55 executed tests plus two expected CUDA-only skips. Thirty native/transport/neural component gates include seven strict default-PDL memchecks with zero errors, API reporting `all`, exit 99, no kernel filters and eager loading only for the checker. All64 D256/D512 reader cases, cached pending appends, one-page rings, wide transfers, queued-copy faults and the existing conversion/pipeline controls remain exact. Additional normal/ASAN neural cases prove an unselected peer's checkpoint survives selected-peer failure. Component reuse after the queue-only fix verifies every actually loaded project library, executable, relevant core source, input and profile; those clients do not link the changed server implementation. Current full-server tests separately qualify the updated queue. This is not a full-model CUDA memcheck or a non-CUDA hardware qualification.
+
+Existing single-slot vision controls match the frozen V2 server in all six scoped modes, including changed/cached/multiple images. Ordinary-native two-slot JSON/SSE controls preserve stock unified-context reporting and outputs. The single-slot performance screen contains 192 requests and 21,504 exact generated IDs across a six-mode 64-output cohort and a separate focused Gemma 256-output cohort. A roughly 0.22% initial Gemma target-prefill decrease did not persist in the opposite-order follow-up; remaining small timing changes have mixed directions and overlap observed variation. No confirmed regression is established in these short-context profiles. No speedup, exact timing parity, heavy-context qualification or new multi-slot performance win is claimed; MS13 remains mandatory.
+
+Local source patches, immutable runtimes, raw failures, classified fixture mistakes, commands, loader identities, models, inventories and audits remain under `benchmarks/results/multi-slot-20261109/`, particularly `ms8-qualification.json`, `ms8-core-reused-evidence.json` and `ms8-performance-audit.json`. They are not committed. CUDA arithmetic/kernel code is unchanged. The declaration remains target-only, text-only and cache-disabled for two slots until MS9-MS12 extend their own contracts.
 
 ### MS9 - Qwen and Gemma MTP
 

@@ -116,6 +116,192 @@ static selection projected_selection(const std::vector<uint32_t> & weights) {
 
 int main() {
     testing t;
+    t.test("request_groups_freeze_membership_and_finish_exclusive_preparation_before_decode", [](testing & t) {
+        using phase=llama_kv_stream_group_phase;
+        llama_kv_stream_request_group group({128,2});
+        t.assert_true(group.phase()==phase::idle);
+        t.assert_true(group.admit({{1,12,0,5,true},{0,11,0,5,false}}));
+        t.assert_true(!group.admit({{2,13,0,5,false}}));
+        t.assert_true(group.busy(0,11) && group.busy(1,12));
+        t.assert_true(group.phase()==phase::vision);
+        llama_kv_stream_group_plan plan;
+        t.assert_true(group.plan(plan)==selection_status::no_progress);
+        t.assert_true(!group.prepared(0,11,phase::prefill,30));
+        t.assert_true(!group.prepared(1,13,phase::vision,0));
+        t.assert_true(group.prepared(1,12,phase::vision,0));
+        t.assert_true(group.phase()==phase::prefill);
+        t.assert_true(!group.prepared(1,12,phase::prefill,90));
+        t.assert_true(group.prepared(0,11,phase::prefill,30));
+        t.assert_true(group.prepared(1,12,phase::prefill,90));
+        t.assert_true(group.phase()==phase::decode);
+        if (!t.assert_true(group.plan(plan)==selection_status::success)) return;
+        if (!t.assert_equal(size_t(2),plan.selected.slots.size())) return;
+        t.assert_equal(size_t(4),plan.selected.slots[0].growth_tokens);
+        t.assert_equal(size_t(4),plan.selected.slots[1].growth_tokens);
+        t.assert_equal(size_t(34),plan.selected.slots[1].offset_tokens);
+        t.assert_true(group.activate(std::move(plan)));
+        t.assert_true(group.selected(0,11) && group.selected(1,12));
+        llama_kv_stream_generation_budget budget;
+        t.assert_true(group.submission(0,11,7,100,budget));
+        t.assert_equal(uint32_t(4),budget.query_rows);
+        t.assert_equal(uint32_t(3),budget.proposal_tokens);
+        t.assert_true(!group.advance({{0,11,35},{1,12,94}}));
+        t.assert_true(group.submission(0,11,7,100,budget));
+        t.assert_equal(uint32_t(4),budget.query_rows);
+        t.assert_true(group.advance({{0,11,34},{1,12,91}}));
+        t.assert_true(group.needs_reselection());
+        t.assert_true(!group.submission(0,11,0,100,budget));
+        t.assert_true(!group.submission(1,12,0,100,budget));
+        if (!t.assert_true(group.plan(plan)==selection_status::success)) return;
+        t.assert_equal(size_t(2),plan.selected.slots.size());
+        t.assert_equal(size_t(2),plan.selected.slots[0].growth_tokens);
+        t.assert_equal(size_t(1),plan.selected.slots[1].growth_tokens);
+        t.assert_true(group.activate(std::move(plan)));
+        t.assert_true(group.advance({{0,11,36},{1,12,92}}));
+        if (!t.assert_true(group.plan(plan)==selection_status::success)) return;
+        t.assert_equal(size_t(1),plan.selected.slots.size());
+        t.assert_equal(uint32_t(0),plan.selected.slots[0].id);
+        t.assert_true(group.activate(std::move(plan)));
+        t.assert_true(group.selected(0,11) && !group.selected(1,12));
+        t.assert_true(group.busy(1,12));
+        t.assert_true(!group.finish(1,13));
+        t.assert_true(group.finish(0,11));
+        if (!t.assert_true(group.plan(plan)==selection_status::success)) return;
+        t.assert_equal(uint32_t(1),plan.selected.slots[0].id);
+        t.assert_true(group.activate(std::move(plan)));
+        t.assert_true(group.finish(1,12));
+        t.assert_true(group.phase()==phase::retiring);
+        t.assert_true(!group.admit({{0,14,0,5,false}}));
+        t.assert_true(group.release());
+        t.assert_true(group.phase()==phase::idle);
+        t.assert_true(group.admit({{0,14,0,5,false}}));
+        t.assert_true(!group.busy(0,11));
+    });
+    t.test("request_epochs_are_per_slot_and_cannot_reuse_a_retired_namespace", [](testing & t) {
+        llama_kv_stream_request_group group({32,2});
+        if (!t.assert_true("different slots may start with the same request epoch",group.admit({{0,1,0,0,false},{1,1,0,0,false}}))) return;
+        t.assert_true(group.finish(0,1) && group.finish(1,1) && group.release());
+        t.assert_true(!group.admit({{0,1,0,0,false},{1,2,0,0,false}}));
+        if (!t.assert_true(group.admit({{0,2,0,0,false},{1,2,0,0,false}}))) return;
+        t.assert_true(!group.finish(0,1) && !group.finish(1,1));
+        t.assert_true(group.finish(0,2) && group.finish(1,2) && group.release());
+        if (!t.assert_true(group.admit({{0,UINT64_MAX,0,0,false}}))) return;
+        t.assert_true(group.finish(0,UINT64_MAX) && group.release());
+        t.assert_true(!group.admit({{0,UINT64_MAX,0,0,false}}));
+        t.assert_true(group.admit({{1,3,0,0,false}}));
+    });
+    t.test("request_group_stale_plans_and_partial_progress_cannot_change_peers", [](testing & t) {
+        using phase=llama_kv_stream_group_phase;
+        llama_kv_stream_request_group group({32,2});
+        t.assert_true(group.admit({{0,71,0,9,false},{1,72,0,9,false}}));
+        t.assert_true(group.prepared(0,71,phase::prefill,8));
+        t.assert_true(group.prepared(1,72,phase::prefill,8));
+        llama_kv_stream_group_plan proposal;
+        if (!t.assert_true(group.plan(proposal)==selection_status::success)) return;
+        auto stale=proposal;
+        t.assert_true(group.activate(std::move(proposal)));
+        t.assert_true(!group.activate(std::move(stale)));
+        t.assert_true(group.plan(proposal)==selection_status::success);
+        t.assert_true(group.advance({{0,71,9},{1,72,10}}));
+        t.assert_true(!group.activate(std::move(proposal)));
+        llama_kv_stream_generation_budget left,right;
+        t.assert_true(group.submission(0,71,7,100,left));
+        t.assert_true(group.submission(1,72,7,100,right));
+        t.assert_equal(uint32_t(7),left.query_rows);
+        t.assert_equal(uint32_t(6),right.query_rows);
+        t.assert_true(!group.advance({{0,71,10},{1,73,11}}));
+        t.assert_true(!group.advance({{0,71,10},{0,71,11}}));
+        t.assert_true(!group.advance({{0,71,8}}));
+        t.assert_true(group.submission(0,71,7,100,left));
+        t.assert_equal(uint32_t(7),left.query_rows);
+        t.assert_true(group.submission(1,72,7,100,right));
+        t.assert_equal(uint32_t(6),right.query_rows);
+        t.assert_true(!group.release());
+        t.assert_true(group.finish(0,71));
+        t.assert_true(group.needs_reselection());
+        t.assert_true(!group.submission(1,72,0,100,right));
+        t.assert_true(group.plan(proposal)==selection_status::success);
+        auto old_epoch=proposal;
+        t.assert_true(group.finish(1,72));
+        t.assert_true(group.release());
+        t.assert_true(group.admit({{0,81,0,9,false},{1,82,0,9,false}}));
+        t.assert_true(group.prepared(0,81,phase::prefill,9));
+        t.assert_true(group.prepared(1,82,phase::prefill,10));
+        t.assert_true(!group.activate(std::move(old_epoch)));
+        t.assert_true(!group.finish(1,72));
+    });
+    t.test("request_group_cancellation_keeps_phases_exclusive_and_retires_without_refill", [](testing & t) {
+        using phase=llama_kv_stream_group_phase;
+        for (int cancel=0;cancel<3;++cancel) {
+            llama_kv_stream_request_group group({32,2});
+            t.assert_true(group.admit({{0,1,0,0,true},{1,2,0,0,true}}));
+            llama_kv_stream_group_request next;
+            t.assert_true(group.next_preparation(next) && next.slot==0);
+            if (cancel==0) t.assert_true(group.finish(0,1));
+            else t.assert_true(group.prepared(0,1,phase::vision,0));
+            t.assert_true(group.phase()==phase::vision);
+            t.assert_true(group.next_preparation(next) && next.slot==1);
+            t.assert_true(group.prepared(1,2,phase::vision,0));
+            t.assert_true(group.phase()==phase::prefill);
+            if (cancel==1) t.assert_true(group.finish(0,1));
+            else if (cancel==2) t.assert_true(group.prepared(0,1,phase::prefill,8));
+            t.assert_true(group.prepared(1,2,phase::prefill,8));
+            t.assert_true(group.phase()==phase::decode);
+            if (cancel==2) t.assert_true(group.finish(0,1));
+            t.assert_true(group.busy(1,2) && !group.busy(0,1));
+            t.assert_true(!group.admit({{0,3,0,0,false}}));
+            t.assert_true(group.finish(1,2));
+            t.assert_true(group.phase()==phase::retiring);
+            t.assert_true(!group.next_preparation(next));
+            t.assert_true(group.release());
+            t.assert_true(!group.release());
+        }
+    });
+    t.test("request_group_dynamic_allowances_match_the_independent_selection_oracle", [](testing & t) {
+        using phase=llama_kv_stream_group_phase;
+        for (size_t capacity=4;capacity<=14;++capacity) for (uint32_t count=1;count<=3;++count)
+                for (size_t first=0;first<capacity;++first) {
+            llama_kv_stream_request_group group({capacity,count});
+            std::vector<llama_kv_stream_group_request> requests;
+            std::vector<selection_slot> live;
+            for (uint32_t slot=0;slot<count;++slot) {
+                const size_t history=(first+slot*3)%capacity;
+                requests.push_back({slot,uint64_t(slot)+100,0,0,false});
+                live.push_back({slot,history,1,0,true});
+            }
+            if (!t.assert_true(group.admit(requests))) return;
+            for (const auto & slot : live)
+                if (!t.assert_true(group.prepared(slot.id,uint64_t(slot.id)+100,phase::prefill,slot.history_tokens))) return;
+            size_t rounds=0;
+            while (group.phase()==phase::decode) {
+                if (!t.assert_true(++rounds<=capacity*count)) return;
+                const auto expected=oracle(capacity,count,live,0);
+                llama_kv_stream_group_plan proposal;
+                if (!t.assert_true(group.plan(proposal)==selection_status::success)) return;
+                t.assert_true(expected==ids(proposal.selected));
+                auto chosen=proposal.selected;
+                if (!t.assert_true(group.activate(std::move(proposal)))) return;
+                while (group.phase()==phase::decode && !group.needs_reselection()) {
+                    std::vector<llama_kv_stream_group_progress> progress;
+                    for (const auto & slot : chosen.slots) {
+                        llama_kv_stream_generation_budget work;
+                        if (!t.assert_true(group.submission(slot.id,uint64_t(slot.id)+100,7,SIZE_MAX,work))) return;
+                        const size_t remaining=slot.history_tokens+slot.growth_tokens-live[slot.id].history_tokens;
+                        t.assert_equal(uint32_t(std::min(remaining,size_t(8))),work.query_rows);
+                        // Each independently accepted prefix consumes its own allowance.
+                        const size_t accepted=std::min(size_t(work.query_rows),size_t(1+slot.id%3));
+                        live[slot.id].history_tokens+=accepted;
+                        progress.push_back({slot.id,uint64_t(slot.id)+100,live[slot.id].history_tokens});
+                    }
+                    if (!t.assert_true(group.advance(progress))) return;
+                    for (auto & slot : live) if (slot.eligible && slot.history_tokens==capacity) {
+                        t.assert_true(group.finish(slot.id,uint64_t(slot.id)+100));slot.eligible=false;
+                    }
+                }
+            }
+            t.assert_true(group.phase()==phase::retiring && group.release());
+        }
+    });
     t.test("selected_page_quotas_follow_projected_extent_not_logical_offsets", [](testing & t) {
         selection chosen;
         if (!t.assert_true(llama_kv_stream_select({128*1024,2},{{1,30*1024},{0,90*1024}},chosen)==selection_status::success)) return;

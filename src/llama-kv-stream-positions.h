@@ -10,6 +10,7 @@ struct llama_kv_stream_append_coordinates {
     uint32_t position_channels = 1;
     bool decode = false;
     bool linear_required = false;
+    llama_seq_id sequence = 0;
 };
 
 // Model positions drive RoPE/masking; only first_cell and row count address the KV store.

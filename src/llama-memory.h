@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -15,6 +16,7 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 class llama_kv_stream_logical_cache;
+class llama_kv_stream_group_model;
 class llama_kv_cache;
 class llama_kv_cache_context;
 class llama_memory_recurrent;
@@ -51,7 +53,13 @@ struct llama_memory_params {
     ggml_backend_memory_lease_t bounded_cache_lease = nullptr;
     bool defer_bounded_cache = false;
     bool measure_only = false;
+    bool defer_full_cache = false;
+    llama_kv_stream_group_model * kv_stream_group = nullptr;
+    // Empty preserves the native logical/physical sequence capacity.
+    std::vector<llama_seq_id> kv_stream_selected_sequences = {};
 };
+
+bool llama_memory_selected_sequences_valid(const llama_memory_params & params, uint32_t logical_capacity) noexcept;
 
 enum llama_memory_status {
     LLAMA_MEMORY_STATUS_SUCCESS = 0,

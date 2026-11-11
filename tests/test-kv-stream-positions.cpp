@@ -30,6 +30,27 @@ static llama_kv_cells cells_with(std::initializer_list<llama_pos> positions) {
 
 int main() {
     testing t;
+    t.test("append_coordinates_validate_the_chosen_sequence_without_relabeling",[](testing & t) {
+        coordinate_fixture f;f.seq=1;f.coordinates.sequence=1;
+        t.assert_true(llama_kv_stream_validate_append(f.batch,f.coordinates));
+        f.seq=0;t.assert_true(!llama_kv_stream_validate_append(f.batch,f.coordinates));
+        f.batch.seq_id=nullptr;t.assert_true(!llama_kv_stream_validate_append(f.batch,f.coordinates));
+        f.coordinates.sequence=0;t.assert_true(llama_kv_stream_validate_append(f.batch,f.coordinates));
+        f.batch.seq_id=f.sequences;f.seq=256;f.coordinates.sequence=256;
+        t.assert_true(!llama_kv_stream_validate_append(f.batch,f.coordinates));
+        llama_batch_ext owned(8,2,2,2,nullptr,64,1);
+        owned.tokens.resize(3);
+        for (size_t row=0;row<3;++row) {
+            owned.tokens[row].id=llama_token(row+1);owned.tokens[row].pos[0]=llama_pos(11+row);
+            owned.tokens[row].seq_ids={1};
+        }
+        llama_kv_stream_append_coordinates coordinates{100,256,10,1,true,false};coordinates.sequence=1;
+        t.assert_true(llama_kv_stream_validate_append(owned,coordinates));
+        owned.tokens[1].seq_ids={0};t.assert_true(!llama_kv_stream_validate_append(owned,coordinates));
+        owned.tokens[1].seq_ids={1,0};t.assert_true(!llama_kv_stream_validate_append(owned,coordinates));
+        owned.tokens[1].seq_ids={1};coordinates.sequence=-1;
+        t.assert_true(!llama_kv_stream_validate_append(owned,coordinates));
+    });
     t.test("compact_visibility_matches_stock_positions_and_padding", [](testing & t) {
         auto cells=cells_with({0,1,2,2,2,10,11});
         llama_pos positions[12]={0,2,2,0,1,2,0,1,0,0,0,0};

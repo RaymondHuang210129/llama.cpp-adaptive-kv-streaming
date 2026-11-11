@@ -2,6 +2,17 @@
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cache-iswa.h"
 
+bool llama_memory_selected_sequences_valid(const llama_memory_params & params,uint32_t logical_capacity) noexcept {
+    const auto & selected=params.kv_stream_selected_sequences;
+    if (selected.empty()) return true;
+    if (!logical_capacity || logical_capacity>LLAMA_MAX_SEQ || selected.size()>logical_capacity) return false;
+    for (size_t i=0;i<selected.size();++i) {
+        if (selected[i]<0 || uint32_t(selected[i])>=logical_capacity) return false;
+        for (size_t j=0;j<i;++j) if (selected[i]==selected[j]) return false;
+    }
+    return true;
+}
+
 // Resolve storage roles without assuming a hybrid memory layout or changing ownership.
 llama_memory_kv_resources llama_memory_kv_resources_get(llama_memory_t memory) noexcept {
     if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {

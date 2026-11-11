@@ -30,6 +30,38 @@ static bool is_dirty(testing & t, const llama_kv_stream_content & content, uint3
 
 int main(int argc, char ** argv) {
     testing t;
+    t.test("pending_host_publication_can_dirty_only_its_device_mirror_rows", [](testing & t) {
+        auto host=storage(GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,ggml_backend_cpu_buffer_type(),257);
+        llama_kv_stream_content content(host);
+        t.assert_true(content.flush(all(*host),[](const auto &) {return true;}));
+        llama_kv_stream_host_layer planes;t.assert_true(host->layer(1,planes));
+        uint8_t value=41;llama_kv_stream_write pending;
+        const size_t offset=255*host->layout().v_token_bytes+5;
+        t.assert_true(content.prepare({{1,operand::v,offset,&value,1}},pending));
+        const auto generation=content.generation(),epoch=content.mirror_epoch();
+        const auto * data=static_cast<const uint8_t *>(ggml_backend_buffer_get_base(host->buffer()));
+        const std::vector<uint8_t> before(data,data+host->bytes());
+        t.assert_true(content.invalidate_mirror_rows({{0,operand::k,63,3},{1,operand::v,256,1}}));
+        t.assert_equal(generation,content.generation());t.assert_equal(epoch,content.mirror_epoch());
+        t.assert_true(pending.pending() && !std::memcmp(before.data(),data,before.size()));
+        for (uint32_t layer=0;layer<2;++layer) for (auto plane : {operand::k,operand::v})
+            for (size_t row=0;row<host->layout().tokens;++row)
+                t.assert_equal((layer==0 && plane==operand::k && row>=63 && row<66) ||
+                    (layer==1 && plane==operand::v && row==256),is_dirty(t,content,layer,plane,row));
+        for (const auto bad : std::vector<llama_kv_stream_rows>{{2,operand::k,0,1},{0,operand::k,SIZE_MAX,1},
+                {0,operand::v,1,SIZE_MAX},{0,operand(99),0,1}}) {
+            t.assert_true(!content.invalidate_mirror_rows({{0,operand::k,0,1},bad}));
+            t.assert_true(!is_dirty(t,content,0,operand::k,0));
+        }
+        t.assert_true(!content.flush({{0,operand::k,63,3}},[&](const auto &) {
+            t.assert_true(!content.invalidate_mirror_rows({{0,operand::k,0,1}}));return false;
+        }));
+        t.assert_true(is_dirty(t,content,0,operand::k,63));
+        t.assert_true(content.commit(pending));
+        t.assert_equal(generation+1,content.generation());t.assert_equal(epoch,content.mirror_epoch());
+        t.assert_equal(value,static_cast<const uint8_t *>(planes.v)[offset]);
+        t.assert_true(is_dirty(t,content,1,operand::v,255));
+    });
     t.test("suffix_invalidation_preserves_prefix_and_rejects_stale_writes", [](testing & t) {
         for (size_t first : {0u,1u,63u,64u,65u,255u,256u,257u,513u,520u}) {
             auto host = storage(GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,ggml_backend_cpu_buffer_type(),513);

@@ -99,6 +99,7 @@ struct llama_context_memory::implementation : llama_memory_executor_backend {
     uint64_t transition_count = 0, executor_revision = 0;
     uint64_t last_transition_us = 0;
     std::function<bool()> before_capture;
+    std::function<bool()> external_submission_allowed;
     std::unique_ptr<llama_memory_bounded_kv> bounded_cache;
     llama_memory_resource bounded_resource;
     std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> staging_lease{nullptr,ggml_backend_memory_lease_free};
@@ -329,6 +330,54 @@ bool llama_context_memory::supported(const std::vector<ggml_backend_t> & backend
 }
 
 // Preserve the old fixed-maximum construction for callers without phase measurements.
+std::unique_ptr<llama_context_memory> llama_context_memory::create_external_workspace(ggml_backend_sched_t sched,
+        const std::vector<ggml_backend_t> & backends,std::vector<llama_memory_workspace_group> groups,
+        const std::function<bool()> & submission_allowed,const std::function<bool()> & before_capture) {
+    if (!sched || !submission_allowed || groups.empty() || !supported(backends) ||
+            backends.size()!=size_t(ggml_backend_sched_get_n_backends(sched))) return {};
+    for (size_t i=0;i<backends.size();++i) if (ggml_backend_sched_get_backend(sched,int(i))!=backends[i]) return {};
+    try {
+        auto state=std::make_unique<implementation>();
+        state->sched=sched;state->before_capture=before_capture;state->external_submission_allowed=submission_allowed;
+        for (auto * backend : backends) {
+            context_cache cache{};
+            if (!context_cache_for(backend,cache)) return {};
+            state->caches.push_back(cache);
+        }
+        llama_memory_execution_plan validation;
+        std::vector<llama_memory_stage_id> stages;
+        for (const auto & group : groups) {
+            if (!group.workspace.buft || group.workspace.first_slot>=backends.size() || group.stages.empty() ||
+                    ggml_backend_sched_get_buffer_type(sched,backends[group.workspace.first_slot])!=group.workspace.buft) return {};
+            const auto domain=std::find_if(validation.domains.begin(),validation.domains.end(),
+                [&](const auto & entry) {return entry.id==group.resource.domain;});
+            if (domain==validation.domains.end())
+                validation.domains.push_back({group.resource.domain,group.resource.allocation_class,LLAMA_MEMORY_CAPABILITY_BUFFER_VIEWS});
+            else domain->allocation_classes|=group.resource.allocation_class;
+            for (const auto & stage : group.stages) if (std::find(stages.begin(),stages.end(),stage.id)==stages.end()) {
+                stages.push_back(stage.id);validation.stages.push_back({stage.id,{},{}});
+            }
+        }
+        auto * owner=state.get();
+        state->workspace=std::make_unique<llama_memory_workspace>(sched,std::move(groups),llama_memory_workspace_hooks{
+            [owner] {owner->executor.quiesce();return true;},[owner] {return owner->invalidate();}});
+        if (!state->workspace->register_resources(validation,stages)) return {};
+        auto result=std::unique_ptr<llama_context_memory>(new llama_context_memory(std::move(state)));
+        result->impl->self=result.get();*result->impl->lifetime=result.get();
+        return result;
+    } catch (const std::bad_alloc &) {return {};}
+}
+
+llama_memory_workspace * llama_context_memory::external_workspace() noexcept {
+    return impl->external_submission_allowed ? impl->workspace.get() : nullptr;
+}
+
+bool llama_context_memory::capture_external_workspace() noexcept {
+    if (!impl->external_submission_allowed || !valid() || impl->serial_busy) return false;
+    serial_gate gate(impl->serial_busy);
+    try {return impl->capture_execution();} catch (...) {return false;}
+}
+
 std::unique_ptr<llama_context_memory> llama_context_memory::create(ggml_backend_sched_t sched,
         const std::vector<ggml_backend_t> & backends,
         const std::vector<ggml_backend_memory_workspace_group> & groups) {
@@ -1290,20 +1339,23 @@ ggml_status llama_context_memory::compute_async(ggml_cgraph * graph) {
     if (!impl->serial_children.empty() && impl->serial_active != this) return GGML_STATUS_FAILED;
     auto * owner = impl->serial_parent ? impl->serial_parent->impl.get() : impl.get();
     serial_gate gate(owner->serial_busy);
-    const auto admission = impl->transition->admit();
-    if (!admission) return GGML_STATUS_FAILED;
+    const bool external=bool(impl->external_submission_allowed);
+    if (external && (!impl->external_submission_allowed() ||
+            !impl->executor.matches(impl->workspace->leases(),impl->executor_revision))) return GGML_STATUS_FAILED;
+    const auto admission=external ? 0 : impl->transition->admit();
+    if (!external && !admission) return GGML_STATUS_FAILED;
     if (!impl->pending) {
         impl->pending = impl->executor.acquire(
             impl->bindings,impl->executor_revision);
     }
     if (!impl->pending) {
-        impl->transition->finish(admission);
+        if (!external) impl->transition->finish(admission);
         return GGML_STATUS_FAILED;
     }
     try {
         const auto result = ggml_backend_sched_graph_compute_async(impl->sched, graph);
         if (result != GGML_STATUS_SUCCESS) impl->executor.quiesce();
-        GGML_ASSERT(impl->transition->finish(admission));
+        if (!external) GGML_ASSERT(impl->transition->finish(admission));
         // Cancellation can recapture after draining; other execution failures stay quiescent.
         if (result == GGML_STATUS_ABORTED && !impl->invalidate()) {
             impl->invalid=true;
@@ -1312,7 +1364,7 @@ ggml_status llama_context_memory::compute_async(ggml_cgraph * graph) {
         return result;
     } catch (...) {
         impl->executor.quiesce();
-        impl->transition->finish(admission);
+        if (!external) impl->transition->finish(admission);
         throw;
     }
 }
@@ -1321,7 +1373,9 @@ ggml_status llama_context_memory::compute_async(ggml_cgraph * graph) {
 void llama_context_memory::synchronize() { ggml_backend_sched_synchronize(impl->sched); }
 
 // Fallback-only schedulers need no physical arena while retaining the same teardown protocol.
-bool llama_context_memory::uses_arenas() const noexcept { return !impl->arenas.empty(); }
+bool llama_context_memory::uses_arenas() const noexcept {
+    return !impl->arenas.empty() || (impl->external_submission_allowed && !impl->workspace->leases().empty());
+}
 
 const std::vector<ggml_backend_memory_lease_t> & llama_context_memory::workspace_leases() const noexcept {
     return impl->workspace->leases();

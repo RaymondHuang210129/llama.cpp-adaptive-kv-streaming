@@ -8,6 +8,7 @@
 #include "../src/llama-memory-bounded-kv.h"
 #include "../src/llama-kv-cache-iswa.h"
 #include "../src/llama-hparams.h"
+#include "../src/llama-memory-workspace.h"
 
 #include <algorithm>
 #include <cstring>
@@ -175,6 +176,18 @@ int main(int argc, char ** argv) {
         t.assert_equal(uint32_t(1024),result.cache.window_rows);
         t.assert_equal(uint32_t(256),result.cache.headroom_rows);
         t.assert_equal(uint32_t(2),result.cache.sequence_capacity);
+        params.kv_stream_selected_sequences={1};
+        if (!t.assert_true("one chosen logical slot quotes one native window",llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,type,{9,3},result))) return;
+        t.assert_equal(uint32_t(1280),result.allocation.capacity_rows);
+        t.assert_equal(size_t(425984000),result.allocation.bytes);
+        t.assert_equal(uint32_t(1),result.cache.sequence_capacity);
+        for (const auto & invalid : std::vector<std::vector<llama_seq_id>>{{2},{-1},{1,1}}) {
+            params.kv_stream_selected_sequences=invalid;
+            t.assert_true(!llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,type,{9,4},result));
+            t.assert_equal(size_t(425984000),result.allocation.bytes);
+        }
+        params.kv_stream_selected_sequences={};
+        if (!t.assert_true(llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,type,{9,5},result))) return;
         const auto bytes=result.allocation.bytes;
         cp.kv_unified=false;
         t.assert_true(!llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,type,{9,3},result));
@@ -257,6 +270,78 @@ int main(int argc, char ** argv) {
         bad[0].first_slot = 99;
         t.assert_true(!llama_context_memory::create(f.sched.get(), f.backends, bad));
         t.assert_equal(size_t(0), ggml_backend_sched_get_buffer_size(f.sched.get(), f.device.get()));
+    });
+    t.test("group_workspace_uses_external_phase_grants_and_requires_the_group_submission_gate",[&](testing & t) {
+        fixture f(dev);
+        std::vector<llama_memory_workspace_group> groups;
+        std::vector<llama_compute_arena_ptr> parents;
+        std::vector<llama_memory_transition_arena> supplied;
+        llama_memory_transition_target first;
+        first.stage=1;first.plan.stages={{1,{},{}},{2,{1},{}}};
+        for (size_t i=0;i<f.groups.size();++i) {
+            const auto & native=f.groups[i];
+            const auto id=uint64_t(i)+1;
+            const auto allocation=ggml_backend_buft_is_host(native.buft) ? LLAMA_MEMORY_ALLOCATION_HOST : LLAMA_MEMORY_ALLOCATION_DEVICE_LOCAL;
+            groups.push_back({native,{id,id,allocation,llama_memory_content::discardable},{{1,native.size},{2,native.size/2}},false});
+            first.plan.domains.push_back({id,allocation,LLAMA_MEMORY_CAPABILITY_BUFFER_VIEWS});
+            first.budgets.push_back({id,allocation,native.size,native.alignment});
+        }
+        uint64_t admission=0;bool allow_capture=true,reentered=false;
+        llama_context_memory * observed=nullptr;
+        const auto allowed=[&] {
+            if (observed) reentered=reentered || observed->retire_graph();
+            return admission!=0;
+        };
+        t.assert_true(!llama_context_memory::create_external_workspace(nullptr,f.backends,groups,allowed));
+        t.assert_true(!llama_context_memory::create_external_workspace(f.sched.get(),f.backends,groups,{}));
+        auto invalid=groups;invalid[0].workspace.first_slot=f.backends.size();
+        t.assert_true(!llama_context_memory::create_external_workspace(f.sched.get(),f.backends,invalid,allowed));
+        invalid=groups;invalid[0].stages[0].id=0;
+        t.assert_true(!llama_context_memory::create_external_workspace(f.sched.get(),f.backends,invalid,allowed));
+        auto workspace=llama_context_memory::create_external_workspace(f.sched.get(),f.backends,groups,allowed,[&] {
+            if (observed) reentered=reentered || observed->capture_external_workspace() || observed->retire_graph();
+            return allow_capture;
+        });
+        if (!t.assert_true(workspace!=nullptr)) return;
+        observed=workspace.get();
+        t.assert_true(!workspace->uses_arenas());
+        auto * consumer=workspace->external_workspace();
+        if (!t.assert_true(consumer && consumer->register_resources(first.plan,{1,2}))) return;
+        for (auto * backend : f.backends) t.assert_equal(size_t(0),ggml_backend_sched_get_buffer_size(f.sched.get(),backend));
+        t.assert_true(workspace->workspace_leases().empty() && !workspace->capture_external_workspace());
+        for (size_t i=0;i<groups.size();++i) {
+            parents.emplace_back(ggml_backend_memory_arena_new(groups[i].workspace.buft,groups[i].workspace.size));
+            if (!t.assert_true(bool(parents.back()))) return;
+            supplied.push_back({groups[i].resource.domain,groups[i].resource.allocation_class,parents.back().get()});
+        }
+        const std::vector<llama_memory_phase_cache_identity> sources{{801,1},{802,1}};
+        auto second=first;second.stage=2;
+        auto owner=llama_memory_phase_owner::create({{llama_memory_work_phase::target_prefill,first,256,1},
+                {llama_memory_work_phase::target_verify,second,16,1}},supplied,{consumer},sources);
+        if (!t.assert_true(bool(owner))) return;
+        if (!t.assert_true(owner->enter(llama_memory_work_phase::target_prefill,16,sources,1,1).status==llama_memory_phase_owner_status::changed)) return;
+        if (!t.assert_true(workspace->capture_external_workspace())) return;
+        if (!t.assert_true("external leased workspace reports its physical arena",workspace->uses_arenas())) return;
+        f.rebuild();
+        t.assert_equal(GGML_STATUS_FAILED,workspace->compute_async(f.graph));
+        admission=owner->admit();
+        if (!t.assert_true(admission!=0)) return;
+        f.run(t,*workspace,2.0f);
+        t.assert_true(owner->finish(admission,sources));admission=0;
+        t.assert_equal(GGML_STATUS_FAILED,workspace->compute_async(f.graph));
+        if (!t.assert_true(owner->enter(llama_memory_work_phase::target_verify,2,sources,1,2).status==llama_memory_phase_owner_status::changed)) return;
+        allow_capture=false;
+        t.assert_true(!workspace->capture_external_workspace());
+        t.assert_equal(GGML_STATUS_FAILED,workspace->compute_async(f.graph));
+        allow_capture=true;
+        if (!t.assert_true(workspace->capture_external_workspace())) return;
+        f.rebuild();admission=owner->admit();
+        if (!t.assert_true(admission!=0)) return;
+        f.run(t,*workspace,-3.0f);
+        t.assert_true(owner->finish(admission,sources));admission=0;
+        t.assert_true(!reentered);
+        owner.reset();
+        t.assert_true(workspace->retire_graph());
     });
     t.test("shared_reader_role_requires_a_cache_owning_serial_parent",[&](testing & t) {
         fixture target(dev),reader(dev);

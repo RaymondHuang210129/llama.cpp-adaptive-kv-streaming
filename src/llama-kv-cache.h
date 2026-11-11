@@ -14,6 +14,8 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 class llama_kv_stream_model;
+class llama_kv_stream_group_model;
+struct llama_kv_stream_slot_projection;
 class llama_kv_stream_logical_cache;
 class llama_kv_stream_mtp_proxy;
 class llama_kv_stream_read_proxy;
@@ -129,6 +131,10 @@ public:
 
     ~llama_kv_cache();
     llama_kv_stream_model * get_kv_stream() const noexcept { return kv_stream.get(); }
+    llama_kv_stream_group_model * get_group_model() const noexcept { return group_stream.get(); }
+    // Retire old reservation graphs first. Candidate ownership transfers only on complete native binding.
+    bool bind_group_model(std::unique_ptr<llama_kv_stream_group_model> & candidate,
+        const llama_kv_stream_slot_projection & projection);
     // Replace shared full-cache roots with owned read-only metadata. The target and parent outlive all reader graphs.
     bool attach_shared_stream_reader(llama_context_memory & parent, uint32_t max_queries);
     // Arm only after preparing the parent's serial phase; release before any target mutation.
@@ -212,6 +218,7 @@ public:
     std::unique_ptr<llama_memory_bounded_kv> retain_bounded_storage(uint64_t identity,uint64_t generation,
             uint32_t history_rows,uint32_t headroom_rows,llama_memory_resource resource = {}) const;
     bool bounded_storage_pending() const noexcept;
+    bool full_storage_pending() const noexcept { return full_pending; }
     // Bind an empty deferred cache after retiring reservation graphs; old placeholder metadata stays alive.
     bool bind_bounded_storage(ggml_backend_memory_lease_t lease);
     // Capture native state and retire all graphs/readers first. Release roots and reset only their projection cells.
@@ -327,6 +334,7 @@ private:
     std::unique_ptr<llama_kv_stream_mtp_proxy> mtp_proxy;
     std::shared_ptr<llama_kv_stream_logical_cache> attached_mtp_cache;
     std::unique_ptr<llama_kv_stream_model> kv_stream;
+    std::unique_ptr<llama_kv_stream_group_model> group_stream;
     std::vector<std::unique_ptr<llama_kv_stream_read_proxy>> shared_readers;
     ggml_context_ptr shared_read_metadata;
     std::unique_ptr<llama_memory_bounded_kv_read> shared_bounded_read;
@@ -364,8 +372,9 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> retired_bounded_metadata;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> retired_storage_metadata;
     bool bounded_pending = false;
+    bool full_pending = false;
     std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> bounded_lease{nullptr,ggml_backend_memory_lease_free};
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
@@ -426,6 +435,9 @@ private:
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
     struct bounded_parking_state;
     std::unique_ptr<bounded_parking_state> parked_bounded;
+    std::vector<llama_seq_id> storage_selected_sequences;
+    bool selected_sequence_valid(llama_seq_id sequence) const noexcept;
+    bool selected_batch_valid(const llama_ubatch & batch) const noexcept;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -472,6 +484,7 @@ public:
 
     uint32_t get_n_kv() const;
     bool kv_stream_begin(const llama_ubatch & ubatch, bool decode) const;
+    bool selected_indices(std::vector<uint32_t> & output) const;
     bool prepare_mask_bounds(const llama_ubatch & ubatch, bool causal) const;
     bool mtp_span_append(const llama_ubatch & ubatch) const;
 

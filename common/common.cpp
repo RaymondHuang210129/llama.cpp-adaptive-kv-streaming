@@ -1086,7 +1086,7 @@ bool tty_enable_ansi() {
 //
 
 // TODO: move to common/sampling
-static void common_init_sampler_from_model(
+void common_init_sampler_from_model(
     const llama_model * model,
     common_params_sampling & sparams) {
 
@@ -1144,6 +1144,27 @@ static void common_init_sampler_from_model(
     get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT),        sparams.mirostat,        common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT);
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU),    sparams.mirostat_tau,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU);
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
+
+    const auto * vocab=llama_model_get_vocab(model);
+    if (sparams.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
+        sparams.ignore_eos = false;
+    }
+
+    // initialize once
+    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
+        if (llama_vocab_is_eog(vocab, i)) {
+            COM_TRC("added %s logit bias = %f\n", common_token_to_piece(vocab, i).c_str(), -INFINITY);
+            sparams.logit_bias_eog.push_back({i, -INFINITY});
+        }
+    }
+
+    if (sparams.ignore_eos) {
+        // add EOG biases to the active set of logit biases
+        sparams.logit_bias.insert(
+                sparams.logit_bias.end(),
+                sparams.logit_bias_eog.begin(), sparams.logit_bias_eog.end());
+    }
 }
 
 struct common_init_result::impl {
@@ -1440,7 +1461,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_INF("adaptive MTP: using %u auxiliary KV layer(s) from model metadata\n", cparams.kv_stream_auxiliary_layers);
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // these decision models return a score for each token via the embeddings output
     // TODO: maybe improve this in the future
@@ -1487,26 +1507,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // updates params.sampling
     // TODO: fix naming
     common_init_sampler_from_model(model, params.sampling);
-
-    if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
-        COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
-        params.sampling.ignore_eos = false;
-    }
-
-    // initialize once
-    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
-        if (llama_vocab_is_eog(vocab, i)) {
-            COM_TRC("added %s logit bias = %f\n", common_token_to_piece(vocab, i).c_str(), -INFINITY);
-            params.sampling.logit_bias_eog.push_back({i, -INFINITY});
-        }
-    }
-
-    if (params.sampling.ignore_eos) {
-        // add EOG biases to the active set of logit biases
-        params.sampling.logit_bias.insert(
-                params.sampling.logit_bias.end(),
-                params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
-    }
 
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);

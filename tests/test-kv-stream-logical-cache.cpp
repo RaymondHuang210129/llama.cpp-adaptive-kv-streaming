@@ -1,11 +1,15 @@
 #include "../src/llama-kv-stream-logical-cache.h"
 #include "../src/llama-kv-cells.h"
+#include "../src/llama-batch.h"
+#include "../src/llama-memory-phase.h"
+#include "../src/llama-memory-executor-cuda.h"
 #include "testing.h"
 #include "../src/llama-kv-stream-writer.h"
 #include "../src/llama-kv-stream-model.h"
 #include "ggml-cpp.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-execution.h"
 
 #include <cstring>
 #include <vector>
@@ -13,10 +17,11 @@
 
 using operand = ggml_kv_stream_operand;
 
-static std::shared_ptr<llama_kv_stream_logical_cache> reserved_cache(uint64_t id) {
-    llama_kv_stream_host_config c{id, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 32, 32, 1, 8, 128},
-        {{GGML_TYPE_Q8_0, true, true, true, true}, {GGML_TYPE_Q4_0, true, true, true, true}, true, true}, 33, 1};
-    auto sparse = llama_kv_stream_host_reservation::create(c, ggml_backend_cpu_buffer_type(),
+static std::shared_ptr<llama_kv_stream_logical_cache> reserved_cache(uint64_t id,uint32_t layers=1,ggml_backend_dev_t device=nullptr,uint32_t width=32,uint32_t page=8) {
+    llama_kv_stream_host_config c{id, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, width, width, 1, page, 128},
+        {{GGML_TYPE_Q8_0, true, true, true, true}, {GGML_TYPE_Q4_0, true, true, true, true}, true, true}, 33, layers};
+    auto sparse = device ? llama_kv_stream_host_reservation::create(c,device,65536) :
+        llama_kv_stream_host_reservation::create(c, ggml_backend_cpu_buffer_type(),
         [](ggml_backend_buffer_t owner) {
             owner->buft = ggml_backend_cpu_buffer_type();
             return ggml_backend_buffer_retain(owner);
@@ -64,21 +69,64 @@ struct generated_source {
     ggml_tensor * k = nullptr;
     ggml_tensor * v = nullptr;
 
-    generated_source(ggml_backend_t backend, size_t rows) {
+    generated_source(ggml_backend_t backend, size_t rows, size_t width=32) {
         context.reset(ggml_init({65536, nullptr, true}));
         GGML_ASSERT(context);
-        k = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 32, int64_t(rows));
-        v = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 32, int64_t(rows));
+        k = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, int64_t(width), int64_t(rows));
+        v = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, int64_t(width), int64_t(rows));
         buffer.reset(ggml_backend_alloc_ctx_tensors(context.get(), backend));
         GGML_ASSERT(buffer);
-        std::vector<float> keys(rows*32, 1.25f), values(rows*32, 2.5f);
+        std::vector<float> keys(rows*width, 1.25f), values(rows*width, 2.5f);
         ggml_backend_tensor_set(k, keys.data(), 0, keys.size()*sizeof(float));
         ggml_backend_tensor_set(v, values.data(), 0, values.size()*sizeof(float));
     }
 };
 
-int main() {
+static std::vector<uint8_t> native_rows(ggml_backend_t backend, bool cuda, ggml_type type,
+        const std::vector<float> & values,size_t width=32) {
+    ggml_context_ptr context(ggml_init({65536,nullptr,true}));
+    GGML_ASSERT(context && values.size()%width==0);
+    const size_t rows=values.size()/width;
+    auto * input=ggml_new_tensor_2d(context.get(),GGML_TYPE_F32,int64_t(width),int64_t(rows));
+    auto * indices=ggml_new_tensor_1d(context.get(),GGML_TYPE_I64,int64_t(rows));
+    auto * destination=ggml_new_tensor_2d(context.get(),type,int64_t(width),int64_t(rows));
+    auto * output=ggml_set_rows(context.get(),destination,input,indices);
+    auto * graph=ggml_new_graph_custom(context.get(),32,false);
+    ggml_build_forward_expand(graph,output);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(context.get(),backend));
+    GGML_ASSERT(buffer);
+    std::vector<int64_t> offsets(rows);
+    for (size_t row=0;row<rows;++row) offsets[row]=int64_t(row);
+    ggml_backend_tensor_set(input,values.data(),0,values.size()*sizeof(float));
+    ggml_backend_tensor_set(indices,offsets.data(),0,offsets.size()*sizeof(int64_t));
+    if (cuda) {
+        llama_memory_cuda_executor execution(backend);
+        GGML_ASSERT(execution.bind(graph,{},1));
+        GGML_ASSERT(execution.compute_async({},1)==GGML_STATUS_SUCCESS && execution.drain());
+    } else {
+        GGML_ASSERT(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS);
+    }
+    std::vector<uint8_t> encoded(ggml_nbytes(output));
+    ggml_backend_tensor_get(output,encoded.data(),0,encoded.size());
+    return encoded;
+}
+
+int main(int argc,char ** argv) {
+    const bool proxy_frame=argc==2 && std::strcmp(argv[1],"--cuda-group-proxy-frame")==0;
+    const bool proxy=argc==2 && std::strcmp(argv[1],"--cuda-group-proxy")==0;
+    const bool cuda=proxy_frame || proxy || (argc==2 && std::strcmp(argv[1],"--cuda-group-producer")==0);
+    if (argc>1 && !cuda) return 1;
+    ggml_backend_ptr joint_backend;
+    if (cuda) {
+        ggml_backend_load_all();
+        auto * device=ggml_backend_dev_by_name("CUDA0");
+        if (!device) return 1;
+        joint_backend.reset(ggml_backend_dev_init(device,nullptr));
+    } else joint_backend.reset(ggml_backend_cpu_init());
+    if (!joint_backend) return 1;
     testing t;
+    if (cuda) t.set_filter(proxy ? "group_proxy_reserves_native_views_but_cannot_execute_before_binding" :
+        "joint_producer_routes_rows_and_commits_all_layers_under_one_source_frontier");
     t.test("cache_namespace_ranges_do_not_wrap_or_overlap_under_concurrent_creation", [](testing & t) {
         const uint64_t limit = (UINT64_MAX - 3)/4;
         std::atomic<uint64_t> clock{1};
@@ -197,6 +245,243 @@ int main() {
         t.assert_true(!table->get(ha,0,cache) && cache == b);
         t.assert_true(!table->logical_used(ha,0,logical) && logical == 77);
         t.assert_true(table->get_cells(hb,0,resolved) && resolved == cb);
+    });
+    t.test("group_proxy_reserves_native_views_but_cannot_execute_before_binding",[&](testing & t) {
+        llama_kv_stream_context_limits limits;
+        if (!t.assert_true(llama_kv_stream_context_limits_make(33,256,2,limits))) return;
+        std::shared_ptr<llama_kv_stream_slot_table> table(llama_kv_stream_slot_table::create(limits));
+        llama_kv_stream_group_model_config config;
+        config.backend=joint_backend.get();config.table=table;
+        config.shape={GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,256,256,4,256,128};
+        config.layers=2;config.query_heads=24;config.maximum_rows=256;config.maximum_verify_rows=1;config.maximum_selected=2;
+        auto model=llama_kv_stream_group_model::create(config);
+        if (!cuda) {t.assert_true(!model);return;}
+        if (!t.assert_true(model!=nullptr)) return;
+        auto * buffer=model->buffer();
+        t.assert_true(buffer && ggml_backend_buft_is_execution(ggml_backend_buffer_get_type(buffer)));
+        ggml_kv_stream_layout layout;
+        if (!t.assert_true(ggml_kv_stream_layout_make(config.shape,256,layout).status==ggml_kv_stream_status::success)) return;
+        t.assert_equal(layout.bytes*2,ggml_backend_buffer_get_size(buffer));
+        llama_kv_stream_host_layer first,second,untouched{reinterpret_cast<void *>(1),reinterpret_cast<void *>(2)};
+        t.assert_true(model->layer(0,first) && model->layer(1,second));
+        t.assert_equal(layout.bytes,uintptr_t(second.k)-uintptr_t(first.k));
+        t.assert_true(!model->layer(2,untouched) && untouched.k==reinterpret_cast<void *>(1));
+        ggml_backend_buffer_clear(buffer,0);
+        auto allocator=llama_batch_allocr(1);auto batch=allocator.ubatch_reserve(1,1);
+        t.assert_true(!model->begin({},batch,{0},llama_memory_work_phase::target_verify));
+        t.assert_true(!model->finish() && model->abort());
+        t.assert_true(!model->bind({},[](uint32_t,ggml_tensor *) {return true;},[] {return true;}));
+        auto invalid=config;invalid.maximum_rows=1;
+        t.assert_true(!llama_kv_stream_group_model::create(invalid));
+        invalid=config;invalid.maximum_verify_rows=9;
+        t.assert_true(!llama_kv_stream_group_model::create(invalid));
+        ggml_backend_buffer_ptr retained(ggml_backend_buffer_retain(buffer));
+        model.reset();
+        ggml_backend_buffer_clear(retained.get(),0);
+        ggml_tensor metadata{};metadata.op=GGML_OP_NONE;
+        t.assert_true(ggml_backend_execution_compute(retained.get(),joint_backend.get(),&metadata)==GGML_STATUS_SUCCESS);
+    });
+    t.test("joint_producer_routes_rows_and_commits_all_layers_under_one_source_frontier", [&](testing & t) {
+        llama_kv_stream_context_limits limits;
+        if (!t.assert_true(llama_kv_stream_context_limits_make(33,proxy_frame ? 256 : 40,2,limits))) return;
+        std::shared_ptr<llama_kv_stream_slot_table> table(llama_kv_stream_slot_table::create(limits));
+        auto * device=cuda ? ggml_backend_get_device(joint_backend.get()) : nullptr;
+        const size_t width=proxy_frame ? 256 : 32;
+        auto a=reserved_cache(721,2,device,uint32_t(width),proxy_frame ? 256 : 8),
+             b=reserved_cache(722,2,device,uint32_t(width),proxy_frame ? 256 : 8);
+        llama_kv_stream_slot_handle ha,hb;
+        if (!t.assert_true(table && table->bind(0,{a},ha) && table->bind(1,{b},hb))) return;
+        auto projection=std::make_shared<llama_kv_stream_slot_projection>();
+        llama_kv_stream_selection selected;
+        if (!t.assert_true(llama_kv_stream_select({33,2},{{0,1},{1,1}},selected)==llama_kv_stream_selection_status::success &&
+                table->project(selected,{ha,hb},0,*projection))) return;
+        auto backend=joint_backend.get();
+        auto * buffer_type=cuda ? llama_kv_stream_device_buffer_type(device) : ggml_backend_cpu_buffer_type();
+        size_t scratch_bytes=4096;
+        if (proxy_frame && !t.assert_true(llama_kv_stream_writer::requirements(buffer_type,a->host()->config().shape,9,scratch_bytes))) return;
+        ggml_backend_buffer_ptr scratch(ggml_backend_buft_alloc_buffer(buffer_type,scratch_bytes));
+        std::shared_ptr<llama_kv_stream_writer> writer(llama_kv_stream_writer::create(backend,scratch.get(),scratch_bytes,a->host()->config().shape,9));
+        std::shared_ptr<llama_kv_stream_group_producer> producer(llama_kv_stream_group_producer::create(table,writer,9,2,2));
+        std::unique_ptr<llama_kv_stream_group_model> model;
+        bool admitted=false;uint32_t attention_calls=0;
+        if (proxy_frame) {
+            llama_kv_stream_group_model_config config{backend,table,a->host()->config().shape,2,4,9,2,2};
+            model=llama_kv_stream_group_model::create(config);
+            if (!t.assert_true(model && model->bind(producer,[&](uint32_t layer,ggml_tensor *) {
+                    ++attention_calls;return producer->layer_ready(layer);},[&] {return admitted;}))) return;
+        }
+        if (!t.assert_true(producer!=nullptr)) return;
+        auto allocator=llama_batch_allocr(1);auto batch=allocator.ubatch_reserve(3,1);
+        llama_seq_id ids[3]={0,1,0};
+        for (size_t row=0;row<3;++row) {
+            batch.n_seq_id[row]=1;batch.seq_id[row]=&ids[row];batch.pos[row]=row==2 ? 1 : 0;batch.token[row]=llama_token(100+row);
+        }
+        const auto begin=[&](const auto & input,const std::vector<uint32_t> & rows) {
+            return model ? model->begin(projection,input,rows,llama_memory_work_phase::target_verify) :
+                producer->begin(projection,input,rows,llama_memory_work_phase::target_verify);
+        };
+        const auto finish=[&] {return model ? model->finish() : producer->finish();};
+        const auto abort=[&] {return model ? model->abort() : producer->abort();};
+        if (model) {
+            t.assert_true(!begin(batch,{0,1,2}) && a->ready() && b->ready());admitted=true;
+        }
+        if (!t.assert_true(begin(batch,{0,1,2}))) return;
+        t.assert_true(!a->ready() && !b->ready());
+        generated_source source(backend,3,width);
+        std::vector<float> keys(3*width),values(3*width);
+        for (size_t row=0;row<3;++row) for (size_t col=0;col<width;++col) {
+            keys[row*width+col]=float(row*8+col)*0.125f;values[row*width+col]=-float(row*16+col)*0.0625f;
+        }
+        std::vector<std::vector<uint8_t>> expected_keys(2),expected_values(2);
+
+        for (uint32_t row=0;row<3;++row) {
+            projection->cells->pos_set(row,batch.pos[row]);projection->cells->seq_add(row,ids[row]);
+            projection->cells->ext_set(row,{0,0,batch.token[row]});
+        }
+        ggml_context_ptr coordinate_metadata(ggml_init({4096,nullptr,true}));
+        auto * coordinate=ggml_new_tensor_1d(coordinate_metadata.get(),GGML_TYPE_I64,3);
+        ggml_backend_buffer_ptr coordinate_buffer(ggml_backend_alloc_ctx_tensors(coordinate_metadata.get(),backend));
+        const auto publish=[&](uint32_t layer,const generated_source & input,const std::vector<int64_t> & rows) {
+            if (!model) return producer->produce(layer,input.k,input.v);
+            ggml_backend_tensor_set(coordinate,rows.data(),0,rows.size()*sizeof(int64_t));
+            auto index=*coordinate;index.ne[0]=int64_t(rows.size());
+            index.nb[1]=index.nb[2]=index.nb[3]=rows.size()*sizeof(int64_t);
+            llama_kv_stream_host_layer planes;
+            if (!model->layer(layer,planes)) return false;
+            ggml_tensor key{},value{},op{};
+            key.type=GGML_TYPE_Q8_0;value.type=GGML_TYPE_Q4_0;
+            key.data=planes.k;value.data=planes.v;key.buffer=value.buffer=model->buffer();
+            op.op=GGML_OP_SET_ROWS;op.src[0]=input.k;op.src[1]=&index;op.src[2]=&key;
+            if (ggml_backend_execution_compute(model->buffer(),backend,&op)!=GGML_STATUS_SUCCESS) return false;
+            op.src[0]=input.v;op.src[2]=&value;op.src[3]=input.k;
+            return ggml_backend_execution_compute(model->buffer(),backend,&op)==GGML_STATUS_SUCCESS;
+        };
+        if (model && !t.assert_true(model->apply_cells(*projection->cells))) return;
+        for (uint32_t layer=0;layer<2;++layer) {
+            for (auto & value : keys) value+=0.5f;
+            for (auto & value : values) value-=0.25f;
+            ggml_backend_tensor_set(source.k,keys.data(),0,keys.size()*sizeof(float));
+            ggml_backend_tensor_set(source.v,values.data(),0,values.size()*sizeof(float));
+            expected_keys[layer]=native_rows(backend,cuda,GGML_TYPE_Q8_0,keys,width);
+            expected_values[layer]=native_rows(backend,cuda,GGML_TYPE_Q4_0,values,width);
+            if (!t.assert_true(publish(layer,source,{0,1,2}) && producer->layer_ready(layer))) return;
+            if (model) {
+                llama_kv_stream_host_layer planes;if (!t.assert_true(model->layer(layer,planes))) return;
+                ggml_tensor query{},key{},value{},mask{},op{};
+                query.type=op.type=GGML_TYPE_F32;key.type=GGML_TYPE_Q8_0;value.type=GGML_TYPE_Q4_0;
+                query.ne[0]=int64_t(width);query.ne[1]=3;query.ne[2]=4;query.ne[3]=1;
+                key.ne[0]=value.ne[0]=int64_t(width);key.ne[1]=value.ne[1]=256;
+                key.ne[2]=value.ne[2]=key.ne[3]=value.ne[3]=1;
+                key.data=planes.k;value.data=planes.v;key.buffer=value.buffer=model->buffer();
+                op.op=GGML_OP_FLASH_ATTN_EXT;op.src[0]=&query;op.src[1]=&key;op.src[2]=&value;op.src[3]=&mask;
+                const float params[3]={0.125f,0,0};std::memcpy(op.op_params,params,sizeof(params));
+                if (!t.assert_true(ggml_backend_execution_compute(model->buffer(),backend,&op)==GGML_STATUS_SUCCESS)) return;
+            }
+            if (!layer) {
+                t.assert_true(!finish() && !a->ready() && !b->ready());
+                t.assert_equal(size_t(0),a->tokens());t.assert_equal(size_t(0),b->tokens());
+            }
+        }
+        if (!t.assert_true(finish())) return;
+        t.assert_equal(size_t(2),a->tokens());t.assert_equal(size_t(1),b->tokens());
+        t.assert_true(a->ready() && b->ready() && table->projection_current(*projection));
+        for (uint32_t layer_index=0;layer_index<2;++layer_index) for (bool value : {false,true}) {
+            const auto type=value ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
+            const size_t stride=ggml_row_size(type,int64_t(width));
+            const auto & encoded=value ? expected_values[layer_index] : expected_keys[layer_index];
+            for (uint32_t row=0;row<3;++row) {
+                const auto cache=row==1 ? b : a;
+                const size_t token=row==2 ? 1 : 0;
+                llama_kv_stream_host_layer layer;
+                if (!t.assert_true(cache->host()->layer(layer_index,layer))) return;
+                const auto * address=static_cast<const uint8_t *>(value ? layer.v : layer.k)+token*stride;
+                t.assert_true(!std::memcmp(encoded.data()+row*stride,address,stride));
+                t.assert_equal(uint32_t(row==1 ? 1 : 0),projection->columns[row].source);
+                t.assert_equal(token,projection->columns[row].token);
+            }
+        }
+        const auto before_a=a->checkpoint(),before_b=b->checkpoint();
+        ids[0]=2;
+        t.assert_true(!begin(batch,{3,4,5}));
+        t.assert_equal(before_a.generation,a->identity().generation);t.assert_equal(before_b.generation,b->identity().generation);
+        auto one=allocator.ubatch_reserve(1,1);llama_seq_id id=0;
+        one.pos[0]=2;one.token[0]=200;one.n_seq_id[0]=1;one.seq_id[0]=&id;
+        if (!t.assert_true(begin(one,{3}))) return;
+        projection->cells->pos_set(3,2);projection->cells->seq_add(3,0);
+        generated_source extra(backend,1,width);
+        if (model && !t.assert_true(model->apply_cells(*projection->cells))) return;
+        if (!t.assert_true(publish(0,extra,{3}) && !finish())) return;
+        t.assert_true(abort());
+        t.assert_equal(size_t(2),a->tokens());t.assert_equal(size_t(1),b->tokens());
+        t.assert_true(a->ready() && b->ready());
+        if (!t.assert_true(llama_kv_stream_select({33,2},{{0,2},{1,1}},selected)==llama_kv_stream_selection_status::success &&
+                table->project(selected,{ha,hb},0,*projection))) return;
+        if (!t.assert_true(begin(one,{3}))) return;
+        projection->cells->pos_set(3,2);projection->cells->seq_add(3,0);
+        if (model && !t.assert_true(model->apply_cells(*projection->cells))) return;
+        if (!t.assert_true(a->content()->invalidate())) return;
+        if (!t.assert_true("stale source generation rejects before joint producer submission",!publish(0,extra,{3}))) {
+            abort();return;
+        }
+        t.assert_true("unknown external content mutation cannot reopen cache admission",!abort());
+        t.assert_equal(size_t(2),a->tokens());t.assert_equal(size_t(1),b->tokens());
+        t.assert_true(!a->ready() && b->ready());
+        t.assert_true(!begin(one,{3}));
+        if (model) t.assert_equal(uint32_t(2),attention_calls);
+    });
+    t.test("selected_native_projection_keeps_canonical_rows_positions_and_logical_allowances", [](testing & t) {
+        llama_kv_stream_context_limits limits;
+        if (!t.assert_true(llama_kv_stream_context_limits_make(33,40,2,limits))) return;
+        auto table=llama_kv_stream_slot_table::create(limits);
+        auto a=reserved_cache(601),b=reserved_cache(602);
+        llama_kv_stream_slot_handle ha,hb;
+        if (!t.assert_true(table && table->bind(0,{a},ha) && table->bind(1,{b},hb))) return;
+        if (!t.assert_true(append(t,*a,7,0x31) && append(t,*b,13,0x51))) return;
+        std::shared_ptr<llama_kv_cells> ca,cb;
+        if (!t.assert_true(table->get_cells(ha,0,ca) && table->get_cells(hb,0,cb))) return;
+        for (uint32_t row=0;row<13;++row) {
+            cb->pos_set(row,llama_pos(91+row));cb->seq_add(row,1);cb->ext_set(row,{llama_pos(row),3,LLAMA_TOKEN_NULL});
+            if (row<7) {ca->pos_set(row,llama_pos(17+row));ca->seq_add(row,0);ca->ext_set(row,{2,llama_pos(row),llama_token(100+row)});}
+        }
+        llama_kv_stream_selection selected;
+        if (!t.assert_true(llama_kv_stream_select({33,2},{{0,8},{1,14}},selected)==llama_kv_stream_selection_status::success)) return;
+        llama_kv_stream_slot_projection projection;
+        if (!t.assert_true(table->project(selected,{ha,hb},0,projection))) return;
+        if (!t.assert_true(projection.cells && projection.columns.size()==40)) return;
+        t.assert_true(table->projection_current(projection));
+        t.assert_equal(uint32_t(20),projection.cells->get_used());
+        if (!t.assert_true("logical growth allowances do not increase native attention key extent",projection.cells->used_max_p1()==20)) return;
+        t.assert_equal(size_t(14),selected.slots[1].offset_tokens);
+        for (size_t col=0;col<40;++col) {
+            const bool first=col<7,second=col>=7 && col<20;
+            if (!first && !second) {
+                t.assert_true(projection.cells->is_empty(uint32_t(col)) && projection.columns[col].source==UINT32_MAX);
+                continue;
+            }
+            const uint32_t row=uint32_t(first ? col : col-7),slot=first ? 0 : 1;
+            const auto & source=first ? *ca : *cb;
+            t.assert_equal(slot,projection.columns[col].source);
+            t.assert_equal(size_t(row),projection.columns[col].token);
+            t.assert_equal(source.pos_get(row),projection.cells->pos_get(uint32_t(col)));
+            t.assert_true(projection.cells->seq_get_all(uint32_t(col))==source.seq_get_all(row));
+            const auto & want=source.ext_get(row);const auto & got=projection.cells->ext_get(uint32_t(col));
+            t.assert_true(want.x==got.x && want.y==got.y && want.tok==got.tok);
+        }
+        auto before=projection.cells;
+        auto bad=selected;bad.slots[1].offset_tokens=13;
+        t.assert_true(!table->project(bad,{ha,hb},0,projection) && projection.cells==before);
+        t.assert_true(!table->project(selected,{hb,ha},0,projection) && projection.cells==before);
+        t.assert_true(!table->project(selected,{ha,hb},1,projection) && projection.cells==before);
+        t.assert_true(table->advance(ha,ha));
+        t.assert_true(!table->projection_current(projection));
+        t.assert_true(table->project(selected,{ha,hb},0,projection));
+        if (!t.assert_true(b->begin(1))) return;
+        t.assert_true(!table->projection_current(projection));
+        t.assert_true(!table->project(selected,{ha,hb},0,projection));
+        t.assert_true(b->cancel());
+        t.assert_true(!table->projection_current(projection));
+        t.assert_true(table->project(selected,{ha,hb},0,projection));
+        t.assert_true(ca->get_used()==7 && cb->get_used()==13);
     });
     t.test("sampled_pending_anchor_counts_once_in_logical_context", [](testing & t) {
         llama_kv_stream_context_limits limits;
@@ -420,6 +705,38 @@ int main() {
         t.assert_true(std::memcmp(layer.k, saved_bytes.data(), saved_bytes.size()) == 0);
         t.assert_true(mtp->identity().generation > saved.generation);
         t.assert_true(append(t, *mtp, 1, 0x60));
+    });
+    t.test("layered_publication_commits_one_frontier_only_after_all_native_layers_complete", [](testing & t) {
+        auto config=host(711)->config();config.layers=2;
+        auto backing=llama_kv_stream_host::create(config,ggml_backend_cpu_buffer_type());
+        auto cache=llama_kv_stream_logical_cache::create(backing);
+        if (!t.assert_true(cache && cache->begin(3))) return;
+        const auto generation=cache->identity().generation;
+        llama_kv_stream_write writes[2];
+        for (uint32_t layer=0;layer<2;++layer) {
+            const size_t kb=3*backing->layout().k_token_bytes,vb=3*backing->layout().v_token_bytes;
+            std::vector<uint8_t> keys(kb,uint8_t(10+layer)),values(vb,uint8_t(20+layer));
+            if (!t.assert_true(cache->content()->prepare({{layer,operand::k,0,keys.data(),kb},
+                    {layer,operand::v,0,values.data(),vb}},writes[layer]))) return;
+        }
+        std::vector<llama_kv_stream_write *> partial{&writes[0]};
+        t.assert_true(!cache->publish_host(partial));
+        t.assert_equal(size_t(0),cache->tokens());
+        t.assert_equal(generation,cache->identity().generation);
+        t.assert_true(writes[0].pending() && writes[1].pending());
+        std::vector<llama_kv_stream_write *> invalid{&writes[0],nullptr,&writes[1]};
+        t.assert_true(!cache->publish_host(invalid));
+        std::vector<llama_kv_stream_write *> complete{&writes[0],&writes[1]};
+        if (!t.assert_true(cache->publish_host(complete) && cache->finish())) return;
+        t.assert_equal(size_t(3),cache->tokens());
+        t.assert_equal(generation+1,cache->identity().generation);
+        for (uint32_t layer=0;layer<2;++layer) {
+            llama_kv_stream_host_layer planes;
+            if (!t.assert_true(backing->layer(layer,planes))) return;
+            const auto * key=static_cast<const uint8_t *>(planes.k),*value=static_cast<const uint8_t *>(planes.v);
+            t.assert_true(std::all_of(key,key+3*backing->layout().k_token_bytes,[&](uint8_t byte) {return byte==10+layer;}));
+            t.assert_true(std::all_of(value,value+3*backing->layout().v_token_bytes,[&](uint8_t byte) {return byte==20+layer;}));
+        }
     });
     t.test("partial_or_out_of_range_kv_cannot_publish_a_token_frontier", [](testing & t) {
         auto mtp = llama_kv_stream_logical_cache::create(host(404));

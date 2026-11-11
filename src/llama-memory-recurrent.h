@@ -76,6 +76,8 @@ public:
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    // Select logical identities for a deferred physical bank; no state may be live or bound.
+    bool configure_selected_sequences(const std::vector<llama_seq_id> & sequences);
     bool current_storage_pending() const noexcept;
     bool current_storage_requirements(ggml_backend_buffer_type_t & type, size_t & bytes) const noexcept;
     // Opt an already drained native bank into explicit arena-owned parking on the same device.
@@ -164,6 +166,10 @@ private:
     struct current_storage_state;
     std::unique_ptr<current_storage_state> selected_storage;
     bool replace_current_storage(ggml_backend_memory_lease_t lease);
+    uint32_t sequence_capacity() const noexcept;
+    bool sequence_selected(llama_seq_id id) const noexcept;
+    int32_t & sequence_tail(llama_seq_id id);
+    int32_t sequence_tail(llama_seq_id id) const;
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;

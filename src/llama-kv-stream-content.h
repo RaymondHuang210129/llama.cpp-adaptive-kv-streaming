@@ -92,6 +92,9 @@ public:
     // Call on every mirror rebind/repartition, even if addresses and arena generation happen to match.
     // Does not invalidate a pending host write; content and device-layout lifecycles are separate.
     bool reset_mirror();
+    // An enclosing producer may expose completed rows to its mirror before host publication.
+    // This does not change host bytes, content identity, layout epoch or pending write tickets.
+    bool invalidate_mirror_rows(const std::vector<llama_kv_stream_rows> & rows);
 
     // Copy only dirty runs in the selected ranges. Callback must finish all its accesses before returning/throwing.
     // Any failure retains all dirty marks; partially copied device data must not be used for attention until retry.

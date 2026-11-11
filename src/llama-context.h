@@ -19,6 +19,19 @@
 #include <vector>
 
 struct llama_model;
+struct llama_kv_stream_slot_projection;
+struct llama_kv_stream_slot_handle;
+struct llama_kv_stream_selection;
+class llama_kv_stream_slot_table;
+
+// Process-local native role snapshots. Canonical full KV remains owned by the slot table.
+struct llama_context_group_sequence_state {
+    const llama_model * model = nullptr;
+    llama_seq_id sequence = -1;
+    uint64_t request_epoch = 0, cache_id = 0, cache_generation = 0;
+    size_t tokens = 0;
+    std::vector<uint8_t> recurrent, bounded;
+};
 class llama_batch_allocr;
 class llama_moe_cache;
 
@@ -44,7 +57,7 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
-enum class llama_context_mode { execution, measurement };
+enum class llama_context_mode { execution, measurement, group_initialization };
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -63,6 +76,33 @@ struct llama_context {
     // Build topology and size storage without allocating or executing it.
     llama_context(const llama_model & model, llama_context_params params, llama_context_mode mode);
     bool is_measurement_only() const { return measurement_only; }
+    // Selected-state metadata stays non-executable until all group grants are bound.
+    llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected);
+    bool group_storage_pending() const noexcept { return group_initializing; }
+    // The supplied owner and measured workspace cover all selected native state and graph users.
+    bool attach_group_execution(std::unique_ptr<llama_context_memory> & workspace,
+        std::shared_ptr<llama_kv_stream_slot_projection> projection,std::unique_ptr<llama_memory_phase_owner> & owner,
+        llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision);
+    bool group_submission_allowed() const noexcept;
+    // Borrow already initialized chains from the same model's non-executing metadata context.
+    // The frontend retains their RNG/grammar ownership through group retirement.
+    bool bind_group_samplers_from(const llama_context & prepared);
+    // Compose the measured group on one caller-retained parent, or allocate its first parent.
+    bool initialize_group_execution(std::shared_ptr<llama_kv_stream_slot_table> table,
+        std::shared_ptr<llama_kv_stream_slot_projection> projection,const llama_batch & representative,
+        llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,
+        ggml_backend_buffer_t parent = nullptr,const std::vector<llama_context_group_sequence_state> & states = {},
+        llama_context_memory_create_result * result = nullptr);
+    ggml_backend_buffer_t group_parent() const noexcept;
+    // Export only selected current/SWA roles after all group work has completed.
+    bool save_group_sequences(std::vector<llama_context_group_sequence_state> & output);
+    // Save any desired current/SWA snapshots first. Failed retirement stays non-executable.
+    bool detach_group_execution() noexcept;
+    // Drain failed work and cancel its publication before releasing selected device state.
+    bool abort_group_execution() noexcept;
+    // Restore only into a closed, rebound selected-state layout; the full KV checkpoint must still match.
+    bool restore_group_sequences(const std::vector<llama_context_group_sequence_state> & states,
+        const llama_kv_stream_slot_projection & projection);
     // Managed attention storage is quoted separately; failure preserves sizes.
     bool measure_workspace(uint32_t tokens, uint32_t sequences, uint32_t outputs,
         bool managed_full_attention, std::vector<size_t> & sizes);
@@ -273,7 +313,8 @@ struct llama_context {
 
 private:
     llama_context(const llama_model & model, llama_context_params params,
-        uint32_t serial_prediction_rows, bool serial_image_inputs, llama_context_mode mode);
+        uint32_t serial_prediction_rows, bool serial_image_inputs, llama_context_mode mode,
+        const std::vector<llama_seq_id> & selected = {});
     bool no_alloc() const;
 
     //
@@ -518,5 +559,38 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
     bool measurement_only = false;
+    bool group_initializing = false;
+    bool group_restore_failed = false;
+    std::vector<llama_seq_id> group_selected;
+    struct group_execution_binding;
+    std::unique_ptr<group_execution_binding> group_execution;
 
+};
+
+// Own only the selected execution context, parked native roles and one retained device parent.
+// Request queues, samplers and response cursors stay with the server.
+class llama_context_group {
+public:
+    // Reserve canonical host addresses before accepting requests; commit/register rows on demand.
+    static std::unique_ptr<llama_context_group> create(const llama_model & model,llama_context_params params);
+    static std::unique_ptr<llama_context_group> create(const llama_model & model,llama_context_params params,
+        std::shared_ptr<llama_kv_stream_slot_table> table);
+    ~llama_context_group();
+    bool activate(const llama_kv_stream_selection & selection,const std::vector<llama_kv_stream_slot_handle> & handles,
+        const llama_batch & representative,llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,
+        llama_context_memory_create_result * result = nullptr);
+    // Save selected roles before retiring their GPU grants; failed retirement keeps the owner closed.
+    bool park();
+    // Discard selected native state after failure; reset those request namespaces before reuse.
+    bool discard() noexcept;
+    llama_context * context() const noexcept;
+    llama_context * metadata_context() const noexcept;
+    std::shared_ptr<llama_kv_stream_slot_table> source_table() const noexcept;
+    const std::vector<llama_kv_stream_slot_handle> & source_handles() const noexcept;
+    // A new request retires the old namespace, not its stable canonical address range.
+    bool reset_request(uint32_t slot);
+private:
+    llama_context_group();
+    struct implementation;
+    std::unique_ptr<implementation> impl;
 };

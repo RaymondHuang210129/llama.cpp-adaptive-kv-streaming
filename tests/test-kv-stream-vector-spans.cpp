@@ -5,6 +5,8 @@
 #include "../ggml/src/ggml-backend-execution.h"
 #include "../src/llama-kv-stream-model.h"
 #include "../src/llama-kv-stream-selection.h"
+#include "../src/llama-kv-stream-resident.h"
+#include "../ggml/src/ggml-kv-stream-registered-copy.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1107,10 +1109,91 @@ static void check_slot_page_queues(testing & t) {
     t.assert_equal(size_t(42),profiles);
 }
 
-static void check_slot_joint_attention(testing & t,bool small,bool wide_only=false) {
+struct group_pipeline_probe {
+    inline static group_pipeline_probe * active=nullptr;
+    ggml_backend_reg_t reg;
+    decltype(ggml_backend_reg_i::get_proc_address) original;
+    const ggml_kv_stream_copy_ops * copy;
+    const ggml_kv_stream_registered_copy_ops * registered;
+    const ggml_kv_stream_partial_ops * partial;
+    ggml_kv_stream_copy_ops copy_probe;
+    ggml_kv_stream_registered_copy_ops registered_probe;
+    ggml_kv_stream_partial_ops partial_probe;
+    std::vector<char> events;
+    std::map<void *,size_t> held;
+    size_t maximum_held=0,fail_seen=0;
+    int fail_kind=-1;
+    bool fail_fired=false;
+    bool inject(int kind) {
+        if (fail_kind!=kind || ++fail_seen!=(kind ? 1u : 3u)) return false;
+        fail_fired=true;return true;
+    }
+    explicit group_pipeline_probe(ggml_backend_t backend) : reg(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend))),
+        original(reg->iface.get_proc_address) {
+        GGML_ASSERT(!active);active=this;
+        copy=reinterpret_cast<ggml_kv_stream_copy_ops_get>(original(reg,"ggml_backend_kv_stream_copy_ops"))();
+        registered=reinterpret_cast<ggml_kv_stream_registered_copy_ops_get>(original(reg,"ggml_backend_kv_stream_registered_copy_ops"))();
+        partial=reinterpret_cast<ggml_kv_stream_partial_ops_get>(original(reg,"ggml_backend_kv_stream_partial_ops"))();
+        copy_probe=*copy;registered_probe=*registered;partial_probe=*partial;
+        copy_probe.gather=[](ggml_backend_t backend,ggml_backend_buffer_t output,
+                const ggml_kv_stream_copy_rectangle * rectangles,size_t count,bool initialize) {
+            const bool okay=active->copy->gather(backend,output,rectangles,count,initialize);
+            if (okay) active->events.push_back('G');
+            return okay;
+        };
+        copy_probe.acquire_span=[](void * queue,size_t slot,size_t count) {
+            const bool okay=active->copy->acquire_span(queue,slot,count);
+            if (okay) {active->held[queue]+=count;active->maximum_held=std::max(active->maximum_held,active->held[queue]);}
+            return okay && !active->inject(1);
+        };
+        copy_probe.release_span=[](void * queue,size_t slot,size_t count) {
+            const bool okay=active->copy->release_span(queue,slot,count);
+            if (okay) {GGML_ASSERT(active->held[queue]>=count);active->held[queue]-=count;}
+            return okay && !active->inject(2);
+        };
+        copy_probe.drain=[](void * queue) {active->copy->drain(queue);active->held[queue]=0;};
+        registered_probe.enqueue=[](void * queue,size_t slot,const ggml_kv_stream_registered_copy_fragment * k,size_t nk,
+                const ggml_kv_stream_registered_copy_fragment * v,size_t nv,size_t live,size_t padded,bool feedback) {
+            const bool okay=active->registered->enqueue(queue,slot,k,nk,v,nv,live,padded,feedback);
+            if (okay) active->events.push_back('C');
+            return okay && !active->inject(0);
+        };
+        partial_probe.resume=[](ggml_backend_t backend,const ggml_tensor * op,ggml_backend_buffer_t workspace,
+                const ggml_kv_stream_resume_plan & plan,size_t tokens,size_t first,bool last) {
+            active->events.push_back('A');return active->partial->resume(backend,op,workspace,plan,tokens,first,last);
+        };
+        partial_probe.resume_spans=[](ggml_backend_t backend,const ggml_tensor * op,ggml_backend_buffer_t workspace,
+                const ggml_kv_stream_resume_plan & plan,const ggml_kv_stream_span_plan_view & view,size_t first,size_t end) {
+            active->events.push_back('A');return active->partial->resume_spans(backend,op,workspace,plan,view,first,end);
+        };
+        reg->iface.get_proc_address=[](ggml_backend_reg_t reg,const char * name) -> void * {
+            if (!std::strcmp(name,"ggml_backend_kv_stream_copy_ops"))
+                return reinterpret_cast<void *>(+[]() -> const ggml_kv_stream_copy_ops * {return &active->copy_probe;});
+            if (!std::strcmp(name,"ggml_backend_kv_stream_registered_copy_ops"))
+                return reinterpret_cast<void *>(+[]() -> const ggml_kv_stream_registered_copy_ops * {return &active->registered_probe;});
+            if (!std::strcmp(name,"ggml_backend_kv_stream_partial_ops"))
+                return reinterpret_cast<void *>(+[]() -> const ggml_kv_stream_partial_ops * {return &active->partial_probe;});
+            return active->original(reg,name);
+        };
+    }
+    bool copy_between_gather_and_attention() const {
+        bool copied=false;
+        for (auto event : events) {
+            if (event=='G') copied=false;
+            if (event=='C') copied=true;
+            if (event=='A' && copied) return true;
+        }
+        return false;
+    }
+    ~group_pipeline_probe() {reg->iface.get_proc_address=original;active=nullptr;}
+};
+
+static void check_slot_joint_attention(testing & t,bool small,bool wide_only=false,bool managed=false,bool reader_errors=false,bool reader_grid=false,bool attention_adapter=false,size_t resident_pool_pages=0,bool pending_append=false,bool pipeline_probe=false,uint32_t prefill_queries=0,uint32_t pipeline_dimension=0) {
     ggml_backend_load_all();auto * device=ggml_backend_dev_by_name("CUDA0");
     if (!t.assert_true(device!=nullptr)) return;
     ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
+    std::unique_ptr<group_pipeline_probe> pipeline;
+    if (pipeline_probe) pipeline=std::make_unique<group_pipeline_probe>(backend.get());
     auto * reg=ggml_backend_dev_backend_reg(device);
     const auto partial_get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_partial_ops"));
     const auto copy_get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_copy_ops"));
@@ -1123,10 +1206,13 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
         const bool extended=(key==GGML_TYPE_Q8_0 && (value==GGML_TYPE_Q4_0 || value==GGML_TYPE_Q8_0)) ||
             (key==GGML_TYPE_Q5_1 && value==GGML_TYPE_Q5_1);
         if (small && !extended) continue;
+        if ((reader_errors || pipeline_probe) && (width!=(pipeline_dimension ? pipeline_dimension : 256) ||
+                key!=GGML_TYPE_Q8_0 || value!=GGML_TYPE_Q4_0)) continue;
         const ggml_kv_stream_shape shape{key,value,width,width,4,256,128};
         ggml_kv_stream_layout tile;
         if (!t.assert_true(ggml_kv_stream_layout_make(shape,256,tile).status==ggml_kv_stream_status::success)) return;
         for (size_t selected : {size_t(1),size_t(2)}) {
+            if ((reader_errors || reader_grid || pipeline_probe) && selected!=2) continue;
             if (wide_only && selected!=2) continue;
             std::vector<std::pair<uint32_t,uint32_t>> widths={{1,1}};
             if (extended) {
@@ -1134,10 +1220,13 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                 if (selected==2) {widths.push_back({1,3});widths.push_back({2,4});}
             }
             if (wide_only) widths={{8,8}};
+            if (reader_errors || reader_grid || pipeline_probe) widths={{1,3}};
+            if (prefill_queries) widths={{prefill_queries/2,prefill_queries/2}};
             for (auto query_counts : widths) for (size_t layout=0;layout<(selected==1 ? 1u : 5u);++layout)
             for (bool compact : {false,true}) {
                 if (compact && layout!=0) continue;
                 if (wide_only && layout!=4) continue;
+                if ((reader_errors || reader_grid || pipeline_probe) && layout!=4) continue;
                 const uint32_t own_queries[]={query_counts.first,query_counts.second};
                 const uint32_t queries=own_queries[0]+(selected==2 ? own_queries[1] : 0),heads=width==256 ? 24 : 32;
                 const size_t lengths[]={2049,769},gap=layout==3 ? 256 : 0;
@@ -1145,19 +1234,33 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                 ggml_kv_stream_resume_plan plan;
                 if (!t.assert_true(ggml_kv_stream_resume_plan_query(partial,backend.get(),{shape,heads,queries,padded},plan))) return;
                 size_t scratch_bytes=plan.bytes;
-                if (wide_only && !t.assert_true(ggml_kv_stream_workspace_query(partial,backend.get(),
-                        {shape,heads,queries,padded},ggml_kv_stream_workspace_kind::decode,scratch_bytes))) return;
-                if (wide_only && !t.assert_true(scratch_bytes>=plan.bytes)) return;
+                if ((wide_only || attention_adapter) && !t.assert_true(ggml_kv_stream_workspace_query(partial,backend.get(),
+                        {shape,heads,queries,padded},prefill_queries ? ggml_kv_stream_workspace_kind::prefill : ggml_kv_stream_workspace_kind::decode,scratch_bytes))) return;
+                if ((wide_only || attention_adapter) && !t.assert_true(scratch_bytes>=plan.bytes)) return;
                 const size_t alignment=ggml_backend_buft_get_alignment(llama_kv_stream_device_buffer_type(device));
-                const size_t guard=(alignment+127)/128*128,kv_end=guard+selected*3*tile.bytes;
+                ggml_kv_stream_execution page;
+                if (!t.assert_true(ggml_kv_stream_resolve(shape,partial->capabilities(backend.get(),key,value),256,page).status==ggml_kv_stream_status::success)) return;
+                const size_t pool_pages=resident_pool_pages ? resident_pool_pages : 3;
+                const size_t pool_bytes=pool_pages*tile.bytes+(resident_pool_pages ? page.conversion.bytes : 0);
+                const size_t guard=(alignment+127)/128*128,kv_end=guard+selected*pool_bytes;
                 const size_t stage_offset=(kv_end+guard+alignment-1)/alignment*alignment;
                 const size_t partial_offset=(stage_offset+tile.bytes+guard+alignment-1)/alignment*alignment;
-                arena_ptr parent(ggml_backend_memory_arena_new(llama_kv_stream_device_buffer_type(device),partial_offset+scratch_bytes+guard),ggml_backend_memory_arena_free);
+                const bool attention_errors=attention_adapter && reader_errors;
+                const size_t short_offset=(partial_offset+scratch_bytes+guard+alignment-1)/alignment*alignment;
+                const size_t parent_bytes=attention_errors ? short_offset+scratch_bytes-1+guard : partial_offset+scratch_bytes+guard;
+                std::vector<std::shared_ptr<void>> prepared;
+                if (managed) for (size_t slot=0;slot<selected;++slot) {
+                    prepared.emplace_back(copy->prepare(backend.get(),pool_pages,false),copy->free_prepared);
+                    if (!t.assert_true(prepared.back()!=nullptr)) return;
+                }
+                arena_ptr parent(ggml_backend_memory_arena_new(llama_kv_stream_device_buffer_type(device),parent_bytes),ggml_backend_memory_arena_free);
                 if (!t.assert_true(parent && ggml_backend_memory_arena_begin(parent.get(),0))) return;
                 for (size_t slot=0;slot<selected;++slot) if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),101+slot,
-                        guard+slot*3*tile.bytes,3*tile.bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr))) return;
+                        guard+slot*pool_bytes,pool_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr))) return;
                 if (!t.assert_true(ggml_backend_memory_arena_reserve_at(parent.get(),201,stage_offset,tile.bytes,alignment,0,nullptr) &&
-                        ggml_backend_memory_arena_reserve_at(parent.get(),202,partial_offset,scratch_bytes,alignment,0,nullptr) && ggml_backend_memory_arena_commit(parent.get()))) return;
+                        ggml_backend_memory_arena_reserve_at(parent.get(),202,partial_offset,scratch_bytes,alignment,0,nullptr) &&
+                        (!attention_errors || ggml_backend_memory_arena_reserve_at(parent.get(),203,short_offset,scratch_bytes-1,alignment,0,nullptr)) &&
+                        ggml_backend_memory_arena_commit(parent.get()))) return;
                 ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(parent.get()),0xa5);
                 lease_ptr source_lease[2]={{nullptr,ggml_backend_memory_lease_free},{nullptr,ggml_backend_memory_lease_free}};
                 std::unique_ptr<fixture> sources[2];
@@ -1165,7 +1268,7 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                 std::vector<std::unique_ptr<void,void (*)(void *)>> queues;
                 for (size_t slot=0;slot<selected;++slot) {
                     source_lease[slot].reset(ggml_backend_memory_arena_acquire(parent.get(),101+slot));
-                    sources[slot]=std::make_unique<fixture>(backend.get(),true,key,value,4096,false,2,4,3,width,width,source_lease[slot].get(),37+slot,uint32_t(slot*101));
+                    sources[slot]=std::make_unique<fixture>(backend.get(),true,key,value,4096,false,2,4,pool_pages,width,width,source_lease[slot].get(),37+slot,uint32_t(slot*101));
                     const auto & host=sources[slot]->host;
                     canonical[slot].resize(host->bytes());
                     std::memcpy(canonical[slot].data(),ggml_backend_buffer_get_base(host->buffer()),host->bytes());
@@ -1174,6 +1277,18 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                 }
                 lease_ptr staging(ggml_backend_memory_arena_acquire(parent.get(),201),ggml_backend_memory_lease_free),
                     scratch(ggml_backend_memory_arena_acquire(parent.get(),202),ggml_backend_memory_lease_free);
+                lease_ptr short_scratch(attention_errors ? ggml_backend_memory_arena_acquire(parent.get(),203) : nullptr,ggml_backend_memory_lease_free);
+                std::unique_ptr<llama_kv_stream_group_reader> reader;
+                bool source_current=true,source_throws=false;size_t source_checks=0;
+                if (managed) {
+                    std::vector<llama_kv_stream_group_reader_source> grants;
+                    for (size_t slot=0;slot<selected;++slot)
+                        grants.push_back({sources[slot]->host,source_lease[slot].get(),pool_pages,lengths[slot],prepared[slot],
+                            resident_pool_pages ? sources[slot]->content : nullptr});
+                    reader=llama_kv_stream_group_reader::create(backend.get(),grants,staging.get(),
+                        [&](uint32_t) {++source_checks;if (source_throws) throw std::runtime_error("source proof fault");return source_current;});
+                    if (!t.assert_true(reader!=nullptr)) return;
+                }
                 fixture reference(backend.get(),true,key,value,4096,false,2,4,3,width,width,nullptr,49,0);
                 std::vector<ggml_kv_stream_gather_row> columns(padded),packet(256);
                 size_t cursor=gap;
@@ -1215,12 +1330,12 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                 struct retirement {ggml_backend_t backend;void (*release)(ggml_backend_t);
                     ~retirement() {ggml_backend_synchronize(backend);release(backend);}} captures{backend.get(),retire};
                 const auto generation_a=sources[0]->content->generation(),generation_b=selected==2 ? sources[1]->content->generation() : 0;
-                size_t max_sources=0;
+                size_t max_sources=0;bool appended=false;
                 for (uint32_t layer : {0u,1u}) {
                     llama_kv_stream_host_layer origin[2],native;
                     for (size_t slot=0;slot<selected;++slot) if (!t.assert_true(sources[slot]->host->layer(layer,origin[slot]))) return;
                     if (!t.assert_true(reference.host->layer(layer,native))) return;
-                    for (size_t col=0;col<active;++col) for (bool side : {false,true}) {
+                    for (size_t col=0;col<active+size_t(appended);++col) for (bool side : {false,true}) {
                         const auto & row=columns[col];const size_t bytes=side ? tile.v_token_bytes : tile.k_token_bytes;
                         if (row.source==UINT32_MAX) continue;
                         std::memcpy(static_cast<uint8_t *>(side ? native.v : native.k)+col*bytes,
@@ -1232,9 +1347,42 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                         ggml_backend_tensor_set(control.v_storage,native.v,0,ggml_nbytes(control.v_storage));
                     }
                     for (size_t replay=0;replay<3;++replay) {
+                        llama_kv_stream_write pending;
+                        const bool publishing=pending_append && !layer && replay==1;
+                        if (publishing) {
+                            std::vector<std::vector<uint8_t>> encoded(2);
+                            std::vector<llama_kv_stream_write_span> spans;
+                            for (bool side : {false,true}) {
+                                const auto dtype=side ? value : key;
+                                const size_t bytes=side ? tile.v_token_bytes : tile.k_token_bytes;
+                                encoded[side].resize(bytes);std::vector<float> values(width*4,side ? 2.0f : 0.0f);
+                                ggml_quantize_chunk(dtype,values.data(),encoded[side].data(),0,1,width*4,nullptr);
+                                spans.push_back({layer,side ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,lengths[0]*bytes,nullptr,bytes});
+                            }
+                            if (!t.assert_true(sources[0]->content->prepare_direct_generated(spans,[&](const auto & span,void * destination) {
+                                const bool side=span.operand==ggml_kv_stream_operand::v;
+                                std::memcpy(destination,encoded[side].data(),encoded[side].size());return true;
+                            },pending))) return;
+                            for (bool side : {false,true}) {
+                                const size_t bytes=side ? tile.v_token_bytes : tile.k_token_bytes;
+                                const auto * plane=static_cast<const uint8_t *>(side ? origin[0].v : origin[0].k);
+                                const auto * base=static_cast<const uint8_t *>(ggml_backend_buffer_get_base(sources[0]->host->buffer()));
+                                std::memcpy(canonical[0].data()+size_t(plane-base)+lengths[0]*bytes,encoded[side].data(),bytes);
+                                std::memcpy(static_cast<uint8_t *>(side ? native.v : native.k)+active*bytes,encoded[side].data(),bytes);
+                            }
+                            columns[active]={0,lengths[0]};mask[active]=ggml_fp32_to_fp16(0);
+                            ggml_backend_tensor_set(input.mask,mask.data(),0,mask.size()*sizeof(mask[0]));
+                            ggml_backend_tensor_set(control.k_storage,native.k,0,ggml_nbytes(control.k_storage));
+                            ggml_backend_tensor_set(control.v_storage,native.v,0,ggml_nbytes(control.v_storage));
+                            if (!t.assert_true(reader->update_frontiers({{lengths[0]+1,lengths[0]},{lengths[1],lengths[1]}}))) return;
+                            t.assert_equal(generation_a,sources[0]->content->generation());
+                            appended=true;
+                        }
                         control.run();std::vector<float> expected(ggml_nelements(control.output));
                         ggml_backend_tensor_get(control.output,expected.data(),0,ggml_nbytes(control.output));
-                        for (size_t slot=0;slot<selected;++slot) if (!t.assert_true(copy->begin(queues[slot].get()))) return;
+                        if (managed && !attention_adapter) {
+                            if (!t.assert_true(reader->begin(layer,columns))) return;
+                        } else if (!managed) for (size_t slot=0;slot<selected;++slot) if (!t.assert_true(copy->begin(queues[slot].get()))) return;
                         auto op=*control.output;op.buffer=input.output->buffer;op.data=input.output->data;
                         auto logical_k=*control.k,logical_v=*control.v;
                         logical_k.buffer=logical_v.buffer=nullptr;logical_k.data=logical_v.data=nullptr;
@@ -1242,7 +1390,53 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                         if (compact) {op.src[3]=nullptr;if (!t.assert_true(ggml_backend_execution_set_mask_bounds(&op,bounds))) return;}
                         std::vector<ggml_kv_stream_copy_rectangle> rectangles;
                         size_t next_physical[2]={0,1};
-                        for (size_t first=0;first<padded;first+=256) {
+                        if (attention_adapter) {
+                            if (attention_errors && !layer && !replay) {
+                                const auto snapshot=[&] {
+                                    ggml_tensor raw{};auto * buffer=ggml_backend_memory_arena_parent(parent.get());
+                                    raw.type=GGML_TYPE_I8;raw.ne[0]=int64_t(ggml_backend_buffer_get_size(buffer));raw.ne[1]=raw.ne[2]=raw.ne[3]=1;
+                                    raw.nb[0]=1;raw.nb[1]=raw.nb[2]=raw.nb[3]=size_t(raw.ne[0]);raw.buffer=buffer;raw.data=ggml_backend_buffer_get_base(buffer);
+                                    std::vector<uint8_t> bytes(size_t(raw.ne[0]));ggml_backend_tensor_get(&raw,bytes.data(),0,bytes.size());return bytes;
+                                };
+                                const auto before=snapshot();const auto checks=source_checks;
+                                std::vector<float> canary(size_t(ggml_nelements(input.output)),0.375f);
+                                ggml_backend_tensor_set(input.output,canary.data(),0,canary.size()*sizeof(float));
+                                auto bad=op;bad.data=ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(staging.get()));
+                                bad.buffer=ggml_backend_memory_lease_buffer(staging.get());
+                                t.assert_true(!reader->attention(layer,columns,&bad,scratch.get(),!prefill_queries));
+                                bad=op;auto query=*op.src[0];query.data=ggml_backend_buffer_get_base(ggml_backend_memory_lease_buffer(source_lease[0].get()));
+                                query.buffer=ggml_backend_memory_lease_buffer(source_lease[0].get());bad.src[0]=&query;
+                                t.assert_true(!reader->attention(layer,columns,&bad,scratch.get(),!prefill_queries));
+                                bad=op;bad.data=op.src[0]->data;bad.buffer=op.src[0]->buffer;
+                                t.assert_true(!reader->attention(layer,columns,&bad,scratch.get(),!prefill_queries));
+                                t.assert_true(!reader->attention(layer,columns,&op,staging.get(),!prefill_queries));
+                                if (!t.assert_true(bool(short_scratch))) return;
+                                t.assert_true(!reader->attention(layer,columns,&op,short_scratch.get(),!prefill_queries));
+                                t.assert_equal(checks,source_checks);
+                                source_current=false;t.assert_true(!reader->attention(layer,columns,&op,scratch.get(),!prefill_queries));source_current=true;
+                                source_throws=true;t.assert_true(!reader->attention(layer,columns,&op,scratch.get(),!prefill_queries));source_throws=false;
+                                ggml_backend_synchronize(backend.get());
+                                t.assert_true(before==snapshot());
+                                t.assert_true(same_float_bits(canary,input.read()));
+                            }
+                            if (pipeline && reader_errors && !layer && !replay) {
+                                for (int kind : {0,1,2}) {
+                                    const std::vector<float> before(size_t(ggml_nelements(input.output)),.375f);
+                                    ggml_backend_tensor_set(input.output,before.data(),0,before.size()*sizeof(float));
+                                    pipeline->fail_kind=kind;pipeline->fail_seen=0;pipeline->fail_fired=false;
+                                    t.assert_true("queued transfer/wait failure closes the read",
+                                        !reader->attention(layer,columns,&op,scratch.get(),!prefill_queries));
+                                    t.assert_true(pipeline->fail_fired && pipeline->fail_seen>0);
+                                    t.assert_true("failure before attention preserves the public output",same_float_bits(before,input.read()));
+                                    pipeline->fail_kind=-1;
+                                }
+                            }
+                            if (pipeline) pipeline->events.clear();
+                            if (!t.assert_true(reader->attention(layer,columns,&op,scratch.get(),!prefill_queries))) return;
+                        } else for (size_t first=0;first<padded;first+=256) {
+                            if (managed) {
+                                if (!t.assert_true(reader->gather(first))) return;
+                            } else {
                             bool initialize=true;size_t covered=0;
                             for (size_t slot=0;slot<selected;++slot) {
                                 std::vector<size_t> pages;
@@ -1284,6 +1478,7 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                             size_t expected_coverage=0;
                             for (size_t col=first;col<first+256;++col) expected_coverage+=columns[col].source!=UINT32_MAX;
                             if (!t.assert_equal(expected_coverage,covered)) return;
+                            }
                             if (plan.span_resume) {
                                 auto * buffer=ggml_backend_memory_lease_buffer(staging.get());
                                 const ggml_kv_stream_span span{buffer,buffer,first,256,0,tile.v_offset};
@@ -1305,13 +1500,51 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                             if (!compact) {slice=*input.mask;slice.ne[0]=256;slice.data=static_cast<uint8_t *>(input.mask->data)+first*sizeof(ggml_fp16_t);step.src[3]=&slice;}
                             if (!t.assert_true(partial->resume(backend.get(),&step,ggml_backend_memory_lease_buffer(scratch.get()),plan,padded,first,first+256==padded))) return;
                         }
-                        for (size_t slot=0;slot<selected;++slot) copy->drain(queues[slot].get());
+                        if (managed) reader->finish();
+                        else for (size_t slot=0;slot<selected;++slot) copy->drain(queues[slot].get());
                         ggml_backend_synchronize(backend.get());
                         if (!t.assert_true("shared native attention preserves every output bit",same_float_bits(expected,input.read()))) return;
+                        if (pipeline && !t.assert_true("next-wave copies are queued before the current attention dispatch",
+                                pipeline->copy_between_gather_and_attention())) return;
+                        if (pipeline && prefill_queries>=128) t.assert_true("wide prefill ready waves use at most half the ring",
+                            pipeline->maximum_held<=(resident_pool_pages-2)/2+(resident_pool_pages-2)%2);
+                        if (resident_pool_pages==26 && !t.assert_true("resident prefix uploads only initially or after a pending append",
+                                (!replay || publishing) ? reader->resident_upload_bytes()>0 : reader->resident_upload_bytes()==0)) return;
+                        if (publishing) {
+                            if (!t.assert_true(pending.pending() && sources[0]->content->commit(pending))) return;
+                            t.assert_true(sources[0]->content->flush({{layer,ggml_kv_stream_operand::k,lengths[0],1},
+                                {layer,ggml_kv_stream_operand::v,lengths[0],1}},[](const auto &) {return true;}));
+                            if (!t.assert_true(reader->update_frontiers({{lengths[0]+1,lengths[0]+1},{lengths[1],lengths[1]}}))) return;
+                        }
                     }
                 }
-                if (layout==4) t.assert_equal(size_t(3),max_sources);
-                t.assert_equal(generation_a,sources[0]->content->generation());
+                if (reader_errors) {
+                    std::vector<llama_kv_stream_group_reader_source> grants;
+                    for (size_t slot=0;slot<selected;++slot)
+                        grants.push_back({sources[slot]->host,source_lease[slot].get(),3,lengths[slot],prepared[slot]});
+                    auto duplicate=grants;duplicate[1].pool=duplicate[0].pool;
+                    t.assert_true(!llama_kv_stream_group_reader::create(backend.get(),duplicate,staging.get(),[](uint32_t) {return true;}));
+                    t.assert_true(!llama_kv_stream_group_reader::create(backend.get(),grants,source_lease[0].get(),[](uint32_t) {return true;}));
+                    auto unprepared=grants;unprepared[1].prepared_copies.reset();
+                    t.assert_true(!llama_kv_stream_group_reader::create(backend.get(),unprepared,staging.get(),[](uint32_t) {return true;}));
+                    auto bad=columns;bad.back()={0,lengths[0]};
+                    t.assert_true(!reader->begin(0,bad));
+                    source_current=false;t.assert_true(!reader->begin(0,columns));source_current=true;
+                    source_throws=true;
+                    t.assert_true("source proof exceptions close admission",!reader->begin(0,columns));
+                    source_throws=false;
+                    if (!t.assert_true(reader->begin(0,columns))) return;
+                    t.assert_true(!reader->begin(0,columns) && !reader->gather(256));
+                    if (!t.assert_true(reader->gather(0))) return;
+                    source_current=false;
+                    t.assert_true(!reader->gather(256));
+                    t.assert_true(reader->finish() && reader->finish());source_current=true;
+                    if (!t.assert_true(reader->begin(1,columns))) return;
+                    for (size_t col=0;col<padded;col+=256) if (!t.assert_true(reader->gather(col))) return;
+                    t.assert_true(!reader->gather(padded) && reader->finish());
+                }
+                if (layout==4 && !managed) t.assert_equal(size_t(3),max_sources);
+                t.assert_equal(generation_a+uint64_t(appended),sources[0]->content->generation());
                 if (selected==2) t.assert_equal(generation_b,sources[1]->content->generation());
                 for (size_t slot=0;slot<selected;++slot) t.assert_true("joint reads preserve all canonical host bytes",
                     !std::memcmp(canonical[slot].data(),ggml_backend_buffer_get_base(sources[slot]->host->buffer()),canonical[slot].size()));
@@ -1329,7 +1562,7 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
             }
         }
     }
-    t.assert_equal(size_t(wide_only ? 128 : small ? 216 : 1192),profiles);
+    t.assert_equal(size_t((reader_errors || pipeline_probe) ? 1 : reader_grid ? 128 : wide_only ? 128 : small ? 216 : 1192),profiles);
 }
 
 int main(int argc, char ** argv) {
@@ -1371,6 +1604,55 @@ int main(int argc, char ** argv) {
                 t.assert_equal(size_t(73),untouched);
             }
             t.assert_equal(size_t(4096),profiles);
+        });
+        return t.summary();
+    }
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-group-pipeline-wide")) {
+        testing t;t.test("wide_selected_groups_keep_native_order_and_bounded_transfer_waves",[&](testing & t) {
+            for (auto dimension : {256u,512u}) for (auto queries : {64u,128u,256u}) for (size_t ring : {1u,3u})
+                check_slot_joint_attention(t,false,false,true,false,false,true,2+ring,false,true,queries,dimension);
+        });
+        return t.summary();
+    }
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-group-pipeline")) {
+        testing t;t.test("selected_group_queues_a_future_wave_before_attention",[&](testing & t) {
+            check_slot_joint_attention(t,false,false,true,true,false,true,3,false,true);
+        });
+        return t.summary();
+    }
+    if (argc>1 && (!std::strcmp(argv[1],"--cuda-slot-group-resident-append") || !std::strcmp(argv[1],"--cuda-slot-group-resident-ring-append"))) {
+        testing t;t.test("pending_native_append_refreshes_the_cached_mirror_before_publication",[&](testing & t) {
+            check_slot_joint_attention(t,false,false,true,false,true,true,
+                !std::strcmp(argv[1],"--cuda-slot-group-resident-append") ? 26 : 3,true);
+        });
+        return t.summary();
+    }
+    if (argc>1 && (!std::strcmp(argv[1],"--cuda-slot-group-resident-grid") || !std::strcmp(argv[1],"--cuda-slot-group-resident-ring-grid"))) {
+        testing t;t.test("selected_group_resident_cache_reuses_the_existing_page_policy",[&](testing & t) {
+            check_slot_joint_attention(t,false,false,true,false,true,true,
+                !std::strcmp(argv[1],"--cuda-slot-group-resident-grid") ? 26 : 3);
+        });
+        return t.summary();
+    }
+    if (argc>1 && (!std::strcmp(argv[1],"--cuda-slot-group-attention") || !std::strcmp(argv[1],"--cuda-slot-group-attention-grid") ||
+            !std::strcmp(argv[1],"--cuda-slot-group-attention-errors"))) {
+        testing t;t.test("selected_group_attention_adapter_preserves_exact_native_outputs",[&](testing & t) {
+            check_slot_joint_attention(t,argc>2 && !std::strcmp(argv[2],"--small"),false,true,
+                !std::strcmp(argv[1],"--cuda-slot-group-attention-errors"),!std::strcmp(argv[1],"--cuda-slot-group-attention-grid"),true);
+        });
+        return t.summary();
+    }
+    if (argc>1 && (!std::strcmp(argv[1],"--cuda-slot-group-reader-errors") || !std::strcmp(argv[1],"--cuda-slot-group-reader-grid"))) {
+        testing t;t.test("selected_group_reader_guards_and_all_native_encodings",[&](testing & t) {
+            check_slot_joint_attention(t,false,false,true,!std::strcmp(argv[1],"--cuda-slot-group-reader-errors"),
+                !std::strcmp(argv[1],"--cuda-slot-group-reader-grid"));
+        });
+        return t.summary();
+    }
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-group-reader")) {
+        testing t;
+        t.test("selected_group_reader_preserves_joint_native_attention",[&](testing & t) {
+            check_slot_joint_attention(t,argc>2 && !std::strcmp(argv[2],"--small"),false,true);
         });
         return t.summary();
     }

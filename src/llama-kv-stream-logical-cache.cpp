@@ -1,5 +1,7 @@
 #include "llama-kv-stream-logical-cache.h"
 #include "llama-kv-cells.h"
+#include "llama-batch.h"
+#include "llama-memory-phase.h"
 
 #include <new>
 #include <utility>
@@ -179,6 +181,45 @@ bool llama_kv_stream_logical_cache::publish_host(llama_kv_stream_write & write) 
     return true;
 }
 
+bool llama_kv_stream_logical_cache::covers(const std::vector<llama_kv_stream_write *> & writes) const noexcept {
+    if (writes.empty()) return false;
+    const size_t first=pending.first(),count=pending.count();
+    const auto & layout=backing->layout();
+    for (size_t i=0;i<writes.size();++i) {
+        const auto * write=writes[i];
+        if (!write || !write->pending()) return false;
+        for (size_t j=0;j<i;++j) if (writes[j]==write) return false;
+        for (const auto & part : write->parts) {
+            if (part.layer>=backing->config().layers || (part.operand!=ggml_kv_stream_operand::k && part.operand!=ggml_kv_stream_operand::v)) return false;
+            const size_t stride=part.operand==ggml_kv_stream_operand::k ? layout.k_token_bytes : layout.v_token_bytes;
+            const size_t begin=first*stride,end=(first+count)*stride;
+            if (part.offset<begin || part.offset>end || part.bytes>end-part.offset) return false;
+        }
+    }
+    for (uint32_t layer=0;layer<backing->config().layers;++layer) for (auto operand : {ggml_kv_stream_operand::k,ggml_kv_stream_operand::v}) {
+        const size_t stride=operand==ggml_kv_stream_operand::k ? layout.k_token_bytes : layout.v_token_bytes;
+        size_t covered=first*stride;
+        const size_t end=(first+count)*stride;
+        while (covered<end) {
+            size_t next=covered;
+            for (const auto * write : writes) for (const auto & part : write->parts)
+                if (part.layer==layer && part.operand==operand && part.offset<=covered && part.offset+part.bytes>next) next=part.offset+part.bytes;
+            if (next==covered) return false;
+            covered=next;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_stream_logical_cache::publish_host(const std::vector<llama_kv_stream_write *> & writes) {
+    if (failed || active_writer || !pending.pending() || host_ready ||
+            authoritative->generation()!=expected_generation || !covers(writes) || !authoritative->commit(writes)) return false;
+    expected_generation=authoritative->generation();
+    if (!complete(llama_kv_stream_publication_domain::host)) {failed=true; return false;}
+    host_ready=true;
+    return true;
+}
+
 bool llama_kv_stream_logical_cache::finish() {
     if (failed || !backing->valid() || !pending.pending() || !host_ready ||
             !pending.committed() || authoritative->generation() != expected_generation) return false;
@@ -346,3 +387,254 @@ bool llama_kv_stream_slot_table::logical_used(const llama_kv_stream_slot_handle 
 }
 
 const llama_kv_stream_context_limits & llama_kv_stream_slot_table::limits() const noexcept { return capacity; }
+
+bool llama_kv_stream_slot_table::project(const llama_kv_stream_selection & selected,
+        const std::vector<llama_kv_stream_slot_handle> & handles,uint32_t role,llama_kv_stream_slot_projection & output) const {
+    if (!llama_kv_stream_selection_valid(selected) || selected.context_tokens!=capacity.group_limit ||
+            selected.slots.size()!=handles.size() || handles.size()>capacity.slots) return false;
+    try {
+        llama_kv_stream_slot_projection next;
+        next.selected=selected;next.handles=handles;next.role=role;
+        next.cells=std::make_shared<llama_kv_cells>();next.cells->resize(capacity.slot_storage);
+        next.columns.resize(capacity.slot_storage);
+        uint32_t native_rows=0;
+        for (size_t source=0;source<selected.slots.size();++source) {
+            const auto & slot=selected.slots[source];
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            std::shared_ptr<llama_kv_cells> cells;
+            if (handles[source].slot!=slot.id || !get(handles[source],role,cache) || !cache->ready() ||
+                    !get_cells(handles[source],role,cells) || cells->get_has_shift() ||
+                    slot.history_tokens<cache->tokens() || slot.history_tokens-cache->tokens()>1 ||
+                    cells->get_used()!=cache->tokens()) return false;
+            const auto tokens=uint32_t(cache->tokens());
+            for (uint32_t row=0;row<tokens;++row) {
+                if (cells->is_empty(row) || cells->seq_count(row)!=1 || !cells->seq_has(row,llama_seq_id(slot.id))) return false;
+                next.columns[native_rows+row]={uint32_t(source),row};
+            }
+            next.cells->set(native_rows,cells->cp(0,tokens));
+            native_rows+=tokens;
+            next.sources.push_back(cache->checkpoint());
+        }
+        output=std::move(next);
+        return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+bool llama_kv_stream_slot_table::projection_current(const llama_kv_stream_slot_projection & projection) const noexcept {
+    if (!projection.cells || !llama_kv_stream_selection_valid(projection.selected) || projection.selected.context_tokens!=capacity.group_limit ||
+            projection.handles.size()!=projection.selected.slots.size() || projection.sources.size()!=projection.handles.size() ||
+            projection.cells->size()!=capacity.slot_storage || projection.columns.size()!=capacity.slot_storage) return false;
+    for (size_t source=0;source<projection.handles.size();++source) {
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;
+        std::shared_ptr<llama_kv_cells> cells;
+        if (projection.handles[source].slot!=projection.selected.slots[source].id ||
+                !get(projection.handles[source],projection.role,cache) || !cache->ready() ||
+                !get_cells(projection.handles[source],projection.role,cells)) return false;
+        const auto current=cache->checkpoint(),saved=projection.sources[source];
+        if (current.id!=saved.id || current.generation!=saved.generation || current.tokens!=saved.tokens ||
+                cells->get_used()!=current.tokens || cells->get_has_shift()) return false;
+    }
+    return !projection.handles.empty();
+}
+
+struct llama_kv_stream_group_producer::implementation {
+    struct source {
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;
+        std::shared_ptr<llama_kv_cells> cells;
+        llama_kv_stream_logical_checkpoint before;
+        std::vector<uint32_t> indices;
+        std::vector<llama_kv_stream_write> writes;
+        bool begun=false,published=false;
+    };
+    struct row {uint32_t source,column;size_t token;llama_pos position;};
+    struct frame {
+        std::shared_ptr<llama_kv_stream_slot_projection> projection;
+        std::vector<source> sources;
+        std::vector<row> rows;
+        std::vector<uint32_t> indices;
+        std::vector<ggml_kv_stream_gather_row> previous_columns;
+        llama_kv_cells previous_cells;
+        std::vector<bool> ready;
+        bool admitted=false,columns_changed=false;
+    };
+    std::shared_ptr<llama_kv_stream_slot_table> table;
+    std::shared_ptr<llama_kv_stream_writer> writer;
+    uint32_t maximum_rows=0,maximum_verify_rows=0,maximum_selected=0;
+    std::unique_ptr<frame> active;
+    bool failed=false;
+};
+
+std::unique_ptr<llama_kv_stream_group_producer> llama_kv_stream_group_producer::create(
+        std::shared_ptr<llama_kv_stream_slot_table> table,std::shared_ptr<llama_kv_stream_writer> writer,
+        uint32_t maximum_rows,uint32_t maximum_verify_rows,uint32_t maximum_selected) {
+    if (!table || !writer || !maximum_rows || maximum_rows>writer->maximum_rows() ||
+            !maximum_verify_rows || maximum_verify_rows>8 || !maximum_selected || maximum_selected>table->limits().slots ||
+            uint64_t(maximum_verify_rows)*maximum_selected>maximum_rows) return {};
+    try {
+        auto result=std::unique_ptr<llama_kv_stream_group_producer>(new llama_kv_stream_group_producer);
+        result->impl=std::make_unique<implementation>();
+        result->impl->table=std::move(table);result->impl->writer=std::move(writer);
+        result->impl->maximum_rows=maximum_rows;result->impl->maximum_verify_rows=maximum_verify_rows;
+        result->impl->maximum_selected=maximum_selected;
+        return result;
+    } catch (const std::bad_alloc &) {return {};}
+}
+
+llama_kv_stream_group_producer::~llama_kv_stream_group_producer() {if (impl) abort();}
+
+bool llama_kv_stream_group_producer::begin(std::shared_ptr<llama_kv_stream_slot_projection> projection,
+        const llama_ubatch & batch,const std::vector<uint32_t> & indices,llama_memory_work_phase phase) {
+    auto & s=*impl;
+    if (s.failed || s.active || !projection || !s.table->projection_current(*projection) || !batch.n_tokens ||
+            batch.n_tokens>s.maximum_rows || indices.size()!=batch.n_tokens || !batch.pos ||
+            !batch.n_seq_id || !batch.seq_id || (batch.n_pos!=1 && batch.n_pos!=4) ||
+            projection->handles.size()>s.maximum_selected ||
+            (phase!=llama_memory_work_phase::target_prefill && phase!=llama_memory_work_phase::target_verify)) return false;
+    try {
+        auto next=std::make_unique<implementation::frame>();next->projection=std::move(projection);next->indices=indices;
+        next->sources.resize(next->projection->handles.size());
+        uint32_t layers=0;
+        for (size_t i=0;i<next->sources.size();++i) {
+            auto & source=next->sources[i];
+            if (!s.table->get(next->projection->handles[i],next->projection->role,source.cache) || !source.cache->ready() ||
+                    !s.table->get_cells(next->projection->handles[i],next->projection->role,source.cells) ||
+                    !s.writer->matches_shape(source.cache->host()->config().shape)) return false;
+            const auto count=source.cache->host()->config().layers;
+            if (!count || (layers && layers!=count)) return false;
+            layers=count;source.writes.resize(layers);source.before=source.cache->checkpoint();
+        }
+        next->ready.resize(layers,false);
+        for (uint32_t row=0;row<batch.n_tokens;++row) {
+            if (batch.n_seq_id[row]!=1 || !batch.seq_id[row] || batch.seq_id[row][0]<0 ||
+                    indices[row]>=next->projection->columns.size() || !next->projection->cells->is_empty(indices[row])) return false;
+            for (uint32_t previous=0;previous<row;++previous) if (indices[previous]==indices[row]) return false;
+            size_t owner=next->sources.size();
+            for (size_t i=0;i<next->sources.size();++i)
+                if (next->projection->handles[i].slot==uint32_t(batch.seq_id[row][0])) owner=i;
+            if (owner==next->sources.size()) return false;
+            auto & source=next->sources[owner];
+            const size_t token=source.before.tokens+source.indices.size();
+            const auto & allowance=next->projection->selected.slots[owner];
+            if (token>=s.table->limits().slot_limit || token>=allowance.history_tokens+allowance.growth_tokens ||
+                    (phase==llama_memory_work_phase::target_verify && source.indices.size()>=s.maximum_verify_rows)) return false;
+            source.indices.push_back(indices[row]);next->rows.push_back({uint32_t(owner),indices[row],token,batch.pos[row]});
+            next->previous_columns.push_back(next->projection->columns[indices[row]]);
+        }
+        next->previous_cells=next->projection->cells->cp(indices);
+        for (auto & source : next->sources) if (!source.indices.empty() &&
+                !source.cache->host()->prepare(source.before.tokens+source.indices.size())) return false;
+        s.active=std::move(next);
+        for (auto & source : s.active->sources) if (!source.indices.empty()) {
+            if (!source.cache->begin(source.indices.size())) {abort();return false;}
+            source.begun=true;
+        }
+        for (const auto & row : s.active->rows) s.active->projection->columns[row.column]={row.source,row.token};
+        s.active->columns_changed=true;s.active->admitted=true;
+        return true;
+    } catch (...) {abort();return false;}
+}
+
+bool llama_kv_stream_group_producer::produce(uint32_t layer,const ggml_tensor * key,const ggml_tensor * value) {
+    auto & s=*impl;
+    if (!s.active || !s.active->admitted || layer>=s.active->ready.size() || s.active->ready[layer] ||
+            !s.writer->accepts(key,false) || !s.writer->accepts(value,true) ||
+            key->ne[1]!=int64_t(s.active->rows.size()) || value->ne[1]!=key->ne[1]) return false;
+    for (size_t i=0;i<s.active->sources.size();++i) {
+        const auto & source=s.active->sources[i];
+        std::shared_ptr<llama_kv_stream_logical_cache> current;
+        if (!s.table->get(s.active->projection->handles[i],s.active->projection->role,current) || current!=source.cache ||
+                current->tokens()!=source.before.tokens || current->identity().generation!=source.before.generation ||
+                current->content()->generation()!=source.before.generation || source.cells->get_used()!=source.before.tokens ||
+                (source.begun ? current->frontiers().reserved!=source.before.tokens+source.indices.size() : !current->ready())) return false;
+    }
+    llama_kv_stream_writer_completion completions[2];
+    const auto drain=[&] {
+        bool okay=true;
+        for (auto & completion : completions) {
+            if (completion.host) okay=completion.host->synchronize() && okay;
+            if (completion.device) okay=completion.device->synchronize() && okay;
+        }
+        s.writer->release_completed();return okay;
+    };
+    try {
+        std::vector<llama_kv_stream_host_range> routes[2];
+        for (bool side : {false,true}) for (const auto & row : s.active->rows) {
+            const auto host=s.active->sources[row.source].cache->host();
+            const size_t stride=side ? host->layout().v_token_bytes : host->layout().k_token_bytes;
+            std::vector<llama_kv_stream_host_range> ranges;
+            if (!host->ranges(layer,side ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,row.token*stride,stride,ranges)) return false;
+            for (auto & range : ranges) routes[side].push_back(std::move(range));
+        }
+        if (!s.writer->generate_async_routed(key,false,routes[0],{},completions[0]) ||
+                !s.writer->generate_async_routed(value,true,routes[1],{},completions[1]) || !drain()) {
+            drain();abort();return false;
+        }
+        for (auto & source : s.active->sources) if (source.begun) {
+            const auto & layout=source.cache->host()->layout();
+            const size_t first=source.before.tokens,count=source.indices.size();
+            // The routed writer completed these exact bytes before the direct ticket is created.
+            if (!source.cache->content()->prepare_direct_generated({
+                    {layer,ggml_kv_stream_operand::k,first*layout.k_token_bytes,nullptr,count*layout.k_token_bytes},
+                    {layer,ggml_kv_stream_operand::v,first*layout.v_token_bytes,nullptr,count*layout.v_token_bytes}},
+                    [](const auto &,void *) {return true;},source.writes[layer])) {abort();return false;}
+        }
+        s.active->ready[layer]=true;return true;
+    } catch (...) {drain();abort();return false;}
+}
+
+bool llama_kv_stream_group_producer::layer_ready(uint32_t layer) const noexcept {
+    return impl->active && impl->active->admitted && layer<impl->active->ready.size() && impl->active->ready[layer];
+}
+
+bool llama_kv_stream_group_producer::finish() {
+    auto & s=*impl;
+    if (!s.active || !s.active->admitted || !std::all_of(s.active->ready.begin(),s.active->ready.end(),[](bool ready) {return ready;})) return false;
+    try {
+        std::vector<llama_kv_cells> metadata;
+        for (size_t i=0;i<s.active->sources.size();++i) {
+            const auto & source=s.active->sources[i];
+            std::shared_ptr<llama_kv_stream_logical_cache> current;
+            if (!s.table->get(s.active->projection->handles[i],s.active->projection->role,current) || current!=source.cache ||
+                    current->tokens()!=source.before.tokens || current->identity().generation!=source.before.generation ||
+                    current->content()->generation()!=source.before.generation || source.cells->get_used()!=source.before.tokens) return false;
+            for (auto column : source.indices) if (s.active->projection->cells->is_empty(column) ||
+                    s.active->projection->cells->seq_count(column)!=1 ||
+                    !s.active->projection->cells->seq_has(column,llama_seq_id(s.active->projection->handles[i].slot))) return false;
+            metadata.push_back(s.active->projection->cells->cp(source.indices));
+        }
+        for (const auto & row : s.active->rows)
+            if (s.active->projection->cells->pos_get(row.column)!=row.position) return false;
+        for (auto & source : s.active->sources) if (source.begun) {
+            std::vector<llama_kv_stream_write *> writes;
+            for (auto & write : source.writes) writes.push_back(&write);
+            if (!source.cache->publish_host(writes) || !source.cache->finish()) {abort();return false;}
+            source.published=true;
+        }
+        for (size_t i=0;i<s.active->sources.size();++i) {
+            auto & source=s.active->sources[i];
+            if (source.begun) source.cells->set(uint32_t(source.before.tokens),metadata[i]);
+            s.active->projection->sources[i]=source.cache->checkpoint();
+        }
+        s.active.reset();return true;
+    } catch (...) {s.failed=true;abort();return false;}
+}
+
+bool llama_kv_stream_group_producer::abort() noexcept {
+    auto & s=*impl;
+    if (!s.active) return !s.failed;
+    bool okay=true;
+    try {
+        s.writer->release_completed();
+        for (auto & source : s.active->sources) if (source.begun) {
+            okay=(source.published ? source.cache->truncate(source.before.tokens) : source.cache->cancel()) && okay;
+            for (auto & write : source.writes) write.cancel();
+        }
+        if (s.active->columns_changed) {
+            s.active->projection->cells->set(s.active->indices,s.active->previous_cells);
+            for (size_t i=0;i<s.active->indices.size();++i)
+                s.active->projection->columns[s.active->indices[i]]=s.active->previous_columns[i];
+        }
+    } catch (...) {okay=false;}
+    s.active.reset();s.failed=s.failed || !okay;
+    return okay;
+}

@@ -178,6 +178,8 @@ bool llama_kv_stream_writer::matches_shape(const ggml_kv_stream_shape & shape) c
 }
 
 
+size_t llama_kv_stream_writer::maximum_rows() const noexcept {return impl ? impl->maximum : 0;}
+
 bool llama_kv_stream_writer::accepts(const ggml_tensor * source, bool value) const {
     const auto & s = *impl;
     if (!source || source->type != GGML_TYPE_F32 || !source->data || source->ne[0] != int64_t(s.width(value)) ||
@@ -207,10 +209,17 @@ bool llama_kv_stream_writer::generate_async_registered(const ggml_tensor * sourc
     return generate_async_impl(source,value,nullptr,&destinations,publish,completion);
 }
 
+bool llama_kv_stream_writer::generate_async_routed(const ggml_tensor * source,bool value,
+        const std::vector<llama_kv_stream_host_range> & destinations,
+        const std::function<bool(const ggml_tensor *,size_t,size_t)> & publish,
+        llama_kv_stream_writer_completion & completion) {
+    return generate_async_impl(source,value,nullptr,&destinations,publish,completion,true);
+}
+
 bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, bool value, void * host,
         const std::vector<llama_kv_stream_host_range> * destinations,
         const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
-        llama_kv_stream_writer_completion & completion) {
+        llama_kv_stream_writer_completion & completion,bool routed) {
     auto & s=*impl;
     s.last={}; s.last.device_scratch_bytes=s.scratch_bytes; s.last.tile_rows=s.capacity;
     if ((!host && !destinations) || !accepts(source,value) || completion.device || completion.host) return false;
@@ -228,6 +237,8 @@ bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, boo
             if (!s.cpu && !required_type) return false;
             size_t total = 0;
             uintptr_t previous = 0;
+            std::vector<std::pair<uintptr_t,uintptr_t>> intervals;
+            if (routed) intervals.reserve(destinations->size());
             for (const auto & range : *destinations) {
                 if (!range.buffer || !range.bytes || range.bytes > rows*stride-total ||
                         !ggml_backend_buffer_is_host(range.buffer.get()) ||
@@ -236,9 +247,23 @@ bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, boo
                 const auto address = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(range.buffer.get()));
                 if (!address || range.offset > capacity || range.bytes > capacity-range.offset ||
                         range.offset > UINTPTR_MAX-address || range.bytes > UINTPTR_MAX-address-range.offset ||
-                        (total && address+range.offset != previous)) return false;
+                        (!routed && total && address+range.offset != previous)) return false;
                 previous = address+range.offset+range.bytes;
+                if (routed) {
+                    const auto begin=address+range.offset,end=previous;
+                    const auto source_base=reinterpret_cast<uintptr_t>(source->data);
+                    const auto scratch_base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(s.buffer.get()));
+                    const auto source_bytes=ggml_nbytes(source);
+                    if (source_bytes>UINTPTR_MAX-source_base || s.scratch_bytes>UINTPTR_MAX-scratch_base ||
+                            (begin<source_base+source_bytes && source_base<end) ||
+                            (begin<scratch_base+s.scratch_bytes && scratch_base<end)) return false;
+                    intervals.emplace_back(begin,end);
+                }
                 total += range.bytes;
+            }
+            if (routed) {
+                std::sort(intervals.begin(),intervals.end());
+                for (size_t i=1;i<intervals.size();++i) if (intervals[i].first<intervals[i-1].second) return false;
             }
             if (total != rows*stride || destinations->size() > s.destinations.max_size()-s.destinations.size()) return false;
             s.destinations.reserve(s.destinations.size()+destinations->size());

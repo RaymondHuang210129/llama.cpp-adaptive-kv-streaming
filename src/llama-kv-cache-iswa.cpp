@@ -19,6 +19,8 @@ bool llama_kv_cache_iswa::bounded_storage_requirements(const llama_hparams & hp,
             (cp.n_seq_max>1 && (!cp.kv_unified || !cp.n_ctx)) ||
             !cp.n_ctx_seq || !cp.n_ubatch || !hp.n_swa || !hp.n_layer_all || hp.n_layer_all > LLAMA_MAX_LAYERS ||
             hp.n_layer_nextn > hp.n_layer_all || hp.swa_type == LLAMA_SWA_TYPE_NONE) return false;
+    if (!llama_memory_selected_sequences_valid(params,cp.n_seq_max)) return false;
+    const auto selected=params.kv_stream_selected_sequences.empty() ? cp.n_seq_max : uint32_t(params.kv_stream_selected_sequences.size());
     int32_t kt, vt;
     std::memcpy(&kt,&params.type_k,sizeof(kt)); std::memcpy(&vt,&params.type_v,sizeof(vt));
     if (kt < 0 || kt >= GGML_TYPE_COUNT || vt < 0 || vt >= GGML_TYPE_COUNT) return false;
@@ -30,7 +32,7 @@ bool llama_kv_cache_iswa::bounded_storage_requirements(const llama_hparams & hp,
         cache.identity=identity; cache.role=llama_memory_cache_role::bounded_resident;
         cache.layers=uint32_t(ids.size()); cache.history_rows=cp.n_seq_max==1 ? cp.n_ctx_seq : cp.n_ctx;
         cache.window_rows=hp.n_swa; cache.headroom_rows=cp.n_ubatch; cache.row_padding=256;
-        cache.sequence_capacity=cp.n_seq_max;
+        cache.sequence_capacity=selected;
         const auto first=ids.front();
         cache.format={params.type_k,params.type_v,hp.n_embd_head_k(first),hp.n_embd_head_v(first),hp.n_head_kv(first),!cp.flash_attn};
         for (auto il : ids) if (hp.n_embd_head_k(il) != cache.format.key_head_dim ||
@@ -121,7 +123,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
-    uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    uint32_t selected=n_seq_max;
+    if (stream && !stream->kv_stream_selected_sequences.empty()) {
+        if (!unified || (!measure_only && !stream->defer_bounded_cache && !stream->bounded_cache_lease) ||
+                !llama_memory_selected_sequences_valid(*stream,n_seq_max))
+            throw std::runtime_error("selected SWA sequences require valid deferred unified storage");
+        selected=uint32_t(stream->kv_stream_selected_sequences.size());
+    }
+    const uint64_t local_rows=std::min(uint64_t(size_base),uint64_t(hparams.n_swa)*(unified ? selected : 1)+n_ubatch);
+    if (local_rows>UINT32_MAX-255) throw std::runtime_error("SWA storage padding exceeds native row capacity");
+    uint32_t size_swa=uint32_t((local_rows+255)/256*256);
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
