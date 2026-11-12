@@ -30,6 +30,7 @@ struct llama_context_group_sequence_state {
     llama_seq_id sequence = -1;
     uint64_t request_epoch = 0, cache_id = 0, cache_generation = 0;
     size_t tokens = 0;
+    llama_pos draft_position = -1;
     std::vector<uint8_t> recurrent, bounded;
     std::vector<uint32_t> full_columns;
 };
@@ -626,6 +627,11 @@ public:
     // The caller retains model weights. Declare the shared child before allocating the parent.
     bool prepare_shared_mtp(const llama_model & model,llama_context_params params);
     bool prepare_dflash(const llama_model & model,llama_context_params params,uint32_t prediction_rows);
+    // Borrow the retained parent only while all selected states are parked.
+    LLAMA_API ggml_backend_buffer_t prepare_vision_parent();
+    LLAMA_API bool lend_vision(const std::vector<size_t> & bytes,std::vector<ggml_backend_memory_lease_t> & output);
+    // Retained encoder leases reject retirement and keep text admission closed.
+    LLAMA_API bool release_vision();
     bool activate(const llama_kv_stream_selection & selection,const std::vector<llama_kv_stream_slot_handle> & handles,
         const llama_batch & representative,llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,
         llama_context_memory_create_result * result = nullptr);
@@ -633,8 +639,8 @@ public:
     bool park();
     // Discard selected native state after failure; reset those request namespaces before reuse.
     bool discard() noexcept;
-    llama_context * context() const noexcept;
-    llama_context * auxiliary_context() const noexcept;
+    LLAMA_API llama_context * context() const noexcept;
+    LLAMA_API llama_context * auxiliary_context() const noexcept;
     llama_context * metadata_context() const noexcept;
     llama_context * auxiliary_metadata_context() const noexcept;
     std::shared_ptr<llama_kv_stream_slot_table> source_table() const noexcept;

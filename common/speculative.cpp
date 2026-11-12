@@ -1617,21 +1617,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         if (visual) {
-            if (is_mem_shared || chain_heads || n_seq != 1 || i_batch_beg[0] != 0 ||
-                    i_batch_end[0] != n_tokens-1) return false;
-            for (const auto & entry : batch_in.tokens) {
+            if (is_mem_shared || chain_heads) return false;
+            for (int32_t k = 0; k < n_tokens; ++k) {
+                const auto & entry = batch_in.tokens[k];
                 if (entry.id != LLAMA_TOKEN_NULL || !entry.embd.data || entry.embd.n_rows != 1 ||
-                        entry.embd.n_embd != size_t(n_embd) || entry.seq_id != 0 ||
+                        entry.embd.n_embd != size_t(n_embd) || entry.seq_id < 0 || entry.seq_id >= llama_seq_id(n_seq) ||
                         !entry.seq_ids_extra.empty()) return false;
+                if (k != i_batch_beg[entry.seq_id] && batch_in.tokens[k-1].seq_id != entry.seq_id) return false;
             }
-            std::vector<float> shifted(size_t(n_tokens)*size_t(n_embd));
-            std::memcpy(shifted.data(),pending_h[0].data(),row_bytes);
             const auto * h = llama_get_embeddings_nextn(ctx_tgt);
             if (!h) return false;
-            if (n_tokens > 1) std::memcpy(shifted.data()+n_embd,h,row_bytes*size_t(n_tokens-1));
+            std::vector<float> shifted(size_t(n_tokens)*size_t(n_embd));
+            for (llama_seq_id seq_id = 0; seq_id < llama_seq_id(n_seq); ++seq_id) {
+                const auto first = i_batch_beg[seq_id], last = i_batch_end[seq_id];
+                if (first < 0) continue;
+                std::memcpy(shifted.data()+size_t(first)*n_embd,pending_h[seq_id].data(),row_bytes);
+                if (last > first) std::memcpy(shifted.data()+size_t(first+1)*n_embd,h+size_t(first)*n_embd,
+                        row_bytes*size_t(last-first));
+            }
             common_batch visual_batch(ctx_dft);
             if (visual_batch.n_pos != batch_in.n_pos) return false;
             visual_batch.tokens = batch_in.tokens;
+            if (ctx_dft->group_parent()) {
+                for (auto & entry : visual_batch.tokens) entry.output = false;
+            }
             if (n_tokens <= 4 && !llama_kv_stream_mtp_prepare(ctx_tgt,uint32_t(std::clamp(params.n_max,0,4)))) return false;
             if (llama_decode_mtp_embeddings(ctx_dft,*visual_batch.get(),shifted.data(),shifted.size()) != 0) {
                 llama_kv_stream_mtp_release(ctx_tgt);
@@ -2781,7 +2790,7 @@ common_speculative_init_result::common_speculative_init_result(
         COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)!=params.speculative.types.end();
     if (group && ((!spec_mtp && !spec_dflash) || (spec_mtp && spec_dflash) || !model_tgt || !ctx_tgt || ctx_tgt!=group->metadata_context() ||
             llama_get_model(ctx_tgt)!=model_tgt || group->context() || params.n_parallel!=2 || !params.kv_unified ||
-            params.embedding || !params.mmproj.path.empty() || params.shared_device_memory_bytes || params.kv_stream_pool_bytes ||
+            params.embedding || params.shared_device_memory_bytes || params.kv_stream_pool_bytes ||
             params.kv_stream_auxiliary_layers || params.speculative.draft.cache_type_k_explicit ||
             params.speculative.draft.cache_type_v_explicit ||
             std::any_of(params.speculative.types.begin(),params.speculative.types.end(),[&](auto type) {

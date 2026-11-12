@@ -70,3 +70,8 @@ MTMD_API int32_t mtmd_session_eval_chunks_arena(mtmd_context * ctx,llama_context
     const mtmd_input_chunks * chunks,llama_pos n_past,llama_seq_id seq_id,int32_t n_batch,bool logits_last,llama_pos * new_n_past);
 MTMD_API int32_t mtmd_batch_encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_context * target,
     mtmd_progress_callback progress = nullptr,void * user_data = nullptr);
+
+// The group is parked; encoding retains host rows and returns all device grants before text selection.
+class llama_context_group;
+MTMD_API int32_t mtmd_batch_encode_group(mtmd_context * ctx,mtmd_batch * batch,llama_context_group & group,
+    mtmd_progress_callback progress = nullptr,void * user_data = nullptr);

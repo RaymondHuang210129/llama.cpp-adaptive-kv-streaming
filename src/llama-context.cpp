@@ -73,6 +73,16 @@ static uint32_t group_verify_rows(const llama_cparams & params) {
     return params.kv_stream_verify_max ? params.kv_stream_verify_max : params.n_rs_seq ? params.n_rs_seq+1 : 1;
 }
 
+static bool group_next_position(const llama_kv_cells & cells,size_t tokens,llama_pos & output) {
+    if (!tokens) {output=0;return true;}
+    if (tokens>cells.size() || cells.is_empty(uint32_t(tokens-1))) return false;
+    auto last=cells.pos_get(uint32_t(tokens-1));
+    const auto & ext=cells.ext_get(uint32_t(tokens-1));
+    if (ext.tok==LLAMA_TOKEN_NULL) last=std::max({last,ext.x,ext.y});
+    if (last<0 || last==INT32_MAX) return false;
+    output=last+1;return true;
+}
+
 static bool group_dflash_supported(const llama_context & target,const llama_model & model,
         const llama_context_params & params,uint32_t rows) {
     const auto & source=target.get_model();const auto & cp=target.get_cparams();const auto & hp=model.hparams;
@@ -162,11 +172,13 @@ struct llama_context::group_execution_binding {
     bool shared_readonly=false;
     bool shared_block=false;
     std::vector<llama_kv_stream_logical_checkpoint> draft_sources = {},pending_draft_sources = {};
+    std::vector<llama_pos> draft_positions = {},pending_draft_positions = {};
     std::vector<llama_kv_stream_logical_checkpoint> draft_suffixes = {};
     struct source_append {
         size_t source;
         llama_kv_stream_logical_checkpoint before;
         size_t rows;
+        bool pinned_image;
     };
     std::vector<source_append> source_appends = {};
     std::function<bool(const llama_ubatch &)> read_prepare={};
@@ -208,20 +220,36 @@ struct llama_context::group_execution_binding {
         const bool inject=batch.tokens.front().has_embd;
         if (std::any_of(batch.tokens.begin(),batch.tokens.end(),[&](const auto & token) {return token.has_embd!=inject || token.output;})) return false;
         if (inject) {
-            if (batch.n_embd!=context.model.hparams.n_embd_inp_enc() || !target->serial_feature_image_rows.empty() ||
+            if (batch.n_embd!=context.model.hparams.n_embd_inp_enc() ||
                     target->serial_feature_rows.empty() || target->serial_feature_rows.size()>INT32_MAX) return false;
-            auto input=llama_batch_init(int32_t(target->serial_feature_rows.size()),0,1);
-            struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{input};
-            input.n_tokens=int32_t(target->serial_feature_rows.size());
-            for (int32_t row=0;row<input.n_tokens;++row) {
-                const auto & saved=target->serial_feature_rows[row];input.token[row]=saved.token;input.pos[row]=saved.position;
-                input.n_seq_id[row]=1;input.seq_id[row][0]=saved.sequence;input.logits[row]=false;
+            if (!target->serial_feature_image_rows.empty()) {
+                if (!target->serial_feature_images || target->serial_feature_image_rows.size()!=target->serial_feature_rows.size()) return false;
+                llama_batch_ext source(target);
+                if (target->serial_feature_rows.size()>source.n_tokens_max) return false;
+                source.n_embd=target->serial_feature_image_width;source.embd=target->serial_feature_image_values;
+                for (size_t row=0;row<target->serial_feature_rows.size();++row) {
+                    const auto & saved=target->serial_feature_rows[row];const auto & image=target->serial_feature_image_rows[row];
+                    llama_batch_ext::token token;token.id=saved.token;token.seq_ids.insert(saved.sequence);
+                    token.pos=image.position;token.has_embd=image.has_embd;token.embd_off=image.offset;
+                    source.tokens.push_back(std::move(token));
+                }
+                if (!target->serial_features_match(source,context.model.target_layer_ids.data(),uint32_t(context.model.target_layer_ids.size()))) return false;
+            } else {
+                auto input=llama_batch_init(int32_t(target->serial_feature_rows.size()),0,1);
+                struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{input};
+                input.n_tokens=int32_t(target->serial_feature_rows.size());
+                for (int32_t row=0;row<input.n_tokens;++row) {
+                    const auto & saved=target->serial_feature_rows[row];input.token[row]=saved.token;input.pos[row]=saved.position;
+                    input.n_seq_id[row]=1;input.seq_id[row][0]=saved.sequence;input.logits[row]=false;
+                }
+                llama_batch_compat source(target,input);
+                if (!target->serial_features_match(*source.batch_ext,context.model.target_layer_ids.data(),uint32_t(context.model.target_layer_ids.size()))) return false;
             }
-            llama_batch_compat source(target,input);
-            if (!target->serial_features_match(*source.batch_ext,context.model.target_layer_ids.data(),uint32_t(context.model.target_layer_ids.size()))) return false;
         }
         pending_draft_sources.clear();
-        if (inject) pending_draft_sources=draft_sources;
+        pending_draft_positions.clear();
+        if (draft_positions.size()!=draft_sources.size()) return false;
+        if (inject) {pending_draft_sources=draft_sources;pending_draft_positions=draft_positions;}
         uint32_t common_width=0;
         size_t active=0;
         for (size_t source=0;source<projection->handles.size();++source) {
@@ -238,16 +266,26 @@ struct llama_context::group_execution_binding {
             const auto current=cache->checkpoint(),saved=draft_sources[source];
             if (saved.id && (saved.id!=current.id || saved.generation!=current.generation || saved.tokens>current.tokens)) return false;
             const size_t first=inject ? saved.tokens : current.tokens;
+            llama_pos native_first=0;
+            std::shared_ptr<llama_kv_cells> target_cells;
+            if (!table->get_cells(handle,0,target_cells)) return false;
+            if (!inject && (!group_next_position(*target_cells,current.tokens,native_first) ||
+                    draft_positions[source]<-1 || draft_positions[source]>=native_first ||
+                    uint64_t(selected.size())>uint64_t(INT32_MAX)-uint32_t(native_first))) return false;
             if (!inject && (!saved.id || saved.tokens!=current.tokens || selected.size()<2 ||
                     selected.size()>context.cparams.serial_block_rows || (common_width && common_width!=selected.size()) ||
-                    context.memory->seq_pos_max(sequence)!=llama_pos(first)-1)) return false;
+                    context.memory->seq_pos_max(sequence)<draft_positions[source])) return false;
             common_width=uint32_t(selected.size());
             const auto & allowance=projection->selected.slots[source];
             const uint64_t end=uint64_t(allowance.history_tokens)+allowance.growth_tokens;
             if (first>end || selected.size()>end-first || first>INT32_MAX || selected.size()>uint64_t(INT32_MAX)-first) return false;
+            if (inject && (first>current.tokens || selected.size()>current.tokens-first ||
+                    current.tokens>target_cells->size())) return false;
             for (size_t row=0;row<selected.size();++row) {
                 const auto & token=*selected[row];
-                if (token.pos[0]!=llama_pos(first+row)) return false;
+                if (inject) {
+                    if (target_cells->is_empty(uint32_t(first+row)) || token.pos[0]!=target_cells->pos_get(uint32_t(first+row))) return false;
+                } else if (token.pos[0]!=native_first+llama_pos(row)) return false;
                 if (inject) {
                     if (batch.n_pos_per_embd==4 && (token.pos[1]!=token.pos[0] || token.pos[2]!=token.pos[0] || token.pos[3])) return false;
                     if (token.id!=LLAMA_TOKEN_NULL || token.embd_off>batch.embd.size() || batch.n_embd>batch.embd.size()-token.embd_off) return false;
@@ -263,7 +301,10 @@ struct llama_context::group_execution_binding {
                 } else if (token.id<0 || uint32_t(token.id)>=context.model.vocab.n_tokens() ||
                         (row && token.id!=llama_vocab_mask(llama_model_get_vocab(&context.model)))) return false;
             }
-            if (inject) {pending_draft_sources[source]=current;pending_draft_sources[source].tokens=first+selected.size();}
+            if (inject) {
+                pending_draft_sources[source]=current;pending_draft_sources[source].tokens=first+selected.size();
+                pending_draft_positions[source]=selected.back()->pos[0];
+            }
         }
         if (!active || (inject && active!=1)) return false;
         next_phase=inject ? llama_memory_work_phase::draft_feature_injection : llama_memory_work_phase::draft_block_prediction;
@@ -314,8 +355,13 @@ struct llama_context::group_execution_binding {
                 coordinates.token_hidden=shared_roles && context.cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP &&
                     !context.mtp_visual_hidden;
                 if (!llama_kv_stream_validate_append(selected,coordinates)) return false;
-                if (shared_block && context.model.arch==LLM_ARCH_QWEN35 && peer)
-                    source_appends.push_back({source,cache->checkpoint(),selected.tokens.size()});
+                if (shared_block && context.model.arch==LLM_ARCH_QWEN35 && peer) {
+                    const bool pinned=context.serial_feature_images && batch.n_pos_per_embd==4 && selected.tokens.size()>1 &&
+                        std::all_of(selected.tokens.begin(),selected.tokens.end(),[&](const auto & token) {
+                            return token.id==LLAMA_TOKEN_NULL && token.has_embd && token.pos[0]==selected.tokens.front().pos[0];
+                        });
+                    source_appends.push_back({source,cache->checkpoint(),selected.tokens.size(),pinned});
+                }
             }
             std::vector<llama_memory_phase_cache_identity> sources;
             if (!identities(sources)) return false;
@@ -361,7 +407,9 @@ struct llama_context::group_execution_binding {
             if (closed) admission=0;
             if (!closed) failed=true;
             if (closed && success && !mutating && shared_block && context.model.arch==LLM_ARCH_DFLASH &&
-                    phase==llama_memory_work_phase::draft_feature_injection) draft_sources.swap(pending_draft_sources);
+                    phase==llama_memory_work_phase::draft_feature_injection) {
+                draft_sources.swap(pending_draft_sources);draft_positions.swap(pending_draft_positions);
+            }
             if (closed && success && !mutating && shared_block && context.model.arch==LLM_ARCH_QWEN35 && peer) {
                 auto next=peer->draft_sources;
                 for (const auto & append : source_appends) {
@@ -375,10 +423,16 @@ struct llama_context::group_execution_binding {
                     }
                     if (saved.id==append.before.id && saved.generation==append.before.generation && saved.tokens<=append.before.tokens)
                         next[append.source].generation=after.generation;
+                    const bool covered=saved.id==append.before.id && saved.generation==append.before.generation && saved.tokens==append.before.tokens;
+                    const bool empty=!saved.id && !saved.tokens && !append.before.tokens &&
+                        peer->context.memory->seq_pos_max(llama_seq_id(projection->handles[append.source].slot))<0;
+                    // Native DFlash leaves pinned image rows out of its cache.
+                    if (append.pinned_image && (covered || empty)) next[append.source]=after;
                 }
                 peer->draft_sources.swap(next);
             }
             pending_draft_sources.clear();
+            pending_draft_positions.clear();
             source_appends.clear();
             return closed && success;
         } catch (...) {failed=true;return false;}
@@ -386,7 +440,7 @@ struct llama_context::group_execution_binding {
 
     bool remove_draft(llama_seq_id sequence,llama_pos first,llama_pos end,const std::function<bool()> & remove) {
         if (!shared_block || context.model.arch!=LLM_ARCH_DFLASH || !peer || peer->failed || peer->admission ||
-                first<0 || end>=0 || draft_sources.size()!=projection->handles.size()) return false;
+                first<0 || end>=0 || draft_sources.size()!=projection->handles.size() || draft_positions.size()!=draft_sources.size()) return false;
         const auto found=std::find_if(projection->handles.begin(),projection->handles.end(),
             [&](const auto & handle) {return llama_seq_id(handle.slot)==sequence;});
         if (found==projection->handles.end()) return false;
@@ -397,10 +451,17 @@ struct llama_context::group_execution_binding {
         const bool unchanged=saved.id==current.id && saved.generation==current.generation;
         const auto suffix=source<draft_suffixes.size() ? draft_suffixes[source] : llama_kv_stream_logical_checkpoint{};
         const bool rollback=suffix.id==current.id && suffix.generation==current.generation && suffix.tokens==current.tokens;
-        if (!saved.id || (!unchanged && !rollback) || (rollback ? size_t(first)!=current.tokens : size_t(first)<saved.tokens)) return false;
+        std::shared_ptr<llama_kv_cells> cells;llama_pos next=0;
+        if (!table->get_cells(*found,0,cells) || !group_next_position(*cells,current.tokens,next)) return false;
+        if (!saved.id || (!unchanged && !rollback) || (rollback ? first!=next : first<=draft_positions[source])) return false;
+        const auto & positions=context.kv_resources.bounded->get_cells(0).seq_pos_get(sequence);
+        const auto cut=positions.lower_bound({first,0});
+        const auto expected=cut==positions.begin() ? llama_pos(-1) : std::prev(cut)->first;
         if (!mutate(remove)) return false;
+        const auto actual=context.memory->seq_pos_max(sequence);
+        if (actual!=expected) {failed=true;return false;}
         if (rollback) {
-            if (context.memory->seq_pos_max(sequence)!=llama_pos(current.tokens)-1) {failed=true;return false;}
+            draft_positions[source]=actual;
             draft_sources[source]=current;draft_suffixes[source]={};
         }
         return true;
@@ -564,7 +625,10 @@ bool llama_context::attach_group_execution_impl(std::unique_ptr<llama_context_me
         binding->shared_roles=shared_roles;
         binding->shared_readonly=readonly;
         binding->shared_block=block;
-        if (block_child) binding->draft_sources.resize(binding->projection->handles.size());
+        if (block_child) {
+            binding->draft_sources.resize(binding->projection->handles.size());
+            binding->draft_positions.assign(binding->projection->handles.size(),-1);
+        }
         for (auto & graph : gf_res_prev) if (graph) graph->reset();
         gf_res_prev_active=nullptr;
         std::vector<size_t> expected_bytes(backend_ptrs.size());
@@ -7333,6 +7397,11 @@ bool llama_context::save_group_sequences(std::vector<llama_context_group_sequenc
             llama_context_group_sequence_state state;
             state.model=&model;state.sequence=llama_seq_id(handle.slot);state.request_epoch=handle.generation;
             state.cache_id=checkpoint.id;state.cache_generation=checkpoint.generation;state.tokens=checkpoint.tokens;
+            if (block) {
+                if (next.size()>=group_execution->draft_positions.size()) return false;
+                state.draft_position=group_execution->draft_positions[next.size()];
+                if (state.draft_position<-1 || memory->seq_pos_max(state.sequence)<state.draft_position) return false;
+            }
             const auto & native=block ? *group_execution->projection->cells : kv_resources.full->get_cells(0);
             std::vector<bool> seen(state.tokens,false);state.full_columns.reserve(state.tokens);
             for (uint32_t row=0;row<native.used_max_p1();++row) if (!native.is_empty(row) && native.seq_has(row,state.sequence)) {
@@ -7381,6 +7450,11 @@ bool llama_context::restore_group_sequences(const std::vector<llama_context_grou
             const auto checkpoint=cache->checkpoint();
             if (found->cache_id!=checkpoint.id || found->cache_generation!=checkpoint.generation || found->tokens!=checkpoint.tokens ||
                     found->full_columns.size()!=found->tokens) return false;
+            if (block) {
+                std::shared_ptr<llama_kv_cells> cells;llama_pos next=0;
+                if (found->draft_position<-1 || !table->get_cells(handle,0,cells) ||
+                        !group_next_position(*cells,checkpoint.tokens,next) || found->draft_position>=next) return false;
+            }
             size_t ordinal=0;std::vector<bool> seen(found->tokens,false);
             for (uint32_t row=0;row<projection.cells->used_max_p1();++row) if (!projection.cells->is_empty(row) &&
                     projection.cells->seq_has(row,found->sequence)) {
@@ -7417,6 +7491,12 @@ bool llama_context::restore_group_sequences(const std::vector<llama_context_grou
             if (!found->tokens && found->recurrent.empty() && found->bounded.empty()) continue;
             load(kv_resources.recurrent,sequence,found->recurrent);
             load(block ? memory.get() : kv_resources.bounded,sequence,found->bounded);
+            if (block && memory->seq_pos_max(sequence)<found->draft_position) return false;
+            if (block && found->draft_position>=0) {
+                const auto & positions=kv_resources.bounded->get_cells(0).seq_pos_get(sequence);
+                const auto point=positions.lower_bound({found->draft_position,0});
+                if (point==positions.end() || point->first!=found->draft_position) return false;
+            }
         }
         synchronize();group_restore_failed=false;return true;
     } catch (const std::exception & error) {
@@ -7789,6 +7869,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
                         [&](const auto & state) {return state.sequence==sequence;});
                     if (found==auxiliary_states.end()) return false;
                     if (found->tokens) auxiliary->group_execution->draft_sources[i]={found->cache_id,found->cache_generation,found->tokens};
+                    auxiliary->group_execution->draft_positions[i]=found->draft_position;
                 }
             }
             const auto entered=owner->enter(phase,uint32_t(representative.n_tokens),identities,profile,selection_revision);
@@ -7926,6 +8007,8 @@ struct llama_context_group::implementation {
     std::unique_ptr<llama_context> metadata;
     std::unique_ptr<llama_context> auxiliary_metadata;
     ggml_backend_buffer_ptr parent;
+    llama_compute_arena_ptr vision;
+    bool vision_lent=false;
     std::unique_ptr<llama_context> active;
     std::unique_ptr<llama_context> active_auxiliary;
     std::vector<llama_seq_id> selected;
@@ -7933,6 +8016,69 @@ struct llama_context_group::implementation {
 
 llama_context_group::llama_context_group() = default;
 llama_context_group::~llama_context_group() = default;
+
+ggml_backend_buffer_t llama_context_group::prepare_vision_parent() {
+    if (!impl || impl->active || impl->active_auxiliary || impl->vision_lent) return nullptr;
+    try {
+        if (!impl->parent) {
+            auto * type=llama_kv_stream_device_buffer_type(impl->model->devices.front().dev);
+            llama_compute_arena_ptr arena(ggml_backend_memory_arena_new(type,impl->params.shared_device_memory_bytes));
+            if (!arena) return nullptr;
+            impl->parent.reset(ggml_backend_buffer_retain(ggml_backend_memory_arena_parent(arena.get())));
+        }
+        return impl->parent.get();
+    } catch (...) {return nullptr;}
+}
+
+bool llama_context_group::lend_vision(const std::vector<size_t> & bytes,std::vector<ggml_backend_memory_lease_t> & output) {
+    if (!impl || impl->active || impl->active_auxiliary || impl->vision_lent || !impl->parent || bytes.empty() || !output.empty()) return false;
+    const auto capacity=ggml_backend_buffer_get_size(impl->parent.get());
+    const auto alignment=ggml_backend_buffer_get_alignment(impl->parent.get());
+    if (!alignment) return false;
+    size_t cursor=0;
+    for (const auto size:bytes) {
+        if (!size || cursor>SIZE_MAX-(alignment-1)) return false;
+        cursor=(cursor+alignment-1)/alignment*alignment;
+        if (cursor>capacity || size>capacity-cursor) return false;
+        cursor+=size;
+    }
+    std::vector<ggml_backend_memory_lease_t> candidate;
+    bool committed=false;
+    const auto fail=[&] {
+        for (auto * lease:candidate) ggml_backend_memory_lease_free(lease);
+        if (impl->vision) {
+            ggml_backend_memory_arena_rollback(impl->vision.get());
+            if (committed && ggml_backend_memory_arena_begin(impl->vision.get(),0) &&
+                    ggml_backend_memory_arena_commit(impl->vision.get())) impl->vision_lent=false;
+        }
+        return false;
+    };
+    try {
+        candidate.reserve(bytes.size());
+        if (!impl->vision) impl->vision.reset(ggml_backend_memory_arena_new_from_buffer(impl->parent.get()));
+        auto * arena=impl->vision.get();
+        if (!arena || !ggml_backend_memory_arena_begin(arena,0)) return false;
+        for (size_t i=0;i<bytes.size();++i)
+            if (!ggml_backend_memory_arena_reserve(arena,UINT64_MAX-i,bytes[i],alignment,0,nullptr)) return fail();
+        if (!ggml_backend_memory_arena_commit(arena)) return fail();
+        committed=true;impl->vision_lent=true;
+        for (size_t i=0;i<bytes.size();++i) {
+            auto * lease=ggml_backend_memory_arena_acquire(arena,UINT64_MAX-i);
+            if (!lease) return fail();
+            candidate.push_back(lease);
+        }
+        output=std::move(candidate);return true;
+    } catch (...) {return fail();}
+}
+
+bool llama_context_group::release_vision() {
+    if (!impl || !impl->vision_lent || !impl->vision) return false;
+    if (!ggml_backend_memory_arena_begin(impl->vision.get(),0)) return false;
+    if (!ggml_backend_memory_arena_commit(impl->vision.get())) {
+        ggml_backend_memory_arena_rollback(impl->vision.get());return false;
+    }
+    impl->vision_lent=false;return true;
+}
 
 bool llama_context_group::prepare_dflash(const llama_model & model,llama_context_params params,uint32_t prediction_rows) {
     if (!impl || !impl->metadata || impl->active || impl->parent || impl->auxiliary_metadata || impl->shared_model || impl->block_model ||
@@ -7943,6 +8089,7 @@ bool llama_context_group::prepare_dflash(const llama_model & model,llama_context
         auto layers=model.target_layer_ids;
         for (auto layer : model.target_layer_ids) impl->metadata->set_embeddings_layer_inp(uint32_t(layer),true);
         impl->metadata->serial_feature_layers=std::move(layers);impl->metadata->serial_feature_producer=true;
+        impl->metadata->serial_feature_images=true;
         impl->block_model=&model;impl->prediction_rows=prediction_rows;impl->shared_params=params;
         impl->shared_params.samplers=nullptr;impl->shared_params.n_samplers=0;impl->shared_params.ctx_other=nullptr;
         impl->auxiliary_metadata=std::move(child);return true;
@@ -8085,7 +8232,7 @@ bool llama_context_group::activate(const llama_kv_stream_selection & selection,
         const std::vector<llama_kv_stream_slot_handle> & handles,const llama_batch & representative,
         llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,llama_context_memory_create_result * result) {
     if (result) *result={};
-    if (!impl || impl->active || impl->active_auxiliary || !profile || !selection_revision) return false;
+    if (!impl || impl->active || impl->active_auxiliary || impl->vision_lent || !profile || !selection_revision) return false;
     try {
         auto projection=std::make_shared<llama_kv_stream_slot_projection>();
         if (!impl->table->project(selection,handles,0,*projection)) return false;
@@ -8101,11 +8248,13 @@ bool llama_context_group::activate(const llama_kv_stream_selection & selection,
         auto candidate=std::make_unique<llama_context>(*impl->model,impl->params,selected);
         if (impl->metadata) {
             const auto & prepared=impl->metadata->get_cparams();
+            candidate->set_causal_attn(prepared.causal_attn);
             candidate->set_embeddings_nextn(prepared.embeddings_nextn,prepared.embeddings_nextn_masked);
             if (!candidate->bind_group_samplers_from(*impl->metadata)) return false;
         }
         if (impl->block_model) {
             candidate->serial_feature_layers=impl->block_model->target_layer_ids;candidate->serial_feature_producer=true;
+            candidate->serial_feature_images=impl->metadata->serial_feature_images;
             for (auto layer : candidate->serial_feature_layers) candidate->set_embeddings_layer_inp(uint32_t(layer),true);
         }
         std::unique_ptr<llama_context> child;
@@ -8177,7 +8326,7 @@ bool llama_context_group::park() {
 }
 
 bool llama_context_group::discard() noexcept {
-    if (!impl) return false;
+    if (!impl || impl->vision_lent) return false;
     if (!impl->active) return true;
     if (impl->active_auxiliary && impl->active_auxiliary->get_compute_memory() &&
             !impl->active_auxiliary->abort_group_execution()) return false;
@@ -8196,7 +8345,7 @@ std::shared_ptr<llama_kv_stream_slot_table> llama_context_group::source_table() 
 const std::vector<llama_kv_stream_slot_handle> & llama_context_group::source_handles() const noexcept {return impl->handles;}
 
 bool llama_context_group::reset_request(uint32_t slot) {
-    if (!impl || impl->active || slot>=impl->handles.size() || impl->handles[slot].generation==UINT64_MAX) return false;
+    if (!impl || impl->active || impl->vision_lent || slot>=impl->handles.size() || impl->handles[slot].generation==UINT64_MAX) return false;
     try {
         const auto handle=impl->handles[slot];
         std::vector<std::shared_ptr<llama_kv_stream_logical_cache>> caches;

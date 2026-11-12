@@ -3,6 +3,7 @@
 #include "mtmd-projector-storage.h"
 #include "mtmd-helper-common.h"
 #include "../../src/llama-context-memory.h"
+#include "../../src/llama-context.h"
 
 #include <limits>
 #include <utility>
@@ -276,29 +277,37 @@ int32_t mtmd_session_eval_chunks_arena(mtmd_context * ctx,llama_context * lctx,c
 }
 
 // The parent lease counts remain authoritative even if a reader outlives the projector or this request.
-int32_t mtmd_batch_encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_context * target,mtmd_progress_callback progress,void * user_data) {
-    if (!ctx || !batch || !target || mtmd_batch_context(batch) != ctx) return -1;
+static int32_t encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_context * target,llama_context_group * group,
+        mtmd_progress_callback progress,void * user_data) {
+    if (!ctx || !batch || bool(target)==bool(group) || mtmd_batch_context(batch)!=ctx) return -1;
     mtmd_batch_clear_output_embd(batch);
     struct output_transaction {
         mtmd_batch * batch;
         bool committed=false;
         ~output_transaction() { if (!committed) mtmd_batch_clear_output_embd(batch); }
     } output{batch};
-    auto * owner = llama_context_compute_memory(target);
-    auto * parent = owner ? owner->shared_parent() : nullptr;
-    if (!owner || !owner->valid() || owner->kv_device_suspended() || !owner->shares_kv_memory() ||
-            !owner->can_suspend_for_vision() || !parent) return -1;
+    if (group) try {
+        if (group->context() || group->auxiliary_context() || !mtmd_release_compute_workspace(ctx) ||
+                !mtmd_unload_projector_weights(ctx)) return -1;
+        // Retry retirement after an earlier encoder cleanup held the group closed.
+        group->release_vision();
+    } catch (...) {return -1;}
+    auto * owner = target ? llama_context_compute_memory(target) : nullptr;
+    auto * parent = group ? group->prepare_vision_parent() : owner ? owner->shared_parent() : nullptr;
+    if (!parent || (!group && (!owner || !owner->valid() || owner->kv_device_suspended() ||
+            !owner->shares_kv_memory() || !owner->can_suspend_for_vision()))) return -1;
     const auto begin_us = ggml_time_us();
     llama_context_memory_diagnostics before, during, after;
-    const bool before_ok = owner->diagnostics(before);
+    const bool before_ok = owner ? owner->diagnostics(before) : false;
     struct phase_return {
         mtmd_context * ctx;
         llama_context * target;
+        llama_context_group * group;
         std::vector<ggml_backend_memory_lease_t> grants;
         std::vector<std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)>> host;
         bool suspended = false, finished = false, armed = false;
         int64_t release_us = 0, resume_us = 0;
-        phase_return(mtmd_context * ctx,llama_context * target) : ctx(ctx),target(target) {}
+        phase_return(mtmd_context * ctx,llama_context * target,llama_context_group * group) : ctx(ctx),target(target),group(group) {}
         bool finish() noexcept {
             if (finished) return true;
             finished = true;
@@ -310,19 +319,32 @@ int32_t mtmd_batch_encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_cont
             grants.clear(); host.clear();
             release_us = ggml_time_us()-start_us;
             const auto resume_start = ggml_time_us();
-            const bool resumed = released && (!suspended || llama_context_resume_kv_device(target,llama_memory_text_phase::prefill));
+            const bool resumed = released && (!suspended || (group ? group->release_vision() :
+                llama_context_resume_kv_device(target,llama_memory_text_phase::prefill)));
             resume_us = ggml_time_us()-resume_start;
             return resumed;
         }
         ~phase_return() { finish(); }
-    } returned{ctx,target};
+    } returned{ctx,target,group};
     try {
         if (!mtmd_unload_projector_weights(ctx)) return -1;
         returned.armed = true;
         mtmd_vision_phase_requirements plan;
         if (!mtmd_batch_quote_vision_phase(batch,parent,plan)) return -1;
         llama_context_memory_create_result admission;
-        if (!owner->quote_suspended_loans({plan.weight_bytes,plan.device_compute_bytes},admission)) {
+        bool fits=false;
+        if (group) {
+            const auto alignment=ggml_backend_buffer_get_alignment(parent);
+            if (!alignment || plan.weight_bytes>SIZE_MAX-(alignment-1)) return -1;
+            const size_t compute_offset=(plan.weight_bytes+alignment-1)/alignment*alignment;
+            if (plan.device_compute_bytes>SIZE_MAX-compute_offset) return -1;
+            admission.available_bytes=ggml_backend_buffer_get_size(parent);
+            admission.required_bytes=compute_offset+plan.device_compute_bytes;
+            fits=admission.required_bytes<=admission.available_bytes;
+            admission.status=fits ? llama_context_memory_create_status::success : llama_context_memory_create_status::insufficient_budget;
+            admission.additional_bytes=fits ? 0 : admission.required_bytes-admission.available_bytes;
+        } else fits=owner->quote_suspended_loans({plan.weight_bytes,plan.device_compute_bytes},admission);
+        if (!fits) {
             if (admission.status==llama_context_memory_create_status::insufficient_budget) {
                 LOG_ERR("vision shared arena quota insufficient: requested=%zu required=%zu additional=%zu weights=%zu compute=%zu\n",
                     admission.available_bytes,admission.required_bytes,admission.additional_bytes,plan.weight_bytes,plan.device_compute_bytes);
@@ -330,10 +352,15 @@ int32_t mtmd_batch_encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_cont
             return -1;
         }
         const auto measured_us = ggml_time_us();
-        if (!llama_context_suspend_kv_device(target)) return -1;
-        returned.suspended = true;
+        if (!group) {
+            if (!llama_context_suspend_kv_device(target)) return -1;
+            returned.suspended=true;
+        }
         const auto suspended_us = ggml_time_us();
-        if (!owner->lend_suspended({plan.weight_bytes,plan.device_compute_bytes},returned.grants)) return -1;
+        if (group) {
+            if (!group->lend_vision({plan.weight_bytes,plan.device_compute_bytes},returned.grants)) return -1;
+            returned.suspended=true;
+        } else if (!owner->lend_suspended({plan.weight_bytes,plan.device_compute_bytes},returned.grants)) return -1;
         const auto loaned_us = ggml_time_us();
         if (!mtmd_reload_projector_weights_in(ctx,returned.grants[0],progress,user_data)) return -1;
         const auto loaded_us = ggml_time_us();
@@ -353,15 +380,23 @@ int32_t mtmd_batch_encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_cont
             }
         }
         if (!mtmd_attach_compute_workspace(ctx,compute)) return -1;
-        const bool during_ok = owner->diagnostics(during);
+        const bool during_ok = owner ? owner->diagnostics(during) : false;
         const auto encode_start = ggml_time_us();
         const auto result = mtmd_batch_encode(batch);
         const auto encoded_us = ggml_time_us();
         if (result) return result;
         if (!returned.finish()) return -1;
-        const bool after_ok = owner->diagnostics(after);
+        const bool after_ok = owner ? owner->diagnostics(after) : false;
         mtmd_vision_shape shape;
         const bool single_image=mtmd_batch_vision_shape(batch,shape);
+        if (group) {
+            LOG_WRN("vision_group_phase: parent=%zu weights=%zu compute=%zu host_compute=%zu graph=%zu operator=%zu library=%zu padding=%zu grants_after=0 selected_state_bytes=0 image_width=%d image_height=%d image_tokens=%zu encode_us=%lld begin_us=%lld end_us=%lld\n",
+                ggml_backend_buffer_get_size(parent),plan.weight_bytes,plan.device_compute_bytes,plan.host_compute_bytes,
+                plan.workspace.graph_bytes,plan.workspace.operator_bytes,plan.workspace.library_bytes,plan.workspace.padding_bytes,
+                single_image ? shape.width : 0,single_image ? shape.height : 0,single_image ? shape.tokens : 0,
+                static_cast<long long>(encoded_us-encode_start),static_cast<long long>(begin_us),static_cast<long long>(ggml_time_us()));
+            output.committed=true;return 0;
+        }
         // Resume rebuilds text grants. Attention uploads host KV lazily after this phase.
         // Match memory_phase visibility through the server's backend log callback.
         LOG_WRN("vision_phase: parent=%zu weights=%zu compute=%zu host_compute=%zu graph=%zu operator=%zu library=%zu padding=%zu grants=%zu before_kv=%zu resumed_kv=%zu borrowed_after=%zu suspended_after=%d diagnostics=%d image_width=%d image_height=%d image_tokens=%zu measure_us=%lld suspend_us=%lld loan_us=%lld projector_reload_us=%lld encode_us=%lld release_us=%lld text_resume_us=%lld begin_us=%lld end_us=%lld\n",
@@ -376,4 +411,14 @@ int32_t mtmd_batch_encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_cont
         output.committed=true;
         return 0;
     } catch (...) { return -1; }
+}
+
+int32_t mtmd_batch_encode_arena(mtmd_context * ctx,mtmd_batch * batch,llama_context * target,
+        mtmd_progress_callback progress,void * user_data) {
+    return encode_arena(ctx,batch,target,nullptr,progress,user_data);
+}
+
+int32_t mtmd_batch_encode_group(mtmd_context * ctx,mtmd_batch * batch,llama_context_group & group,
+        mtmd_progress_callback progress,void * user_data) {
+    return encode_arena(ctx,batch,nullptr,&group,progress,user_data);
 }

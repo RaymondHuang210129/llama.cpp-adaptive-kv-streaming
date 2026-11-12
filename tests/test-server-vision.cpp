@@ -19,6 +19,27 @@ int main(int argc, char ** argv) {
     const bool k4v_readiness = argc == 2 && !std::strcmp(argv[1], "--k4v-vision-readiness");
     if (argc > 1 && !k4v_readiness) return 2;
     if (k4v_readiness) t.set_filter("k4v_vision_readiness");
+    t.test("two_slot_vision_admission_keeps_unified_gpu_and_inherited_speculation_guards",[](testing & t) {
+        for (int mode=0;mode<5;++mode) {
+            auto p=qualified();p.n_parallel=2;p.kv_unified=true;p.cache_ram_mib=0;p.n_batch=p.n_ubatch=256;
+            if (mode==1 || mode==2) {
+                p.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_MTP};p.speculative.draft.n_max=3;
+                if (mode==2) p.speculative.draft.mparams.path="matching-gemma-assistant.gguf";
+            } else if (mode>=3) {
+                p.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};p.speculative.draft.n_max=7;
+                p.speculative.draft.mparams.path="matching-dflash.gguf";
+                if (mode==4) {
+                    p.speculative.types.insert(p.speculative.types.begin(),COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
+                    p.speculative.ngram_map_k4v.size_n=12;p.speculative.ngram_map_k4v.size_m=7;
+                }
+            }
+            t.assert_true("a unified two-slot image profile reaches loaded-model validation",!server_vision_arena_config_error(p));
+            auto bad=p;bad.kv_unified=false;t.assert_true(server_vision_arena_config_error(bad));
+            bad=p;bad.n_parallel=3;t.assert_true(server_vision_arena_config_error(bad));
+            bad=p;bad.mmproj_use_gpu=false;t.assert_true(server_vision_arena_config_error(bad));
+            bad=p;bad.fit_params=true;t.assert_true(server_vision_arena_config_error(bad));
+        }
+    });
     if (k4v_readiness) t.test("k4v_vision_readiness", [](testing & t) {
         mtmd::input_chunks_ptr chunks(mtmd_test_create_input_chunks());
         const auto * image = mtmd_input_chunks_get(chunks.get(), 1);

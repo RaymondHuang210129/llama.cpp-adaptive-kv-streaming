@@ -692,7 +692,7 @@ int main(int argc, char ** argv) {
             t.assert_true("two-slot DFlash/K4V has a bounded joint profile",!common_streamed_dflash_config_error(params));
             t.assert_equal(uint32_t(std::max(maximum,int(copied))),common_context_params_to_llama(params).n_rs_seq);
             auto bad=params;bad.kv_unified=false;t.assert_true(common_streamed_dflash_config_error(bad)!=nullptr);
-            bad=params;bad.mmproj.path="not-admitted-until-vision-stage";t.assert_true(common_streamed_dflash_config_error(bad)!=nullptr);
+            bad=params;bad.mmproj.path="matching-projector.gguf";t.assert_true(common_streamed_dflash_config_error(bad)==nullptr);
         }
     });
     t.test("seven_token_copy_keys_keep_distinct_values_for_two_histories",[&](testing & t) {

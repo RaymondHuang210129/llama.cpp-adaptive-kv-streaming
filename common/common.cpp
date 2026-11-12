@@ -1320,12 +1320,12 @@ const char * common_streamed_dflash_config_error(const common_params & params) {
     if (const auto * error = common_streamed_kv_config_error(params)) return error;
     if (!params.shared_device_memory_bytes || params.kv_stream_pool_bytes || params.fit_params)
         return "adaptive DFlash2 requires a declared --kv-stream-arena-mib budget and --fit off";
-    const bool grouped=params.n_parallel==2 && params.kv_unified && params.mmproj.path.empty();
+    const bool grouped=params.n_parallel==2 && params.kv_unified;
     if ((params.n_parallel != 1 && !grouped) || params.kv_stream_auxiliary_layers ||
             std::any_of(params.speculative.types.begin(),params.speculative.types.end(),[](auto type) {
                 return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
                     type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
-            })) return "adaptive DFlash2 requires serial or unified two-slot text execution, no auxiliary MTP layers and optional ngram-map-k4v only";
+            })) return "adaptive DFlash2 requires serial or unified two-slot execution, no auxiliary MTP layers and optional ngram-map-k4v only";
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED)
         return "adaptive DFlash2 requires -fa on";
     uint32_t depth = 0;

@@ -18,6 +18,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "mtmd-session.h"
+#include "mtmd-embeddings.h"
 #include "mtmd-workspace.h"
 #include "mtmd-projector-storage.h"
 #include "src/llama-context-memory.h"
@@ -31,6 +32,7 @@
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <map>
 #include <filesystem>
 #include <random>
 #include <set>
@@ -262,7 +264,9 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
     bool vision_arena = false;
+    bool grouped_vision = false;
     mtmd::batch_ptr mbatch = nullptr;
+    std::map<size_t,mtmd_embedding_view> image_outputs;
 
     // speculative decoding
     common_speculative * spec;
@@ -440,6 +444,7 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+        image_outputs.clear();
     }
 
     void init_sampler() const {
@@ -809,7 +814,7 @@ struct server_slot {
 
 // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
 // returns 0 on success
-static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx) {
+static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx,llama_context_group * group=nullptr) {
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
     const auto & chunk = input_tokens.find_chunk(idx);
@@ -836,7 +841,8 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
-    res = slot.vision_arena ? mtmd_batch_encode_arena(mctx,mbatch.get(),slot.ctx_tgt) : mtmd_batch_encode(mbatch.get());
+    res = group ? mtmd_batch_encode_group(mctx,mbatch.get(),*group) :
+        slot.vision_arena ? mtmd_batch_encode_arena(mctx,mbatch.get(),slot.ctx_tgt) : mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
@@ -924,6 +930,14 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     }
 
     return try_decode();
+}
+
+static const float * retained_mtmd_chunk(const server_slot & slot,size_t index,const mtmd_input_chunk * chunk) {
+    if (slot.grouped_vision) {
+        const auto found=slot.image_outputs.find(index);
+        return found==slot.image_outputs.end() ? nullptr : found->second.data();
+    }
+    return slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(),chunk) : nullptr;
 }
 
 // add an encoded mtmd chunk to the batch of the text tokens, instead of decoding it on its own like process_mtmd_chunk()
@@ -1018,6 +1032,8 @@ private:
     llama_kv_stream_selection stream_selection;
     llama_kv_stream_group_plan stream_proposal;
     std::vector<std::array<uint32_t,2>> stream_shape;
+    bool stream_embedded = false;
+    bool stream_vision_primed = false;
     uint32_t stream_preparing = UINT32_MAX;
     uint64_t stream_binding_revision = 0;
 
@@ -1084,6 +1100,7 @@ private:
         mctx = nullptr;
         vision_arena = false;
         stream_requests.reset();stream_contexts.reset();stream_shape.clear();stream_selection={};stream_proposal={};
+        stream_embedded=false;stream_vision_primed=false;
         stream_preparing=UINT32_MAX;stream_binding_revision=0;
         spec_init.reset();
         llama_init.reset();
@@ -1282,12 +1299,12 @@ private:
         }
 
         const bool multi_stream=params_base.shared_device_memory_bytes && params_base.n_parallel==2;
-        if (multi_stream && (has_mmproj || (has_spec && !streamed_mtp && !streamed_dflash) || params_base.embedding || !params_base.lora_adapters.empty() ||
+        if (multi_stream && ((has_spec && !streamed_mtp && !streamed_dflash) || params_base.embedding || !params_base.lora_adapters.empty() ||
                 !params_base.kv_unified || std::any_of(params_base.speculative.types.begin(),params_base.speculative.types.end(),
                     [streamed_dflash](auto type) {return type!=COMMON_SPECULATIVE_TYPE_NONE && (streamed_dflash ?
                         type!=COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V :
                         type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP);}))) {
-            SRV_ERR("%s\n","two-slot KV streaming requires independent text completions, unified KV and admitted target or speculative execution");return false;
+            SRV_ERR("%s\n","two-slot KV streaming requires independent completions, unified KV and admitted target or speculative execution");return false;
         }
         llama_init = common_init_from_params(params_base,multi_stream);
 
@@ -1393,10 +1410,10 @@ private:
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
             if (vision_arena) {
                 auto * owner = llama_context_compute_memory(ctx_tgt);
-                if (!owner || !owner->valid() || !owner->shares_kv_memory() || !owner->can_suspend_for_vision() ||
+                if ((!stream_contexts && (!owner || !owner->valid() || !owner->shares_kv_memory() || !owner->can_suspend_for_vision() ||
                         ((streamed_mtp || streamed_dflash) && (!ctx_dft || !llama_context_compute_memory(ctx_dft) ||
                             !llama_context_compute_memory(ctx_dft)->valid() ||
-                            !llama_context_compute_memory(ctx_dft)->borrows_serial_parent())) ||
+                            !llama_context_compute_memory(ctx_dft)->borrows_serial_parent())))) ||
                         !mtmd_vision_phase_compatible(mctx,model_tgt)) {
                     SRV_ERR("%s", "unsupported vision arena model/projector capabilities\n");
                     return false;
@@ -1539,6 +1556,7 @@ private:
 
             slot.mctx                   = mctx;
             slot.vision_arena            = vision_arena;
+            slot.grouped_vision          = vision_arena && stream_contexts!=nullptr;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
@@ -2036,8 +2054,8 @@ private:
             return false;
         }
 
-        if (stream_contexts && (task.type!=SERVER_TASK_TYPE_COMPLETION || task.is_parent() || task.is_child() || task.tokens.has_mtmd)) {
-            send_error(task,"two-slot KV streaming currently requires independent text completions",ERROR_TYPE_INVALID_REQUEST);return false;
+        if (stream_contexts && (task.type!=SERVER_TASK_TYPE_COMPLETION || task.is_parent() || task.is_child())) {
+            send_error(task,"two-slot KV streaming requires independent completions",ERROR_TYPE_INVALID_REQUEST);return false;
         }
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
@@ -3436,6 +3454,76 @@ private:
         bind_stream_context(stream_contexts->metadata_context());
         if (stream_contexts->context() && !stream_contexts->park()) throw std::runtime_error("selected-slot retirement failed");
         stream_shape.clear();
+        stream_embedded=false;
+    }
+
+    bool prewarm_stream_vision(const server_slot & slot,const mtmd_input_chunk * chunk) {
+        if (stream_vision_primed) return true;
+        auto * target=stream_contexts->metadata_context();auto * child=stream_contexts->auxiliary_metadata_context();
+        const auto table=stream_contexts->source_table();std::vector<llama_memory_phase_cache_identity> sources,auxiliary;
+        for (const auto & handle : stream_contexts->source_handles()) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!table->get(handle,0,cache) || !cache->ready()) return false;
+            sources.push_back({cache->identity().id,cache->content()->generation()});
+            if (params_base.kv_stream_auxiliary_layers || target->get_cparams().kv_stream_auxiliary_layers) {
+                if (!table->get(handle,1,cache) || !cache->ready()) return false;
+                auxiliary.push_back({cache->identity().id,cache->content()->generation()});
+            }
+        }
+        const bool previous=llama_get_causal_attn(target);
+        struct restore_mode {llama_context * context;bool causal;~restore_mode() {llama_set_causal_attn(context,causal);}} restore{target,previous};
+        const auto measure=[&](common_batch & batch,llama_memory_work_phase phase,bool causal) {
+            llama_set_causal_attn(target,causal);llama_batch_allocr allocator(uint32_t(batch.get()->n_pos_per_embd));
+            if (!allocator.init(*batch.get(),*vocab,false)) return false;
+            llama_context_group_plan quote;
+            const auto result=target->quote_target_group(allocator.get_batch(),sources,{sources.front().id*4+1,1},phase,
+                1,SIZE_MAX,quote,child,auxiliary);
+            return result.status==llama_context_memory_create_status::success;
+        };
+        common_batch tokens(target);
+        for (const auto & handle : stream_contexts->source_handles()) tokens.add(0,0,llama_seq_id(handle.slot),true);
+        if (!measure(tokens,llama_memory_work_phase::target_verify,true)) return false;
+        const size_t rows=std::min(size_t(llama_n_ubatch(target)),mtmd_input_chunk_get_n_tokens(chunk));
+        const size_t width=llama_model_n_embd_inp(model_tgt);
+        if (!rows || !width || rows>SIZE_MAX/width) return false;
+        std::vector<float> values(rows*width);common_batch image(target);
+        for (size_t row=0;row<rows;++row) {
+            const llama_pos position[4]={llama_pos(row),llama_pos(row),llama_pos(row),0};
+            image.add_embd({values.data()+row*width,1,width},position,slot.id,false);
+        }
+        if (!measure(image,llama_memory_work_phase::target_prefill,!mtmd_decode_use_non_causal(mctx,chunk))) return false;
+        stream_vision_primed=true;return true;
+    }
+
+    bool encode_stream_images(server_slot & slot) {
+        const auto & input=slot.task->tokens;
+        std::map<size_t,mtmd_embedding_view> outputs;
+        mtmd::batch_ptr encoded;
+        for (size_t index=0;index<input.size();) {
+            if (input[index]!=LLAMA_TOKEN_NULL) {++index;continue;}
+            const auto & chunk=input.find_chunk(index);
+            if (mtmd_input_chunk_get_type(chunk.get())!=MTMD_INPUT_CHUNK_TYPE_IMAGE) return false;
+            const auto count=mtmd_input_chunk_get_n_tokens(chunk.get());
+            if (!count || count>input.size()-index) return false;
+            if (!outputs.count(index)) {
+                if (!prewarm_stream_vision(slot,chunk.get())) return false;
+                if (encode_mtmd_chunk(slot,encoded,index,stream_contexts.get())!=0) return false;
+                auto current=index;
+                while (true) {
+                    const auto & entry=input.find_chunk(current);mtmd_embedding_view view;
+                    if (!mtmd_batch_acquire_output_embd(encoded.get(),entry.get(),view)) break;
+                    if (view.n_tokens()!=mtmd_input_chunk_get_n_tokens(entry.get()) || view.n_embd()!=size_t(llama_model_n_embd_inp(model_tgt))) return false;
+                    outputs.emplace(current,std::move(view));
+                    auto next=input.find_next_media_chunk(current);
+                    if (!next.first) break;
+                    current=next.second;
+                }
+                encoded.reset();
+                if (!outputs.count(index)) return false;
+            }
+            index+=count;
+        }
+        slot.image_outputs=std::move(outputs);return true;
     }
 
     static bool admit_stream_selection(const llama_kv_stream_selection & selection,void * data) {
@@ -3524,11 +3612,33 @@ private:
                 slot.prompt.clear();
                 if (spec) common_speculative_begin(spec.get(),slot.id,{});
                 const auto handle=stream_contexts->source_handles()[slot.id];
-                admitted.push_back({handle.slot,handle.generation,0,0,false});
+                bool images=false;
+                for (size_t index=0;index<slot.task->tokens.size();++index) if (slot.task->tokens[index]==LLAMA_TOKEN_NULL) {images=true;break;}
+                admitted.push_back({handle.slot,handle.generation,0,0,images});
             }
             if (admitted.empty()) return;
             if (!requests.admit(admitted)) throw std::runtime_error("request group admission failed");
             current=requests.phase();
+        }
+        if (current==phase::vision) {
+            park_stream_context();
+            while (requests.phase()==phase::vision) {
+                llama_kv_stream_group_request next;
+                if (!requests.next_preparation(next)) throw std::runtime_error("missing group vision request");
+                auto & slot=slots[next.slot];bool encoded=false;
+                queue_tasks.yield_to_queue([&] {encoded=encode_stream_images(slot);});
+                if (!encoded) {
+                    if (!stream_contexts->release_vision() && !stream_contexts->prepare_vision_parent())
+                        throw std::runtime_error("group vision resources could not retire");
+                    send_error(slot,"failed to encode image within the shared vision arena",ERROR_TYPE_SERVER);slot.release();
+                } else if (!requests.prepared(next.slot,next.request,phase::vision,next.history_tokens))
+                    throw std::runtime_error("image preparation frontier could not be published");
+            }
+            current=requests.phase();
+            if (current==phase::retiring) {
+                if (!requests.release()) throw std::runtime_error("failed image group could not retire");
+                stream_preparing=UINT32_MAX;stream_selection={};stream_proposal={};return;
+            }
         }
         if (current==phase::prefill) {
             llama_kv_stream_group_request next;
@@ -3571,7 +3681,7 @@ private:
         return stream_requests->selected(uint32_t(slot.id),handle.generation);
     }
 
-    void ensure_stream_execution(llama_batch * supplied=nullptr) {
+    void ensure_stream_execution(llama_batch * supplied=nullptr,bool causal=true) {
         if (!stream_contexts) return;
         const auto phase=stream_requests->phase()==llama_kv_stream_group_phase::decode ?
             llama_memory_work_phase::target_verify : llama_memory_work_phase::target_prefill;
@@ -3598,9 +3708,12 @@ private:
             }
         }
         auto * active=stream_contexts->context();
-        if (active && (shape==stream_shape || (spec && phase==llama_memory_work_phase::target_verify)) &&
+        const bool embedded=representative.embd!=nullptr;
+        if (active && embedded==stream_embedded && active->get_cparams().causal_attn==causal &&
+                (shape==stream_shape || (spec && phase==llama_memory_work_phase::target_verify)) &&
                 active->get_cparams().kv_stream_decode==(phase==llama_memory_work_phase::target_verify)) return;
         park_stream_context();
+        llama_set_causal_attn(stream_contexts->metadata_context(),causal);
         auto selection=stream_selection;selection.history_tokens=0;
         std::vector<llama_kv_stream_slot_handle> handles;
         for (auto & selected : selection.slots) {
@@ -3623,9 +3736,48 @@ private:
                 park_stream_context();throw std::runtime_error("request selection could not commit after resource activation");
             }
         }
-        bind_stream_context(stream_contexts->context());stream_shape=std::move(shape);
+        bind_stream_context(stream_contexts->context());stream_shape=std::move(shape);stream_embedded=embedded;
         SRV_INF("stream group bind: selected=%zu rows=%d phase=%s revision=%" PRIu64 "\n",selection.slots.size(),
             representative.n_tokens,phase==llama_memory_work_phase::target_verify ? "decode" : "prefill",stream_binding_revision);
+    }
+
+    int process_stream_image(server_slot & slot,size_t index,size_t & count) {
+        const auto & chunk=slot.task->tokens.find_chunk(index);
+        if (mtmd_input_chunk_get_type(chunk.get())!=MTMD_INPUT_CHUNK_TYPE_IMAGE) return -1;
+        const auto found=slot.image_outputs.find(index);
+        if (found==slot.image_outputs.end()) return -1;
+        const auto & view=found->second;count=mtmd_input_chunk_get_n_tokens(chunk.get());
+        const size_t width=llama_model_n_embd_inp(model_tgt);
+        if (!count || view.n_tokens()!=count || view.n_embd()!=width) return -1;
+        const auto * image=mtmd_input_chunk_get_tokens_image(chunk.get());
+        const bool spatial=mtmd_decode_use_mrope(mctx),causal=!mtmd_decode_use_non_causal(mctx,chunk.get());
+        const auto base=slot.prompt.tokens.pos_next();
+        const size_t maximum=llama_n_batch(stream_contexts->metadata_context());
+        if (!maximum || base<0 || count>uint64_t(INT32_MAX)-uint32_t(base)) return -1;
+        for (size_t first=0;first<count;) {
+            const auto rows=std::min(maximum,count-first);
+            common_batch input(stream_contexts->metadata_context());
+            for (size_t row=0;row<rows;++row) {
+                const auto i=first+row;const auto p=base+llama_pos(i);llama_pos position[4]={p,p,p,p};
+                if (spatial) {
+                    if (!image) return -1;
+                    const auto pos=mtmd_image_tokens_get_decoder_pos(image,base,i);
+                    position[0]=pos.t;position[1]=pos.y;position[2]=pos.x;position[3]=pos.z;
+                }
+                input.add_embd({view.data()+i*width,1,width},position,slot.id,false);
+            }
+            llama_batch_allocr allocator(uint32_t(input.get()->n_pos_per_embd));
+            if (!allocator.init(*input.get(),*vocab,false)) return -1;
+            auto representative=allocator.get_batch();ensure_stream_execution(&representative,causal);
+            int result=0;
+            queue_tasks.yield_to_queue([&] {
+                result=llama_process(ctx_tgt,LLAMA_PROCESS_TYPE_DECODE,input.get());
+                if (!result && spec && !common_speculative_process(spec.get(),input)) result=-1;
+            });
+            if (result) return result;
+            first+=rows;
+        }
+        return 0;
     }
 
     void pre_decode() {
@@ -4308,14 +4460,17 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
-                        queue_tasks.yield_to_queue([&]() {
+                        if (stream_contexts) res=process_stream_image(slot,cur_token_idx,n_tokens_out);
+                        else queue_tasks.yield_to_queue([&]() {
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
-                            if (slot.vision_arena) {
+                            if (stream_contexts) {
+                                abort_all_slots("selected image prefill failed");return;
+                            } else if (slot.vision_arena) {
                                 auto * owner = llama_context_compute_memory(ctx_tgt);
                                 bool restored = owner && owner->valid() &&
                                     (!owner->kv_device_suspended() || llama_context_resume_kv_device(ctx_tgt,llama_memory_text_phase::prefill));
@@ -4519,8 +4674,8 @@ private:
 
             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
 
-            float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
-            if (!embd) {
+            const float * embd = retained_mtmd_chunk(slot,cur_token_idx,chunk.get());
+            if (!embd && !slot.grouped_vision) {
                 // encode on the worker thread, so we can still handle metrics tasks
                 int32_t res = 0;
                 queue_tasks.yield_to_queue([&]() {

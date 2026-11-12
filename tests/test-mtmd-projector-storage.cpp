@@ -4,10 +4,14 @@
 #include "../tools/mtmd/mtmd-workspace.h"
 #include "../tools/mtmd/mtmd-session.h"
 #include "../src/llama-context-memory.h"
+#include "../src/llama-context.h"
+#include "../src/llama-kv-stream-logical-cache.h"
+#include "../src/llama-kv-stream-selection.h"
 #include "../src/llama-kv-cache-iswa.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-backend-operator-workspace.h"
 #include "testing.h"
+#include "speculative.h"
 #include "kv-stream-bit-exact-test.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
@@ -178,9 +182,9 @@ static std::vector<uint8_t> projector_test_pixels(size_t width,size_t height) {
 }
 
 int main(int argc,char ** argv) {
-    const char * model_path = nullptr, * projector_path = nullptr, * baseline = nullptr, * save = nullptr, * save_input = nullptr, * dflash_path = nullptr;
+    const char * model_path = nullptr, * projector_path = nullptr, * baseline = nullptr, * save = nullptr, * save_input = nullptr, * dflash_path = nullptr, * assistant_path = nullptr;
     bool cuda = false;
-    bool phase_only = false;
+    bool phase_only = false,group_arena=false,group_handoff=false,group_image=false;
     bool protected_target = false;
     bool measure_only = false,library_release_faults=false;
     bool parent_explicit=false,long_vision=false,audit_scratch=false,quote_scratch=false;
@@ -190,6 +194,10 @@ int main(int argc,char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i],"--cuda")) cuda = true;
         else if (!std::strcmp(argv[i],"--phase-only")) phase_only = true;
+        else if (!std::strcmp(argv[i],"--group-arena")) group_arena=true;
+        else if (!std::strcmp(argv[i],"--group-target-handoff")) group_handoff=group_arena=true;
+        else if (!std::strcmp(argv[i],"--group-image-prefill")) group_image=true;
+        else if (!std::strcmp(argv[i],"--group-image-assistant") && i+1<argc) {group_image=true;assistant_path=argv[++i];}
         else if (!std::strcmp(argv[i],"--protected-target")) protected_target = true;
         else if (!std::strcmp(argv[i],"--long-vision")) long_vision = true;
         else if (!std::strcmp(argv[i],"--library-release-faults")) library_release_faults=true;
@@ -231,7 +239,7 @@ int main(int argc,char ** argv) {
     if (save_input && (!save || phase_only || !model_path || !projector_path)) return 2;
     testing t;
     if (image_count>2 || image_budget>4096 ||
-            (image_count!=1 && !phase_only) || (parent_explicit && !phase_only && !protected_target) ||
+            (image_count!=1 && !phase_only) || (parent_explicit && !phase_only && !protected_target && !group_arena && !group_image) ||
             (long_vision && !protected_target) ||
             ((image_width!=256 || image_height!=256) && (protected_target || (!phase_only && !save && !baseline))) ||
             (image_budget && !phase_only && !save && !baseline)) return 2;
@@ -244,6 +252,17 @@ int main(int argc,char ** argv) {
         t.assert_equal(size_t(1536)*1048576,protected_test_parent_bytes(true,1536));
         t.assert_equal(size_t(2048)*1048576,protected_test_parent_bytes(true,2048));
     });
+#if defined(_WIN32) && defined(LLAMA_SHARED)
+    if (group_arena || group_handoff || group_image) return 2;
+#endif
+    if (group_image) {
+        if (!cuda || !model_path || !projector_path || !baseline || phase_only || protected_target || group_arena || save || image_count!=1) return 2;
+        t.set_filter("real_group_image_prefill_and_text_continuation_match_native");
+    }
+    if (group_arena) {
+        if (!cuda || !model_path || !projector_path || !baseline || phase_only || protected_target || save || image_count!=1) return 2;
+        t.set_filter("real_group_projector_matches_native_embeddings_without_active_decoder");
+    }
     if (phase_only) {
         if (!model_path || !projector_path) return 2;
         t.set_filter("real_deferred_projector_uses_disjoint_weight_and_compute_grants");
@@ -536,6 +555,385 @@ int main(int argc,char ** argv) {
         t.assert_equal(size_t(0),ggml_backend_memory_arena_lease_count(arena.get()));
         t.assert_true(!tensor->data && metadata->source() != nullptr);
     });
+#if !defined(_WIN32) || !defined(LLAMA_SHARED)
+    if (group_image) t.test("real_group_image_prefill_and_text_continuation_match_native",[&](testing & t) {
+        ggml_backend_load_all();auto mp=llama_model_default_params();mp.n_gpu_layers=999;
+        llama_model_ptr model(llama_model_load_from_file(model_path,mp));if (!t.assert_true(model!=nullptr)) return;
+        llama_model_ptr assistant(assistant_path ? llama_model_load_from_file(assistant_path,mp) : nullptr);
+        if (assistant_path && !t.assert_true(assistant!=nullptr)) return;
+        auto params=mtmd_context_params_default();params.use_gpu=true;params.warmup=false;params.n_threads=4;
+        params.image_min_tokens=image_budget ? int(image_budget) : 64;params.image_max_tokens=image_budget ? int(image_budget) : 256;
+        params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        mtmd::context_ptr projector(mtmd_init_from_file_deferred(projector_path,model.get(),params));if (!t.assert_true(projector!=nullptr)) return;
+        const auto pixels=projector_test_pixels(image_width,image_height);mtmd::bitmap_ptr image(mtmd_bitmap_init(uint32_t(image_width),uint32_t(image_height),pixels.data()));
+        const auto * bitmap=image.get();const std::string prompt=mtmd_get_marker(projector.get());const mtmd_input_text input{prompt.c_str(),prompt.size(),true,true};
+        mtmd::input_chunks_ptr chunks(mtmd_input_chunks_init());if (!t.assert_equal(0,mtmd_tokenize(projector.get(),chunks.get(),&input,&bitmap,1))) return;
+        const mtmd_input_chunk * chunk=nullptr;
+        for (size_t i=0;i<mtmd_input_chunks_size(chunks.get());++i) if (mtmd_input_chunk_get_type(mtmd_input_chunks_get(chunks.get(),i))==MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            if (!t.assert_true(!chunk)) return;
+            chunk=mtmd_input_chunks_get(chunks.get(),i);
+        }
+        if (!t.assert_true(chunk!=nullptr)) return;
+        const size_t rows=mtmd_input_chunk_get_n_tokens(chunk),width=llama_model_n_embd_inp(model.get());
+        if (!t.assert_true(rows>0 && rows<=256 && width>0 && rows<=SIZE_MAX/width)) return;
+        std::vector<float> embeddings(rows*width);std::ifstream file(baseline,std::ios::binary);file.read(reinterpret_cast<char *>(embeddings.data()),std::streamsize(embeddings.size()*sizeof(float)));
+        if (!t.assert_true(file && file.peek()==EOF && std::all_of(embeddings.begin(),embeddings.end(),[](float x) {return std::isfinite(x);}))) return;
+        const bool spatial=mtmd_decode_use_mrope(projector.get()),noncausal=mtmd_decode_use_non_causal(projector.get(),chunk);
+        const llama_pos next_position=5+mtmd_input_chunk_get_n_pos(chunk);
+        auto cp=llama_context_default_params();cp.n_ctx=1024;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=2;cp.kv_unified=true;cp.swa_full=false;
+        cp.n_outputs_max=16;cp.n_outputs_max_per_seq=8;cp.n_threads=cp.n_threads_batch=4;
+        cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        const auto text=[&](llama_context * context,bool next) {
+            common_batch batch(context);
+            for (llama_seq_id slot=0;slot<2;++slot) for (int32_t row=0;row<(next ? 1 : slot ? 7 : 5);++row)
+                batch.add(next ? 500+slot : 100+slot*20+row,next ? (slot ? 7 : next_position) : row,slot,true);
+            return batch;
+        };
+        const auto picture=[&](llama_context * context) {
+            common_batch batch(context);
+            for (size_t row=0;row<rows;++row) {
+                const llama_pos p=5+llama_pos(row);llama_pos position[4]={p,p,p,p};
+                if (spatial) {const auto pos=mtmd_image_tokens_get_decoder_pos(mtmd_input_chunk_get_tokens_image(chunk),5,row);position[0]=pos.t;position[1]=pos.y;position[2]=pos.x;position[3]=pos.z;}
+                batch.add_embd({embeddings.data()+row*width,1,width},position,0,row+1==rows);
+            }
+            return batch;
+        };
+        kv_stream_bit_oracle prefix,image_vectors,image_state,next_vectors,assistant_outputs;
+        kv_stream_exact_trace assistant_trace(assistant_outputs,"image_assistant");
+        const auto assistant_params=[&](llama_context * target) {
+            auto dp=cp;dp.ctx_type=LLAMA_CONTEXT_TYPE_MTP;dp.ctx_other=target;
+            dp.shared_device_memory_bytes=0;dp.kv_stream_verify_max=0;dp.n_batch=dp.n_ubatch=2;
+            dp.n_outputs_max=2;dp.n_outputs_max_per_seq=1;
+            dp.cb_eval=kv_stream_exact_trace::callback;dp.cb_eval_user_data=&assistant_trace;return dp;
+        };
+        const auto predict=[&](llama_context * target,llama_context * child,common_batch & batch) {
+            common_params_speculative parameters;parameters.types={COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+            parameters.draft.ctx_tgt=target;parameters.draft.ctx_dft=child;parameters.draft.n_max=3;
+            parameters.draft.n_min=0;parameters.draft.p_min=0;parameters.draft.backend_sampling=false;
+            common_speculative_ptr spec(common_speculative_init(parameters,2));
+            if (!t.assert_true(spec && common_speculative_process(spec.get(),batch))) return false;
+            std::array<std::vector<uint8_t>,2> before;
+            target->synchronize();
+            for (llama_seq_id slot=0;slot<2;++slot) {
+                before[slot].resize(llama_state_seq_get_size(target,slot));
+                if (!t.assert_equal(before[slot].size(),llama_state_seq_get_data(target,before[slot].data(),before[slot].size(),slot))) return false;
+            }
+            std::array<llama_tokens,2> histories,proposals;
+            for (llama_seq_id slot=0;slot<2;++slot) {
+                for (int row=0;row<(slot ? 7 : 5);++row) histories[slot].push_back(100+slot*20+row);
+                if (!slot) histories[slot].insert(histories[slot].end(),rows,LLAMA_TOKEN_NULL);
+                histories[slot].push_back(500+slot);
+                const auto * logits=llama_get_logits_ith(target,slot);
+                if (!t.assert_true(logits!=nullptr)) return false;
+                const auto count=llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+                const auto anchor=llama_token(std::max_element(logits,logits+count)-logits);
+                common_speculative_begin(spec.get(),slot,histories[slot]);
+                common_speculative_get_draft_params(spec.get(),slot)={true,uint16_t(slot ? 3 : 1),llama_pos(histories[slot].size()),anchor,
+                    &histories[slot],&proposals[slot],nullptr,0.0f,123};
+            }
+            const auto outputs_before=assistant_trace.outputs;
+            assistant_trace.phase="predict";common_speculative_draft(spec.get());llama_synchronize(child);assistant_trace.check();assistant_trace.phase.clear();
+            if (!t.assert_true("the assistant oracle observes actual native output tensors",assistant_trace.outputs>outputs_before)) return false;
+            for (llama_seq_id slot=0;slot<2;++slot) {
+                if (!t.assert_equal(size_t(slot ? 3 : 1),proposals[slot].size())) return false;
+                std::vector<uint8_t> carry;if (!t.assert_true(common_speculative_get_state(spec.get(),slot,carry))) return false;
+                assistant_outputs.bytes("proposal/"+std::to_string(slot),proposals[slot].data(),proposals[slot].size()*sizeof(llama_token));
+                assistant_outputs.bytes("carry/"+std::to_string(slot),carry.data(),carry.size());
+                std::vector<uint8_t> after(llama_state_seq_get_size(target,slot));
+                if (!t.assert_equal(after.size(),llama_state_seq_get_data(target,after.data(),after.size(),slot)) ||
+                        !t.assert_true("image-conditioned assistant reads preserve every target KV and state byte",before[slot]==after)) return false;
+            }
+            t.out<<"image assistant exact records="<<assistant_outputs.records()<<" outputs="<<assistant_trace.outputs-outputs_before
+                <<" bytes="<<assistant_outputs.byte_count()<<'\n';
+            return true;
+        };
+        const auto vectors=[&](llama_context * context,kv_stream_bit_oracle & oracle,size_t hidden_rows,size_t logit_rows=1) {
+            context->synchronize();const auto * logits=llama_get_logits(context);const auto * hidden=llama_get_embeddings_nextn(context);
+            const size_t count=logit_rows*size_t(llama_vocab_n_tokens(llama_model_get_vocab(model.get()))),hidden_count=hidden_rows*size_t(llama_model_n_embd_out(model.get()));
+            if (!t.assert_true(logits && hidden && std::all_of(logits,logits+count,[](float x) {return std::isfinite(x);}) &&
+                    std::all_of(hidden,hidden+hidden_count,[](float x) {return std::isfinite(x);}))) return false;
+            oracle.bytes("last_logits",logits,count*sizeof(float));oracle.bytes("all_hidden",hidden,hidden_count*sizeof(float));return true;
+        };
+        const auto state=[&](llama_context * context) {
+            context->synchronize();const auto resources=context->get_kv_resources();
+            for (llama_seq_id slot=0;slot<2;++slot) {
+                kv_stream_exact_state full;resources.full->state_write(full,slot,0);full.compare_with(image_state,"full/"+std::to_string(slot));
+                if (resources.bounded) {kv_stream_exact_state local;resources.bounded->state_write(local,slot,0);local.compare_with(image_state,"bounded/"+std::to_string(slot));}
+                if (resources.recurrent) {kv_stream_exact_state local;resources.recurrent->state_write(local,slot,0);local.compare_with(image_state,"recurrent/"+std::to_string(slot));}
+            }
+        };
+        const char * diagnostic=std::getenv("LLAMA_TEST_IMAGE_LAYOUT_DIRECTORY");
+        std::array<std::vector<uint8_t>,2> native_checkpoints;
+        const auto dump=[&](llama_context * context,const char * name) {
+            if (!diagnostic) return;
+            context->synchronize();const size_t vocabulary=llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            const size_t hidden=llama_model_n_embd_out(model.get());
+            std::ofstream values(std::string(diagnostic)+"/"+name+".bin",std::ios::binary);
+            const std::array<uint64_t,3> shape{2,vocabulary,hidden};values.write(reinterpret_cast<const char *>(shape.data()),sizeof(shape));
+            values.write(reinterpret_cast<const char *>(llama_get_logits(context)),std::streamsize(2*vocabulary*sizeof(float)));
+            values.write(reinterpret_cast<const char *>(llama_get_embeddings_nextn(context)),std::streamsize(2*hidden*sizeof(float)));
+            if (!values) throw std::runtime_error("cannot preserve image layout diagnostic vectors");
+            std::ofstream cells_file(std::string(diagnostic)+"/"+name+"-cells.txt");
+            const auto resources=context->get_kv_resources();
+            const auto & cells=resources.full->get_cells(0);
+            for (uint32_t column=0;column<cells.used_max_p1();++column) if (!cells.is_empty(column))
+                for (llama_seq_id slot=0;slot<2;++slot) if (cells.seq_has(column,slot)) cells_file<<slot<<' '<<column<<' '<<cells.pos_get(column)<<'\n';
+        };
+        {
+            llama_context_ptr native(llama_init_from_model(model.get(),cp));if (!t.assert_true(native!=nullptr)) return;
+            llama_set_embeddings_nextn(native.get(),true,false);auto batch=text(native.get(),false);
+            if (!t.assert_equal(0,llama_process(native.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get())) || !vectors(native.get(),prefix,12,12)) return;
+            auto image_batch=picture(native.get());llama_set_causal_attn(native.get(),!noncausal);
+            if (!t.assert_equal(0,llama_process(native.get(),LLAMA_PROCESS_TYPE_DECODE,image_batch.get())) || !vectors(native.get(),image_vectors,rows)) return;
+            llama_set_causal_attn(native.get(),true);state(native.get());
+            for (llama_seq_id slot=0;slot<2;++slot) {
+                auto & saved=native_checkpoints[slot];saved.resize(llama_state_seq_get_size(native.get(),slot));
+                if (!t.assert_true(!saved.empty() && saved.size()==llama_state_seq_get_data(native.get(),saved.data(),saved.size(),slot))) return;
+            }
+            if (diagnostic) {
+                auto next=text(native.get(),true);kv_stream_bit_oracle direct;
+                if (!t.assert_equal(0,llama_process(native.get(),LLAMA_PROCESS_TYPE_DECODE,next.get())) || !vectors(native.get(),direct,2,2)) return;
+                dump(native.get(),"native-direct");
+            }
+        }
+        // Selection boundaries use native sequence-checkpoint reconstruction and its physical column order.
+        {
+            llama_context_ptr native(llama_init_from_model(model.get(),cp));if (!t.assert_true(native!=nullptr)) return;
+            llama_set_embeddings_nextn(native.get(),true,false);
+            for (llama_seq_id slot=0;slot<2;++slot) {
+                const auto & saved=native_checkpoints[slot];
+                if (!t.assert_equal(saved.size(),llama_state_seq_set_data(native.get(),saved.data(),saved.size(),slot))) return;
+            }
+            for (llama_seq_id slot=0;slot<2;++slot) {
+                std::vector<uint8_t> restored(llama_state_seq_get_size(native.get(),slot));
+                if (!t.assert_equal(restored.size(),llama_state_seq_get_data(native.get(),restored.data(),restored.size(),slot))) return;
+                if (!t.assert_true("native checkpoint reconstruction preserves every serialized state byte",restored==native_checkpoints[slot])) return;
+                t.out<<"native image checkpoint slot="<<slot<<" original_bytes="<<native_checkpoints[slot].size()
+                    <<" restored_bytes="<<restored.size()<<" exact="<<(restored==native_checkpoints[slot])<<'\n';
+            }
+            auto next=text(native.get(),true);
+            if (!t.assert_equal(0,llama_process(native.get(),LLAMA_PROCESS_TYPE_DECODE,next.get())) || !vectors(native.get(),next_vectors,2,2)) return;
+            dump(native.get(),"native-restored");
+            if (assistant) {
+                auto dp=assistant_params(native.get());llama_context_ptr child(llama_init_from_model(assistant.get(),dp));
+                if (!t.assert_true(child!=nullptr)) return;
+                llama_set_embeddings_nextn(child.get(),true,true);
+                if (!predict(native.get(),child.get(),next)) return;
+            }
+        }
+        if (assistant) cp.kv_stream_verify_max=4;
+        cp.shared_device_memory_bytes=parent_mib*1048576;auto group=llama_context_group::create(*model,cp);if (!t.assert_true(group!=nullptr)) return;
+        llama_set_embeddings_nextn(group->metadata_context(),true,false);
+        if (assistant && !t.assert_true(group->prepare_shared_mtp(*assistant,assistant_params(group->metadata_context())))) return;
+        const auto activate=[&](common_batch & batch,const std::array<size_t,2> & history,llama_memory_work_phase phase,uint64_t revision) {
+            llama_kv_stream_selection selected;
+            if (llama_kv_stream_select({1024,2},{{0,history[0]},{1,history[1]}},selected)!=llama_kv_stream_selection_status::success) return false;
+            llama_batch_allocr allocator(uint32_t(batch.get()->n_pos_per_embd));
+            if (!allocator.init(*batch.get(),*llama_model_get_vocab(model.get()),false)) return false;
+            llama_context_memory_create_result result;
+            const bool active=group->activate(selected,group->source_handles(),allocator.get_batch(),phase,1,revision,&result);
+            t.out<<"image prefill activate phase="<<unsigned(phase)<<" status="<<llama_context_memory_create_status_name(result.status)<<'\n';return active;
+        };
+        auto batch=text(group->metadata_context(),false);
+        if (!t.assert_true(activate(batch,{0,0},llama_memory_work_phase::target_prefill,1)) ||
+                !t.assert_equal(0,llama_process(group->context(),LLAMA_PROCESS_TYPE_DECODE,batch.get()))) return;
+        prefix.compare();if (!vectors(group->context(),prefix,12,12)) return;prefix.finish();
+        if (!t.assert_true(group->park())) return;
+        auto image_batch=picture(group->metadata_context());llama_set_causal_attn(group->metadata_context(),!noncausal);
+        if (!t.assert_true("an admitted embedding prefill has a measured group workspace",activate(image_batch,{5,7},llama_memory_work_phase::target_prefill,2))) return;
+        if (!t.assert_true("image attention mode is measured before activating live storage",llama_get_causal_attn(group->context())==!noncausal)) return;
+        llama_set_kv_stream_decode(group->context(),false);
+        if (!t.assert_equal("native image positions and embedding rows remain valid in a group",0,llama_process(group->context(),LLAMA_PROCESS_TYPE_DECODE,image_batch.get()))) return;
+        image_vectors.compare();if (!vectors(group->context(),image_vectors,rows)) return;image_vectors.finish();
+        image_state.compare();state(group->context());image_state.finish();
+        if (!t.assert_true(group->park())) return;
+        auto next=text(group->metadata_context(),true);llama_set_causal_attn(group->metadata_context(),true);
+        if (!t.assert_true(activate(next,{5+rows,7},llama_memory_work_phase::target_verify,3))) return;
+        llama_set_causal_attn(group->context(),true);llama_set_kv_stream_decode(group->context(),true);
+        if (!t.assert_equal(0,llama_process(group->context(),LLAMA_PROCESS_TYPE_DECODE,next.get()))) return;
+        dump(group->context(),"group-restored");
+        next_vectors.compare();if (!vectors(group->context(),next_vectors,2,2)) return;next_vectors.finish();
+        if (assistant) {
+            if (!t.assert_true(group->auxiliary_context() && group->context()->group_parent()==group->auxiliary_context()->group_parent())) return;
+            assistant_outputs.compare();if (!predict(group->context(),group->auxiliary_context(),next)) return;assistant_outputs.finish();
+        }
+        if (!t.assert_true(group->park())) return;
+        t.out<<"group image prefill exact rows="<<rows<<" native_next="<<next_position<<" physical_rows="<<5+rows<<" noncausal="<<noncausal<<'\n';
+    });
+#endif
+#if !defined(_WIN32) || !defined(LLAMA_SHARED)
+    if (group_arena) t.test("real_group_projector_matches_native_embeddings_without_active_decoder",[&](testing & t) {
+        ggml_backend_load_all();
+        const llama_model_tensor_buft_override cpu_weights[]={{".*",ggml_backend_cpu_buffer_type()},{nullptr,nullptr}};
+        auto mp=llama_model_default_params();mp.n_gpu_layers=999;mp.tensor_buft_overrides=group_handoff ? nullptr : cpu_weights;
+        llama_model_ptr model(llama_model_load_from_file(model_path,mp));if (!t.assert_true(model!=nullptr)) return;
+        auto cp=llama_context_default_params();cp.n_ctx=2048;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=2;
+        cp.kv_unified=true;cp.swa_full=false;cp.shared_device_memory_bytes=parent_mib*1048576;
+        cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        kv_stream_bit_oracle prefix_vectors,prefix_state,restored_state,next_vectors;
+        const llama_context_group * state_group=nullptr;
+        auto input_batch=llama_batch_init(12,0,1);
+        struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release_input{input_batch};
+        const auto fill=[&](bool next) {
+            input_batch.n_tokens=0;
+            for (llama_seq_id slot=0;slot<2;++slot) for (int32_t row=0;row<(next ? 1 : slot ? 7 : 5);++row) {
+                const auto i=input_batch.n_tokens++;input_batch.token[i]=next ? 500+slot : 100+slot*20+row;
+                input_batch.pos[i]=next ? (slot ? 7 : 5) : row;input_batch.n_seq_id[i]=1;input_batch.seq_id[i][0]=slot;input_batch.logits[i]=true;
+            }
+        };
+        const auto capture_vectors=[&](llama_context * context,kv_stream_bit_oracle & oracle) {
+            context->synchronize();const size_t vocabulary=llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            const size_t hidden=llama_model_n_embd_out(model.get());
+            for (int32_t row=0;row<input_batch.n_tokens;++row) {
+                const auto * logits=llama_get_logits_ith(context,row);const auto * values=llama_get_embeddings_nextn_ith(context,row);
+                if (!t.assert_true(logits && values && std::all_of(logits,logits+vocabulary,[](float x) {return std::isfinite(x);}) &&
+                        std::all_of(values,values+hidden,[](float x) {return std::isfinite(x);}))) return false;
+                oracle.bytes("logits/"+std::to_string(row),logits,vocabulary*sizeof(float));
+                oracle.bytes("hidden/"+std::to_string(row),values,hidden*sizeof(float));
+            }
+            return true;
+        };
+        const auto capture_state=[&](llama_context * context,kv_stream_bit_oracle & state_oracle) {
+            context->synchronize();const auto resources=context->get_kv_resources();
+            for (llama_seq_id slot=0;slot<2;++slot) {
+                const auto name="full/"+std::to_string(slot);const size_t count=slot ? 7 : 5;
+                if (!resources.full->get_group_model()) kv_stream_exact_kv(state_oracle,name,resources.full,0,count,slot);
+                else {
+                    std::shared_ptr<llama_kv_stream_logical_cache> cache;
+                    if (!t.assert_true(state_group && state_group->source_table()->get(state_group->source_handles()[slot],0,cache) &&
+                            cache->ready() && cache->tokens()==count)) return;
+                    const auto layers=resources.full->get_layer_ids();
+                    if (!t.assert_equal(layers.size(),size_t(cache->host()->config().layers))) return;
+                    state_oracle.bytes(name+"/layers",layers.data(),layers.size()*sizeof(layers[0]));
+                    for (size_t index=0;index<layers.size();++index) for (bool value:{false,true}) {
+                        auto * tensor=value ? resources.full->get_v_storage(layers[index]) : resources.full->get_k_storage(layers[index]);
+                        const size_t row=value ? cache->host()->layout().v_token_bytes : cache->host()->layout().k_token_bytes;
+                        if (!t.assert_true(tensor && row==ggml_row_size(tensor->type,tensor->ne[0]) && count<=SIZE_MAX/row)) return;
+                        llama_kv_stream_host_layer storage;
+                        if (!t.assert_true(cache->host()->layer(uint32_t(index),storage))) return;
+                        const auto tag=name+"/L"+std::to_string(layers[index])+(value ? "/V" : "/K");
+                        const std::array<uint64_t,5> geometry{uint64_t(tensor->type),uint64_t(tensor->ne[0]),row,0,count};
+                        state_oracle.bytes(tag+"/shape",geometry.data(),sizeof(geometry));
+                        state_oracle.bytes(tag,value ? storage.v : storage.k,count*row);
+                    }
+                }
+                if (resources.bounded) {kv_stream_exact_state state;resources.bounded->state_write(state,slot,0);state.compare_with(state_oracle,"bounded/"+std::to_string(slot));}
+                if (resources.recurrent) {kv_stream_exact_state state;resources.recurrent->state_write(state,slot,0);state.compare_with(state_oracle,"recurrent/"+std::to_string(slot));}
+            }
+        };
+        if (group_handoff) {
+            cp.n_ctx=512;cp.n_outputs_max=16;cp.n_outputs_max_per_seq=8;cp.n_threads=cp.n_threads_batch=4;
+            auto native_params=cp;native_params.shared_device_memory_bytes=0;
+            llama_context_ptr native(llama_init_from_model(model.get(),native_params));if (!t.assert_true(native!=nullptr)) return;
+            llama_set_embeddings_nextn(native.get(),true,false);fill(false);
+            if (!t.assert_equal(0,llama_decode(native.get(),input_batch)) || !capture_vectors(native.get(),prefix_vectors)) return;
+            capture_state(native.get(),prefix_state);capture_state(native.get(),restored_state);fill(true);
+            if (!t.assert_equal(0,llama_decode(native.get(),input_batch)) || !capture_vectors(native.get(),next_vectors)) return;
+        }
+        auto group=llama_context_group::create(*model,cp);if (!t.assert_true(group!=nullptr)) return;
+        state_group=group.get();
+        ggml_backend_buffer_t text_parent=nullptr;
+        std::array<llama_kv_stream_logical_checkpoint,2> checkpoints{};
+        if (group_handoff) {
+            llama_set_embeddings_nextn(group->metadata_context(),true,false);llama_kv_stream_selection selected;
+            if (!t.assert_true(llama_kv_stream_select({512,2},{{0,0},{1,0}},selected)==llama_kv_stream_selection_status::success)) return;
+            fill(false);
+            if (!t.assert_true(group->activate(selected,group->source_handles(),input_batch,llama_memory_work_phase::target_prefill,1,1)) ||
+                    !t.assert_equal(0,llama_decode(group->context(),input_batch))) return;
+            prefix_vectors.compare();if (!capture_vectors(group->context(),prefix_vectors)) return;prefix_vectors.finish();
+            prefix_state.compare();capture_state(group->context(),prefix_state);prefix_state.finish();text_parent=group->context()->group_parent();
+            if (!t.assert_true(group->park() && !group->context() && group->prepare_vision_parent()==text_parent)) return;
+            for (uint32_t slot=0;slot<2;++slot) {
+                std::shared_ptr<llama_kv_stream_logical_cache> source;
+                if (!t.assert_true(group->source_table()->get(group->source_handles()[slot],0,source))) return;
+                checkpoints[slot]=source->checkpoint();
+            }
+        }
+        auto params=mtmd_context_params_default();params.use_gpu=true;params.warmup=false;params.n_threads=4;
+        struct encode_probe {llama_context_group * group;bool fail=false,blocked=true;size_t seen=0,completed=0;} probe{group.get()};
+        params.cb_eval_user_data=&probe;
+        params.cb_eval=[](ggml_tensor * tensor,bool ask,void * data) {
+            auto & state=*static_cast<encode_probe *>(data);
+            if (!tensor || tensor->op!=GGML_OP_MUL_MAT) return false;
+            if (ask) {
+                ++state.seen;state.blocked=state.blocked && !state.group->prepare_vision_parent();
+                return state.fail;
+            }
+            if (state.fail) {
+                if (!tensor->buffer || ggml_backend_buffer_is_host(tensor->buffer)) throw std::runtime_error("fault fixture did not reach a GPU matrix output");
+                ++state.completed;throw std::runtime_error("injected completed GPU vision operation failure");
+            }
+            return true;
+        };
+        params.image_min_tokens=image_budget ? int(image_budget) : 64;
+        params.image_max_tokens=image_budget ? int(image_budget) : 256;params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        mtmd::context_ptr projector(mtmd_init_from_file_deferred(projector_path,model.get(),params));
+        if (!t.assert_true(projector && !mtmd_acquire_projector_weights(projector.get()))) return;
+        const auto pixels=projector_test_pixels(image_width,image_height);
+        mtmd::bitmap_ptr image(mtmd_bitmap_init(uint32_t(image_width),uint32_t(image_height),pixels.data()));
+        const auto * bitmap=image.get();const std::string prompt=mtmd_get_marker(projector.get());
+        const mtmd_input_text input{prompt.c_str(),prompt.size(),true,true};mtmd::input_chunks_ptr chunks(mtmd_input_chunks_init());
+        if (!t.assert_equal(0,mtmd_tokenize(projector.get(),chunks.get(),&input,&bitmap,1))) return;
+        mtmd::batch_ptr batch(mtmd_batch_init(projector.get()));const mtmd_input_chunk * chunk=nullptr;
+        for (size_t i=0;i<mtmd_input_chunks_size(chunks.get());++i) {
+            const auto * entry=mtmd_input_chunks_get(chunks.get(),i);
+            if (mtmd_input_chunk_get_type(entry)==MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                if (!t.assert_true(!chunk) || !t.assert_equal(0,mtmd_batch_add_chunk(batch.get(),entry))) return;
+                chunk=entry;
+            }
+        }
+        if (!t.assert_true(chunk!=nullptr)) return;
+        size_t upload_calls=0;
+        const auto cancel_upload=[](float,void * data) {return ++*static_cast<size_t *>(data)==1;};
+        if (!t.assert_true(mtmd_batch_encode_group(projector.get(),batch.get(),*group,cancel_upload,&upload_calls)!=0) ||
+                !t.assert_equal(size_t(2),upload_calls)) return;
+        mtmd_embedding_view rejected,held;
+        if (!t.assert_true(!mtmd_batch_acquire_output_embd(batch.get(),chunk,rejected) && !mtmd_acquire_projector_weights(projector.get()) &&
+                group->prepare_vision_parent()!=nullptr)) return;
+        for (unsigned round=0;round<2;++round) {
+            if (round==1) {
+                probe.fail=true;
+                if (!t.assert_true(mtmd_batch_encode_group(projector.get(),batch.get(),*group)!=0 && probe.completed==1 && probe.blocked)) return;
+                probe.fail=false;
+                if (!t.assert_true(!mtmd_batch_acquire_output_embd(batch.get(),chunk,rejected) && !mtmd_acquire_projector_weights(projector.get()) &&
+                        group->prepare_vision_parent()!=nullptr && held.data()!=nullptr)) return;
+            }
+            if (!t.assert_equal(0,mtmd_batch_encode_group(projector.get(),batch.get(),*group))) return;
+            mtmd_embedding_view output;
+            if (!t.assert_true(mtmd_batch_acquire_output_embd(batch.get(),chunk,output))) return;
+            const size_t bytes=output.n_tokens()*output.n_embd()*sizeof(float);std::vector<uint8_t> expected(bytes);
+            std::ifstream file(baseline,std::ios::binary);file.read(reinterpret_cast<char *>(expected.data()),std::streamsize(bytes));
+            if (!t.assert_true(file && file.peek()==EOF && !std::memcmp(expected.data(),output.data(),bytes))) return;
+            if (!round) held=output;
+            if (!t.assert_true(held.n_tokens()==output.n_tokens() && held.n_embd()==output.n_embd() &&
+                    !std::memcmp(expected.data(),held.data(),bytes) && probe.seen>0 && probe.blocked)) return;
+            if (!t.assert_true(!group->context() && !group->auxiliary_context() && !mtmd_acquire_projector_weights(projector.get()))) return;
+            auto * parent=group->prepare_vision_parent();std::vector<ggml_backend_memory_lease_t> grants;
+            if (!t.assert_true(parent && group->lend_vision({64},grants))) return;
+            for (auto * lease:grants) ggml_backend_memory_lease_free(lease);
+            if (!t.assert_true(group->release_vision())) return;
+            t.out<<"grouped image round="<<round<<" rows="<<output.n_tokens()<<" width="<<output.n_embd()<<" exact_bytes="<<bytes<<'\n';
+        }
+        if (group_handoff) {
+            for (uint32_t slot=0;slot<2;++slot) {
+                std::shared_ptr<llama_kv_stream_logical_cache> source;
+                if (!t.assert_true(group->source_table()->get(group->source_handles()[slot],0,source))) return;
+                const auto after=source->checkpoint(),before=checkpoints[slot];
+                if (!t.assert_true(after.id==before.id && after.generation==before.generation && after.tokens==before.tokens)) return;
+            }
+            llama_kv_stream_selection selected;
+            if (!t.assert_true(llama_kv_stream_select({512,2},{{0,5},{1,7}},selected)==llama_kv_stream_selection_status::success)) return;
+            fill(true);
+            if (!t.assert_true(group->activate(selected,group->source_handles(),input_batch,llama_memory_work_phase::target_verify,1,2) &&
+                    group->context()->group_parent()==text_parent)) return;
+            restored_state.compare();capture_state(group->context(),restored_state);restored_state.finish();
+            if (!t.assert_equal(0,llama_decode(group->context(),input_batch))) return;
+            next_vectors.compare();if (!capture_vectors(group->context(),next_vectors)) return;next_vectors.finish();
+            if (!t.assert_true(group->park())) return;
+            t.out<<"populated target vision handoff full_KV_and_native_state_exact=1 continuation_records="<<next_vectors.records()<<'\n';
+        }
+    });
+#endif
     if (model_path && projector_path) t.test("real_projector_encoding_matches_the_original_eager_loader", [&](testing & t) {
         ggml_backend_load_all();
         auto model_params = llama_model_default_params();
