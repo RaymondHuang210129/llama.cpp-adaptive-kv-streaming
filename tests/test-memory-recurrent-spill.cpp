@@ -1047,8 +1047,8 @@ int main(int argc, char ** argv) {
         using lease_ptr=std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)>;
         ggml_backend_ptr backend(ggml_backend_cpu_init());auto * raw=backend.get();
         ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(&raw,nullptr,1,128,false,true));
-        for (const auto & selected : {std::vector<llama_seq_id>{0,1},std::vector<llama_seq_id>{1}}) {
-            llama_memory_recurrent memory(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,uint32_t(selected.size()),2,3,nullptr,true,true,true);
+        for (uint32_t depth=3;depth<=7;++depth) for (const auto & selected : {std::vector<llama_seq_id>{0,1},std::vector<llama_seq_id>{1}}) {
+            llama_memory_recurrent memory(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,uint32_t(selected.size()),2,depth,nullptr,true,true,true);
             if (!t.assert_true(memory.configure_selected_sequences(selected))) return;
             ggml_backend_buffer_type_t measured=nullptr;size_t current_bytes=0,stage_bytes=0;
             if (!t.assert_true(memory.current_storage_requirements(measured,current_bytes) && measured==type &&
@@ -1092,10 +1092,10 @@ int main(int argc, char ** argv) {
             current.reset();stage.reset();
             if (!t.assert_equal("both outer grants stay leased after caller handles retire",size_t(2),ggml_backend_memory_arena_lease_count(arena.get()))) return;
             const auto capture=[&](std::vector<llama_seq_id> sequences,bool cancel=false) {
-                llama_batch_allocr allocator(1);auto input=allocator.ubatch_reserve(4,uint32_t(sequences.size()));
-                for (size_t i=0;i<sequences.size();++i) for (size_t row=0;row<4;++row) {
-                    input.n_seq_id[i*4+row]=1;input.seq_id[i*4+row]=&sequences[i];
-                    input.pos[i*4+row]=memory.seq_pos_max(sequences[i])+1+llama_pos(row);
+                llama_batch_allocr allocator(1);auto input=allocator.ubatch_reserve(depth+1,uint32_t(sequences.size()));
+                for (size_t i=0;i<sequences.size();++i) for (size_t row=0;row<=depth;++row) {
+                    input.n_seq_id[i*(depth+1)+row]=1;input.seq_id[i*(depth+1)+row]=&sequences[i];
+                    input.pos[i*(depth+1)+row]=memory.seq_pos_max(sequences[i])+1+llama_pos(row);
                 }
                 if (!t.assert_true("complete current/publication grants admit native selected rows",memory.find_slot(input))) return false;
                 llm_graph_result result(256);result.reset();auto * context=result.get_ctx();auto * graph=result.get_gf();
@@ -1105,7 +1105,7 @@ int main(int argc, char ** argv) {
                 const std::array<uint64_t,2> before{memory.spill_generation(0),memory.spill_generation(1)};
                 for (bool value : {false,true}) {
                     std::vector<ggml_tensor *> copies;
-                    for (uint32_t slot=1;slot<=3;++slot) {
+                    for (uint32_t slot=1;slot<=depth;++slot) {
                         const auto * stage=memory.spill_bank(sequences.front())->staging_tensor(0,value,slot);
                         const auto width=ggml_nelements(stage);
                         auto * source=value ? ggml_new_tensor_2d(context,GGML_TYPE_F32,width,int64_t(sequences.size())) :

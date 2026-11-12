@@ -1282,10 +1282,12 @@ private:
         }
 
         const bool multi_stream=params_base.shared_device_memory_bytes && params_base.n_parallel==2;
-        if (multi_stream && (has_mmproj || (has_spec && !streamed_mtp) || params_base.embedding || !params_base.lora_adapters.empty() ||
+        if (multi_stream && (has_mmproj || (has_spec && !streamed_mtp && !streamed_dflash) || params_base.embedding || !params_base.lora_adapters.empty() ||
                 !params_base.kv_unified || std::any_of(params_base.speculative.types.begin(),params_base.speculative.types.end(),
-                    [](auto type) {return type!=COMMON_SPECULATIVE_TYPE_NONE && type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP;}))) {
-            SRV_ERR("%s\n","two-slot KV streaming requires independent text completions, unified KV and target-only or admitted MTP execution");return false;
+                    [streamed_dflash](auto type) {return type!=COMMON_SPECULATIVE_TYPE_NONE && (streamed_dflash ?
+                        type!=COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V :
+                        type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP);}))) {
+            SRV_ERR("%s\n","two-slot KV streaming requires independent text completions, unified KV and admitted target or speculative execution");return false;
         }
         llama_init = common_init_from_params(params_base,multi_stream);
 
@@ -1474,7 +1476,7 @@ private:
         slots.clear();
 
         ctx_tgt_seq_rm_type = stream_contexts ?
-            (streamed_mtp ? (llama_n_rs_seq(ctx_tgt) ? COMMON_CONTEXT_SEQ_RM_TYPE_RS : COMMON_CONTEXT_SEQ_RM_TYPE_PART) : COMMON_CONTEXT_SEQ_RM_TYPE_FULL) :
+            ((streamed_mtp || streamed_dflash) ? (llama_n_rs_seq(ctx_tgt) ? COMMON_CONTEXT_SEQ_RM_TYPE_RS : COMMON_CONTEXT_SEQ_RM_TYPE_PART) : COMMON_CONTEXT_SEQ_RM_TYPE_FULL) :
             common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
@@ -3422,7 +3424,7 @@ private:
         auto * draft=stream_contexts && spec ?
             (context==stream_contexts->metadata_context() ? stream_contexts->auxiliary_metadata_context() : stream_contexts->auxiliary_context()) : ctx_dft;
         if (stream_contexts && spec && !common_speculative_rebind(spec.get(),context,draft))
-            throw std::runtime_error("selected MTP contexts could not be rebound");
+            throw std::runtime_error("selected speculative contexts could not be rebound");
         ctx_tgt=context;ctx_dft=draft;
         for (auto & slot : slots) {
             slot.ctx_tgt=context;slot.ctx_dft=draft;slot.mem.init(context,draft);
@@ -3467,15 +3469,22 @@ private:
         std::unique_ptr<llama_context> child;
         if (server.spec) {
             auto * metadata=server.stream_contexts->auxiliary_metadata_context();
+            const auto * model=llama_get_model(metadata);
+            const bool block=metadata->get_cparams().serial_block_rows!=0;
+            if (block) {
+                const auto * layers=llama_model_target_layer_ids(model);
+                for (uint32_t i=0;i<llama_model_target_layer_ids_n(model);++i) pending.set_embeddings_layer_inp(uint32_t(layers[i]),true);
+            }
             auto child_params=common_context_params_to_llama(common_base_params_to_speculative(server.params_base));
-            child_params.ctx_type=LLAMA_CONTEXT_TYPE_MTP;child_params.ctx_other=&pending;
+            child_params.ctx_type=block ? LLAMA_CONTEXT_TYPE_DEFAULT : LLAMA_CONTEXT_TYPE_MTP;child_params.ctx_other=&pending;
             child_params.n_ctx=params.n_ctx;child_params.n_rs_seq=0;child_params.kv_stream_verify_max=0;
             child_params.n_outputs_max=metadata->get_cparams().n_outputs_max;
             child_params.n_outputs_max_per_seq=metadata->get_cparams().n_outputs_max_per_seq;
-            if (!params.kv_stream_auxiliary_layers) child_params.n_batch=child_params.n_ubatch=2;
-            child=std::make_unique<llama_context>(metadata->get_model(),child_params,selected);
-            child->set_embeddings_nextn(true,true);
-            if (!child->bind_group_samplers_from(*metadata)) throw std::runtime_error("selected MTP sampling graph could not be measured");
+            if (!block && !params.kv_stream_auxiliary_layers) child_params.n_batch=child_params.n_ubatch=2;
+            child=block ? std::make_unique<llama_context>(metadata->get_model(),child_params,selected,metadata->get_cparams().serial_block_rows) :
+                std::make_unique<llama_context>(metadata->get_model(),child_params,selected);
+            child->set_embeddings_nextn(true,!block);
+            if (!child->bind_group_samplers_from(*metadata)) throw std::runtime_error("selected speculative sampling graph could not be measured");
         }
         const auto result=pending.quote_target_group(batch,identities,{identities.front().id*4+1,1},
             llama_memory_work_phase::target_verify,1,params.shared_device_memory_bytes,quote,child.get(),auxiliary_identities);

@@ -38,6 +38,10 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+// Partition complete native draft blocks; zero rows exclude a sequence. Failure preserves output.
+bool common_speculative_partition_draft_blocks(const std::vector<uint32_t> & rows,uint32_t microbatch,
+        std::vector<std::vector<llama_seq_id>> & output);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;
@@ -91,7 +95,7 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
-// Rebind matched MTP contexts at an idle boundary, before the old contexts are destroyed.
+// Rebind matched MTP or DFlash contexts at an idle boundary, before destroying old contexts.
 bool common_speculative_rebind(common_speculative * spec,llama_context * target,llama_context * draft);
 
 // optionally call once at the beginning of a new generation

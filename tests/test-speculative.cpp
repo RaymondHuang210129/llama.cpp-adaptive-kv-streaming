@@ -598,7 +598,7 @@ int main(int argc, char ** argv) {
         for (int change=0;change<8;++change) {
             auto params=streamed_dflash_params(3,7);
             switch (change) {
-                case 0: params.n_parallel=2; break;
+                case 0: params.n_parallel=3; break;
                 case 1: params.kv_stream_auxiliary_layers=1; break;
                 case 2: params.fit_params=true; break;
                 case 3: params.mmproj.path="vision.gguf"; params.speculative.ngram_map_k4v.size_m=8; break;
@@ -686,5 +686,67 @@ int main(int argc, char ** argv) {
         t.assert_true(common_streamed_dflash_verification_error(params, depth) != nullptr);
     });
 
+    t.test("two_slot_dflash_admission_inherits_types_and_keeps_independent_widths",[&](testing & t) {
+        for (int maximum=1;maximum<=7;++maximum) for (uint16_t copied=1;copied<=7;++copied) {
+            auto params=streamed_dflash_params(maximum,copied);params.n_parallel=2;params.kv_unified=true;
+            t.assert_true("two-slot DFlash/K4V has a bounded joint profile",!common_streamed_dflash_config_error(params));
+            t.assert_equal(uint32_t(std::max(maximum,int(copied))),common_context_params_to_llama(params).n_rs_seq);
+            auto bad=params;bad.kv_unified=false;t.assert_true(common_streamed_dflash_config_error(bad)!=nullptr);
+            bad=params;bad.mmproj.path="not-admitted-until-vision-stage";t.assert_true(common_streamed_dflash_config_error(bad)!=nullptr);
+        }
+    });
+    t.test("seven_token_copy_keys_keep_distinct_values_for_two_histories",[&](testing & t) {
+        auto params=ngram_params();params.ngram_map_k4v.size_m=7;
+        common_speculative_ptr spec(common_speculative_init(params,2));
+        std::array<llama_tokens,2> histories,results;
+        for (llama_seq_id slot=0;slot<2;++slot) {
+            histories[slot]={99,10,20};
+            for (int32_t i=0;i<7;++i) histories[slot].push_back(30+slot*10+i);
+            histories[slot].insert(histories[slot].end(),{98,10});
+            common_speculative_begin(spec.get(),slot,histories[slot],{0,1});
+            auto & request=common_speculative_get_draft_params(spec.get(),slot);
+            request.drafting=true;request.n_max=7;request.pos0=llama_pos(histories[slot].size());request.id_last=20;
+            request.prompt=&histories[slot];request.result=&results[slot];
+        }
+        common_speculative_draft(spec.get());
+        for (llama_seq_id slot=0;slot<2;++slot) {
+            llama_tokens expected;for (int32_t i=0;i<7;++i) expected.push_back(30+slot*10+i);
+            t.assert_true(results[slot]==expected);
+            t.assert_equal(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,common_speculative_get_last_type(spec.get(),slot));
+        }
+        t.assert_equal(size_t(0),common_speculative_get_stats(spec.get())[0].n_predict);
+    });
+    t.test("draft_blocks_keep_equal_widths_and_never_split_a_sequence",[&](testing & t) {
+        std::vector<std::vector<llama_seq_id>> groups;
+        t.assert_true(common_speculative_partition_draft_blocks({8,8},16,groups));
+        t.assert_true(groups==std::vector<std::vector<llama_seq_id>>{{0,1}});
+        t.assert_true(common_speculative_partition_draft_blocks({2,8,2,0,8},16,groups));
+        t.assert_true(groups==std::vector<std::vector<llama_seq_id>>{{0,2},{1,4}});
+        t.assert_true(common_speculative_partition_draft_blocks({8,8,8},16,groups));
+        t.assert_true(groups==std::vector<std::vector<llama_seq_id>>{{0,1},{2}});
+        t.assert_true(common_speculative_partition_draft_blocks({2,8,2},8,groups));
+        t.assert_true(groups==std::vector<std::vector<llama_seq_id>>{{0,2},{1}});
+        const auto saved=groups;
+        t.assert_true(!common_speculative_partition_draft_blocks({2,9},8,groups) && groups==saved);
+        t.assert_true(!common_speculative_partition_draft_blocks({2},0,groups) && groups==saved);
+        t.assert_true(common_speculative_partition_draft_blocks({0,0},8,groups) && groups.empty());
+        for (uint32_t capacity=1;capacity<=32;++capacity) for (size_t count=1;count<=16;++count) {
+            std::vector<uint32_t> widths(count);
+            for (size_t i=0;i<count;++i) widths[i]=uint32_t((i*7+count)%(capacity+1));
+            if (!t.assert_true(common_speculative_partition_draft_blocks(widths,capacity,groups))) return;
+            std::vector<bool> seen(count,false);
+            for (const auto & group : groups) {
+                if (!t.assert_true(!group.empty())) return;
+                uint32_t rows=0;llama_seq_id previous=-1;
+                for (auto slot : group) {
+                    if (!t.assert_true(slot>previous && size_t(slot)<count && !seen[slot] && widths[slot] &&
+                            widths[slot]==widths[group.front()])) return;
+                    previous=slot;seen[slot]=true;rows+=widths[slot];
+                }
+                if (!t.assert_true(rows<=capacity)) return;
+            }
+            for (size_t i=0;i<count;++i) t.assert_true(seen[i]==bool(widths[i]));
+        }
+    });
     return t.summary();
 }

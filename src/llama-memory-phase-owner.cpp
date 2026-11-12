@@ -43,7 +43,8 @@ static bool same_identity(llama_memory_phase_cache_identity a, llama_memory_phas
 static bool same_workload(const llama_memory_workload_requirement & a, const llama_memory_workload_requirement & b) {
     return a.phase == b.phase && same_identity(a.cache, b.cache) && a.input_rows == b.input_rows &&
         a.query_rows == b.query_rows && a.output_rows == b.output_rows && a.rollback_depth == b.rollback_depth &&
-        a.microbatch_rows == b.microbatch_rows && a.serial == b.serial && a.writes_cache == b.writes_cache && a.causal == b.causal;
+        a.microbatch_rows == b.microbatch_rows && a.serial == b.serial && a.writes_cache == b.writes_cache && a.causal == b.causal &&
+        same_identity(a.destination_cache,b.destination_cache) && a.hidden_output_rows==b.hidden_output_rows;
 }
 
 static llama_memory_workload_budget_result cache_storage_measure(
@@ -105,7 +106,10 @@ llama_memory_workload_budget_result llama_memory_workload_budget_make(
             const auto * cache = find_cache(workload.cache.id);
             if (!cache) return {status::missing_cache, i};
             if (!same_identity(cache->identity, workload.cache)) return {status::stale_cache, i};
-            if (!llama_memory_workload_requirement_valid(workload, *cache)) return {status::invalid_workload, i};
+            const auto * destination=workload.destination_cache.id ? find_cache(workload.destination_cache.id) : nullptr;
+            if (workload.destination_cache.id && !destination) return {status::missing_cache,i};
+            if (destination && !same_identity(destination->identity,workload.destination_cache)) return {status::stale_cache,i};
+            if (!llama_memory_workload_requirement_valid(workload,*cache,destination)) return {status::invalid_workload,i};
             if (!same_workload(workload, measurement.workload)) return {status::missing_measurement, i};
             if (!measurement.execution_available) return {status::missing_kernel, i};
             if (measurement.fallback_selected && !measurement.fallback_measured) return {status::unbudgeted_fallback, i};
@@ -170,32 +174,43 @@ llama_memory_workload_budget_result llama_memory_group_workload_budget_make(
                 const auto * cache=find_cache(member.cache.id);
                 if (!cache) return {status::missing_cache,i};
                 if (!same_identity(member.cache,cache->identity)) return {status::stale_cache,i};
+                const auto * destination=member.destination_cache.id ? find_cache(member.destination_cache.id) : nullptr;
+                if (member.destination_cache.id && !destination) return {status::missing_cache,i};
+                if (destination && !same_identity(member.destination_cache,destination->identity)) return {status::stale_cache,i};
                 if (member.microbatch_rows!=group.microbatch_rows || member.phase!=group.members[0].phase ||
-                        !llama_memory_workload_group_member_valid(member,*cache)) return {status::invalid_workload,i};
+                        bool(member.destination_cache.id)!=bool(group.members[0].destination_cache.id) ||
+                        !llama_memory_workload_group_member_valid(member,*cache,destination)) return {status::invalid_workload,i};
                 for (size_t prior=0;prior<m;++prior)
                     if (group.members[prior].cache.id==member.cache.id) return {status::invalid_workload,i};
             }
-            std::vector<uint32_t> consumed(group.members.size(),0),outputs(group.members.size(),0);
+            std::vector<uint32_t> consumed(group.members.size(),0),outputs(group.members.size(),0),hidden(group.members.size(),0);
             for (const auto & batch : group.native_batches) {
                 if (batch.empty()) return {status::invalid_workload,i};
                 uint64_t rows=0;
                 const llama_memory_cache_requirement * first=nullptr;
+                const llama_memory_cache_requirement * first_destination=nullptr;
                 for (const auto & range : batch) {
                     if (range.member>=group.members.size() || !range.rows) return {status::invalid_workload,i};
                     const auto member=range.member;
                     const auto & intent=group.members[member];
                     if (range.first_row!=consumed[member] || range.rows>intent.input_rows-consumed[member] ||
-                            range.output_rows>range.rows || range.output_rows>intent.output_rows-outputs[member])
+                            range.output_rows>range.rows || range.output_rows>intent.output_rows-outputs[member] ||
+                            range.hidden_output_rows>range.rows || range.hidden_output_rows>intent.hidden_output_rows-hidden[member])
                         return {status::invalid_workload,i};
-                    consumed[member]+=range.rows; outputs[member]+=range.output_rows;
+                    consumed[member]+=range.rows; outputs[member]+=range.output_rows;hidden[member]+=range.hidden_output_rows;
                     const auto * cache=find_cache(intent.cache.id);
                     if (first && !llama_memory_cache_format_equal(first->format,cache->format)) return {status::invalid_workload,i};
+                    const auto * destination=intent.destination_cache.id ? find_cache(intent.destination_cache.id) : cache;
+                    if (first_destination && !llama_memory_cache_format_equal(first_destination->format,destination->format))
+                        return {status::invalid_workload,i};
+                    first_destination=destination;
                     first=cache; rows+=range.rows;
                 }
                 if (rows>group.microbatch_rows) return {status::invalid_workload,i};
             }
             for (size_t member=0;member<group.members.size();++member)
-                if (consumed[member]!=group.members[member].input_rows || outputs[member]!=group.members[member].output_rows)
+                if (consumed[member]!=group.members[member].input_rows || outputs[member]!=group.members[member].output_rows ||
+                        hidden[member]!=group.members[member].hidden_output_rows)
                     return {status::invalid_workload,i};
         }
         llama_memory_workload_budget next;

@@ -154,10 +154,17 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
     }
 
+    const llama_memory_params * base_stream=(streaming || measure_only) ? &base_params : nullptr;
+    if (model.arch==LLM_ARCH_DFLASH && stream && stream->defer_full_cache && stream->defer_bounded_cache) {
+        bool full=false;
+        for (uint32_t layer=0;layer<hparams.n_layer();++layer) full=full || (hparams.has_kv(layer) && filter_base(layer));
+        // An all-local draft's empty full cache retains native cell metadata only.
+        if (!full) base_stream=nullptr;
+    }
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,"",(streaming || measure_only) ? &base_params : nullptr);
+            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,"",base_stream);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
@@ -174,10 +181,13 @@ void llama_kv_cache_iswa::clear(bool data) {
 }
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    size_t retained=0;
-    if (!kv_base->kv_stream_can_remove(seq_id,p0,p1,&retained) || !kv_swa->kv_stream_can_remove(seq_id,p0,p1)) return false;
-    if (!kv_base->kv_stream_bounded_suffix_available(*kv_swa,seq_id,p0,p1)) return false;
-    return kv_base->seq_rm(seq_id,p0,p1) && kv_swa->seq_rm(seq_id,p0,p1);
+    const auto remove = [&] {
+        size_t retained=0;
+        if (!kv_base->kv_stream_can_remove(seq_id,p0,p1,&retained) || !kv_swa->kv_stream_can_remove(seq_id,p0,p1)) return false;
+        if (!kv_base->kv_stream_bounded_suffix_available(*kv_swa,seq_id,p0,p1)) return false;
+        return kv_base->seq_rm(seq_id,p0,p1) && kv_swa->seq_rm(seq_id,p0,p1);
+    };
+    return group_remove ? group_remove(seq_id,p0,p1,remove) : remove();
 }
 
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

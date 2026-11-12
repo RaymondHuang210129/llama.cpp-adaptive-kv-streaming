@@ -3,6 +3,7 @@
 #include "llama-kv-cache.h"
 
 #include <vector>
+#include <functional>
 
 struct llama_memory_phase_cache_identity;
 struct llama_memory_bounded_kv_layout;
@@ -98,11 +99,15 @@ public:
     llama_kv_cache * get_base() const { return kv_base.get(); }
     llama_kv_cache * get_swa () const { return kv_swa.get(); }
 
+    void bind_group_remove(std::function<bool(llama_seq_id, llama_pos, llama_pos,
+            const std::function<bool()> &)> remove) { group_remove = std::move(remove); }
+
 private:
     const bool unified;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;
+    std::function<bool(llama_seq_id, llama_pos, llama_pos, const std::function<bool()> &)> group_remove;
 };
 
 class llama_kv_cache_iswa_context : public llama_memory_context_i {

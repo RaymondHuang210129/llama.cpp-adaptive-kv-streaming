@@ -1171,6 +1171,72 @@ int main(int argc, char ** argv) {
                 llama_memory_workload_budget_status::invalid_workload);
         }
     });
+    t.test("DFlash_group_accounts_for_source_features_and_one_bounded_destination", [](testing & t) {
+        llama_memory_cache_requirement first;
+        first.identity={711,1};first.layers=2;first.history_rows=8192;first.row_padding=256;
+        first.format={GGML_TYPE_F16,GGML_TYPE_F16,32,32,1,false};first.row_bytes=128;
+        auto second=first;second.identity={712,2};
+        auto destination=first;destination.identity={713,3};destination.role=llama_memory_cache_role::bounded_resident;
+        destination.layers=5;destination.window_rows=16;destination.headroom_rows=8;destination.row_padding=16;
+        destination.sequence_capacity=2;destination.format={GGML_TYPE_F16,GGML_TYPE_F16,64,64,2,false};destination.row_bytes=512;
+        std::vector<llama_memory_cache_requirement> caches={first,second,destination};
+        std::vector<llama_memory_cache_allocation_measurement> allocations;
+        for (const auto & cache : caches) {
+            llama_memory_cache_bound bound;
+            if (!t.assert_true(llama_memory_cache_bound_make(cache,nullptr,bound))) return;
+            allocations.push_back({cache.identity,cache.role==llama_memory_cache_role::bounded_resident ? bound.storage_bytes : 0,
+                128,bound.capacity_rows,cache.format});
+        }
+        t.assert_equal(size_t(122880),allocations.back().bytes);
+        llama_memory_workload_requirement a;
+        a.phase=llama_memory_work_phase::draft_block_prediction;a.cache=first.identity;
+        a.destination_cache=destination.identity;a.input_rows=a.query_rows=a.hidden_output_rows=8;
+        a.microbatch_rows=16;a.writes_cache=true;a.causal=false;
+        auto b=a;b.cache=second.identity;
+        llama_memory_group_workload predict;
+        predict.id=83;predict.selected_count=2;predict.microbatch_rows=16;predict.members={a,b};
+        predict.native_batches={{{0,0,8,0,8},{1,0,8,0,8}}};
+        auto inject=predict;inject.id=84;
+        for (size_t i=0;i<inject.members.size();++i) {
+            auto & member=inject.members[i];member.phase=llama_memory_work_phase::draft_feature_injection;
+            member.input_rows=uint32_t(5+2*i);member.query_rows=member.hidden_output_rows=0;
+        }
+        inject.native_batches={{{0,0,5,0,0}},{{1,0,7,0,0}}};
+        llama_memory_group_workload_measurement p;
+        p.workload=predict;p.graph_bytes={640};p.execution_available={true};p.live_device_bytes=128;p.alignment=128;
+        auto q=p;q.workload=inject;q.graph_bytes={320,512};q.execution_available={true,true};
+        const std::vector<llama_memory_group_workload> workloads={predict,inject};
+        const std::vector<llama_memory_group_workload_measurement> measured={p,q};
+        llama_memory_workload_budget budget;
+        if (!t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,workloads,measured,512,124160,budget).status==
+                llama_memory_workload_budget_status::success)) return;
+        t.assert_equal(size_t(122880),budget.persistent_cache_bytes);
+        t.assert_equal(size_t(124160),budget.parent_minimum_bytes);
+        const auto saved=budget;
+        const auto short_fit=llama_memory_group_workload_budget_make(caches,allocations,workloads,measured,512,124159,budget);
+        t.assert_true(short_fit.status==llama_memory_workload_budget_status::insufficient_budget && short_fit.additional_bytes==1);
+        for (uint32_t defect=0;defect<9;++defect) {
+            auto bad=workloads;auto proof=measured;
+            switch (defect) {
+                case 0: bad[0].members[0].destination_cache.id=799;break;
+                case 1: ++bad[0].members[0].destination_cache.generation;break;
+                case 2: bad[0].members[0].destination_cache=first.identity;break;
+                case 3: bad[0].members[1].cache=first.identity;break;
+                case 4: bad[0].members[0].hidden_output_rows=9;break;
+                case 5: bad[0].native_batches[0][0].hidden_output_rows=7;break;
+                case 6: proof[0].workload.members[0].hidden_output_rows=7;break;
+                case 7: bad[1].members[0].phase=llama_memory_work_phase::target_verify;break;
+                case 8: bad[0].members[0].destination_cache={};break;
+            }
+            const auto result=llama_memory_group_workload_budget_make(caches,allocations,bad,proof,512,124160,budget);
+            const auto expected=defect==0 ? llama_memory_workload_budget_status::missing_cache :
+                defect==1 ? llama_memory_workload_budget_status::stale_cache :
+                defect==6 ? llama_memory_workload_budget_status::missing_measurement : llama_memory_workload_budget_status::invalid_workload;
+            t.assert_true(result.status==expected);
+            t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+            t.assert_true(saved.workload_bytes==budget.workload_bytes);
+        }
+    });
     t.test("measured_cache_padding_and_aliases_are_accounted_once", [](testing & t) {
         llama_memory_cache_requirement source{{201,2},{},llama_memory_cache_role::bounded_resident,
                                             5,262144,2048,256,256,1664};

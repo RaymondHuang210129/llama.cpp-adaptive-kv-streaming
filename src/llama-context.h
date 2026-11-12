@@ -79,6 +79,8 @@ struct llama_context {
     bool is_measurement_only() const { return measurement_only; }
     // Selected-state metadata stays non-executable until all group grants are bound.
     llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected);
+    llama_context(const llama_model & model,llama_context_params params,
+        const std::vector<llama_seq_id> & selected,uint32_t prediction_rows);
     bool group_storage_pending() const noexcept { return group_initializing; }
     const llama_context * group_target_context() const noexcept { return group_target; }
     // The supplied owner and measured workspace cover all selected native state and graph users.
@@ -319,7 +321,10 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    friend class llama_context_group;
     friend bool llama_mtp_rebind_compatible(const llama_context * old_target,const llama_context * old_draft,
+        const llama_context * target,const llama_context * draft,llama_sampler * const * samplers,size_t count);
+    friend bool llama_speculative_rebind_compatible(const llama_context * old_target,const llama_context * old_draft,
         const llama_context * target,const llama_context * draft,llama_sampler * const * samplers,size_t count);
     llama_context(const llama_model & model, llama_context_params params,
         uint32_t serial_prediction_rows, bool serial_image_inputs, llama_context_mode mode,
@@ -376,6 +381,14 @@ private:
         llama_memory_phase_cache_identity bounded_identity,llama_memory_work_phase phase,
         uint64_t id,size_t capacity,llama_context_group_plan & output,llama_context & auxiliary,
         const std::vector<llama_memory_phase_cache_identity> & auxiliary_sources);
+    llama_context_memory_create_result quote_dflash_group(const llama_batch & batch,
+        const std::vector<llama_memory_phase_cache_identity> & sources,
+        llama_memory_phase_cache_identity bounded_identity,llama_memory_work_phase phase,
+        uint64_t id,size_t capacity,llama_context_group_plan & output,llama_context & draft);
+    bool measure_dflash_workload(const llama_batch & batch,
+        const std::vector<llama_memory_phase_cache_identity> & sources,
+        llama_memory_phase_cache_identity destination,llama_memory_work_phase phase,
+        uint64_t id,llama_context_group_workload_quote & output);
     llm_graph_result * get_gf_res_prev();
     ggml_cgraph * graph_build_reserve(uint32_t tokens, uint32_t sequences, uint32_t outputs,
         const llama_memory_context_i * memory, bool feature_input, const llama_ubatch * native_batch = nullptr);
@@ -505,7 +518,18 @@ private:
     bool serial_feature_producer = false;
     bool serial_feature_images = false;
     std::vector<int32_t> serial_feature_layers;
-    std::vector<std::pair<llama_token,llama_pos>> serial_feature_rows;
+    struct serial_feature_row {
+        llama_token token;
+        llama_pos position;
+        llama_seq_id sequence;
+    };
+    std::vector<serial_feature_row> serial_feature_rows;
+    struct serial_feature_source {
+        uint32_t slot;
+        uint64_t request_epoch,cache_id,generation;
+        size_t tokens;
+    };
+    std::vector<serial_feature_source> serial_feature_sources;
     struct serial_feature_image_row {
         bool has_embd;
         size_t offset;
@@ -586,6 +610,7 @@ private:
     std::vector<llama_seq_id> group_selected;
     struct group_execution_binding;
     std::unique_ptr<group_execution_binding> group_execution;
+    std::weak_ptr<llama_kv_stream_slot_table> group_source_table;
 
 };
 
@@ -600,6 +625,7 @@ public:
     ~llama_context_group();
     // The caller retains model weights. Declare the shared child before allocating the parent.
     bool prepare_shared_mtp(const llama_model & model,llama_context_params params);
+    bool prepare_dflash(const llama_model & model,llama_context_params params,uint32_t prediction_rows);
     bool activate(const llama_kv_stream_selection & selection,const std::vector<llama_kv_stream_slot_handle> & handles,
         const llama_batch & representative,llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,
         llama_context_memory_create_result * result = nullptr);

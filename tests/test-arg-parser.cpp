@@ -104,7 +104,7 @@ static void test(void) {
         for (int change=0;change<7;++change) {
             auto invalid=dflash;
             switch (change) {
-                case 0: invalid.n_parallel=2; break;
+                case 0: invalid.n_parallel=3; break;
                 case 1: invalid.speculative.draft.n_max=8; break;
                 case 2: invalid.kv_stream_auxiliary_layers=1; break;
                 case 3: invalid.fit_params=true; break;

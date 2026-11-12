@@ -1034,7 +1034,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const llama_model * model_dft = llama_get_model(ctx_dft);
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
         const auto * target_owner=llama_context_compute_memory(ctx_tgt);
-        serial_features=target_owner && target_owner->shares_kv_memory();
+        serial_features=ctx_tgt->group_parent() || ctx_tgt->group_storage_pending() ||
+            (target_owner && target_owner->shares_kv_memory());
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
@@ -1258,33 +1259,45 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        std::vector<uint32_t> widths(n_seq,0);
+        for (llama_seq_id seq_id=0;seq_id<llama_seq_id(n_seq);++seq_id) {
+            const auto & dp=dparams[seq_id];
+            if (!dp.drafting || dp.pos0<0) continue;
+            int32_t proposals=params.n_max;
+            if (is_dflash2 && n_seq>1 && dp.n_max>=0) proposals=std::min(proposals,dp.n_max);
+            if (is_dflash2) {
+                const auto capacity=llama_n_ctx_seq(ctx_dft);
+                if (uint64_t(dp.pos0)>=capacity || capacity-uint32_t(dp.pos0)<=1) continue;
+                proposals=std::min(proposals,int32_t(capacity-uint32_t(dp.pos0)-1));
+            }
+            if (proposals<=0) continue;
+            const uint64_t rows=uint64_t(proposals)+(is_dspark && sample_from_anchor ? 0u : 1u);
+            if (rows>uint64_t(INT32_MAX-dp.pos0)) continue;
+            widths[seq_id]=uint32_t(rows);
+        }
+        std::vector<std::vector<llama_seq_id>> groups;
+        if (!common_speculative_partition_draft_blocks(widths,llama_n_ubatch(ctx_dft),groups)) {
+            LOG_WRN("%s: a complete draft block exceeds the microbatch\n",__func__);return;
+        }
+        for (const auto & group : groups) draft_group(dparams,group,widths);
+    }
+
+    void draft_group(common_speculative_draft_params_vec & dparams,const std::vector<llama_seq_id> & group,
+            const std::vector<uint32_t> & widths) {
+        auto & ctx_dft=params.ctx_dft;
         batch.clear();
 
-        // build one batch holding every drafting sequence's noise block into a single decode)
-        // record where each block starts and its size
+        // Native convolution and selector shapes require equal, complete blocks.
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+        for (auto seq_id : group) {
             auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
 
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
-
-            int32_t n_draft = params.n_max;
-            if (is_dflash2) {
-                const uint32_t capacity = llama_n_ctx_seq(ctx_dft);
-                if (dp.pos0 < 0 || uint64_t(dp.pos0) >= capacity) continue;
-                const uint32_t remaining = capacity-uint32_t(dp.pos0);
-                if (remaining <= 1) continue;
-                n_draft = std::min(n_draft, int32_t(remaining-1));
-            }
-
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            const int32_t n_block_tokens = int32_t(widths[seq_id]);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1300,6 +1313,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+            if (params.ctx_tgt->group_parent() || params.ctx_tgt->group_storage_pending()) {
+                for (auto & request : dparams) if (request.drafting) {
+                    request.result->clear();
+                    if (request.result_q) request.result_q->clear();
+                }
+                throw std::runtime_error("selected DFlash execution failed");
+            }
             return;
         }
         n_predict++;
@@ -2757,17 +2777,20 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    if (group && (!spec_mtp || !model_tgt || !ctx_tgt || ctx_tgt!=group->metadata_context() ||
+    const bool spec_dflash=std::find(params.speculative.types.begin(),params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)!=params.speculative.types.end();
+    if (group && ((!spec_mtp && !spec_dflash) || (spec_mtp && spec_dflash) || !model_tgt || !ctx_tgt || ctx_tgt!=group->metadata_context() ||
             llama_get_model(ctx_tgt)!=model_tgt || group->context() || params.n_parallel!=2 || !params.kv_unified ||
             params.embedding || !params.mmproj.path.empty() || params.shared_device_memory_bytes || params.kv_stream_pool_bytes ||
             params.kv_stream_auxiliary_layers || params.speculative.draft.cache_type_k_explicit ||
             params.speculative.draft.cache_type_v_explicit ||
-            std::any_of(params.speculative.types.begin(),params.speculative.types.end(),[](auto type) {
-                return type!=COMMON_SPECULATIVE_TYPE_NONE && type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
-            }))) throw std::invalid_argument("group MTP startup requires matching deferred targets and inherited draft parameters");
+            std::any_of(params.speculative.types.begin(),params.speculative.types.end(),[&](auto type) {
+                return type!=COMMON_SPECULATIVE_TYPE_NONE && (spec_dflash ?
+                    type!=COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V :
+                    type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+            }))) throw std::invalid_argument("group speculative startup requires matching deferred targets and inherited draft parameters");
     auto * target_memory=llama_context_compute_memory(ctx_tgt);
-    const bool streamed_block=target_memory && target_memory->shares_kv_memory() &&
-        std::find(params.speculative.types.begin(),params.speculative.types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
+    const bool streamed_block=spec_dflash && (group || (target_memory && target_memory->shares_kv_memory()));
     if (streamed_block) {
         uint32_t depth = 0;
         if (const auto * error = common_streamed_dflash_verification_error(params, depth)) {
@@ -2834,8 +2857,9 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         if (group) {
-            if (!shared_gemma_mtp || !group->prepare_shared_mtp(*model_dft,cparams))
-                throw std::invalid_argument("group MTP requires a matching shared Gemma assistant declaration");
+            const bool declared=spec_dflash ? group->prepare_dflash(*model_dft,cparams,uint32_t(params.speculative.draft.n_max)+1) :
+                shared_gemma_mtp && group->prepare_shared_mtp(*model_dft,cparams);
+            if (!declared) throw std::invalid_argument("group speculation requires a matching shared draft declaration");
             pimpl->borrowed_context=group->auxiliary_metadata_context();return;
         }
 
@@ -2902,6 +2926,23 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params,llama_model * model_tgt,
         llama_context * ctx_tgt,llama_context_group * group) {
     return std::make_unique<common_speculative_init_result>(params,model_tgt,ctx_tgt,group);
+}
+
+bool common_speculative_partition_draft_blocks(const std::vector<uint32_t> & rows,uint32_t microbatch,
+        std::vector<std::vector<llama_seq_id>> & output) {
+    if (!microbatch || rows.size()>LLAMA_MAX_SEQ) return false;
+    std::vector<std::vector<llama_seq_id>> groups;
+    for (size_t slot=0;slot<rows.size();++slot) {
+        const auto width=rows[slot];
+        if (width>microbatch) return false;
+        if (!width) continue;
+        const auto found=std::find_if(groups.begin(),groups.end(),[&](const auto & group) {
+            return rows[group.front()]==width && group.size()<microbatch/width;
+        });
+        if (found==groups.end()) groups.push_back({llama_seq_id(slot)});
+        else found->push_back(llama_seq_id(slot));
+    }
+    output=std::move(groups);return true;
 }
 
 common_speculative_output_limits common_speculative_get_output_limits(
@@ -3211,7 +3252,34 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 bool common_speculative_rebind(common_speculative * spec,llama_context * target,llama_context * draft) {
-    if (!spec || spec->impls.size()!=1 || spec->impls.front()->type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP) return false;
+    if (!spec || spec->impls.empty()) return false;
+    common_speculative_impl_draft_dflash * block=nullptr;
+    for (const auto & candidate : spec->impls) {
+        if (candidate->type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            if (block) return false;
+            block=static_cast<common_speculative_impl_draft_dflash *>(candidate.get());
+        } else if (candidate->type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V &&
+                candidate->type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP) return false;
+    }
+    if (block) {
+        if (std::any_of(spec->impls.begin(),spec->impls.end(),[](const auto & candidate) {
+                return candidate->type==COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            }) || !llama_speculative_rebind_compatible(block->params.ctx_tgt,block->params.ctx_dft,target,draft,
+                block->backend_chains.data(),block->backend_chains.size())) return false;
+        if (block->params.ctx_tgt==target && block->params.ctx_dft==draft) return true;
+        try {
+            common_batch replacement(draft),injection(draft);
+            llama_synchronize(block->params.ctx_tgt);llama_synchronize(block->params.ctx_dft);
+            llama_kv_stream_schedule_next(target,draft,uint32_t(std::max(0,block->params.n_max)));
+            block->batch=std::move(replacement);block->batch_inject=std::move(injection);
+            block->params.ctx_tgt=target;block->params.ctx_dft=draft;
+            const auto * owner=llama_context_compute_memory(target);
+            block->serial_features=target->group_parent() || target->group_storage_pending() ||
+                (owner && owner->shares_kv_memory());
+            return true;
+        } catch (const std::bad_alloc &) {return false;}
+    }
+    if (spec->impls.size()!=1 || spec->impls.front()->type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP) return false;
     auto & impl=*static_cast<common_speculative_impl_draft_mtp *>(spec->impls.front().get());
     if (!llama_mtp_rebind_compatible(impl.params.ctx_tgt,impl.params.ctx_dft,target,draft,
             impl.backend_chains.data(),impl.backend_chains.size()) ||

@@ -322,10 +322,10 @@ struct kv_stream_exact_trace {
 
 // Read valid KV rows in logical order, not allocation order or padded capacity.
 static void kv_stream_exact_kv(kv_stream_bit_oracle & oracle, const std::string & label,
-        llama_kv_cache * kv, size_t first, size_t count) {
+        llama_kv_cache * kv, size_t first, size_t count,llama_seq_id sequence=0) {
     const auto & cells = kv->get_cells(0);
     std::vector<uint32_t> slots(count, UINT32_MAX);
-    for (const auto & item : cells.seq_pos_get(0)) {
+    for (const auto & item : cells.seq_pos_get(sequence)) {
         if (item.first >= 0 && size_t(item.first) >= first && size_t(item.first)-first < count)
             slots[size_t(item.first)-first] = item.second;
     }

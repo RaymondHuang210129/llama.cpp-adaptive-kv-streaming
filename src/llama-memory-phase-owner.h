@@ -101,8 +101,10 @@ llama_memory_workload_budget_result llama_memory_workload_budget_make(
 
 struct llama_memory_group_member_range {
     uint32_t member = 0, first_row = 0, rows = 0, output_rows = 0;
+    uint32_t hidden_output_rows = 0;
     bool operator==(const llama_memory_group_member_range & other) const noexcept {
-        return member==other.member && first_row==other.first_row && rows==other.rows && output_rows==other.output_rows;
+        return member==other.member && first_row==other.first_row && rows==other.rows && output_rows==other.output_rows &&
+            hidden_output_rows==other.hidden_output_rows;
     }
 };
 

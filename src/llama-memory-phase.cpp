@@ -85,16 +85,28 @@ bool llama_memory_cache_read_binding_valid(const llama_memory_cache_read_binding
 }
 
 static bool workload_fields_valid(const llama_memory_workload_requirement & r,
-        const llama_memory_cache_requirement & cache,bool single_batch) noexcept {
+        const llama_memory_cache_requirement & cache,bool single_batch,
+        const llama_memory_cache_requirement * destination=nullptr) noexcept {
     if (!r.input_rows || !r.microbatch_rows || (single_batch && r.input_rows > r.microbatch_rows) || r.output_rows > r.input_rows ||
             !r.cache.id || !r.cache.generation || r.cache.id != cache.identity.id ||
             r.cache.generation != cache.identity.generation ||
-            (r.writes_cache && cache.role == llama_memory_cache_role::read_only_source)) return false;
+            (r.writes_cache && cache.role == llama_memory_cache_role::read_only_source) || r.hidden_output_rows>r.input_rows) return false;
+    const bool separate=r.destination_cache.id || r.destination_cache.generation;
+    if (separate) {
+        if (!destination || !r.destination_cache.id || !r.destination_cache.generation ||
+                r.destination_cache.id!=destination->identity.id || r.destination_cache.generation!=destination->identity.generation ||
+                destination->identity.id==cache.identity.id || destination->role!=llama_memory_cache_role::bounded_resident ||
+                cache.role!=llama_memory_cache_role::full_history || !r.writes_cache ||
+                (r.phase!=llama_memory_work_phase::draft_feature_injection && r.phase!=llama_memory_work_phase::draft_block_prediction)) return false;
+    } else if (destination || r.hidden_output_rows) return false;
+    if (r.hidden_output_rows && r.phase!=llama_memory_work_phase::draft_block_prediction) return false;
     switch (r.phase) {
         case llama_memory_work_phase::draft_feature_injection:
             return !r.query_rows && !r.output_rows && !r.rollback_depth && r.writes_cache;
         case llama_memory_work_phase::draft_block_prediction:
-            return r.query_rows == r.input_rows && r.output_rows == r.input_rows && !r.rollback_depth;
+            return r.query_rows == r.input_rows && !r.rollback_depth &&
+                ((r.output_rows==r.input_rows && !r.hidden_output_rows) ||
+                 (!r.output_rows && r.hidden_output_rows==r.input_rows));
         case llama_memory_work_phase::target_verify:
             return r.query_rows == r.input_rows && r.output_rows;
         case llama_memory_work_phase::target_prefill:
@@ -114,9 +126,19 @@ bool llama_memory_workload_requirement_valid(const llama_memory_workload_require
     return r.serial && workload_fields_valid(r,cache,true);
 }
 
+bool llama_memory_workload_requirement_valid(const llama_memory_workload_requirement & r,
+        const llama_memory_cache_requirement & cache,const llama_memory_cache_requirement * destination) noexcept {
+    return r.serial && workload_fields_valid(r,cache,true,destination);
+}
+
 bool llama_memory_workload_group_member_valid(const llama_memory_workload_requirement & r,
         const llama_memory_cache_requirement & cache) noexcept {
     return !r.serial && workload_fields_valid(r,cache,false);
+}
+
+bool llama_memory_workload_group_member_valid(const llama_memory_workload_requirement & r,
+        const llama_memory_cache_requirement & cache,const llama_memory_cache_requirement * destination) noexcept {
+    return !r.serial && workload_fields_valid(r,cache,false,destination);
 }
 
 llama_memory_text_phase_result llama_memory_text_phase_tracker::notify(
