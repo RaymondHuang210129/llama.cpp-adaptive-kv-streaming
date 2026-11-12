@@ -176,9 +176,7 @@ void llama_kv_cache_iswa::clear(bool data) {
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     size_t retained=0;
     if (!kv_base->kv_stream_can_remove(seq_id,p0,p1,&retained) || !kv_swa->kv_stream_can_remove(seq_id,p0,p1)) return false;
-    const auto * stream=kv_base->get_kv_stream();
-    if (stream && retained && retained < stream->tokens() &&
-            !kv_swa->bounded_prefix_available(kv_base->get_cells(0),retained)) return false;
+    if (!kv_base->kv_stream_bounded_suffix_available(*kv_swa,seq_id,p0,p1)) return false;
     return kv_base->seq_rm(seq_id,p0,p1) && kv_swa->seq_rm(seq_id,p0,p1);
 }
 

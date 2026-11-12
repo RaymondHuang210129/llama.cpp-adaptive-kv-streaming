@@ -160,7 +160,8 @@ public:
     }
     bool kv_stream_can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1, size_t * retained = nullptr) const;
     // A retained prefix needs every local row visible to its next query, not only full-cache backing.
-    bool bounded_prefix_available(const llama_kv_cells & full, size_t retained) const noexcept;
+    bool bounded_prefix_available(const llama_kv_cells & full, size_t retained, llama_seq_id sequence = 0) const noexcept;
+    bool kv_stream_bounded_suffix_available(const llama_kv_cache & bounded,llama_seq_id sequence,llama_pos begin,llama_pos end) const;
 
     //
     // llama_memory_i
@@ -209,6 +210,8 @@ public:
     ggml_type type_v() const { return layers[0].v->type; }
 
     std::vector<uint32_t> get_layer_ids() const;
+    // Protect native aliases after their source binds its final physical views.
+    bool protect_shared_views();
     // First streamed source follows this cache's actual graph-layer order, not the target's layer count.
     bool shared_stream_consumer(uint32_t query_tokens, llama_kv_stream_next_consumer & output) const noexcept;
     // Describe one serial homogeneous SWA allocation without changing stock cells, tensors or masks.

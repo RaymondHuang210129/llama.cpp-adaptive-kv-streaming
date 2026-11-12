@@ -217,12 +217,24 @@ public:
     bool unbind() noexcept;
     bool bind(std::shared_ptr<llama_kv_stream_group_producer> producer,
         std::function<bool(uint32_t,ggml_tensor *)> attention, std::function<bool()> admitted);
+    bool bind_projection(std::shared_ptr<llama_kv_stream_slot_projection> projection);
     bool begin(std::shared_ptr<llama_kv_stream_slot_projection> projection,const llama_ubatch & batch,
         const std::vector<uint32_t> & native_indices,llama_memory_work_phase phase);
     // Copy native placement after memory apply, preserving the producer's abort snapshot.
     bool apply_cells(const llama_kv_cells & cells);
     bool finish();
+    // Borrow committed source rows without publishing KV or changing their frontier.
+    // Finish or abort before releasing the source owner's admission and workspace.
+    bool begin_shared_read(ggml_backend_t consumer,const llama_ubatch & batch,const std::vector<uint32_t> & layers,
+        std::function<bool(uint32_t,ggml_tensor *)> attention,std::function<bool()> admitted);
+    bool finish_shared_read();
+    bool shared_read_active() const noexcept;
     bool abort() noexcept;
+    bool suffix(llama_seq_id sequence,llama_pos begin,llama_pos end,size_t & retained,
+        const llama_kv_cells ** cells = nullptr) const noexcept;
+    // The common owner drains readers and admits every semantic mutation.
+    void bind_mutation(std::function<bool(const std::function<bool()> &)> mutation);
+    bool remove_suffix(llama_seq_id sequence,llama_pos begin,llama_pos end,llama_kv_cells & native);
 private:
     llama_kv_stream_group_model() = default;
     struct implementation;

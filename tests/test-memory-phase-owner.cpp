@@ -609,6 +609,45 @@ int main(int argc, char ** argv) {
         t.assert_true(!llama_memory_phase_owner::create({target},f.arenas,{&f.workspace},
             std::vector<llama_memory_phase_cache_identity>{}));
     });
+    t.test("closed_shared_owner_cannot_reenter_after_a_consumer_retires", [](testing & t) {
+        for (bool grouped : {false,true}) {
+            fixture f(t,false);
+            auto target=f.target;
+            target.plan.stages.push_back({11,{10},{{11,f.a,f.a,f.a,LLAMA_MEMORY_ACCESS_WRITE,0},
+                {12,2*f.a,2*f.a,f.a,LLAMA_MEMORY_ACCESS_READ_WRITE,0}}});
+            auto draft=target;draft.stage=11;
+            struct observer : llama_memory_consumer {
+                bool prepare(const llama_memory_transition_target &,const llama_memory_layout &,
+                        std::unique_ptr<llama_memory_preparation> &) override {return true;}
+            };
+            auto participant=std::make_unique<observer>();
+            const std::vector<llama_memory_phase_target> targets={
+                {llama_memory_work_phase::target_verify,target,4,uint32_t(grouped)},
+                {llama_memory_work_phase::mtp_draft,draft,2,uint32_t(grouped)}};
+            const std::vector<llama_memory_consumer *> consumers={&f.workspace,&f.preserved,participant.get()};
+            const std::vector<llama_memory_phase_cache_identity> sources={{701,1},{702,1},{703,1},{704,1}};
+            auto owner=grouped ? llama_memory_phase_owner::create(targets,f.arenas,consumers,sources) :
+                llama_memory_phase_owner::create(targets,f.arenas,consumers,sources[0],sources[1]);
+            if (!t.assert_true(owner!=nullptr)) return;
+            const auto enter=[&](llama_memory_work_phase phase) {
+                return grouped ? owner->enter(phase,2,sources,1,1) : owner->enter(phase,2,sources[0],sources[1]);
+            };
+            if (!t.assert_true(enter(llama_memory_work_phase::target_verify).status==llama_memory_phase_owner_status::changed)) return;
+            const auto ticket=owner->admit();
+            if (!t.assert_true(ticket!=0)) return;
+            t.assert_true(!owner->close());
+            t.assert_true(grouped ? owner->finish(ticket,sources) : owner->finish(ticket,sources[0],sources[1]));
+            t.assert_true(owner->close() && owner->close());
+            const auto before=owner->snapshot();const auto events=f.events.size();
+            participant.reset();
+            t.assert_true(enter(llama_memory_work_phase::mtp_draft).status==llama_memory_phase_owner_status::session_invalid);
+            t.assert_true(enter(llama_memory_work_phase::target_verify).status==llama_memory_phase_owner_status::session_invalid);
+            t.assert_equal(uint64_t(0),owner->admit());
+            t.assert_true(!owner->finish(ticket,sources));
+            t.assert_equal(before.revision,owner->snapshot().revision);
+            t.assert_equal(events,f.events.size());
+        }
+    });
     t.test("failed_handoff_recovers_old_phase_and_independent_generations", [](testing & t) {
         fixture f(t,false);
         auto target=f.target;
@@ -1095,6 +1134,42 @@ int main(int argc, char ** argv) {
         t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,declared,measured,SIZE_MAX,13568,budget).status ==
             llama_memory_workload_budget_status::invalid_measurement);
         t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+    });
+    t.test("group_members_span_native_microbatches_without_enlarging_each_launch", [](testing & t) {
+        llama_memory_cache_requirement first;
+        first.identity={4101,1};first.layers=1;first.history_rows=32;first.row_bytes=52;first.row_padding=32;
+        first.format={GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,32,32,1,false};
+        auto second=first;second.identity={4102,1};
+        llama_memory_workload_requirement a;
+        a.phase=llama_memory_work_phase::target_prefill;a.cache=first.identity;
+        a.input_rows=a.query_rows=5;a.output_rows=1;a.microbatch_rows=4;a.writes_cache=true;a.serial=false;
+        auto b=a;b.cache=second.identity;b.input_rows=b.query_rows=3;
+        llama_memory_group_workload group;
+        group.id=901;group.selected_count=2;group.microbatch_rows=4;group.members={a,b};
+        group.native_batches={{{0,0,4,0}},{{0,4,1,1},{1,0,3,1}}};
+        llama_memory_group_workload_measurement measured;
+        measured.workload=group;measured.graph_bytes={1024,2048};measured.execution_available={true,true};
+        measured.live_device_bytes=256;measured.alignment=64;
+        const std::vector<llama_memory_cache_requirement> caches={first,second};
+        const std::vector<llama_memory_cache_allocation_measurement> allocations={
+            {first.identity,0,64,32,first.format},{second.identity,0,64,32,second.format}};
+        llama_memory_workload_budget output;
+        const auto fit=llama_memory_group_workload_budget_make(caches,allocations,{group},{measured},0,2304,output);
+        if (!t.assert_true("full member extent is covered by bounded native launches",fit.status==llama_memory_workload_budget_status::success)) return;
+        t.assert_equal(size_t(2304),output.parent_minimum_bytes);
+        auto serial=a;serial.serial=true;
+        t.assert_true(!llama_memory_workload_requirement_valid(serial,first));
+        const auto short_fit=llama_memory_group_workload_budget_make(caches,allocations,{group},{measured},0,2303,output);
+        t.assert_true(short_fit.status==llama_memory_workload_budget_status::insufficient_budget && short_fit.additional_bytes==1);
+        for (int invalid=0;invalid<3;++invalid) {
+            auto bad=group;
+            if (invalid==0) bad.native_batches[1][0].rows=2;
+            if (invalid==1) bad.native_batches[1][0].first_row=3;
+            if (invalid==2) bad.microbatch_rows=0;
+            auto proof=measured;proof.workload=bad;
+            t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,{bad},{proof},0,2304,output).status==
+                llama_memory_workload_budget_status::invalid_workload);
+        }
     });
     t.test("measured_cache_padding_and_aliases_are_accounted_once", [](testing & t) {
         llama_memory_cache_requirement source{{201,2},{},llama_memory_cache_role::bounded_resident,

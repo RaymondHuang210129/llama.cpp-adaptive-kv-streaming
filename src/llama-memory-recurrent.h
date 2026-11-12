@@ -94,15 +94,21 @@ public:
     bool complete_spill();
     bool staged_publication_enabled() const noexcept;
     bool begin_spill_capture(uint32_t tokens);
+    bool begin_spill_capture(const llama_ubatch & batch);
     void abort_spill_capture() noexcept;
     bool restore_spill_async(ggml_backend_sched_t sched);
+    bool restore_spill_async(ggml_backend_sched_t sched,bool before_inputs);
     bool complete_restore_spill();
     bool materialize_spill_for_device_state();
     bool capture_spill(ggml_backend_sched_t sched,
             const std::vector<llm_graph_recurrent_snapshot> & outputs);
     const llama_recurrent_spill_bank * spill_bank() const noexcept;
+    const llama_recurrent_spill_bank * spill_bank(llama_seq_id sequence) const noexcept;
+    bool spill_stage_requirements(ggml_backend_buffer_type_t & type,size_t & bytes) const noexcept;
     bool bind_spill_stage(ggml_backend_memory_lease_t lease);
+    bool park_spill_stage();
     uint64_t spill_generation() const noexcept;
+    uint64_t spill_generation(llama_seq_id sequence) const noexcept;
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
@@ -148,9 +154,11 @@ public:
     std::vector<ggml_tensor *> p_l;
 
 private:
+    friend class llama_memory_recurrent_context;
     std::unique_ptr<llama_recurrent_spill_bank> spill;
     bool restore_spill_slot(uint32_t slot);
     bool spill_slot_valid(uint32_t slot);
+    bool spill_slot_valid(uint32_t slot,llama_seq_id sequence);
     uint64_t spill_cache_id = 0;
     uint64_t spill_epoch = 0;
     bool spill_pending = false;
@@ -216,6 +224,10 @@ public:
     const llama_ubatch & get_ubatch() const override;
 
     bool staged_publication_enabled() const;
+    bool sequence_spill_enabled() const;
+    bool stage_sequence_snapshot(ggml_context * ctx,llm_graph_result & result,ggml_tensor * source,
+        size_t layer,bool value,uint32_t snapshot,uint32_t sequence_axis,const llama_ubatch & batch,
+        std::vector<ggml_tensor *> & copies) const;
     bool publish_staged(ggml_context * ctx, ggml_cgraph * graph, size_t layer, bool value,
             const std::vector<ggml_tensor *> & copies) const;
     ggml_tensor * staging_tensor(size_t layer, bool value, uint32_t snapshot) const;

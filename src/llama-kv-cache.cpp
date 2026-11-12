@@ -26,6 +26,27 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+bool llama_kv_cache::protect_shared_views() {
+    if (!other || n_stream!=1 || n_seq_max!=other->n_seq_max || v_trans || group_stream || kv_stream || mtp_proxy ||
+            bounded_pending || full_pending || bounded_lease || shared_read_metadata || layers.empty() ||
+            layers.size()>LLAMA_MAX_LAYERS || !ctxs_bufs.empty() || v_cells_impl!=other->v_cells_impl) return false;
+    try {
+        ggml_context_ptr metadata(ggml_init({4096+4*layers.size()*ggml_tensor_overhead(),nullptr,true}));
+        if (!metadata) return false;
+        auto replacement=layers;
+        for (auto & layer : replacement) {
+            if (!layer.k || !layer.v || !layer.k->buffer || !layer.v->buffer) return false;
+            layer.k=ggml_view_tensor(metadata.get(),layer.k);layer.v=ggml_view_tensor(metadata.get(),layer.v);
+            if (ggml_backend_view_init(layer.k)!=GGML_STATUS_SUCCESS || ggml_backend_view_init(layer.v)!=GGML_STATUS_SUCCESS) return false;
+            layer.k_stream={ggml_view_2d(metadata.get(),layer.k,layer.k->ne[0],layer.k->ne[1],layer.k->nb[1],0)};
+            layer.v_stream={ggml_view_2d(metadata.get(),layer.v,layer.v->ne[0],layer.v->ne[1],layer.v->nb[1],0)};
+            if (ggml_backend_view_init(layer.k_stream[0])!=GGML_STATUS_SUCCESS ||
+                    ggml_backend_view_init(layer.v_stream[0])!=GGML_STATUS_SUCCESS) return false;
+        }
+        shared_read_metadata=std::move(metadata);layers.swap(replacement);return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
 bool llama_kv_cache::attach_shared_stream_reader(llama_context_memory & parent,uint32_t max_queries) {
     if (!other || n_swa || n_seq_max != 1 || n_stream != 1 || v_trans || kv_stream || mtp_proxy ||
             bounded_pending || shared_read_metadata || layers.empty() || layers.size() > LLAMA_MAX_LAYERS || !other->kv_stream) return false;
@@ -90,9 +111,11 @@ bool llama_kv_cache::release_shared_stream_reader() noexcept {
 }
 
 bool llama_kv_cache::attach_shared_bounded_reader(const llama_memory_bounded_kv_read & source) {
-    if (!source || !other || !n_swa || n_seq_max != 1 || n_stream != 1 || v_trans || kv_stream || mtp_proxy ||
+    if (!source || !other || !n_swa || !n_seq_max || n_seq_max>2 || n_stream != 1 || v_trans || kv_stream || mtp_proxy ||
             bounded_pending || shared_read_metadata || !other->bounded_lease || layers.empty() ||
             layers.size() > LLAMA_MAX_LAYERS || source.layout()->allocation.capacity_rows != get_size()) return false;
+    if (n_seq_max>1 && (n_seq_max!=other->n_seq_max || other->storage_selected_sequences.empty() ||
+            source.layout()->cache.sequence_capacity!=other->storage_selected_sequences.size())) return false;
     try {
         ggml_context_ptr metadata(ggml_init({4096+4*layers.size()*ggml_tensor_overhead(),nullptr,true}));
         if (!metadata) return false;
@@ -521,9 +544,16 @@ llama_kv_cache::llama_kv_cache(
         v_heads[s] = 0;
     }
 
-    v_cells.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].resize(kv_size);
+    // Shared views must not resize or reset the source-owned history.
+    if (other) {
+        if (v_cells.size()!=n_stream || std::any_of(v_cells.begin(),v_cells.end(),
+                [&](const llama_kv_cells & cells) {return cells.size()!=kv_size;}))
+            throw std::runtime_error("shared KV source cell geometry does not match the reader");
+    } else {
+        v_cells.resize(n_stream);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s].resize(kv_size);
+        }
     }
 
     // by default, all sequence ids are mapped to the 0th stream
@@ -895,6 +925,16 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::kv_stream_can_remove(llama_seq_id seq_id,llama_pos p0,llama_pos p1,size_t * retained) const {
+    if (group_stream) {
+        if (seq_id<-1) return false;
+        bool matched=false;size_t keep=0;
+        for (auto id : storage_selected_sequences) if (seq_id<0 || seq_id==id) {
+            if (!group_stream->suffix(id,p0,p1,keep)) return false;
+            matched=true;
+        }
+        if (matched && retained) *retained=keep;
+        return matched;
+    }
     if (!kv_stream) return true;
     if (seq_id != 0 && seq_id != -1) return false;
     size_t keep;
@@ -903,9 +943,9 @@ bool llama_kv_cache::kv_stream_can_remove(llama_seq_id seq_id,llama_pos p0,llama
     return true;
 }
 
-bool llama_kv_cache::bounded_prefix_available(const llama_kv_cells & full,size_t retained) const noexcept {
+bool llama_kv_cache::bounded_prefix_available(const llama_kv_cells & full,size_t retained,llama_seq_id sequence) const noexcept {
     if (!retained) return true;
-    if (bounded_pending || !n_swa || n_swa > INT32_MAX || n_stream != 1 || !n_seq_max || n_seq_max>LLAMA_MAX_SEQ ||
+    if (!selected_sequence_valid(sequence) || bounded_pending || !n_swa || n_swa > INT32_MAX || n_stream != 1 || !n_seq_max || n_seq_max>LLAMA_MAX_SEQ ||
             (swa_type != LLAMA_SWA_TYPE_STANDARD && swa_type != LLAMA_SWA_TYPE_CHUNKED && swa_type != LLAMA_SWA_TYPE_SYMMETRIC) ||
             retained > full.size() || full.is_empty(uint32_t(retained-1))) return false;
     auto query=full.pos_get(uint32_t(retained-1));
@@ -921,12 +961,37 @@ bool llama_kv_cache::bounded_prefix_available(const llama_kv_cells & full,size_t
         if (llama_hparams::is_masked_swa(n_swa,swa_type,full.pos_get(uint32_t(middle)),query)) first=middle+1;
         else end=middle;
     }
-    return llama_kv_stream_bounded_contains(full,first,retained,v_cells[0],has_cell_ext());
+    return llama_kv_stream_bounded_contains(full,first,retained,v_cells[0],has_cell_ext(),sequence);
+}
+
+bool llama_kv_cache::kv_stream_bounded_suffix_available(const llama_kv_cache & bounded,
+        llama_seq_id sequence,llama_pos begin,llama_pos end) const {
+    if (group_stream) {
+        for (auto id : storage_selected_sequences) if (sequence<0 || sequence==id) {
+            size_t keep=0;const llama_kv_cells * cells=nullptr;
+            if (!group_stream->suffix(id,begin,end,keep,&cells) || !cells ||
+                    (keep && keep<cells->get_used() && !bounded.bounded_prefix_available(*cells,keep,id))) return false;
+        }
+    } else if (kv_stream) {
+        size_t keep=0;
+        if (!kv_stream_can_remove(sequence,begin,end,&keep) ||
+                (keep && keep<kv_stream->tokens() && !bounded.bounded_prefix_available(v_cells[0],keep))) return false;
+    }
+    return true;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id>=0 && !selected_sequence_valid(seq_id)) return false;
     if (!kv_stream_can_remove(seq_id,p0,p1)) return false;
+    if (group_stream) {
+        auto & cells=v_cells[0];uint32_t first=cells.size();
+        const auto begin=std::max(llama_pos(0),p0),end=p1<0 ? INT32_MAX : p1;
+        for (uint32_t row=0;row<cells.used_max_p1();++row)
+            if (!cells.is_empty(row) && (seq_id<0 || cells.seq_has(row,seq_id)) && cells.pos_in(row,begin,end)) {first=row;break;}
+        if (!group_stream->remove_suffix(seq_id,p0,p1,cells)) return false;
+        if (first<cells.size() && first<v_heads[0]) v_heads[0]=first;
+        return true;
+    }
     if (kv_stream) {
         if (p1 >= 0 && p1 <= std::max(llama_pos(0), p0)) return true;
         size_t keep;

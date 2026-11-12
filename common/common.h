@@ -1025,6 +1025,8 @@ uint32_t common_kv_stream_verify_max(const common_params & params, bool shares_t
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+// Resolve loaded-model MTP metadata before deferred group contexts allocate any payload.
+struct llama_context_params common_context_params_to_llama(const common_params & params,const llama_model * model);
 void common_init_sampler_from_model(const llama_model * model, common_params_sampling & params);
 
 // clear LoRA adapters from context, then apply new list of adapters

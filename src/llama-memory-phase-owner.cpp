@@ -240,6 +240,7 @@ struct llama_memory_phase_owner::implementation {
     uint32_t profile = 0;
     uint64_t selection_revision = 0;
     bool group_sources = false;
+    bool closed = false;
     std::vector<llama_memory_phase_cache_identity> sources;
 
     implementation(std::vector<llama_memory_phase_target> targets,
@@ -336,6 +337,7 @@ llama_memory_phase_owner_result llama_memory_phase_owner::enter_profile(llama_me
         uint32_t tokens,uint32_t profile,uint64_t selection_revision) {
     using status=llama_memory_phase_owner_status;
     auto & s=*impl;
+    if (s.closed) return {status::session_invalid,{}};
     if (!tokens || phase == llama_memory_work_phase::none || bool(profile) != bool(selection_revision))
         return {status::invalid_signal,{}};
     if (selection_revision < s.selection_revision) return {status::stale_identity,{}};
@@ -392,7 +394,13 @@ uint32_t llama_memory_phase_owner::active_profile() const noexcept {return impl-
 uint64_t llama_memory_phase_owner::selection_revision() const noexcept {return impl->selection_revision;}
 
 uint64_t llama_memory_phase_owner::admit() noexcept {
-    return impl->tracker.snapshot().phase == llama_memory_work_phase::none ? 0 : impl->transition.admit();
+    return impl->closed || impl->tracker.snapshot().phase == llama_memory_work_phase::none ? 0 : impl->transition.admit();
+}
+
+bool llama_memory_phase_owner::close() noexcept {
+    if (impl->closed) return true;
+    if (impl->transition.state()!=llama_memory_transition_state::idle) return false;
+    impl->closed=true;return true;
 }
 
 bool llama_memory_phase_owner::finish(uint64_t admission,

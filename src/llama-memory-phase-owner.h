@@ -179,6 +179,8 @@ public:
     uint32_t active_profile() const noexcept;
     uint64_t selection_revision() const noexcept;
     uint64_t admit() noexcept;
+    // Close idle admission before a participant is destroyed. Unresolved work must retire first.
+    bool close() noexcept;
     bool finish(uint64_t admission, llama_memory_phase_cache_identity target,
             llama_memory_phase_cache_identity mtp) noexcept;
     llama_memory_work_phase_snapshot snapshot() const noexcept;

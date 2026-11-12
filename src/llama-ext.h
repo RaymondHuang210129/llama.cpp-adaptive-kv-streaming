@@ -24,6 +24,10 @@ LLAMA_API bool llama_kv_stream_schedule_next(llama_context * producer, llama_con
 // Sampling can reveal an earlier final use than the predeclared maximum draft count.
 LLAMA_API bool llama_kv_stream_finish_access(llama_context * producer);
 
+// Check roles, frozen geometry and existing sampler bindings without initializing or changing them.
+LLAMA_API bool llama_mtp_rebind_compatible(const llama_context * old_target,const llama_context * old_draft,
+        const llama_context * target,const llama_context * draft,llama_sampler * const * samplers,size_t count);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

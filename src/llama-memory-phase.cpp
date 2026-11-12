@@ -85,8 +85,8 @@ bool llama_memory_cache_read_binding_valid(const llama_memory_cache_read_binding
 }
 
 static bool workload_fields_valid(const llama_memory_workload_requirement & r,
-        const llama_memory_cache_requirement & cache) noexcept {
-    if (!r.input_rows || r.input_rows > r.microbatch_rows || r.output_rows > r.input_rows ||
+        const llama_memory_cache_requirement & cache,bool single_batch) noexcept {
+    if (!r.input_rows || !r.microbatch_rows || (single_batch && r.input_rows > r.microbatch_rows) || r.output_rows > r.input_rows ||
             !r.cache.id || !r.cache.generation || r.cache.id != cache.identity.id ||
             r.cache.generation != cache.identity.generation ||
             (r.writes_cache && cache.role == llama_memory_cache_role::read_only_source)) return false;
@@ -111,12 +111,12 @@ static bool workload_fields_valid(const llama_memory_workload_requirement & r,
 
 bool llama_memory_workload_requirement_valid(const llama_memory_workload_requirement & r,
         const llama_memory_cache_requirement & cache) noexcept {
-    return r.serial && workload_fields_valid(r,cache);
+    return r.serial && workload_fields_valid(r,cache,true);
 }
 
 bool llama_memory_workload_group_member_valid(const llama_memory_workload_requirement & r,
         const llama_memory_cache_requirement & cache) noexcept {
-    return !r.serial && workload_fields_valid(r,cache);
+    return !r.serial && workload_fields_valid(r,cache,false);
 }
 
 llama_memory_text_phase_result llama_memory_text_phase_tracker::notify(

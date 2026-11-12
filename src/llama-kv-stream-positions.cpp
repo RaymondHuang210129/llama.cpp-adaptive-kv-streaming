@@ -11,16 +11,20 @@ bool llama_kv_stream_validate_append(const llama_batch_ext & batch,
     if (batch.tokens.empty() || batch.tokens.size() > INT32_MAX || c.previous_position < -1 ||
             c.sequence<0 || c.sequence>=LLAMA_MAX_SEQ || c.sequence>=batch.n_seq_max ||
             (c.position_channels != 1 && c.position_channels != 4) ||
-            c.first_cell > c.capacity || batch.tokens.size() > c.capacity-c.first_cell) return false;
+            c.first_cell > c.capacity || batch.tokens.size() > c.capacity-c.first_cell ||
+            (c.token_hidden && (!batch.n_embd || batch.n_embd!=batch.n_embd_inp))) return false;
     int64_t previous = c.previous_position;
     for (size_t i = 0; i < batch.tokens.size(); ++i) {
         const auto & token = batch.tokens[i];
-        const bool image = token.has_embd;
-        if ((token.id != LLAMA_TOKEN_NULL) == image || token.seq_ids.size() != 1 || !token.seq_ids.count(c.sequence)) return false;
-        if (image) {
-            if (c.decode || c.linear_required || !batch.n_embd || token.embd_off > batch.embd.size() ||
+        const bool image = token.has_embd && !c.token_hidden;
+        if ((c.token_hidden ? !token.has_embd || token.id==LLAMA_TOKEN_NULL : (token.id != LLAMA_TOKEN_NULL) == image) ||
+                token.seq_ids.size() != 1 || !token.seq_ids.count(c.sequence)) return false;
+        if (token.has_embd) {
+            if (!batch.n_embd || token.embd_off > batch.embd.size() ||
                     batch.n_embd > batch.embd.size()-token.embd_off) return false;
-        } else if (token.id < 0 || token.id >= batch.n_vocab) return false;
+        }
+        if (image && (c.decode || c.linear_required)) return false;
+        if (!image && (token.id < 0 || token.id >= batch.n_vocab)) return false;
         int64_t position = token.pos[0];
         if (position == -1 && !image) {
             if (previous >= std::numeric_limits<llama_pos>::max()-1) return false;
@@ -37,7 +41,7 @@ bool llama_kv_stream_validate_append(const llama_batch_ext & batch,
 }
 
 bool llama_kv_stream_validate_append(const llama_batch & batch, const llama_kv_stream_append_coordinates & c) noexcept {
-    if (batch.n_tokens <= 0 || bool(batch.token) == bool(batch.embd) || c.previous_position < -1 ||
+    if (c.token_hidden || batch.n_tokens <= 0 || bool(batch.token) == bool(batch.embd) || c.previous_position < -1 ||
             c.sequence<0 || c.sequence>=LLAMA_MAX_SEQ || (c.sequence!=0 && !batch.seq_id) ||
             (c.position_channels != 1 && c.position_channels != 4) ||
             c.first_cell > c.capacity || size_t(batch.n_tokens) > c.capacity - c.first_cell ||
@@ -77,12 +81,13 @@ bool llama_kv_stream_validate_cells(const llama_kv_cells & cells, size_t count, 
 }
 
 bool llama_kv_stream_suffix(const llama_kv_cells & cells, size_t count,
-        llama_pos begin, llama_pos end, size_t & retained) noexcept {
+        llama_pos begin, llama_pos end, size_t & retained, llama_seq_id sequence) noexcept {
+    if (sequence<0 || sequence>=LLAMA_MAX_SEQ) return false;
     if (begin <= 0 && end < 0) { retained = 0; return true; }
     if (count > cells.size() || cells.get_used() != count || cells.used_max_p1() != count) return false;
     if (!count) { retained = 0; return true; }
-    if (cells.seq_count(0) != 1 || !cells.seq_has(0,0) || cells.seq_count(uint32_t(count-1)) != 1 ||
-            !cells.seq_has(uint32_t(count-1),0) || cells.pos_get(0) < 0 ||
+    if (cells.seq_count(0) != 1 || !cells.seq_has(0,sequence) || cells.seq_count(uint32_t(count-1)) != 1 ||
+            !cells.seq_has(uint32_t(count-1),sequence) || cells.pos_get(0) < 0 ||
             cells.pos_get(uint32_t(count-1)) < cells.pos_get(0)) return false;
     begin = std::max(llama_pos(0), begin);
     if (end >= 0 && end <= begin) { retained = count; return true; }
@@ -102,15 +107,16 @@ bool llama_kv_stream_suffix(const llama_kv_cells & cells, size_t count,
 }
 
 bool llama_kv_stream_bounded_contains(const llama_kv_cells & source,size_t first,size_t end,
-        const llama_kv_cells & local,bool match_extended) noexcept {
+        const llama_kv_cells & local,bool match_extended,llama_seq_id sequence) noexcept {
+    if (sequence<0 || sequence>=LLAMA_MAX_SEQ) return false;
     if (first > end || end > source.size() || end-first > local.get_used()) return false;
     if (first == end) return true;
     if (source.is_empty(uint32_t(first))) return false;
-    const auto & positions=local.seq_pos_get(0);
+    const auto & positions=local.seq_pos_get(sequence);
     auto found=positions.lower_bound({source.pos_get(uint32_t(first)),0});
     for (size_t index=first;index<end;++index,++found) {
         const auto row=uint32_t(index);
-        if (source.is_empty(row) || source.seq_count(row) != 1 || !source.seq_has(row,0) ||
+        if (source.is_empty(row) || source.seq_count(row) != 1 || !source.seq_has(row,sequence) ||
                 found == positions.end() || found->first != source.pos_get(row) || local.seq_count(found->second) != 1) return false;
         if (match_extended) {
             const auto a=source.ext_get(row), b=local.ext_get(found->second);

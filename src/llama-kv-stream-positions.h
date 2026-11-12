@@ -11,6 +11,7 @@ struct llama_kv_stream_append_coordinates {
     bool decode = false;
     bool linear_required = false;
     llama_seq_id sequence = 0;
+    bool token_hidden = false;
 };
 
 // Model positions drive RoPE/masking; only first_cell and row count address the KV store.
@@ -23,10 +24,10 @@ bool llama_kv_stream_validate_append(const llama_batch_ext & batch,
 bool llama_kv_stream_validate_cells(const llama_kv_cells & cells, size_t count, bool linear_required) noexcept;
 // Translate an interval in a validated monotone prefix into a suffix, without scanning the whole cache.
 bool llama_kv_stream_suffix(const llama_kv_cells & cells, size_t count,
-    llama_pos begin, llama_pos end, size_t & retained) noexcept;
+    llama_pos begin, llama_pos end, size_t & retained, llama_seq_id sequence = 0) noexcept;
 // Match a required prefix against local cells; position-only checkpoints do not carry unused extended metadata.
 bool llama_kv_stream_bounded_contains(const llama_kv_cells & source, size_t first, size_t end,
-    const llama_kv_cells & local, bool match_extended = true) noexcept;
+    const llama_kv_cells & local, bool match_extended = true, llama_seq_id sequence = 0) noexcept;
 struct llama_ubatch;
 // Derive exact serial causal visibility from cache positions, including repeated M-RoPE positions.
 bool llama_kv_stream_mask_bounds(const llama_kv_cells & cells, size_t count, size_t padded,

@@ -2386,9 +2386,13 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+    const bool selected_mtp=params.defer_full_cache && params.ctx_type==LLAMA_CONTEXT_TYPE_MTP && arch==LLM_ARCH_QWEN35 &&
+        hparams.n_layer_nextn==1 && cparams.n_seq_max==2 && params.shared_device_memory_bytes &&
+        !cparams.shared_device_memory_bytes && !cparams.n_rs_seq;
     if (!params.kv_stream_selected_sequences.empty() &&
-            ((!params.measure_only && !params.defer_full_cache) || !cparams.kv_unified || cparams.n_rs_seq || params.mem_other ||
-             params.ctx_type!=LLAMA_CONTEXT_TYPE_DEFAULT || (arch!=LLM_ARCH_QWEN35 && arch!=LLM_ARCH_GEMMA4) ||
+            ((!params.measure_only && !params.defer_full_cache) || !cparams.kv_unified ||
+             (cparams.n_rs_seq && !(params.defer_full_cache && arch==LLM_ARCH_QWEN35 && cparams.n_rs_seq<=3 && params.kv_stream_rs_rollback)) || params.mem_other ||
+             (params.ctx_type!=LLAMA_CONTEXT_TYPE_DEFAULT && !selected_mtp) || (arch!=LLM_ARCH_QWEN35 && arch!=LLM_ARCH_GEMMA4) ||
              !llama_memory_selected_sequences_valid(params,cparams.n_seq_max)))
         throw std::runtime_error("selected memory factory is restricted to target measurement until group execution is bound");
 
@@ -2936,7 +2940,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 nullptr,
                                 "",
-                                params.mtp_host_cache ? &params : nullptr);
+                                (params.mtp_host_cache || selected_mtp) ? &params : nullptr);
                     }
                 }
             }

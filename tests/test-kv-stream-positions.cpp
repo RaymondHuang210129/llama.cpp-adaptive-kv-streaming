@@ -30,6 +30,46 @@ static llama_kv_cells cells_with(std::initializer_list<llama_pos> positions) {
 
 int main() {
     testing t;
+    t.test("MTP_token_hidden_rows_keep_their_token_and_coordinate_contract",[](testing & t) {
+        llama_batch_ext batch(8,2,2,2,nullptr,64,1);
+        batch.n_embd=2;batch.embd={1,2,3,4};batch.tokens.resize(2);
+        for (size_t row=0;row<2;++row) {
+            auto & token=batch.tokens[row];token.id=llama_token(5+row);token.has_embd=true;token.embd_off=2*row;
+            token.pos[0]=llama_pos(8+row);token.seq_ids={1};
+        }
+        llama_kv_stream_append_coordinates coordinates{2,8,7,1,false,false};
+        coordinates.sequence=1;coordinates.token_hidden=true;
+        if (!t.assert_true("owned MTP hidden input supplements a real token",llama_kv_stream_validate_append(batch,coordinates))) return;
+        for (int invalid=0;invalid<12;++invalid) {
+            auto bad=batch;auto c=coordinates;
+            switch (invalid) {
+                case 0: bad.tokens[0].id=LLAMA_TOKEN_NULL;break;
+                case 1: bad.tokens[0].has_embd=false;break;
+                case 2: bad.n_embd=1;break;
+                case 3: bad.embd.pop_back();break;
+                case 4: bad.tokens[1].embd_off=SIZE_MAX;break;
+                case 5: bad.tokens[1].id=64;break;
+                case 6: bad.tokens[1].seq_ids={0};break;
+                case 7: bad.tokens[1].seq_ids={0,1};break;
+                case 8: bad.tokens[1].pos[0]=8;break;
+                case 9: c.token_hidden=false;break;
+                case 10: c.sequence=0;break;
+                case 11: c.capacity=3;break;
+            }
+            t.assert_true(!llama_kv_stream_validate_append(bad,c));
+        }
+        batch.tokens.resize(1);coordinates.decode=true;
+        t.assert_true(llama_kv_stream_validate_append(batch,coordinates));
+        batch.tokens[0].id=LLAMA_TOKEN_NULL;coordinates.token_hidden=false;
+        t.assert_true(!llama_kv_stream_validate_append(batch,coordinates));
+        coordinates.decode=false;t.assert_true(llama_kv_stream_validate_append(batch,coordinates));
+        coordinate_fixture plain;plain.batch.token=plain.tokens;plain.batch.embd=nullptr;
+        plain.coordinates.position_channels=1;plain.coordinates.previous_position=9;
+        plain.positions[0]=10;plain.positions[1]=11;plain.positions[2]=12;
+        t.assert_true(llama_kv_stream_validate_append(plain.batch,plain.coordinates));
+        plain.coordinates.token_hidden=true;
+        t.assert_true(!llama_kv_stream_validate_append(plain.batch,plain.coordinates));
+    });
     t.test("append_coordinates_validate_the_chosen_sequence_without_relabeling",[](testing & t) {
         coordinate_fixture f;f.seq=1;f.coordinates.sequence=1;
         t.assert_true(llama_kv_stream_validate_append(f.batch,f.coordinates));
@@ -230,6 +270,30 @@ int main() {
                 }
             }
         }
+    });
+    t.test("suffix_and_local_window_proofs_keep_the_chosen_logical_sequence", [](testing & t) {
+        auto full=cells_with({0,1,2,2,2,5,6,7});
+        for (uint32_t row=0;row<8;++row) {full.seq_add(row,1);full.seq_rm(row,0);}
+        size_t retained=99;
+        t.assert_true(llama_kv_stream_suffix(full,8,2,-1,retained,1));t.assert_equal(size_t(2),retained);
+        retained=99;
+        t.assert_true(!llama_kv_stream_suffix(full,8,2,5,retained,1));t.assert_equal(size_t(99),retained);
+        t.assert_true(!llama_kv_stream_suffix(full,8,2,-1,retained,0));
+        t.assert_true(!llama_kv_stream_suffix(full,8,-1,-1,retained,-1));
+        t.assert_true(!llama_kv_stream_suffix(full,8,-1,-1,retained,LLAMA_MAX_SEQ));
+        llama_kv_cells local;local.resize(8);
+        for (uint32_t row=5;row<8;++row) {
+            local.pos_set(row,llama_pos(row));local.ext_set(row,full.ext_get(row));local.seq_add(row,1);
+        }
+        t.assert_true(llama_kv_stream_bounded_contains(full,5,8,local,true,1));
+        t.assert_true(!llama_kv_stream_bounded_contains(full,5,8,local,true,0));
+        local.seq_add(6,0);local.seq_rm(6,1);
+        t.assert_true(!llama_kv_stream_bounded_contains(full,5,8,local,true,1));
+        local.seq_add(6,1);local.seq_rm(6,0);auto changed=full.ext_get(6);++changed.x;local.ext_set(6,changed);
+        t.assert_true(!llama_kv_stream_bounded_contains(full,5,8,local,true,1));
+        t.assert_true(llama_kv_stream_bounded_contains(full,5,8,local,false,1));
+        t.assert_true(!llama_kv_stream_bounded_contains(full,0,0,local,false,-1));
+        t.assert_true(!llama_kv_stream_bounded_contains(full,0,0,local,false,LLAMA_MAX_SEQ));
     });
     t.test("bounded_history_matches_required_prefix_without_scanning_old_history", [](testing & t) {
         auto full=cells_with({0,1,2,3,4,5,6,7});

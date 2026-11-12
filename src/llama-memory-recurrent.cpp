@@ -8,6 +8,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cassert>
@@ -52,6 +53,15 @@ struct llama_memory_recurrent::current_storage_state {
     uint32_t publication_cells = 0, publication_slots = 0;
     std::vector<int32_t> logical_tails;
     std::vector<uint8_t> selected_sequences;
+    llama_recurrent_spill_layout sequence_layout;
+    // Subarenas retain buffers; keep the outer lease live as well.
+    std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> sequence_stage{nullptr,ggml_backend_memory_lease_free};
+    std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> sequence_arena{nullptr,ggml_backend_memory_arena_free};
+    std::vector<std::unique_ptr<llama_recurrent_spill_bank>> sequence_publications;
+    std::vector<uint64_t> sequence_epochs;
+    std::vector<uint32_t> sequence_rows;
+    std::vector<uint8_t> sequence_capturing,sequence_pending,sequence_restoring,sequence_rollback;
+    bool sequence_failed=false;
 };
 
 uint32_t llama_memory_recurrent::sequence_capacity() const noexcept {
@@ -72,7 +82,9 @@ int32_t llama_memory_recurrent::sequence_tail(llama_seq_id id) const {
 }
 
 bool llama_memory_recurrent::configure_selected_sequences(const std::vector<llama_seq_id> & sequences) {
-    if (!selected_storage || !selected_storage->pending || current_storage_parked() || used || n_rs_seq || spill ||
+    const bool rollback=selected_storage && selected_storage->measurement && n_rs_seq && spill;
+    if (!selected_storage || !selected_storage->pending || current_storage_parked() || used ||
+            ((n_rs_seq || spill) && !rollback) || !selected_storage->sequence_publications.empty() ||
             sequences.size()!=size || !size || size>n_seq_max) return false;
     try {
         std::vector<int32_t> tails(n_seq_max,-1);
@@ -81,8 +93,36 @@ bool llama_memory_recurrent::configure_selected_sequences(const std::vector<llam
             if (id<0 || uint32_t(id)>=n_seq_max || selected[id]) return false;
             selected[id]=1;
         }
+        std::vector<std::unique_ptr<llama_recurrent_spill_bank>> publications;
+        std::vector<uint64_t> epochs(rollback ? n_seq_max : 0,0);
+        std::vector<uint32_t> rows(epochs.size(),0);
+        std::vector<uint8_t> capturing(epochs.size(),0),pending(epochs.size(),0),restoring(epochs.size(),0),rolled(epochs.size(),0);
+        if (rollback) {
+            std::vector<llama_recurrent_spill_layer> layers(r_l.size());
+            for (size_t layer=0;layer<r_l.size();++layer) if (r_l[layer]) {
+                if (!s_l[layer]) return false;
+                layers[layer]={r_l[layer]->type,s_l[layer]->type,uint64_t(r_l[layer]->ne[0]),uint64_t(s_l[layer]->ne[0]),true};
+            }
+            llama_recurrent_spill_layout layout;
+            if (!llama_recurrent_spill_layout_make(layers,1,n_rs_seq,layout) || ctxs_bufs.size()!=1) return false;
+            auto * type=ggml_backend_buffer_get_type(ctxs_bufs.front().second.get());
+            auto * device=ggml_backend_buft_get_device(type);
+            if (!device && type==ggml_backend_cpu_buffer_type()) device=ggml_backend_dev_by_name("CPU");
+            publications.resize(n_seq_max);
+            for (auto id : sequences) {
+                publications[id]=llama_recurrent_spill_bank::create_measurement(layout,device,type,
+                    selected_storage->publication_slots,spill_cache_id,uint64_t(id));
+                if (!publications[id]) return false;
+            }
+            selected_storage->sequence_layout=std::move(layout);
+        }
         selected_storage->logical_tails=std::move(tails);
         selected_storage->selected_sequences=std::move(selected);
+        selected_storage->sequence_publications=std::move(publications);
+        selected_storage->sequence_epochs=std::move(epochs);selected_storage->sequence_rows=std::move(rows);
+        selected_storage->sequence_capturing=std::move(capturing);selected_storage->sequence_pending=std::move(pending);
+        selected_storage->sequence_restoring=std::move(restoring);selected_storage->sequence_rollback=std::move(rolled);
+        if (rollback) spill.reset();
         return true;
     } catch (const std::bad_alloc &) {return false;}
 }
@@ -295,6 +335,7 @@ llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_ty
 bool llama_memory_recurrent::prepare_measurement_publication(uint32_t active_cells) {
     if (!selected_storage || !selected_storage->measurement || !n_rs_seq || !active_cells || active_cells>size ||
             !selected_storage->publication_slots || ctxs_bufs.size()!=1) return false;
+    if (!selected_storage->sequence_publications.empty()) return true;
     if (active_cells==selected_storage->publication_cells) return bool(spill);
     try {
         std::vector<llama_recurrent_spill_layer> specs(r_l.size());
@@ -321,6 +362,14 @@ llama_memory_recurrent::~llama_memory_recurrent() {
 }
 
 void llama_memory_recurrent::clear(bool data) {
+    if (selected_storage) for (auto & bank : selected_storage->sequence_publications) if (bank) bank->reset(data);
+    if (selected_storage) {
+        std::fill(selected_storage->sequence_capturing.begin(),selected_storage->sequence_capturing.end(),0);
+        std::fill(selected_storage->sequence_pending.begin(),selected_storage->sequence_pending.end(),0);
+        std::fill(selected_storage->sequence_rows.begin(),selected_storage->sequence_rows.end(),0);
+        std::fill(selected_storage->sequence_restoring.begin(),selected_storage->sequence_restoring.end(),0);
+        std::fill(selected_storage->sequence_rollback.begin(),selected_storage->sequence_rollback.end(),0);
+    }
     if (spill) {
         spill->reset(data);
         spill_pending=false;
@@ -352,6 +401,8 @@ void llama_memory_recurrent::clear(bool data) {
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    const bool grouped=selected_storage && !selected_storage->sequence_publications.empty();
+    if (grouped && (seq_id<-1 || (seq_id>=0 && !sequence_selected(seq_id)))) return false;
     uint32_t new_head = size;
 
     if (p0 < 0) {
@@ -369,6 +420,13 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
+        if (grouped) for (size_t id=0;id<selected_storage->sequence_publications.size();++id) {
+            if ((seq_id>=0 && size_t(seq_id)!=id) || !selected_storage->sequence_publications[id]) continue;
+            selected_storage->sequence_publications[id]->reset(false);
+            selected_storage->sequence_capturing[id]=selected_storage->sequence_pending[id]=0;
+            selected_storage->sequence_restoring[id]=selected_storage->sequence_rollback[id]=0;
+            selected_storage->sequence_rows[id]=0;
+        }
         if (spill) {
             spill->reset(false);
             spill_pending=false;
@@ -406,11 +464,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 }
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
-                const bool pending = rs_idx[seq_id] != 0 || spill_restore_pending || spill_rollback_pending;
+                const bool pending = rs_idx[seq_id] != 0 || spill_restore_pending || spill_rollback_pending ||
+                    (grouped && (selected_storage->sequence_restoring[seq_id] || selected_storage->sequence_rollback[seq_id]));
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     if (spill && !spill_slot_valid(uint32_t(rollback))) return false;
+                    if (grouped && !spill_slot_valid(uint32_t(rollback),seq_id)) return false;
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     spill_rollback_pending=bool(spill);
+                    if (grouped) selected_storage->sequence_rollback[seq_id]=1;
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -682,8 +743,14 @@ bool llama_memory_recurrent::restore_spill_slot(uint32_t slot) {
 
 
 bool llama_memory_recurrent::current_storage_pending() const noexcept {
-    return selected_storage && (selected_storage->pending || !selected_storage->parked_rows.empty() ||
-            (spill && spill->publication_stage_parked()));
+    if (!selected_storage) return false;
+    if (selected_storage->pending || !selected_storage->parked_rows.empty() || selected_storage->sequence_failed ||
+            (spill && spill->publication_stage_parked())) return true;
+    if (!selected_storage->sequence_publications.empty()) {
+        if (!selected_storage->sequence_arena || !selected_storage->sequence_stage) return true;
+        for (const auto & bank : selected_storage->sequence_publications) if (bank && !bank->staged_publication_enabled()) return true;
+    }
+    return false;
 }
 
 bool llama_memory_recurrent::enable_current_storage_parking(ggml_backend_buffer_type_t type) {
@@ -781,7 +848,7 @@ bool llama_memory_recurrent::bind_current_storage(ggml_backend_memory_lease_t le
 bool llama_memory_recurrent::release_current_storage() {
     if (!selected_storage) return false;
     if (selected_storage->pending) return true;
-    if (spill && spill->staged_publication_enabled()) return false;
+    if (staged_publication_enabled()) return false;
     return replace_current_storage(nullptr);
 }
 
@@ -800,7 +867,7 @@ bool llama_memory_recurrent::park_current_storage() {
             rows.emplace_back(ggml_nbytes(tensor));
             ggml_backend_tensor_get(tensor,rows.back().data(),0,rows.back().size());
         }
-        if (rows.empty() || (spill && spill->staged_publication_enabled() && !spill->park_publication_stage())) return false;
+        if (rows.empty() || !park_spill_stage()) return false;
         selected_storage->parked_rows.swap(rows);
         return release_current_storage();
     } catch (...) { return false; }
@@ -809,7 +876,7 @@ bool llama_memory_recurrent::park_current_storage() {
 bool llama_memory_recurrent::restore_current_storage(ggml_backend_memory_lease_t lease,
         ggml_backend_memory_lease_t publication_lease) {
     if (!current_storage_parked() || !selected_storage->pending || !lease ||
-            (spill && spill->publication_stage_parked() && !publication_lease)) return false;
+            (((spill && spill->publication_stage_parked()) || !selected_storage->sequence_publications.empty()) && !publication_lease)) return false;
     if (publication_lease) {
         auto * current=ggml_backend_memory_lease_buffer(lease);
         auto * publication=ggml_backend_memory_lease_buffer(publication_lease);
@@ -828,7 +895,8 @@ bool llama_memory_recurrent::restore_current_storage(ggml_backend_memory_lease_t
             ggml_backend_tensor_set(tensor,row.data(),0,row.size());
         }
         if (index!=selected_storage->parked_rows.size() ||
-                (spill && spill->publication_stage_parked() && !spill->bind_publication_stage(publication_lease)))
+                (spill && spill->publication_stage_parked() && !spill->bind_publication_stage(publication_lease)) ||
+                (!selected_storage->sequence_publications.empty() && !bind_spill_stage(publication_lease)))
             throw std::runtime_error("failed to restore recurrent publication storage");
         selected_storage->parked_rows.clear();
         return true;
@@ -838,17 +906,68 @@ bool llama_memory_recurrent::restore_current_storage(ggml_backend_memory_lease_t
     }
 }
 
-bool llama_memory_recurrent::spill_enabled() const noexcept { return bool(spill); }
+bool llama_memory_recurrent::spill_enabled() const noexcept { return spill || (selected_storage && !selected_storage->sequence_publications.empty()); }
 
 bool llama_memory_recurrent::complete_spill() {
+    if (selected_storage) for (size_t id=0;id<selected_storage->sequence_pending.size();++id) {
+        if (!selected_storage->sequence_pending[id]) continue;
+        if (!selected_storage->sequence_publications[id] || !selected_storage->sequence_publications[id]->complete_capture()) return false;
+        selected_storage->sequence_pending[id]=0;
+    }
     if (!spill_pending) return true;
     if (!spill || !spill->complete_capture()) return false;
     spill_pending=false;
     return true;
 }
 
+bool llama_memory_recurrent::spill_slot_valid(uint32_t slot,llama_seq_id sequence) {
+    if (!selected_storage || selected_storage->sequence_publications.empty()) return sequence==0 && spill_slot_valid(slot);
+    if (!sequence_selected(sequence) || !slot || slot>n_rs_seq) return false;
+    auto & bank=selected_storage->sequence_publications[sequence];
+    if (!bank || selected_storage->sequence_capturing[sequence] || selected_storage->sequence_restoring[sequence] ||
+            !selected_storage->sequence_epochs[sequence] || slot>=selected_storage->sequence_rows[sequence]) return false;
+    if (selected_storage->sequence_pending[sequence]) {
+        if (!bank->complete_capture()) return false;
+        selected_storage->sequence_pending[sequence]=0;
+    }
+    const auto generation=selected_storage->sequence_epochs[sequence];
+    bool found=false;
+    for (size_t layer=0;layer<r_l.size();++layer) if (r_l[layer]) {
+        found=true;
+        for (bool value : {false,true}) if (bank->snapshot_generation(layer,value,slot)!=generation ||
+                !bank->snapshot_data(layer,value,slot,generation)) return false;
+    }
+    return found;
+}
+
 bool llama_memory_recurrent::restore_spill_async(ggml_backend_sched_t sched) {
+    return restore_spill_async(sched,true);
+}
+
+bool llama_memory_recurrent::restore_spill_async(ggml_backend_sched_t sched,bool before_inputs) {
     if (current_storage_pending()) return false;
+    if (selected_storage && !selected_storage->sequence_publications.empty()) {
+        try {
+            for (llama_seq_id id=0;uint32_t(id)<n_seq_max;++id) if (rs_idx[id]) {
+                auto & bank=selected_storage->sequence_publications[id];const auto slot=rs_idx[id];
+                const auto tail=sequence_tail(id);
+                if (!bank || tail<0 || uint32_t(tail)>=size || !cells[tail].has_seq_id(id) || cells[tail].seq_id.size()!=1 ||
+                        !spill_slot_valid(slot,id)) return false;
+                const auto row=before_inputs ? cells[tail].src0 : cells[tail].src;
+                if (row<0 || uint32_t(row)>=size || !bank->begin_restore({spill_cache_id,uint64_t(id),selected_storage->sequence_epochs[id]},slot)) return false;
+                for (size_t layer=0;layer<r_l.size();++layer) if (r_l[layer]) for (bool value : {false,true}) {
+                    auto * tensor=value ? s_l[layer] : r_l[layer];
+                    auto * backend=sched ? ggml_backend_sched_get_tensor_backend(sched,tensor) : nullptr;
+                    if (!tensor || (sched && !backend) || !bank->restore(backend,layer,value,tensor,size_t(row)*tensor->nb[1])) {
+                        bank->cancel();selected_storage->sequence_failed=true;return false;
+                    }
+                }
+                if (!bank->publish_restore()) {bank->cancel();selected_storage->sequence_failed=true;return false;}
+                selected_storage->sequence_restoring[id]=1;set_rs_idx(id,0);
+            }
+            return true;
+        } catch (...) {selected_storage->sequence_failed=true;return false;}
+    }
     if (!spill || rs_idx.empty() || rs_idx[0] == 0) return true;
     if ((!sched && !staged_publication_enabled()) || spill_restore_pending) return false;
     const uint32_t slot=rs_idx[0];
@@ -874,6 +993,10 @@ bool llama_memory_recurrent::restore_spill_async(ggml_backend_sched_t sched) {
 }
 
 bool llama_memory_recurrent::complete_restore_spill() {
+    if (selected_storage) for (size_t id=0;id<selected_storage->sequence_restoring.size();++id) if (selected_storage->sequence_restoring[id]) {
+        if (!selected_storage->sequence_publications[id]->complete_restore()) {selected_storage->sequence_failed=true;return false;}
+        selected_storage->sequence_restoring[id]=0;
+    }
     if (!spill_restore_pending) return true;
     if (!spill || !spill->complete_restore()) return false;
     spill_restore_pending=false;
@@ -882,6 +1005,8 @@ bool llama_memory_recurrent::complete_restore_spill() {
 
 bool llama_memory_recurrent::materialize_spill_for_device_state() {
     if (current_storage_pending()) return false;
+    if (selected_storage && !selected_storage->sequence_publications.empty())
+        return restore_spill_async(nullptr,false) && complete_restore_spill();
     if (!complete_restore_spill()) return false;
     if (!spill || rs_idx.empty() || rs_idx[0] == 0) return true;
     if (!restore_spill_slot(rs_idx[0])) return false;
@@ -890,22 +1015,86 @@ bool llama_memory_recurrent::materialize_spill_for_device_state() {
 }
 
 bool llama_memory_recurrent::staged_publication_enabled() const noexcept {
+    if (selected_storage && !selected_storage->sequence_publications.empty()) {
+        if (!selected_storage->sequence_arena) return false;
+        for (const auto & bank : selected_storage->sequence_publications) if (bank && bank->staged_publication_enabled()) return true;
+        return false;
+    }
     return spill && spill->staged_publication_enabled();
 }
 
 bool llama_memory_recurrent::begin_spill_capture(uint32_t tokens) {
+    if (selected_storage && !selected_storage->sequence_publications.empty()) return false;
     if (current_storage_pending()) return false;
     if (!staged_publication_enabled()) return true;
     if (!complete_spill() || !complete_restore_spill() || spill_epoch == UINT64_MAX) return false;
     return spill->begin_staged_capture({spill_cache_id,0,spill_epoch+1},tokens);
 }
 
+bool llama_memory_recurrent::begin_spill_capture(const llama_ubatch & batch) {
+    if (!selected_storage || selected_storage->sequence_publications.empty()) return begin_spill_capture(batch.n_tokens);
+    if (current_storage_pending() || !selected_storage->sequence_arena || selected_storage->pending || !batch.n_tokens || !batch.n_seq_id || !batch.seq_id ||
+            std::any_of(selected_storage->sequence_capturing.begin(),selected_storage->sequence_capturing.end(),[](uint8_t active) {return active!=0;})) return false;
+    try {
+        std::array<uint32_t,LLAMA_MAX_SEQ> rows{};
+        for (uint32_t row=0;row<batch.n_tokens;++row) {
+            if (batch.n_seq_id[row]!=1 || !batch.seq_id[row]) return false;
+            const auto id=batch.seq_id[row][0];
+            if (id<0 || uint32_t(id)>=n_seq_max || !selected_storage->sequence_publications[id]) return false;
+            ++rows[id];
+        }
+        if (!complete_restore_spill()) return false;
+        for (size_t id=0;id<n_seq_max;++id) if (rows[id]) {
+            auto & bank=selected_storage->sequence_publications[id];
+            if (selected_storage->sequence_capturing[id] || selected_storage->sequence_epochs[id]==UINT64_MAX ||
+                    !bank->staged_publication_enabled()) return false;
+            if (selected_storage->sequence_pending[id]) {
+                if (!bank->complete_capture()) return false;
+                selected_storage->sequence_pending[id]=0;
+            }
+        }
+        for (size_t id=0;id<n_seq_max;++id) if (rows[id]) {
+            auto & bank=selected_storage->sequence_publications[id];
+            if (!bank->begin_staged_capture({spill_cache_id,id,selected_storage->sequence_epochs[id]+1},rows[id])) {
+                abort_spill_capture();return false;
+            }
+            selected_storage->sequence_capturing[id]=1;selected_storage->sequence_rows[id]=rows[id];
+        }
+        return true;
+    } catch (...) {abort_spill_capture();return false;}
+}
+
 void llama_memory_recurrent::abort_spill_capture() noexcept {
+    if (selected_storage && !selected_storage->sequence_publications.empty()) {
+        for (size_t id=0;id<selected_storage->sequence_capturing.size();++id) if (selected_storage->sequence_capturing[id]) {
+            selected_storage->sequence_publications[id]->cancel();selected_storage->sequence_capturing[id]=0;
+        }
+        return;
+    }
     if (staged_publication_enabled()) spill->cancel();
 }
 
 bool llama_memory_recurrent::capture_spill(ggml_backend_sched_t sched,
         const std::vector<llm_graph_recurrent_snapshot> & outputs) {
+    if (selected_storage && !selected_storage->sequence_publications.empty()) {
+        if (current_storage_pending() || !sched || outputs.empty() || !selected_storage->sequence_arena || selected_storage->pending) return false;
+        std::array<uint8_t,LLAMA_MAX_SEQ> proven{};
+        for (const auto & output : outputs) {
+            const auto id=output.sequence;
+            if (id<0 || uint32_t(id)>=n_seq_max || !selected_storage->sequence_capturing[id] || output.offset) return false;
+            const auto & bank=selected_storage->sequence_publications[id];
+            if (!bank || !output.tensor || bank->publication_tensor(output.layer,output.value,output.slot)!=output.tensor) return false;
+            proven[id]=1;
+        }
+        for (size_t id=0;id<n_seq_max;++id) if (selected_storage->sequence_capturing[id] && !proven[id]) return false;
+        bool captured=false;
+        for (size_t id=0;id<selected_storage->sequence_capturing.size();++id) if (selected_storage->sequence_capturing[id]) {
+            if (!selected_storage->sequence_publications[id]->publish_capture()) return false;
+            ++selected_storage->sequence_epochs[id];selected_storage->sequence_pending[id]=1;
+            selected_storage->sequence_capturing[id]=0;selected_storage->sequence_rollback[id]=0;captured=true;
+        }
+        return captured;
+    }
     if (current_storage_pending()) return false;
     if (!spill) return true;
     if (staged_publication_enabled()) {
@@ -935,17 +1124,194 @@ bool llama_memory_recurrent::capture_spill(ggml_backend_sched_t sched,
 }
 
 const llama_recurrent_spill_bank * llama_memory_recurrent::spill_bank() const noexcept { return spill.get(); }
+const llama_recurrent_spill_bank * llama_memory_recurrent::spill_bank(llama_seq_id sequence) const noexcept {
+    if (sequence<0 || uint32_t(sequence)>=n_seq_max) return nullptr;
+    if (selected_storage && !selected_storage->sequence_publications.empty())
+        return selected_storage->sequence_publications[size_t(sequence)].get();
+    return sequence==0 ? spill.get() : nullptr;
+}
+bool llama_memory_recurrent::spill_stage_requirements(ggml_backend_buffer_type_t & type,size_t & bytes) const noexcept {
+    if (!selected_storage || ctxs_bufs.size()!=1) return false;
+    auto * candidate=ggml_backend_buffer_get_type(ctxs_bufs.front().second.get());
+    const size_t alignment=ggml_backend_buft_get_alignment(candidate);
+    if (!alignment || (alignment&(alignment-1))) return false;
+    size_t total=0;
+    if (selected_storage->sequence_publications.empty()) total=spill ? spill->staged_device_bytes() : 0;
+    else {
+        llama_recurrent_stage_layout plan;
+        if (!llama_recurrent_stage_layout_make(selected_storage->sequence_layout,selected_storage->publication_slots,alignment,plan)) return false;
+        for (const auto & bank : selected_storage->sequence_publications) if (bank) {
+            if (!plan.total_bytes || plan.total_bytes%alignment || plan.total_bytes>SIZE_MAX-total) return false;
+            total+=plan.total_bytes;
+        }
+    }
+    if (!total) return false;
+    type=candidate;bytes=total;return true;
+}
+
+bool llama_memory_recurrent::park_spill_stage() {
+    if (selected_storage && !selected_storage->sequence_publications.empty()) {
+        if (!selected_storage->sequence_arena) return true;
+        if (!complete_spill() || !complete_restore_spill()) return false;
+        for (const auto & bank : selected_storage->sequence_publications) if (bank &&
+                !bank->publication_stage_parked() && !bank->park_publication_stage()) return false;
+        selected_storage->sequence_arena.reset();selected_storage->sequence_stage.reset();return true;
+    }
+    return !spill || !spill->staged_publication_enabled() || spill->park_publication_stage();
+}
+
 bool llama_memory_recurrent::bind_spill_stage(ggml_backend_memory_lease_t lease) {
-    return spill && spill->bind_publication_stage(lease);
+    if (!selected_storage || selected_storage->sequence_publications.empty()) return spill && spill->bind_publication_stage(lease);
+    if (selected_storage->pending || selected_storage->sequence_failed || !selected_storage->lease || selected_storage->sequence_arena || !lease) return false;
+    try {
+        ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+        ggml_backend_memory_region region{};
+        auto * buffer=ggml_backend_memory_lease_buffer(lease);
+        if (!spill_stage_requirements(type,bytes) || !buffer || ggml_backend_buffer_get_type(buffer)!=type ||
+                ggml_backend_buffer_get_size(buffer)!=bytes || !ggml_backend_memory_lease_get_region(lease,&region) ||
+                region.size!=bytes || !(region.flags&GGML_BACKEND_MEMORY_REGION_PERSISTENT) ||
+                region.alignment<ggml_backend_buft_get_alignment(type)) return false;
+        auto * current=ggml_backend_memory_lease_buffer(selected_storage->lease.get());
+        if (!current) return false;
+        const auto a=uintptr_t(ggml_backend_buffer_get_base(buffer)),b=uintptr_t(ggml_backend_buffer_get_base(current));
+        const auto current_bytes=ggml_backend_buffer_get_size(current);
+        if (!a || !b || bytes>UINTPTR_MAX-a || current_bytes>UINTPTR_MAX-b || (a<b+current_bytes && b<a+bytes)) return false;
+        auto * device=ggml_backend_buft_get_device(type);
+        if (!device && type==ggml_backend_cpu_buffer_type()) device=ggml_backend_dev_by_name("CPU");
+        if (!device) return false;
+        auto * host=ggml_backend_dev_host_buffer_type(device);
+        if (!host) host=ggml_backend_cpu_buffer_type();
+        std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> retained(
+            ggml_backend_memory_lease_retain(lease),ggml_backend_memory_lease_free);
+        if (!retained) return false;
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new_from_buffer(buffer),ggml_backend_memory_arena_free);
+        if (!arena || !ggml_backend_memory_arena_begin(arena.get(),0)) return false;
+        llama_recurrent_stage_layout layout;
+        if (!llama_recurrent_stage_layout_make(selected_storage->sequence_layout,selected_storage->publication_slots,
+                ggml_backend_buft_get_alignment(type),layout)) return false;
+        bool any_parked=false,all_parked=true;
+        for (const auto & bank : selected_storage->sequence_publications) if (bank) {
+            any_parked=any_parked || bank->publication_stage_parked();all_parked=all_parked && bank->publication_stage_parked();
+        }
+        if (any_parked && !all_parked) return false;
+        size_t offset=0;
+        for (size_t sequence=0;sequence<selected_storage->sequence_publications.size();++sequence) {
+            const auto & bank=selected_storage->sequence_publications[sequence];if (!bank) continue;
+            const auto part=layout.total_bytes;
+            if (!ggml_backend_memory_arena_reserve_at(arena.get(),sequence+1,offset,part,ggml_backend_buft_get_alignment(type),
+                    GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr)) return false;
+            offset+=part;
+        }
+        if (offset!=bytes || !ggml_backend_memory_arena_commit(arena.get())) return false;
+        if (any_parked) {
+            bool restored=true;
+            try {
+                for (size_t sequence=0;sequence<selected_storage->sequence_publications.size();++sequence) {
+                    auto & bank=selected_storage->sequence_publications[sequence];if (!bank) continue;
+                    std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> part(
+                        ggml_backend_memory_arena_acquire(arena.get(),sequence+1),ggml_backend_memory_lease_free);
+                    if (!part || !bank->bind_publication_stage(part.get())) {restored=false;break;}
+                }
+            } catch (...) {restored=false;}
+            if (!restored) {
+                bool retired=true;
+                for (auto & bank : selected_storage->sequence_publications) if (bank && !bank->publication_stage_parked())
+                    retired=bank->park_publication_stage() && retired;
+                if (!retired) {
+                    selected_storage->sequence_stage=std::move(retained);selected_storage->sequence_arena=std::move(arena);
+                    selected_storage->sequence_failed=true;
+                }
+                return false;
+            }
+            selected_storage->sequence_stage=std::move(retained);selected_storage->sequence_arena=std::move(arena);return true;
+        }
+        std::vector<std::unique_ptr<llama_recurrent_spill_bank>> publications(n_seq_max);
+        for (size_t sequence=0;sequence<selected_storage->sequence_publications.size();++sequence) {
+            if (!selected_storage->sequence_publications[sequence]) continue;
+            auto next=llama_recurrent_spill_bank::create(selected_storage->sequence_layout,host,spill_cache_id,sequence);
+            if (!next || !next->enable_publication(device,type,selected_storage->publication_slots,true)) return false;
+            std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> part(
+                ggml_backend_memory_arena_acquire(arena.get(),sequence+1),ggml_backend_memory_lease_free);
+            if (!part || !next->bind_publication_stage(part.get())) return false;
+            publications[sequence]=std::move(next);
+        }
+        selected_storage->sequence_publications=std::move(publications);
+        selected_storage->sequence_stage=std::move(retained);selected_storage->sequence_arena=std::move(arena);
+        return true;
+    } catch (...) {return false;}
 }
 uint64_t llama_memory_recurrent::spill_generation() const noexcept { return spill_epoch; }
+uint64_t llama_memory_recurrent::spill_generation(llama_seq_id sequence) const noexcept {
+    if (sequence<0 || uint32_t(sequence)>=n_seq_max) return 0;
+    if (selected_storage && !selected_storage->sequence_epochs.empty()) return selected_storage->sequence_epochs[sequence];
+    return sequence==0 ? spill_epoch : 0;
+}
 
 bool llama_memory_recurrent_context::spill_enabled() const { return mem && mem->spill_enabled(); }
 bool llama_memory_recurrent_context::staged_publication_enabled() const {
     return mem && mem->spill_bank() && mem->spill_bank()->staged_publication_enabled();
 }
+bool llama_memory_recurrent_context::sequence_spill_enabled() const {
+    return mem && mem->selected_storage && !mem->selected_storage->sequence_publications.empty();
+}
+
+bool llama_memory_recurrent_context::stage_sequence_snapshot(ggml_context * ctx,llm_graph_result & result,
+        ggml_tensor * source,size_t layer,bool value,uint32_t snapshot,uint32_t sequence_axis,
+        const llama_ubatch & batch,std::vector<ggml_tensor *> & copies) const {
+    if (!sequence_spill_enabled() || !ctx || !source || layer>UINT32_MAX ||
+            (sequence_axis!=1 && sequence_axis!=2) || !batch.n_seqs || !batch.n_seq_tokens ||
+            uint64_t(batch.n_seqs)*batch.n_seq_tokens!=batch.n_tokens || !batch.n_seq_id || !batch.seq_id ||
+            source->ne[sequence_axis]!=batch.n_seqs || source->ne[3]!=1 || (sequence_axis==1 && source->ne[2]!=1)) return false;
+    struct destination {llama_seq_id sequence;ggml_tensor * stage,* publication;};
+    std::vector<destination> destinations;std::array<uint8_t,LLAMA_MAX_SEQ> seen{};
+    for (uint32_t index=0;index<batch.n_seqs;++index) {
+        const auto first=index*batch.n_seq_tokens;
+        if (batch.n_seq_id[first]!=1 || !batch.seq_id[first]) return false;
+        const auto id=batch.seq_id[first][0];
+        if (id<0 || uint32_t(id)>=mem->n_seq_max || seen[id]) return false;
+        seen[id]=1;
+        for (uint32_t row=first;row<first+batch.n_seq_tokens;++row)
+            if (batch.n_seq_id[row]!=1 || !batch.seq_id[row] || batch.seq_id[row][0]!=id) return false;
+        const auto * bank=mem->spill_bank(id);
+        auto * stage=bank ? bank->staging_tensor(layer,value,snapshot) : nullptr;
+        auto * publication=bank ? bank->publication_tensor(layer,value,snapshot) : nullptr;
+        if (!stage || !publication || ggml_nelements(source)/batch.n_seqs!=ggml_nelements(stage)) return false;
+        destinations.push_back({id,stage,publication});
+    }
+    if (batch.n_seqs>1 && source->nb[sequence_axis]>SIZE_MAX/(batch.n_seqs-1)) return false;
+    int64_t shape[4];std::copy(source->ne,source->ne+4,shape);shape[sequence_axis]=1;
+    for (size_t index=0;index<destinations.size();++index) {
+        const auto & destination=destinations[index];
+        auto * row=ggml_view_4d(ctx,source,shape[0],shape[1],shape[2],shape[3],
+            source->nb[1],source->nb[2],source->nb[3],index*source->nb[sequence_axis]);
+        copies.push_back(ggml_cpy(ctx,row,destination.stage));
+        result.add_recurrent_snapshot({destination.publication,uint32_t(layer),snapshot,value,0,destination.sequence});
+    }
+    return true;
+}
+
 bool llama_memory_recurrent_context::publish_staged(ggml_context * ctx, ggml_cgraph * graph,
         size_t layer, bool value, const std::vector<ggml_tensor *> & copies) const {
+    if (sequence_spill_enabled()) {
+        std::vector<std::vector<ggml_tensor *>> grouped(mem->n_seq_max);
+        for (auto * copy : copies) {
+            if (!copy || copy->op!=GGML_OP_CPY || !copy->src[1]) return false;
+            bool found=false;
+            for (llama_seq_id id=0;uint32_t(id)<mem->n_seq_max;++id) {
+                const auto * bank=mem->spill_bank(id);if (!bank) continue;
+                for (uint32_t snapshot=1;snapshot<=mem->n_rs_seq;++snapshot)
+                    if (bank->staging_tensor(layer,value,snapshot)==copy->src[1]) {
+                        if (found) return false;
+                        grouped[id].push_back(copy);found=true;
+                    }
+            }
+            if (!found) return false;
+        }
+        for (size_t id=0;id<grouped.size();++id) if (!grouped[id].empty() &&
+                !mem->spill_bank(llama_seq_id(id))->publish_staged(ctx,graph,layer,value,grouped[id])) return false;
+        return true;
+    }
     return mem && mem->spill_bank() && mem->spill_bank()->publish_staged(ctx,graph,layer,value,copies);
 }
 ggml_tensor * llama_memory_recurrent_context::staging_tensor(
@@ -1315,6 +1681,9 @@ size_t llama_memory_recurrent::size_p_bytes() const {
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
     if (current_storage_pending()) throw std::runtime_error("current recurrent storage is unbound");
+    if (selected_storage && !selected_storage->sequence_publications.empty() &&
+            !const_cast<llama_memory_recurrent *>(this)->materialize_spill_for_device_state())
+        throw std::runtime_error("failed to materialize selected recurrent rollback");
     if (!const_cast<llama_memory_recurrent *>(this)->complete_restore_spill())
         throw std::runtime_error("failed to complete recurrent restore before saving state");
 

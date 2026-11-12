@@ -31,6 +31,7 @@ struct llama_context_group_sequence_state {
     uint64_t request_epoch = 0, cache_id = 0, cache_generation = 0;
     size_t tokens = 0;
     std::vector<uint8_t> recurrent, bounded;
+    std::vector<uint32_t> full_columns;
 };
 class llama_batch_allocr;
 class llama_moe_cache;
@@ -79,11 +80,13 @@ struct llama_context {
     // Selected-state metadata stays non-executable until all group grants are bound.
     llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected);
     bool group_storage_pending() const noexcept { return group_initializing; }
+    const llama_context * group_target_context() const noexcept { return group_target; }
     // The supplied owner and measured workspace cover all selected native state and graph users.
     bool attach_group_execution(std::unique_ptr<llama_context_memory> & workspace,
         std::shared_ptr<llama_kv_stream_slot_projection> projection,std::unique_ptr<llama_memory_phase_owner> & owner,
         llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision);
     bool group_submission_allowed() const noexcept;
+    bool group_mtp_ready(uint32_t future_tokens) const noexcept;
     // Borrow already initialized chains from the same model's non-executing metadata context.
     // The frontend retains their RNG/grammar ownership through group retirement.
     bool bind_group_samplers_from(const llama_context & prepared);
@@ -92,7 +95,9 @@ struct llama_context {
         std::shared_ptr<llama_kv_stream_slot_projection> projection,const llama_batch & representative,
         llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,
         ggml_backend_buffer_t parent = nullptr,const std::vector<llama_context_group_sequence_state> & states = {},
-        llama_context_memory_create_result * result = nullptr);
+        llama_context_memory_create_result * result = nullptr,llama_context * auxiliary = nullptr,
+        std::shared_ptr<llama_kv_stream_slot_projection> auxiliary_projection = {},
+        const std::vector<llama_context_group_sequence_state> & auxiliary_states = {});
     ggml_backend_buffer_t group_parent() const noexcept;
     // Export only selected current/SWA roles after all group work has completed.
     bool save_group_sequences(std::vector<llama_context_group_sequence_state> & output);
@@ -114,7 +119,9 @@ struct llama_context {
     llama_context_memory_create_result quote_target_group(const llama_batch & batch,
         const std::vector<llama_memory_phase_cache_identity> & selected_sources,
         llama_memory_phase_cache_identity bounded_identity, llama_memory_work_phase phase,
-        uint64_t id, size_t capacity, llama_context_group_plan & output);
+        uint64_t id, size_t capacity, llama_context_group_plan & output,
+        llama_context * auxiliary = nullptr,
+        const std::vector<llama_memory_phase_cache_identity> & auxiliary_sources = {});
 
     ~llama_context();
 
@@ -312,6 +319,8 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    friend bool llama_mtp_rebind_compatible(const llama_context * old_target,const llama_context * old_draft,
+        const llama_context * target,const llama_context * draft,llama_sampler * const * samplers,size_t count);
     llama_context(const llama_model & model, llama_context_params params,
         uint32_t serial_prediction_rows, bool serial_image_inputs, llama_context_mode mode,
         const std::vector<llama_seq_id> & selected = {});
@@ -355,6 +364,18 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    bool attach_group_execution_shared(std::unique_ptr<llama_context_memory> & workspace,
+        std::shared_ptr<llama_kv_stream_slot_projection> projection,std::shared_ptr<llama_memory_phase_owner> owner,
+        llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision);
+    bool attach_group_execution_impl(std::unique_ptr<llama_context_memory> & workspace,
+        std::shared_ptr<llama_kv_stream_slot_projection> projection,llama_memory_phase_owner & owner,
+        llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,bool shared_roles,
+        const std::function<std::shared_ptr<llama_memory_phase_owner>()> & acquire_owner);
+    llama_context_memory_create_result quote_mtp_group(const llama_batch & batch,
+        const std::vector<llama_memory_phase_cache_identity> & sources,
+        llama_memory_phase_cache_identity bounded_identity,llama_memory_work_phase phase,
+        uint64_t id,size_t capacity,llama_context_group_plan & output,llama_context & auxiliary,
+        const std::vector<llama_memory_phase_cache_identity> & auxiliary_sources);
     llm_graph_result * get_gf_res_prev();
     ggml_cgraph * graph_build_reserve(uint32_t tokens, uint32_t sequences, uint32_t outputs,
         const llama_memory_context_i * memory, bool feature_input, const llama_ubatch * native_batch = nullptr);
@@ -560,6 +581,7 @@ private:
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
     bool measurement_only = false;
     bool group_initializing = false;
+    const llama_context * group_target = nullptr;
     bool group_restore_failed = false;
     std::vector<llama_seq_id> group_selected;
     struct group_execution_binding;
@@ -576,6 +598,8 @@ public:
     static std::unique_ptr<llama_context_group> create(const llama_model & model,llama_context_params params,
         std::shared_ptr<llama_kv_stream_slot_table> table);
     ~llama_context_group();
+    // The caller retains model weights. Declare the shared child before allocating the parent.
+    bool prepare_shared_mtp(const llama_model & model,llama_context_params params);
     bool activate(const llama_kv_stream_selection & selection,const std::vector<llama_kv_stream_slot_handle> & handles,
         const llama_batch & representative,llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,
         llama_context_memory_create_result * result = nullptr);
@@ -584,7 +608,9 @@ public:
     // Discard selected native state after failure; reset those request namespaces before reuse.
     bool discard() noexcept;
     llama_context * context() const noexcept;
+    llama_context * auxiliary_context() const noexcept;
     llama_context * metadata_context() const noexcept;
+    llama_context * auxiliary_metadata_context() const noexcept;
     std::shared_ptr<llama_kv_stream_slot_table> source_table() const noexcept;
     const std::vector<llama_kv_stream_slot_handle> & source_handles() const noexcept;
     // A new request retires the old namespace, not its stable canonical address range.

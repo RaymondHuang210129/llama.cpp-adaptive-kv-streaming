@@ -1865,15 +1865,29 @@ std::unique_ptr<llama_kv_stream_group_reader> llama_kv_stream_group_reader::crea
         if (shape.page_tokens!=256 || ggml_kv_stream_layout_make(shape,256,s.tile).status!=ggml_kv_stream_status::success ||
                 ggml_backend_buffer_get_size(ggml_backend_memory_lease_buffer(staging))!=s.tile.bytes) return {};
         s.staging.reset(ggml_backend_memory_lease_retain(staging));
+        std::vector<uint64_t> owning_ids;
+        const auto same_shape=[&](const ggml_kv_stream_shape & other) {
+            return other.type_k==shape.type_k && other.type_v==shape.type_v && other.head_dim_k==shape.head_dim_k &&
+                other.head_dim_v==shape.head_dim_v && other.heads==shape.heads && other.page_tokens==shape.page_tokens &&
+                other.alignment==shape.alignment;
+        };
         for (const auto & grant : sources) {
             if (!grant.host || !grant.host->valid() || !grant.prepared_copies || !grant.pages ||
                     grant.pages>size_t(INT32_MAX)/256 || !grant.tokens || grant.tokens>grant.host->config().context_tokens ||
                     !accept(grant.pool)) return {};
-            const auto & other=grant.host->config().shape;
-            if (other.type_k!=shape.type_k || other.type_v!=shape.type_v || other.head_dim_k!=shape.head_dim_k ||
-                    other.head_dim_v!=shape.head_dim_v || other.heads!=shape.heads ||
-                    other.page_tokens!=shape.page_tokens || other.alignment!=shape.alignment) return {};
-            for (const auto & previous : s.sources) if (previous.config.host==grant.host) return {};
+            if (!same_shape(grant.host->config().shape) || (!grant.content && !grant.owning_caches.empty())) return {};
+            auto owners=grant.owning_caches;
+            if (owners.empty()) owners.push_back(grant.host);
+            bool included=false;uint32_t physical_layers=0;
+            for (const auto & owner : owners) {
+                if (!owner || !owner->valid() || !same_shape(owner->config().shape) ||
+                        owner->config().context_tokens!=grant.host->config().context_tokens || !owner->config().cache_id ||
+                        !owner->config().layers || owner->config().layers>LLAMA_MAX_LAYERS-physical_layers ||
+                        std::find(owning_ids.begin(),owning_ids.end(),owner->config().cache_id)!=owning_ids.end()) return {};
+                owning_ids.push_back(owner->config().cache_id);physical_layers+=owner->config().layers;
+                included=included || owner==grant.host;
+            }
+            if (!included) return {};
             implementation::source source;source.config=grant;
             if (source.config.stable_tokens==SIZE_MAX) source.config.stable_tokens=grant.tokens;
             if (source.config.stable_tokens>grant.tokens) return {};
@@ -1885,17 +1899,29 @@ std::unique_ptr<llama_kv_stream_group_reader> llama_kv_stream_group_reader::crea
                 if (!partial || !partial->capabilities) return {};
                 llama_kv_stream_policy_config config;
                 config.shape=shape;config.capabilities=partial->capabilities(backend,shape.type_k,shape.type_v);
-                config.layers=grant.host->config().layers;config.pool_bytes=ggml_backend_buffer_get_size(ggml_backend_memory_lease_buffer(grant.pool));
+                config.layers=physical_layers;config.pool_bytes=ggml_backend_buffer_get_size(ggml_backend_memory_lease_buffer(grant.pool));
+                if (!grant.owning_caches.empty()) for (const auto & owner : owners)
+                    config.caches.push_back({owner->config().cache_id,owner->config().layers});
                 llama_kv_stream_policy_state policy;
                 if (llama_kv_stream_policy_initialize(config,policy).status!=llama_kv_stream_policy_status::success ||
                         policy.budget.pages!=grant.pages ||
                         llama_kv_stream_policy_layout_make(config,policy,grant.tokens,source.placement).status!=llama_kv_stream_policy_status::success) return {};
+                if (!grant.owning_caches.empty()) {
+                    std::vector<llama_kv_stream_policy_layer> local;
+                    for (const auto & layer : source.placement.layers) if (layer.cache_id==grant.host->config().cache_id) {
+                        if (layer.cache_layer!=local.size()) return {};
+                        local.push_back(layer);
+                    }
+                    if (local.size()!=grant.host->config().layers) return {};
+                    source.placement.layers=std::move(local);
+                }
+                const auto layers=grant.host->config().layers;
                 source.slots=policy.ring_slots;
-                source.metadata.reset(ggml_init({size_t(config.layers)*2*ggml_tensor_overhead()+65536,nullptr,true}));
+                source.metadata.reset(ggml_init({size_t(layers)*2*ggml_tensor_overhead()+65536,nullptr,true}));
                 if (!source.metadata) return {};
-                source.prefix.resize(config.layers);source.pending_mirror.resize(config.layers);
+                source.prefix.resize(layers);source.pending_mirror.resize(layers);
                 auto * buffer=ggml_backend_memory_lease_buffer(grant.pool);
-                for (uint32_t layer=0;layer<config.layers;++layer) for (bool value : {false,true}) {
+                for (uint32_t layer=0;layer<layers;++layer) for (bool value : {false,true}) {
                     const auto & entry=source.placement.layers[layer];const auto & planes=entry.planes;
                     const auto bytes=value ? planes.v_bytes : planes.k_bytes;
                     if (!bytes) continue;

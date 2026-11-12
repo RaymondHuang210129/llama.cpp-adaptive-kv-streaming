@@ -1388,11 +1388,29 @@ uint32_t common_kv_stream_verify_max(const common_params & params,bool shares_ta
     const int32_t depth=params.speculative.draft.n_max;
     if (depth < 1 || depth > 3) throw std::invalid_argument("shared-target MTP supports 1-3 draft tokens");
     const int32_t rows=depth+1;
-    if (params.n_parallel != 1 || params.n_batch <= 0 || params.n_ubatch < 0 ||
+    const bool grouped=params.n_parallel==2 && params.shared_device_memory_bytes && !params.kv_stream_pool_bytes && params.kv_unified;
+    if ((params.n_parallel != 1 && !grouped) || params.n_batch <= 0 || params.n_ubatch < 0 ||
             (params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch,params.n_ubatch)) < rows) {
-        throw std::invalid_argument("shared-target MTP requires one serial slot and verification within the target microbatch");
+        throw std::invalid_argument("shared-target MTP requires one serial slot or two unified arena slots and verification within the target microbatch");
     }
     return uint32_t(rows);
+}
+
+static void common_resolve_streaming_context_params(const common_params & params,const llama_model * model,
+        llama_context_params & cparams) {
+    if (!model) throw std::invalid_argument("context metadata resolution requires a loaded model");
+    char architecture[32]={};
+    const bool shared_target_kv=params.speculative.has_dft() &&
+        llama_model_meta_val_str(model,"general.architecture",architecture,sizeof(architecture))==6 && !std::strcmp(architecture,"gemma4");
+    cparams.kv_stream_auxiliary_layers=common_kv_stream_auxiliary_layers(params,llama_model_n_layer_nextn(model),shared_target_kv);
+    cparams.kv_stream_verify_max=common_kv_stream_verify_max(params,shared_target_kv);
+    if (shared_target_kv && common_params_uses_streamed_mtp(params)) cparams.n_rs_seq=0;
+}
+
+struct llama_context_params common_context_params_to_llama(const common_params & params,const llama_model * model) {
+    auto cparams=common_context_params_to_llama(params);
+    common_resolve_streaming_context_params(params,model,cparams);
+    return cparams;
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1446,13 +1464,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     try {
-        char architecture[32] = {};
-        const bool shared_target_kv = params.speculative.has_dft() &&
-            llama_model_meta_val_str(model,"general.architecture",architecture,sizeof(architecture)) == 6 &&
-            std::strcmp(architecture,"gemma4") == 0;
-        cparams.kv_stream_auxiliary_layers = common_kv_stream_auxiliary_layers(
-            params, llama_model_n_layer_nextn(model), shared_target_kv);
-        cparams.kv_stream_verify_max=common_kv_stream_verify_max(params,shared_target_kv);
+        common_resolve_streaming_context_params(params,model,cparams);
     } catch (const std::invalid_argument & error) {
         COM_ERR("%s\n", error.what());
         return;

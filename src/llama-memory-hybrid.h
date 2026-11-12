@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -83,12 +84,14 @@ public:
 
     LLAMA_API llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+    void bind_group_mutation(std::function<bool(const std::function<bool()> &)> mutation);
 
 private:
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+    std::function<bool(const std::function<bool()> &)> group_mutation;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {

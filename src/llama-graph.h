@@ -912,6 +912,7 @@ struct llm_graph_recurrent_snapshot {
     uint32_t layer = 0, slot = 0;
     bool value = false;
     size_t offset = 0;
+    llama_seq_id sequence = 0;
 };
 
 class llm_graph_result {

@@ -77,6 +77,7 @@ struct llama_context_group_workload_quote {
 // Metadata only. A successful byte quote does not activate an execution context.
 struct llama_context_group_plan {
     llama_context_group_workload_quote target;
+    std::vector<llama_context_group_workload_quote> catalog;
     std::vector<llama_memory_cache_requirement> caches;
     std::vector<llama_memory_cache_allocation_measurement> cache_allocations;
     llama_memory_bounded_kv_layout bounded;

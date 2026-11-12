@@ -146,6 +146,8 @@ struct llama_kv_stream_group_reader_source {
     // Opt in to the owning cache's existing resident/ring policy and mirror bookkeeping.
     std::shared_ptr<llama_kv_stream_content> content = {};
     size_t stable_tokens = SIZE_MAX;
+    // Homogeneous owning caches sharing this pool, in native layer order.
+    std::vector<std::shared_ptr<llama_kv_stream_host>> owning_caches = {};
 };
 
 struct llama_kv_stream_group_frontier {

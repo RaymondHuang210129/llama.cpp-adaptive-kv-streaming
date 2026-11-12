@@ -201,6 +201,19 @@ static void test(void) {
         }
         auto invalid=shared; invalid.n_parallel=2;
         assert(rejects(invalid));
+        auto grouped=shared;grouped.n_parallel=2;grouped.kv_unified=true;
+        for (int32_t depth=1;depth<=3;++depth) {
+            grouped.speculative.draft.n_max=depth;
+            bool accepted=false;
+            try {accepted=common_kv_stream_verify_max(grouped,true)==uint32_t(depth+1);}
+            catch (const std::invalid_argument &) {}
+            assert(accepted && "two-slot unified arena MTP retains per-sequence verification width");
+        }
+        auto invalid_group=grouped;invalid_group.n_parallel=3;assert(rejects(invalid_group));
+        invalid_group=grouped;invalid_group.kv_unified=false;assert(rejects(invalid_group));
+        invalid_group=grouped;invalid_group.shared_device_memory_bytes=0;invalid_group.kv_stream_pool_bytes=1024;
+        assert(rejects(invalid_group));
+        invalid_group=grouped;invalid_group.n_ubatch=3;assert(rejects(invalid_group));
         invalid=shared; invalid.n_batch=3; invalid.n_ubatch=0;
         assert(rejects(invalid));
         invalid=shared; invalid.n_batch=4; invalid.n_ubatch=3;
@@ -219,6 +232,10 @@ static void test(void) {
         assert(common_kv_stream_verify_max(shared,true) == 4);
         shared.shared_device_memory_bytes=0;
         assert(common_kv_stream_verify_max(shared,true) == 0);
+        bool missing_model=false;
+        try {(void)common_context_params_to_llama(shared,nullptr);}
+        catch (const std::invalid_argument &) {missing_model=true;}
+        assert(missing_model);
     }
 
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,

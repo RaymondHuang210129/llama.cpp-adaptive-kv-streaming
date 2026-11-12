@@ -1188,6 +1188,98 @@ struct group_pipeline_probe {
     ~group_pipeline_probe() {reg->iface.get_proc_address=original;active=nullptr;}
 };
 
+static void check_owned_cache_groups(testing & t,bool complete=false) {
+    ggml_backend_load_all();auto * device=ggml_backend_dev_by_name("CUDA0");
+    if (!t.assert_true(device!=nullptr)) return;
+    ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
+    auto * registry=ggml_backend_dev_backend_reg(device);
+    const auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_kv_stream_partial_ops"));
+    const auto copy_get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_kv_stream_copy_ops"));
+    const auto retire=reinterpret_cast<void (*)(ggml_backend_t)>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_graph_release_all"));
+    const auto * partial=get ? get() : nullptr;const auto * copies=copy_get ? copy_get() : nullptr;
+    if (!t.assert_true(backend && partial && copies && copies->prepare && copies->free_prepared && retire)) return;
+    size_t profiles=0;
+    const ggml_type types[]={GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16,GGML_TYPE_Q8_0,GGML_TYPE_Q5_0,GGML_TYPE_Q5_1,GGML_TYPE_Q4_0,GGML_TYPE_Q4_1};
+    for (uint32_t width : {256u,512u}) for (auto key : types) for (auto value : types) for (uint32_t queries : {1u,4u}) {
+        if (!complete && !((key==GGML_TYPE_Q8_0 && value==GGML_TYPE_Q4_0) || (key==GGML_TYPE_F16 && value==GGML_TYPE_F16))) continue;
+        const ggml_kv_stream_shape shape{key,value,int32_t(width),int32_t(width),4,256,128};
+        const uint32_t heads=width==256 ? 24 : 32;const size_t pages=24;
+        auto * type=llama_kv_stream_device_buffer_type(device);const auto alignment=ggml_backend_buft_get_alignment(type);
+        const auto aligned=[&](size_t n) {return (n+alignment-1)/alignment*alignment;};
+        ggml_kv_stream_layout tile;ggml_kv_stream_execution execution;size_t attention=0;
+        if (!t.assert_true(ggml_kv_stream_layout_make(shape,256,tile).status==ggml_kv_stream_status::success &&
+                ggml_kv_stream_resolve(shape,partial->capabilities(backend.get(),key,value),256,execution).status==ggml_kv_stream_status::success &&
+                ggml_kv_stream_workspace_query(partial,backend.get(),{shape,heads,queries,2048},ggml_kv_stream_workspace_kind::decode,attention))) return;
+        const auto pool_bytes=pages*tile.bytes+execution.conversion.bytes,stage_offset=aligned(pool_bytes),scratch_offset=aligned(stage_offset+tile.bytes);
+        arena_ptr arena(ggml_backend_memory_arena_new(type,scratch_offset+attention),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),101,0,pool_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),201,stage_offset,tile.bytes,alignment,0,nullptr) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),202,scratch_offset,attention,alignment,0,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        lease_ptr pool(ggml_backend_memory_arena_acquire(arena.get(),101),ggml_backend_memory_lease_free),
+            staging(ggml_backend_memory_arena_acquire(arena.get(),201),ggml_backend_memory_lease_free),
+            scratch(ggml_backend_memory_arena_acquire(arena.get(),202),ggml_backend_memory_lease_free);
+        fixture target(backend.get(),true,key,value,2048,false,2,4,pages,width,width,pool.get(),37,3);
+        fixture auxiliary(backend.get(),true,key,value,2048,false,1,4,pages,width,width,pool.get(),137,93);
+        std::vector<std::shared_ptr<void>> prepared;
+        for (size_t owner=0;owner<2;++owner) {
+            prepared.emplace_back(copies->prepare(backend.get(),pages,false),copies->free_prepared);
+            if (!t.assert_true(prepared.back()!=nullptr)) return;
+        }
+        block_inputs target_input(target,1537,queries,false,heads),auxiliary_input(auxiliary,1025,queries,false,heads);
+        stock_attention_case target_control(target,target_input),auxiliary_control(auxiliary,auxiliary_input);
+        uint32_t role=0;
+        const std::vector<std::shared_ptr<llama_kv_stream_host>> owners{target.host,auxiliary.host};
+        const auto make=[&](fixture & source,size_t tokens,uint32_t expected) {
+            llama_kv_stream_group_reader_source grant{source.host,pool.get(),pages,tokens,prepared[expected],source.content};
+            grant.owning_caches=owners;
+            return llama_kv_stream_group_reader::create(backend.get(),{grant},staging.get(),[&,expected](uint32_t) {return role==expected;});
+        };
+        auto reader=make(target,1537,0),draft=make(auxiliary,1025,1);
+        if (!t.assert_true(reader && draft)) return;
+        struct retirement {ggml_backend_t backend;void (*retire)(ggml_backend_t);
+            ~retirement() {ggml_backend_synchronize(backend);retire(backend);}} captured{backend.get(),retire};
+        const auto target_generation=target.content->generation(),auxiliary_generation=auxiliary.content->generation();
+        std::vector<uint8_t> target_bytes(target.host->bytes()),auxiliary_bytes(auxiliary.host->bytes());
+        std::memcpy(target_bytes.data(),ggml_backend_buffer_get_base(target.host->buffer()),target_bytes.size());
+        std::memcpy(auxiliary_bytes.data(),ggml_backend_buffer_get_base(auxiliary.host->buffer()),auxiliary_bytes.size());
+        for (const auto & step : {std::pair<uint32_t,uint32_t>{0,0},{0,1},{1,0},{0,0},{1,0},{0,1}}) {
+            role=step.first;auto & source=role ? auxiliary : target;auto & input=role ? auxiliary_input : target_input;
+            auto & control=role ? auxiliary_control : target_control;auto & selected=role ? draft : reader;
+            llama_kv_stream_host_layer host;if (!t.assert_true(source.host->layer(step.second,host))) return;
+            ggml_backend_tensor_set(control.k_storage,host.k,0,ggml_nbytes(control.k_storage));
+            ggml_backend_tensor_set(control.v_storage,host.v,0,ggml_nbytes(control.v_storage));
+            control.run();std::vector<float> native(ggml_nelements(control.output));
+            ggml_backend_tensor_get(control.output,native.data(),0,ggml_nbytes(control.output));
+            auto op=*control.output;op.buffer=input.output->buffer;op.data=input.output->data;
+            auto k=*control.k,v=*control.v;k.buffer=v.buffer=nullptr;k.data=v.data=nullptr;op.src[1]=&k;op.src[2]=&v;
+            std::vector<ggml_kv_stream_gather_row> columns(input.padded);
+            for (size_t token=0;token<input.active;++token) columns[token]={0,token};
+            if (!t.assert_true(selected->attention(step.second,columns,&op,scratch.get(),true))) return;
+            ggml_backend_synchronize(backend.get());
+            t.out<<"owned-cache role="<<role<<" layer="<<step.second<<" D="<<width<<" queries="<<queries<<" k="<<int(key)<<" v="<<int(value)<<std::endl;
+            if (!t.assert_true("alternating owning caches preserve every native attention bit",same_float_bits(native,input.read()))) return;
+            const auto previous=input.read();role=1-role;
+            t.assert_true(!selected->attention(step.second,columns,&op,scratch.get(),true));
+            t.assert_true(same_float_bits(previous,input.read()));
+        }
+        for (int invalid=0;invalid<4;++invalid) {
+            llama_kv_stream_group_reader_source bad{target.host,pool.get(),pages,1537,prepared[0],target.content};
+            if (invalid==0) bad.owning_caches={auxiliary.host};
+            if (invalid==1) bad.owning_caches={target.host,target.host};
+            if (invalid==2) bad.owning_caches={target.host,nullptr};
+            if (invalid==3) {bad.owning_caches=owners;bad.content.reset();}
+            t.assert_true(!llama_kv_stream_group_reader::create(backend.get(),{bad},staging.get(),[](uint32_t) {return true;}));
+        }
+        t.assert_equal(target_generation,target.content->generation());t.assert_equal(auxiliary_generation,auxiliary.content->generation());
+        t.assert_true(!std::memcmp(target_bytes.data(),ggml_backend_buffer_get_base(target.host->buffer()),target_bytes.size()));
+        t.assert_true(!std::memcmp(auxiliary_bytes.data(),ggml_backend_buffer_get_base(auxiliary.host->buffer()),auxiliary_bytes.size()));
+        ++profiles;
+    }
+    t.assert_equal(size_t(complete ? 256 : 8),profiles);t.out<<"owned-cache profiles="<<profiles<<std::endl;
+}
+
 static void check_slot_joint_attention(testing & t,bool small,bool wide_only=false,bool managed=false,bool reader_errors=false,bool reader_grid=false,bool attention_adapter=false,size_t resident_pool_pages=0,bool pending_append=false,bool pipeline_probe=false,uint32_t prefill_queries=0,uint32_t pipeline_dimension=0) {
     ggml_backend_load_all();auto * device=ggml_backend_dev_by_name("CUDA0");
     if (!t.assert_true(device!=nullptr)) return;
@@ -1647,6 +1739,10 @@ int main(int argc, char ** argv) {
             check_slot_joint_attention(t,false,false,true,!std::strcmp(argv[1],"--cuda-slot-group-reader-errors"),
                 !std::strcmp(argv[1],"--cuda-slot-group-reader-grid"));
         });
+        return t.summary();
+    }
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-owned-cache-groups")) {
+        testing t;t.test("owning_target_and_auxiliary_caches_share_one_pool_without_aliasing",[&](testing & t) {check_owned_cache_groups(t,argc>2 && !std::strcmp(argv[2],"--all-formats"));});
         return t.summary();
     }
     if (argc>1 && !std::strcmp(argv[1],"--cuda-slot-group-reader")) {

@@ -69,7 +69,7 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_recr,
         stream && stream->kv_stream_rs_rollback,
         stream && (stream->measure_only || !stream->kv_stream_selected_sequences.empty()),
-        stream && stream->measure_only
+        stream && (stream->measure_only || stream->defer_full_cache)
     )) {
     if (stream && !stream->kv_stream_selected_sequences.empty() &&
             !mem_recr->configure_selected_sequences(stream->kv_stream_selected_sequences))
@@ -152,6 +152,10 @@ void llama_memory_hybrid::clear(bool data) {
     mem_recr->clear(data);
 }
 
+void llama_memory_hybrid::bind_group_mutation(std::function<bool(const std::function<bool()> &)> mutation) {
+    group_mutation=std::move(mutation);
+}
+
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     size_t keep = 0;
     if (!mem_attn->kv_stream_can_remove(seq_id,p0,p1,&keep)) return false;
@@ -162,12 +166,10 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         if (!keep &&
                 stream->has_mtp_layer() && !stream->release_mtp_layer()) return false;
     }
-    // Try removing from the recurrent cache first since it may fail. If it does
-    // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
-        return false;
-    }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    const auto remove=[&] {
+        return mem_recr->seq_rm(seq_id,p0,p1) && mem_attn->seq_rm(seq_id,p0,p1);
+    };
+    return group_mutation ? group_mutation(remove) : remove();
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

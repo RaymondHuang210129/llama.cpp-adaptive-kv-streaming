@@ -404,8 +404,8 @@ bool llama_kv_stream_slot_table::project(const llama_kv_stream_selection & selec
             std::shared_ptr<llama_kv_cells> cells;
             if (handles[source].slot!=slot.id || !get(handles[source],role,cache) || !cache->ready() ||
                     !get_cells(handles[source],role,cells) || cells->get_has_shift() ||
-                    slot.history_tokens<cache->tokens() || slot.history_tokens-cache->tokens()>1 ||
-                    cells->get_used()!=cache->tokens()) return false;
+                    (!role && (slot.history_tokens<cache->tokens() || slot.history_tokens-cache->tokens()>1)) ||
+                    (role && cache->tokens()>slot.history_tokens+slot.growth_tokens) || cells->get_used()!=cache->tokens()) return false;
             const auto tokens=uint32_t(cache->tokens());
             for (uint32_t row=0;row<tokens;++row) {
                 if (cells->is_empty(row) || cells->seq_count(row)!=1 || !cells->seq_has(row,llama_seq_id(slot.id))) return false;
@@ -469,7 +469,7 @@ std::unique_ptr<llama_kv_stream_group_producer> llama_kv_stream_group_producer::
         uint32_t maximum_rows,uint32_t maximum_verify_rows,uint32_t maximum_selected) {
     if (!table || !writer || !maximum_rows || maximum_rows>writer->maximum_rows() ||
             !maximum_verify_rows || maximum_verify_rows>8 || !maximum_selected || maximum_selected>table->limits().slots ||
-            uint64_t(maximum_verify_rows)*maximum_selected>maximum_rows) return {};
+            maximum_verify_rows>maximum_rows) return {};
     try {
         auto result=std::unique_ptr<llama_kv_stream_group_producer>(new llama_kv_stream_group_producer);
         result->impl=std::make_unique<implementation>();
@@ -485,11 +485,13 @@ llama_kv_stream_group_producer::~llama_kv_stream_group_producer() {if (impl) abo
 bool llama_kv_stream_group_producer::begin(std::shared_ptr<llama_kv_stream_slot_projection> projection,
         const llama_ubatch & batch,const std::vector<uint32_t> & indices,llama_memory_work_phase phase) {
     auto & s=*impl;
+    const bool target=phase==llama_memory_work_phase::target_prefill || phase==llama_memory_work_phase::target_verify;
+    const bool auxiliary=phase==llama_memory_work_phase::mtp_catchup || phase==llama_memory_work_phase::mtp_draft;
     if (s.failed || s.active || !projection || !s.table->projection_current(*projection) || !batch.n_tokens ||
             batch.n_tokens>s.maximum_rows || indices.size()!=batch.n_tokens || !batch.pos ||
             !batch.n_seq_id || !batch.seq_id || (batch.n_pos!=1 && batch.n_pos!=4) ||
             projection->handles.size()>s.maximum_selected ||
-            (phase!=llama_memory_work_phase::target_prefill && phase!=llama_memory_work_phase::target_verify)) return false;
+            (projection->role==0 ? !target : projection->role!=1 || !auxiliary) || (auxiliary && !batch.output)) return false;
     try {
         auto next=std::make_unique<implementation::frame>();next->projection=std::move(projection);next->indices=indices;
         next->sources.resize(next->projection->handles.size());
@@ -516,7 +518,9 @@ bool llama_kv_stream_group_producer::begin(std::shared_ptr<llama_kv_stream_slot_
             const size_t token=source.before.tokens+source.indices.size();
             const auto & allowance=next->projection->selected.slots[owner];
             if (token>=s.table->limits().slot_limit || token>=allowance.history_tokens+allowance.growth_tokens ||
-                    (phase==llama_memory_work_phase::target_verify && source.indices.size()>=s.maximum_verify_rows)) return false;
+                    (phase==llama_memory_work_phase::target_verify && source.indices.size()>=s.maximum_verify_rows) ||
+                    (auxiliary && (phase==llama_memory_work_phase::mtp_draft ?
+                        source.indices.size()!=0 || !batch.output[row] : bool(batch.output[row])))) return false;
             source.indices.push_back(indices[row]);next->rows.push_back({uint32_t(owner),indices[row],token,batch.pos[row]});
             next->previous_columns.push_back(next->projection->columns[indices[row]]);
         }

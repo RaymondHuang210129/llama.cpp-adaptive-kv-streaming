@@ -511,7 +511,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                         conv_input->nb[1], conv_input->nb[2],
                         ggml_row_size(conv_input->type, s_idx));
 
-            if (mctx_cur->staged_publication_enabled() && s_slot > 0) {
+            if (mctx_cur->sequence_spill_enabled() && s_slot > 0) {
+                GGML_ASSERT(mctx_cur->stage_sequence_snapshot(ctx0,*res,conv_state_last,il,false,uint32_t(s_slot),2,ubatch,staged_copies));
+            } else if (mctx_cur->staged_publication_enabled() && s_slot > 0) {
                 auto * stage=mctx_cur->staging_tensor(il,false,uint32_t(s_slot));
                 auto * publication=mctx_cur->publication_tensor(il,false,uint32_t(s_slot));
                 GGML_ASSERT(stage && publication);
@@ -610,7 +612,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         std::vector<ggml_tensor *> staged_copies;
         for (int64_t slot=0;slot<n_written;++slot) {
             auto * source = ggml_view_2d(ctx0, src, D, n_seqs, src->nb[1], size_t(slot)*src->nb[2]);
-            if (slot > 0 && mctx_cur->staged_publication_enabled()) {
+            if (slot > 0 && mctx_cur->sequence_spill_enabled()) {
+                GGML_ASSERT(mctx_cur->stage_sequence_snapshot(ctx0,*res,source,il,true,uint32_t(slot),1,ubatch,staged_copies));
+            } else if (slot > 0 && mctx_cur->staged_publication_enabled()) {
                 auto * stage=mctx_cur->staging_tensor(il,true,uint32_t(slot));
                 auto * publication=mctx_cur->publication_tensor(il,true,uint32_t(slot));
                 GGML_ASSERT(stage && publication);
