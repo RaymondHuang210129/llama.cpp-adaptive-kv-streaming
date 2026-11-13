@@ -6,6 +6,7 @@
 #include "common.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-context.h"
 
 #include "fit.h"
 #include "log.h"
@@ -2526,11 +2527,11 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    return data_tgt.size() + data_dft.size() + data_spec.size() + (streamed ? streamed->payload_size() : 0);
 }
 
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return data_tgt.empty() && !streamed;
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2541,7 +2542,7 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
-    data_spec.clear();
+    data_spec.clear();streamed.reset();
 }
 
 void common_prompt_checkpoint::update_pos(

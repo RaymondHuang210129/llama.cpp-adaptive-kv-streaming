@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <functional>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -679,6 +680,9 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // Keep selection and eviction policy shared; publish metadata only after the caller restores its storage.
+    bool load(server_prompt & prompt,const server_tokens & tokens_new,
+        const std::function<bool(server_prompt_cache_state &)> & restore);
 
     void update();
 };

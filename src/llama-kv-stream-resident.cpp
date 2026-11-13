@@ -14,6 +14,7 @@
 #include "llama-cparams.h"
 
 #include <cmath>
+#include <cinttypes>
 #include <chrono>
 #include <atomic>
 #include <cstring>
@@ -1945,6 +1946,12 @@ std::unique_ptr<llama_kv_stream_group_reader> llama_kv_stream_group_reader::crea
             source.queue={registered->create(backend,grant.prepared_copies.get(),ggml_backend_memory_lease_buffer(grant.pool),
                 {first.k,grant.host->bytes()},shape,source.slots),copies->free};
             if (!source.queue) return {};
+            size_t resident=0,streamed=0,streamed_layers=0;
+            for (const auto & layer : source.placement.layers) {
+                resident+=layer.resident_live_pages;streamed+=layer.streamed_pages;streamed_layers+=layer.streamed_pages!=0;
+            }
+            LLAMA_LOG_DEBUG("stream_group_reader: cache=%" PRIu64 " tokens=%zu pool_pages=%zu ring_slots=%zu resident_live_pages_total=%zu streamed_pages_total=%zu streamed_layers=%zu\n",
+                grant.host->cache_id(),grant.tokens,grant.pages,source.slots,resident,streamed,streamed_layers);
             s.sources.push_back(std::move(source));
         }
         for (const auto & source : s.sources) if (source.config.content && !source.config.content->reset_mirror()) return {};

@@ -10,6 +10,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-kv-stream-logical-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -33,6 +34,17 @@ struct llama_context_group_sequence_state {
     llama_pos draft_position = -1;
     std::vector<uint8_t> recurrent, bounded;
     std::vector<uint32_t> full_columns;
+};
+// Parked request checkpoint. No physical GPU ownership or process-local source identity is restored.
+struct llama_context_group_checkpoint {
+    const llama_model * model = nullptr;
+    const llama_model * auxiliary_model = nullptr;
+    uint32_t slot = UINT32_MAX;
+    std::vector<llama_kv_stream_logical_snapshot> histories;
+    std::vector<std::shared_ptr<llama_kv_cells>> cells;
+    llama_context_group_sequence_state target, auxiliary;
+    // Payload accounting, separate from process RSS and container/node overhead.
+    size_t payload_size() const noexcept;
 };
 class llama_batch_allocr;
 class llama_moe_cache;
@@ -629,6 +641,7 @@ public:
     bool prepare_dflash(const llama_model & model,llama_context_params params,uint32_t prediction_rows);
     // Borrow the retained parent only while all selected states are parked.
     LLAMA_API ggml_backend_buffer_t prepare_vision_parent();
+    LLAMA_API bool quote_vision(const std::vector<size_t> & bytes,llama_context_memory_create_result & result) const;
     LLAMA_API bool lend_vision(const std::vector<size_t> & bytes,std::vector<ggml_backend_memory_lease_t> & output);
     // Retained encoder leases reject retirement and keep text admission closed.
     LLAMA_API bool release_vision();
@@ -645,8 +658,18 @@ public:
     llama_context * auxiliary_metadata_context() const noexcept;
     std::shared_ptr<llama_kv_stream_slot_table> source_table() const noexcept;
     const std::vector<llama_kv_stream_slot_handle> & source_handles() const noexcept;
+    // Export only parked sources. Loading starts a new namespace at the destination's reserved addresses.
+    bool save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes=true) const;
+    // Versioned native-endian checkpoint. Caller supplies the actual remaining input bytes.
+    bool write_request(uint32_t slot,llama_io_write_i & output) const;
+    bool read_request(uint32_t slot,llama_io_read_i & input,size_t available);
+    bool write_checkpoint(const llama_context_group_checkpoint & saved,llama_io_write_i & output,bool copy_bytes) const;
+    bool read_checkpoint(uint32_t slot,llama_io_read_i & input,size_t available,llama_context_group_checkpoint & output,bool allow_prefix=false);
+    bool load_request(uint32_t slot,const llama_context_group_checkpoint & saved);
     // A new request retires the old namespace, not its stable canonical address range.
     bool reset_request(uint32_t slot);
+    bool advance_request(uint32_t slot);
+    size_t parked_payload_bytes() const noexcept;
 private:
     llama_context_group();
     struct implementation;

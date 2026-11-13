@@ -19,6 +19,8 @@ import shlex
 import socket
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +45,8 @@ def arguments(argv=None):
     parser.add_argument("--server", type=Path, default=ROOT /"build-v2/bin" /executable)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--context-size", type=int, default=262144)
+    parser.add_argument("--parallel", type=int, choices=(1, 2), default=1,
+                        help="adaptive slots; each slot and the selected group retain the full context-size limit")
     parser.add_argument("--cache-type-k", choices=SWEEP.KV_TYPES, default="q8_0")
     parser.add_argument("--cache-type-v", choices=SWEEP.KV_TYPES, default="q4_0")
     parser.add_argument("--spec-mode", choices=("none", "mtp", "dflash", "dflash-k4v"), default="none")
@@ -115,12 +119,14 @@ def arguments(argv=None):
 
 def server_command(args, arena_mib):
     command = [str(args.server), "--model", str(args.model), "--ctx-size", str(args.context_size),
-               "--batch-size", str(args.batch_size), "--ubatch-size", str(args.ubatch_size), "--parallel", "1",
+               "--batch-size", str(args.batch_size), "--ubatch-size", str(args.ubatch_size), "--parallel", str(getattr(args, "parallel", 1)),
                "--n-gpu-layers", "999", "--flash-attn", "on", "--cache-type-k", args.cache_type_k,
                "--cache-type-v", args.cache_type_v, "--shared-device-memory-mib", str(arena_mib), "--fit", "off",
                "--spec-type", {"none":"none", "mtp":"draft-mtp", "dflash":"draft-dflash", "dflash-k4v":"ngram-map-k4v,draft-dflash"}[args.spec_mode],
                "--host", "127.0.0.1", "--port", str(args.port), "--offline", "--no-context-shift", "--cache-ram", "0",
                "-lv", str(max(args.verbosity, 4 if args.spec_mode == "dflash-k4v" or args.copy_probe else 0))]
+    if getattr(args, "parallel", 1) == 2:
+        command.append("--kv-unified")
     if args.no_webui:
         command.append("--no-webui")
     if args.draft_length:
@@ -172,6 +178,38 @@ def probe_text_tokens(args):
     return requested
 
 
+def context_semantics(args):
+    slots = getattr(args, "parallel", 1)
+    return {"slots":slots, "per_slot":args.context_size, "selected_group":args.context_size,
+            "all_histories":slots *args.context_size}
+
+
+def validate_context_semantics(args, props):
+    if getattr(args, "parallel", 1) != 2:
+        return
+    expected = context_semantics(args)
+    observed = props.get("stream_context_limits", {})
+    if (props.get("total_slots") != expected["slots"]
+            or any(observed.get(key) != expected[key] for key in ("per_slot", "selected_group", "all_histories"))
+            or type(observed.get("selected_storage")) is not int or observed["selected_storage"] < args.context_size):
+        raise RuntimeError(f"server reported incompatible two-slot context limits: {props}")
+
+
+def multi_slot_probe_profiles(args):
+    if getattr(args, "parallel", 1) != 2:
+        return []
+    count = probe_text_tokens(args)
+    joint = min(count, max(1, (args.context_size -2 *(args.decode_tokens +15)) //2))
+    profiles = [
+        {"label":"single-0", "slots":[0], "prompt_tokens":[count], "selected_max":1},
+        {"label":"single-1", "slots":[1], "prompt_tokens":[count], "selected_max":1},
+        {"label":"joint", "slots":[0,1], "prompt_tokens":[joint,joint], "selected_max":2},
+    ]
+    if args.probe_mode == "full" and count *2 > args.context_size:
+        profiles.append({"label":"serialized", "slots":[0,1], "prompt_tokens":[count,count], "selected_max":1})
+    return profiles
+
+
 def payload(args, prompt, images):
     if images:
         if not isinstance(prompt, str) or prompt.count(MARKER) != len(images):
@@ -192,6 +230,87 @@ def validate_result(args, result, expected_prompt):
         raise RuntimeError("incomplete prefill response")
     if args.spec_mode != "none" and (type(timing.get("draft_n")) is not int or timing["draft_n"] <= 0):
         raise RuntimeError("speculative workload completed without generating drafts")
+
+
+def request_completion_group(url, body, timeout):
+    request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type":"application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read(64 *1048576 +1)
+        if len(data) > 64 *1048576:
+            raise RuntimeError("completion group response exceeds 64 MiB")
+        rows = json.loads(data)
+    except (urllib.error.URLError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"completion group request failed for {url}: {error}") from error
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("expected an array of completion objects")
+    return rows
+
+
+def observed_completion(args, url, body, label, grouped=False):
+    log_path = getattr(args, "_source_log_path", None)
+    before = speculative_source_stats(log_path.read_text(errors="replace")) if log_path else {}
+    result = request_completion_group(url +"/completion", body, timeout=args.request_timeout) if grouped else request_json(url +"/completion", body, timeout=args.request_timeout)
+    if log_path:
+        after = speculative_source_stats(log_path.read_text(errors="replace"))
+        fields = ("generated_tokens", "accepted_tokens", "accept_calls", "prediction_forwards")
+        delta = {name:{key:row[key] -before.get(name, {}).get(key, 0) for key in fields} for name, row in after.items()}
+        rows = result if grouped else [result]
+        timing = {key:sum(row["timings"].get(key, 0) for row in rows) for key in ("draft_n", "draft_n_accepted")}
+        args._source_groups.append({"label":label, "members":len(rows), "timings":timing, "source_stats":delta})
+    return result
+
+
+def image_slot_requests(args, url, prompt, images):
+    body = payload(args, prompt, images)
+    slots = getattr(args, "parallel", 1)
+    if slots == 2:
+        body["prompt"] = [body["prompt"], body["prompt"]]
+    result = observed_completion(args, url, body, "image", grouped=slots == 2)
+    rows = [result] if isinstance(result, dict) else result
+    if not isinstance(rows, list) or len(rows) != slots:
+        raise RuntimeError("incomplete image completion group")
+    for row in rows:
+        validate_result(args, row, None)
+    if slots == 2 and sorted(row.get("id_slot", -1) for row in rows) != [0, 1]:
+        raise RuntimeError("image group did not use two independent slots")
+    return rows
+
+
+def multi_slot_requests(args, url, tokens, candidate, log_path):
+    observations = []
+    for profile in multi_slot_probe_profiles(args):
+        prompts = [tokens[:count] for count in profile["prompt_tokens"]]
+        if any(len(prompt) != count for prompt, count in zip(prompts, profile["prompt_tokens"])):
+            raise ValueError("corpus is too short for two-slot probes")
+        body = payload(args, prompts[0] if len(prompts) == 1 else prompts, [])
+        if len(prompts) == 1:
+            body["id_slot"] = profile["slots"][0]
+        offset = log_path.stat().st_size
+        result = observed_completion(args, url, body, profile["label"], grouped=len(prompts) == 2)
+        rows = [result] if isinstance(result, dict) else result
+        if not isinstance(rows, list) or len(rows) != len(prompts):
+            raise RuntimeError("incomplete two-slot completion group")
+        for row, count in zip(rows, profile["prompt_tokens"]):
+            validate_result(args, row, count)
+        ids = [row.get("id_slot") for row in rows]
+        if any(type(slot) is not int for slot in ids) or sorted(ids) != profile["slots"]:
+            raise RuntimeError("two-slot response did not identify the requested independent slots")
+        with log_path.open("rb") as source:
+            source.seek(offset)
+            text = source.read().decode("utf-8", errors="replace")
+        selected = [int(value) for value in re.findall(r"stream group bind: selected=(\d+) rows=\d+ phase=decode", text)]
+        if not selected or max(selected) != profile["selected_max"]:
+            rejected = re.findall(r"stream selection capacity: selected=2 required=(\d+) available=\d+", text)
+            if profile["selected_max"] == 2 and rejected:
+                raise SWEEP.ArenaTooSmallError((max(map(int, rejected)) +1048575) //1048576)
+            raise RuntimeError(f"two-slot {profile['label']} selection was not exercised: {selected}")
+        artifact = args.output /f"arena-{candidate}-{profile['label']}-response.json"
+        artifact.write_text(json.dumps({"profile":profile, "request":body, "responses":rows,
+                                       "decode_selections":selected}, indent=2) +"\n")
+        observations.append({"profile":profile, "responses":rows, "artifact":str(artifact),
+                             "sha256":hashlib.sha256(artifact.read_bytes()).hexdigest(), "decode_selections":selected})
+    return observations
 
 
 def mixed_route_probe(args, url, prompt, candidate):
@@ -246,7 +365,7 @@ def mixed_image_route_probe(args, url, images, candidate):
         config.decode_tokens=outputs
         body = payload(config,prompt,images)
         body["logit_bias"]=[[tokenized[0],1000]]
-        result = request_json(url +"/completion",body,timeout=args.request_timeout)
+        result = observed_completion(args,url,body,route)
         path = args.output /f"arena-{candidate}-mixed-{route}.json"
         path.write_text(json.dumps({"payload":body,"result":result},indent=2) +"\n")
         validate_result(config,result,None)
@@ -259,9 +378,26 @@ def mixed_image_route_probe(args, url, images, candidate):
             "scope":"Separate image-conditioned target-biased copy and genuine-miss resource checks. Not performance or image quality evidence."}
 
 
-def validate_completed_image_sources(text, completed):
+def validate_completed_image_sources(text, completed, groups=None):
     totals = {key:sum(row["timings"].get(key,0) for row in completed) for key in ("draft_n","draft_n_accepted")}
     result = validate_mixed_sources(text,generated_tokens=totals["draft_n"],accepted_tokens=totals["draft_n_accepted"])
+    if groups is not None:
+        if sum(group["members"] for group in groups) != len(completed):
+            raise RuntimeError("mixed source barriers do not cover every completed response")
+        for group in groups:
+            delta = group["source_stats"]
+            if set(delta) != set(result) or any(value < 0 for row in delta.values() for value in row.values()):
+                raise RuntimeError("missing or decreasing mixed source group counters")
+            for source_key, timing_key in (("generated_tokens", "draft_n"), ("accepted_tokens", "draft_n_accepted")):
+                if sum(row[source_key] for row in delta.values()) != group["timings"].get(timing_key, 0):
+                    raise RuntimeError("mixed source group totals differ from completed responses")
+            if group["label"] == "image-copy" and not (delta["ngram-map-k4v"]["generated_tokens"] > 0
+                    and delta["ngram-map-k4v"]["accept_calls"] > 0 and delta["draft-dflash"]["prediction_forwards"] == 0):
+                raise RuntimeError("image copy group did not use K4V without a neural forward")
+            if group["label"] == "image-miss" and not (delta["draft-dflash"]["generated_tokens"] > 0
+                    and delta["draft-dflash"]["prediction_forwards"] > 0 and delta["ngram-map-k4v"]["generated_tokens"] == 0):
+                raise RuntimeError("image miss group did not exercise genuine neural fallback")
+        return result
     snapshots = {}
     for line in text.splitlines():
         for name,row in speculative_source_stats(line).items():
@@ -300,17 +436,27 @@ def _runtime_probe(args, candidate):
     result = {}
     mixed_proof = None
     vision_result = None
+    multi_profiles = None
+    observed_context = None
+    image_rows = None
     response_path = None
     prompt_sha256 = None
     completed: list[dict[str, Any]] = []
     mixed_image = bool(args.mmproj and args.spec_mode=="dflash-k4v")
     expected_phases = []
+    if getattr(args, "parallel", 1) == 2 and args.spec_mode == "dflash-k4v":
+        args = argparse.Namespace(**vars(args))
+        args._source_log_path, args._source_groups = log_path, []
     with log_path.open("x", encoding="utf-8") as log:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment(), creationflags=flags)
         try:
             url = f"http://127.0.0.1:{args.port}"
             SWEEP.wait_ready(url, process, log_path)
+            if getattr(args, "parallel", 1) == 2:
+                props = request_json(url +"/props", timeout=args.request_timeout)
+                validate_context_semantics(args, props)
+                observed_context = props["stream_context_limits"]
             expected = None
             if getattr(args,"_vision_validate_text_first",False):
                 prelude=argparse.Namespace(**vars(args))
@@ -319,7 +465,7 @@ def _runtime_probe(args, candidate):
                 corpus=bounded_bytes(args.prefill_text).decode("utf-8")
                 ids=request_json(url +"/tokenize",{"content":corpus,"add_special":True},timeout=args.request_timeout)["tokens"]
                 if len(ids)<count:raise ValueError("corpus is too short for vision transition validation")
-                response=request_json(url +"/completion",payload(args,ids[:count],[]),timeout=args.request_timeout)
+                response=observed_completion(args,url,payload(args,ids[:count],[]),"text-prelude")
                 validate_result(args,response,count)
                 completed.append({"label":"text-prelude","timings":response["timings"]})
                 (args.output /f"arena-{candidate}-text-prelude.json").write_text(json.dumps(response,indent=2) +"\n")
@@ -334,14 +480,28 @@ def _runtime_probe(args, candidate):
                 if len(tokens) < expected:
                     raise ValueError("corpus is too short; provide more text or set --prompt-tokens")
                 prompt, images = tokens[:expected], []
-            result = request_json(url +"/completion", payload(args,prompt,images), timeout=args.request_timeout)
+            if getattr(args, "parallel", 1) == 2 and not images:
+                multi_profiles = multi_slot_requests(args, url, tokens, candidate, log_path)
+                result = multi_profiles[0]["responses"][0]
+            elif getattr(args, "parallel", 1) == 2 and images:
+                image_rows = image_slot_requests(args, url, prompt, images)
+                result = image_rows[0]
+            else:
+                result = request_json(url +"/completion", payload(args,prompt,images), timeout=args.request_timeout)
             response_path = args.output /f"arena-{candidate}-response.json"
             response_path.write_text(json.dumps(result, indent=2) +"\n")
             if not args.image:
                 prompt_sha256 = hashlib.sha256(json.dumps(prompt, separators=(",", ":")).encode()).hexdigest()
             validate_result(args, result, expected)
-            completed.append({"label":"image" if args.image else "text","timings":result["timings"]})
-            if getattr(args,"_expected_vision_shape",None):expected_phases.append(args._expected_vision_shape)
+            if image_rows:
+                completed.extend({"label":"image-slot-" +str(row["id_slot"]), "timings":row["timings"]} for row in image_rows)
+                (args.output /f"arena-{candidate}-image-group-responses.json").write_text(json.dumps(image_rows,indent=2) +"\n")
+            elif multi_profiles:
+                completed.extend({"label":profile["profile"]["label"], "timings":row["timings"]}
+                                 for profile in multi_profiles for row in profile["responses"])
+            else:
+                completed.append({"label":"image" if args.image else "text","timings":result["timings"]})
+            if getattr(args,"_expected_vision_shape",None):expected_phases.extend([args._expected_vision_shape] *len(image_rows or [result]))
             if not mixed_image:
                 mixed_proof = mixed_route_probe(args, url, prompt, candidate)
                 if mixed_proof:completed.append({"label":"text-proof","timings":mixed_proof["timings"]})
@@ -350,15 +510,15 @@ def _runtime_probe(args, candidate):
                 vision_result=[]
                 for item in bootstrap:
                     data=base64.b64encode(bounded_bytes(Path(item["image"]))).decode("ascii")
-                    response=request_json(url +"/completion",payload(args,"Describe: " +MARKER,[data]),timeout=args.request_timeout)
-                    validate_result(args,response,None)
-                    completed.append({"label":"vision-" +item["ratio"],"timings":response["timings"]})
-                    expected_phases.append(item["shape"])
+                    rows=image_slot_requests(args,url,"Describe: " +MARKER,[data])
+                    response=rows[0]
+                    completed.extend({"label":"vision-" +item["ratio"],"timings":row["timings"]} for row in rows)
+                    expected_phases.extend([item["shape"]] *len(rows))
                     path=args.output /f"arena-{candidate}-vision-{item['ratio'].replace(':','x')}-response.json"
                     path.write_text(json.dumps(response,indent=2) +"\n")
                     vision_result.append({"ratio":item["ratio"],"response":str(path),
                                           "response_sha256":hashlib.sha256(path.read_bytes()).hexdigest(),"timings":response["timings"],
-                                          "image":item["image"],"image_sha256":hashlib.sha256(Path(item["image"]).read_bytes()).hexdigest()})
+                                          "responses":rows,"slots":len(rows),"image":item["image"],"image_sha256":hashlib.sha256(Path(item["image"]).read_bytes()).hexdigest()})
             if mixed_image:
                 proof_images=images if args.image else [base64.b64encode(bounded_bytes(Path(bootstrap[0]["image"]))).decode("ascii")] if bootstrap else []
                 mixed_proof=mixed_image_route_probe(args,url,proof_images,candidate)
@@ -376,18 +536,26 @@ def _runtime_probe(args, candidate):
     text = log_path.read_text(encoding="utf-8", errors="replace")
     if re.search(r"illegal memory access|misaligned address|device-side assert|unspecified launch failure", text, re.IGNORECASE):
         raise RuntimeError(f"probe reported a device fault, not an arena capacity boundary; see {log_path}")
+    if isinstance(failure, SWEEP.ArenaTooSmallError):
+        raise failure
     if failure is None:
         try:
             SWEEP.validate_execution_log(text)
             if expected_phases:check_vision_phases(text,expected_phases,candidate)
             elif mixed_image:
-                phases=[dict(re.findall(r"([a-z][a-z0-9_]*)=([^\s]+)",line)) for line in text.splitlines() if "vision_phase:" in line]
-                if len(phases)!=3 *len(args.image) or any(row.get("borrowed_after")!="0" or row.get("suspended_after")!="0" or row.get("diagnostics")!="1" for row in phases):
+                grouped=getattr(args,"parallel",1)==2
+                phases=[dict(re.findall(r"([a-z][a-z0-9_]*)=([^\s]+)",line)) for line in text.splitlines()
+                        if ("vision_group_phase:" if grouped else "vision_phase:") in line]
+                if grouped:
+                    returned=len(phases)>=4 and all(row.get("grants_after")=="0" and row.get("selected_state_bytes")=="0" for row in phases)
+                else:
+                    returned=len(phases)==3 *len(args.image) and all(row.get("borrowed_after")=="0" and row.get("suspended_after")=="0" and row.get("diagnostics")=="1" for row in phases)
+                if not returned:
                     raise RuntimeError("mixed image probes did not complete and return all encoder loans")
             if args.spec_mode == "dflash-k4v":
                 if mixed_proof is None:
                     raise RuntimeError("missing completed mixed route probe")
-                mixed_proof["source_stats"] = validate_completed_image_sources(text,completed) if mixed_image else validate_mixed_sources(text,
+                mixed_proof["source_stats"] = validate_completed_image_sources(text,completed,groups=getattr(args,"_source_groups",None)) if mixed_image else validate_mixed_sources(text,
                                                                                                                                           generated_tokens=sum(row["timings"].get("draft_n",0) for row in completed),
                                                                                                                                           accepted_tokens=sum(row["timings"].get("draft_n_accepted",0) for row in completed))
             elif mixed_proof is not None:
@@ -410,6 +578,8 @@ def _runtime_probe(args, candidate):
             "response":str(response_path) if response_path else None,
             "response_sha256":hashlib.sha256(response_path.read_bytes()).hexdigest() if response_path else None,
             "prompt_ids_sha256":prompt_sha256, "mixed_proof":mixed_proof, "completed_requests":completed,
+            "source_groups":getattr(args,"_source_groups",None),
+            "context_semantics":context_semantics(args), "observed_context_limits":observed_context, "selection_profiles":multi_profiles,
             "probe_mode":args.probe_mode, "timings":result.get("timings"), "error":str(failure) if failure else None,
             "vision_bootstrap":vision_result,"vision_capacity_requested":bool(args.mmproj),
             "limiting_factor":"context" if context_limit else "runtime_capacity" if failure else None}
@@ -500,7 +670,7 @@ def check_vision_phase(text, expected, arena_mib):
 
 
 def check_vision_phases(text, expected, arena_mib):
-    phases=[line for line in text.splitlines() if "vision_phase:" in line]
+    phases=[line for line in text.splitlines() if "vision_phase:" in line or "vision_group_phase:" in line]
     if len(phases)!=len(expected):raise RuntimeError("vision probe did not complete the planned encoder phases")
     return [check_vision_fields(dict(re.findall(r"([a-z][a-z0-9_]*)=([^\s]+)",line)),shape,arena_mib)
             for line,shape in zip(phases,expected)]
@@ -508,7 +678,10 @@ def check_vision_phases(text, expected, arena_mib):
 
 def check_vision_fields(phase, expected, arena_mib):
     fields = {"image_width":expected["width"], "image_height":expected["height"], "image_tokens":expected["image_tokens"], "parent":arena_mib *1048576}
-    if any(phase.get(key) != str(value) for key,value in fields.items()) or phase.get("borrowed_after") != "0" or phase.get("suspended_after") != "0" or phase.get("diagnostics") != "1":
+    grouped="grants_after" in phase
+    returned=(phase.get("grants_after")=="0" and phase.get("selected_state_bytes")=="0") if grouped else (
+        phase.get("borrowed_after")=="0" and phase.get("suspended_after")=="0" and phase.get("diagnostics")=="1")
+    if any(phase.get(key) != str(value) for key,value in fields.items()) or not returned:
         raise RuntimeError("actual vision shape or phase return differs from the server plan")
     if phase.get("weights") != str(expected["weight_bytes"]) or phase.get("compute") != str(expected["compute_bytes"]):
         raise RuntimeError("executed vision allocations differ from the planned shape")
@@ -516,7 +689,8 @@ def check_vision_fields(phase, expected, arena_mib):
     components={"graph":"graph_bytes", "operator":"operator_bytes", "library":"library_bytes", "padding":"padding_bytes"}
     if any(phase.get(key) != str(workspace[value]) for key,value in components.items()):
         raise RuntimeError("executed vision workspace components differ from the controlled plan")
-    return {key:int(phase[key]) for key in (*fields,"weights","compute",*components,"borrowed_after","suspended_after")}
+    lifetime=("grants_after","selected_state_bytes") if grouped else ("borrowed_after","suspended_after")
+    return {key:int(phase[key]) for key in (*fields,"weights","compute",*components,*lifetime)}
 
 
 def vision_plan_probe(args, candidate):
@@ -797,7 +971,9 @@ def fit(args, report_vision=False):
     report = {"arena_mib":maximum, "initial_arena_mib":args.initial_arena_mib,
               "next_mib_rejected":maximum +1 if next_rejected else None,
               "command":server_command(command_args,maximum), "uvm":False, "reserve_mib":0,
-              "context_size":args.context_size, "cache_type_k":args.cache_type_k, "cache_type_v":args.cache_type_v,
+              "context_size":args.context_size, "context_semantics":context_semantics(args),
+              "selection_profiles":(selected or {}).get("selection_profiles"),
+              "observed_context_limits":(selected or {}).get("observed_context_limits"), "cache_type_k":args.cache_type_k, "cache_type_v":args.cache_type_v,
               "spec_mode":args.spec_mode, "draft_length":args.draft_length, "images":[str(path) for path in args.image],
               "ngram":ngram_settings(args), "mixed_routes_validated":args.spec_mode == "dflash-k4v" and bool(selected and selected.get("mixed_proof")),
               "copy_path_validated":bool(selected and selected.get("mixed_proof")), "headless":args.no_webui,

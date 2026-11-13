@@ -1,3 +1,4 @@
+#include "../src/llama-context.h"
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-task.h"
 #include "ngram-map.h"
@@ -19,6 +20,40 @@ int main(int argc, char ** argv) {
     const bool k4v_readiness = argc == 2 && !std::strcmp(argv[1], "--k4v-vision-readiness");
     if (argc > 1 && !k4v_readiness) return 2;
     if (k4v_readiness) t.set_filter("k4v_vision_readiness");
+    t.test("prompt_cache_loader_publishes_only_a_successfully_restored_group_entry", [](testing & t) {
+        server_prompt cached,current;
+        for (auto token : {1,2,3}) cached.tokens.push_back(token);
+        auto requested=cached.tokens.clone();requested.push_back(4);
+        server_prompt_cache cache(1,32);
+        auto * entry=cache.alloc(cached,3,0);
+        if (!t.assert_true(entry!=nullptr)) return;
+        entry->data.main={11,12,13};
+        unsigned calls=0;
+        t.assert_true(!cache.load(current,requested,[&](server_prompt_cache_state & saved) {
+            ++calls;return saved.data.main.empty();
+        }));
+        t.assert_true(current.tokens.empty() && cache.states.size()==1 && calls==1);
+        t.assert_true(cache.load(current,requested,[&](server_prompt_cache_state & saved) {
+            ++calls;return saved.data.main==std::vector<uint8_t>({11,12,13});
+        }));
+        t.assert_true(cache.states.empty() && current.tokens.size()==3 && calls==2);
+        t.assert_true(cache.load(current,requested,[&](server_prompt_cache_state &) {++calls;return false;}));
+        t.assert_equal(2u,calls);
+    });
+    t.test("compact_prompt_checkpoints_account_for_native_state_without_copying_full_KV", [](testing & t) {
+        common_prompt_checkpoint checkpoint{};
+        t.assert_true(checkpoint.empty());
+        checkpoint.streamed=std::make_shared<llama_context_group_checkpoint>();
+        checkpoint.streamed->target.recurrent={1,2};
+        checkpoint.streamed->target.full_columns={0,1,2};
+        checkpoint.streamed->histories.resize(1);checkpoint.streamed->histories[0].tokens=3;
+        checkpoint.data_spec={3,4};
+        t.assert_true(!checkpoint.empty());
+        t.assert_equal(size_t(64),checkpoint.size());
+        checkpoint.clear();
+        t.assert_true(checkpoint.empty() && !checkpoint.streamed);
+        t.assert_equal(size_t(0),checkpoint.size());
+    });
     t.test("two_slot_vision_admission_keeps_unified_gpu_and_inherited_speculation_guards",[](testing & t) {
         for (int mode=0;mode<5;++mode) {
             auto p=qualified();p.n_parallel=2;p.kv_unified=true;p.cache_ram_mib=0;p.n_batch=p.n_ubatch=256;

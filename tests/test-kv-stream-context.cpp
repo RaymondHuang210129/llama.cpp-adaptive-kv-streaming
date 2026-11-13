@@ -2117,6 +2117,13 @@ static void test_group_vision_loans(testing & t,llama_model * model) {
     auto * parent=group->prepare_vision_parent();
     if (!t.assert_true("vision uses the group's only retained device parent",parent &&
             ggml_backend_buffer_get_size(parent)==cp.shared_device_memory_bytes && !group->context())) return;
+    llama_context_memory_create_result quote;
+    t.assert_true(group->quote_vision({65536,131072},quote));
+    t.assert_equal(size_t(196608),quote.required_bytes);
+    t.assert_equal(cp.shared_device_memory_bytes,quote.available_bytes);
+    t.assert_true(!group->quote_vision({cp.shared_device_memory_bytes,1},quote) &&
+        quote.status==llama_context_memory_create_status::insufficient_budget && quote.additional_bytes==1);
+    t.assert_true(!group->quote_vision({SIZE_MAX,1},quote) && quote.status==llama_context_memory_create_status::invalid_configuration);
     std::vector<ggml_backend_memory_lease_t> grants;
     struct release {std::vector<ggml_backend_memory_lease_t> & grants;~release() {for (auto * lease:grants) ggml_backend_memory_lease_free(lease);}} cleanup{grants};
     if (!t.assert_true(!group->lend_vision({SIZE_MAX,1},grants) && grants.empty() &&
@@ -2619,22 +2626,23 @@ static bool make_group_fixture_sources(testing & t,llama_context & context,llama
     return true;
 }
 
-static void test_owned_group_context(testing & t,llama_model * model,uint32_t queries=1,bool managed=false,bool final_output_only=false) {
+static void test_owned_group_context(testing & t,llama_model * model,uint32_t queries=1,bool managed=false,bool final_output_only=false,bool checkpoint=false,bool relocate=false,bool serialized=false,bool compact=false,bool swap=false) {
     auto cp=llama_context_default_params();
     cp.n_ctx=4096;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=2;cp.kv_unified=true;cp.swa_full=false;
     cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.n_threads=cp.n_threads_batch=4;
     const size_t vocabulary=model->vocab.n_tokens();
-    const std::vector<std::vector<llama_seq_id>> selections=queries==1 ?
+    const std::vector<std::vector<llama_seq_id>> selections=queries==1 && !relocate ?
         std::vector<std::vector<llama_seq_id>>{{0,1},{1}} : std::vector<std::vector<llama_seq_id>>{{1}};
     const auto phase=queries==1 ? llama_memory_work_phase::target_verify : llama_memory_work_phase::target_prefill;
-    for (const auto & selected : selections) {
+    for (auto selected : selections) {
+        auto token_sources=selected;const auto original_sources=selected;
         auto batch=llama_batch_init(int32_t(selected.size()*queries),0,1);
         struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{batch};
         batch.n_tokens=int32_t(selected.size()*queries);
         const auto input=[&](int step) {for (size_t source=0;source<selected.size();++source) for (uint32_t query=0;query<queries;++query) {
             const size_t row=source*queries+query;
-            batch.token[row]=llama_token(10+selected[source]*10+step*queries+query);batch.pos[row]=step*queries+query;
+            batch.token[row]=llama_token(10+token_sources[source]*10+step*queries+query);batch.pos[row]=step*queries+query;
             batch.n_seq_id[row]=1;batch.seq_id[row][0]=selected[source];batch.logits[row]=query+1==queries && (!final_output_only || step%4==3);
         }};
         std::vector<std::vector<float>> reference, restored_reference;
@@ -2660,8 +2668,10 @@ static void test_owned_group_context(testing & t,llama_model * model,uint32_t qu
         {
             auto native_params=cp;native_params.shared_device_memory_bytes=0;
             llama_context native(*model,native_params);
+            if (swap && selected.size()==2) std::reverse(token_sources.begin(),token_sources.end());
             for (size_t row=0;row<selected.size();++row) {
-                const auto & state=native_states[row];
+                const auto source=swap && selected.size()==2 ? selected.size()-1-row : row;
+                const auto & state=native_states[source];
                 if (!t.assert_equal(state.size(),llama_state_seq_set_data(&native,state.data(),state.size(),selected[row]))) return;
             }
             for (int step=4;step<8;++step) {
@@ -2674,6 +2684,7 @@ static void test_owned_group_context(testing & t,llama_model * model,uint32_t qu
                 }
             }
         }
+        token_sources=original_sources;
         cp.shared_device_memory_bytes=size_t(1024)*1024*1024;
         llama_context context(*model,cp,selected);
         std::shared_ptr<llama_kv_stream_slot_table> table;
@@ -2705,11 +2716,19 @@ static void test_owned_group_context(testing & t,llama_model * model,uint32_t qu
         t.assert_equal("pool quota counts only chosen sources",selected_live,quote.target.measurement.live_device_bytes);
         std::unique_ptr<llama_context_group> group;
         if (managed) {
-            group=llama_context_group::create(*model,cp,table);
+            group=checkpoint || compact ? llama_context_group::create(*model,cp) : llama_context_group::create(*model,cp,table);
+            if ((checkpoint || compact) && group) {
+                table=group->source_table();handles=group->source_handles();chosen.clear();
+                for (auto slot : selected) chosen.push_back(handles[slot]);
+            }
             if (!t.assert_true(group && group->activate(selection,chosen,batch,phase,1,1,&admission))) return;
         } else if (!t.assert_true(context.initialize_group_execution(table,projection,batch,phase,
                 1,1,nullptr,{},&admission))) return;
         auto * execution=managed ? group->context() : &context;
+        if (checkpoint) {
+            llama_context_group_checkpoint saved;
+            t.assert_true("live sources cannot be exported as parked checkpoints",!group->save_request(uint32_t(selected.front()),saved));
+        }
         auto * parent=execution->group_parent();if (!t.assert_true(parent!=nullptr)) return;
         ggml_backend_buffer_ptr retained(ggml_backend_buffer_retain(parent));
         t.assert_equal(cp.shared_device_memory_bytes,ggml_backend_buffer_get_size(parent));
@@ -2726,11 +2745,77 @@ static void test_owned_group_context(testing & t,llama_model * model,uint32_t qu
         if (!t.assert_true(execution->save_group_sequences(states) && states.size()==selected.size())) return;
         if (managed) {
             if (!t.assert_true(group->park() && !group->context())) return;
+            if (compact) {
+                std::vector<llama_context_group_checkpoint> saved(selected.size());
+                size_t parked_bytes=0;
+                for (size_t row=0;row<selected.size();++row) {
+                    if (!t.assert_true(group->save_request(uint32_t(selected[row]),saved[row],false))) return;
+                    t.assert_true("a live prefix checkpoint does not duplicate full host KV",saved[row].histories.front().bytes.empty());
+                    parked_bytes+=saved[row].target.recurrent.size()+saved[row].target.bounded.size()+saved[row].target.full_columns.size()*sizeof(uint32_t);
+                }
+                t.assert_equal(parked_bytes,group->parked_payload_bytes());
+                auto grown=candidates;for (auto & item : grown) item.history_tokens=4*queries;
+                llama_kv_stream_selection current;
+                if (!t.assert_true(llama_kv_stream_select({limits.group_limit,selected.size()},grown,current)==llama_kv_stream_selection_status::success)) return;
+                input(4);
+                if (!t.assert_true(group->activate(current,chosen,batch,phase,1,2) && group->context()->decode(batch)==0 && group->park())) return;
+                chosen.clear();
+                for (size_t row=0;row<selected.size();++row) {
+                    if (!t.assert_true(group->load_request(uint32_t(selected[row]),saved[row]))) return;
+                    chosen.push_back(group->source_handles()[selected[row]]);
+                }
+            }
+            if (checkpoint) {
+                std::vector<llama_context_group_checkpoint> saved(selected.size());
+                std::vector<image_writer> files(selected.size());
+                if (serialized) for (size_t row=0;row<selected.size();++row)
+                    if (!t.assert_true("encode a parked checkpoint without physical addresses",group->write_request(uint32_t(selected[row]),files[row]))) return;
+                for (size_t row=0;row<selected.size();++row)
+                    if (!t.assert_true("export a fully parked request",group->save_request(uint32_t(selected[row]),saved[row]))) return;
+                group.reset();
+                group=llama_context_group::create(*model,cp);
+                if (!t.assert_true(group!=nullptr)) return;
+                table=group->source_table();handles=group->source_handles();chosen.clear();
+                for (size_t row=0;row<selected.size();++row) {
+                    if (relocate) {selected[row]=0;candidates[row].id=0;}
+                    const auto slot=uint32_t(selected[row]);
+                    const auto source=swap && selected.size()==2 ? selected.size()-1-row : row;
+                    std::shared_ptr<llama_kv_stream_logical_cache> cache;
+                    if (!t.assert_true(table->get(group->source_handles()[slot],0,cache))) return;
+                    const auto before=cache->checkpoint();
+                    auto invalid=saved[source];invalid.histories.front().bytes.pop_back();
+                    t.assert_true("reject truncated host history before changing the destination",!group->load_request(slot,invalid));
+                    invalid=saved[source];++invalid.target.tokens;
+                    t.assert_true("reject mismatched native state before changing the destination",!group->load_request(slot,invalid));
+                    invalid=saved[source];invalid.target.full_columns.back()=invalid.target.full_columns.front();
+                    t.assert_true("reject duplicate native columns before changing the destination",!group->load_request(slot,invalid));
+                    invalid=saved[source];
+                    if (!invalid.target.recurrent.empty()) invalid.target.recurrent.clear();
+                    else invalid.target.bounded.clear();
+                    t.assert_true("reject a missing native persistent role before retiring the destination",!group->load_request(slot,invalid));
+                    t.assert_equal(before.generation,cache->identity().generation);
+                    t.assert_equal(before.tokens,cache->tokens());
+                    if (serialized) {
+                        const auto & bytes=files[row].bytes;
+                        auto bad=bytes;bad.front()^=1;image_reader invalid(bad);
+                        t.assert_true("reject a foreign checkpoint header",!group->read_request(slot,invalid,bad.size()));
+                        image_reader truncated(bytes);
+                        t.assert_true("reject a truncated checkpoint before changing the destination",!group->read_request(slot,truncated,bytes.size()-1));
+                        t.assert_equal(before.generation,cache->identity().generation);
+                        image_reader input(bytes);
+                        if (!t.assert_true("decode checkpoint into fresh addresses and slot ownership",group->read_request(slot,input,bytes.size()))) return;
+                        t.assert_equal(bytes.size(),input.n_bytes());
+                    } else if (!t.assert_true("import into a fresh group namespace",group->load_request(slot,saved[source]))) return;
+                    chosen.push_back(group->source_handles()[slot]);
+                }
+            }
+            if (swap && selected.size()==2) std::reverse(token_sources.begin(),token_sources.end());
         } else if (!t.assert_true(context.detach_group_execution() && !context.group_parent() && context.group_storage_pending())) return;
         std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> reuse(
             ggml_backend_memory_arena_new_from_buffer(retained.get()),ggml_backend_memory_arena_free);
         if (!t.assert_true(reuse && ggml_backend_memory_arena_begin(reuse.get(),0) && ggml_backend_memory_arena_commit(reuse.get()))) return;
         reuse.reset();
+        if (checkpoint) retained.reset();
         for (auto & candidate : candidates) candidate.history_tokens=4*queries;
         auto restored_projection=std::make_shared<llama_kv_stream_slot_projection>();
         if (!t.assert_true(llama_kv_stream_select({limits.group_limit,selected.size()},candidates,selection)==
@@ -2752,7 +2837,7 @@ static void test_owned_group_context(testing & t,llama_model * model,uint32_t qu
         } else if (!t.assert_true(restored.initialize_group_execution(table,restored_projection,batch,phase,
                 1,2,retained.get(),states,&admission))) return;
         auto * resumed=managed ? group->context() : &restored;
-        if (!t.assert_true(resumed->group_parent()==retained.get())) return;
+        if (!checkpoint && !t.assert_true(resumed->group_parent()==retained.get())) return;
         for (int step=4;step<8;++step) {
             input(step);if (!t.assert_true(resumed->decode(batch)==0)) return;
             for (size_t row=0;row<selected.size();++row) {
@@ -2765,6 +2850,104 @@ static void test_owned_group_context(testing & t,llama_model * model,uint32_t qu
         t.assert_true(managed ? group->park() : restored.detach_group_execution());
         cp.shared_device_memory_bytes=0;
     }
+}
+
+static void test_group_checkpoint_large_swap(testing & t,llama_model * model) {
+    auto cp=llama_context_default_params();cp.n_ctx=4096;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=2;cp.kv_unified=true;cp.swa_full=false;
+    cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;cp.n_threads=cp.n_threads_batch=4;
+    cp.shared_device_memory_bytes=size_t(1024)*1024*1024;
+    auto group=llama_context_group::create(*model,cp);if (!t.assert_true(group!=nullptr)) return;
+    group->metadata_context()->set_embeddings_nextn(true,false);
+    const std::array<uint32_t,2> lengths{513,641};
+    std::array<std::vector<uint8_t>,2> native_states;
+    std::array<llama_context_group_checkpoint,2> snapshots;
+    std::array<llama_token,2> first{};
+    const size_t vocabulary=model->vocab.n_tokens(),hidden=model->hparams.n_embd_out();uint64_t revision=0;
+    auto batch=llama_batch_init(256,0,1);
+    struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{batch};
+    for (uint32_t slot=0;slot<2;++slot) {
+        uint32_t past=0;
+        for (auto width : {256u,lengths[slot]-512,252u,4u}) {
+            batch.n_tokens=int32_t(width);
+            for (uint32_t row=0;row<width;++row) {
+                batch.token[row]=llama_token(slot ? 70+(past+row)%31 : 10+(past+row)%53);batch.pos[row]=llama_pos(past+row);
+                batch.n_seq_id[row]=1;batch.seq_id[row][0]=llama_seq_id(slot);batch.logits[row]=row+1==width;
+            }
+            llama_kv_stream_selection selection;
+            if (!t.assert_true(llama_kv_stream_select({cp.n_ctx,1},{{slot,past}},selection)==llama_kv_stream_selection_status::success) ||
+                    !t.assert_true(group->activate(selection,{group->source_handles()[slot]},batch,llama_memory_work_phase::target_prefill,1,++revision))) return;
+            auto * context=group->context();if (!t.assert_equal(0,context->decode(batch))) return;
+            past+=width;
+            if (past==lengths[slot]) {
+                const auto * logits=llama_get_logits_ith(context,int32_t(width-1));
+                if (!t.assert_true(logits!=nullptr)) return;
+                first[slot]=llama_token(std::max_element(logits,logits+vocabulary)-logits);
+                auto & state=native_states[slot];state.resize(llama_state_seq_get_size(context,llama_seq_id(slot)));
+                if (!t.assert_true(!state.empty() && llama_state_seq_get_data(context,state.data(),state.size(),llama_seq_id(slot))==state.size())) return;
+            }
+            if (!t.assert_true(group->park())) return;
+        }
+        if (!t.assert_true(group->save_request(slot,snapshots[slot]))) return;
+    }
+    group.reset();
+    struct record {std::vector<float> logits,hidden;llama_token token;};
+    using run_records=std::vector<std::array<record,2>>;
+    std::array<run_records,2> references;
+    for (uint32_t swapped=0;swapped<2;++swapped) {
+        const std::array<uint32_t,2> sources=swapped ? std::array<uint32_t,2>{1,0} : std::array<uint32_t,2>{0,1};
+        const auto input=[&](uint32_t step,const std::array<llama_token,2> & tokens) {
+            batch.n_tokens=2;
+            for (uint32_t slot=0;slot<2;++slot) {
+                batch.token[slot]=tokens[slot];batch.pos[slot]=llama_pos(lengths[sources[slot]]+step);
+                batch.n_seq_id[slot]=1;batch.seq_id[slot][0]=llama_seq_id(slot);batch.logits[slot]=true;
+            }
+        };
+        {
+            auto native_params=cp;native_params.shared_device_memory_bytes=0;llama_context native(*model,native_params);
+            native.set_embeddings_nextn(true,false);
+            for (uint32_t slot=0;slot<2;++slot) {
+                const auto & bytes=native_states[sources[slot]];
+                if (!t.assert_equal(bytes.size(),llama_state_seq_set_data(&native,bytes.data(),bytes.size(),llama_seq_id(slot)))) return;
+            }
+            std::array<llama_token,2> tokens{first[sources[0]],first[sources[1]]};
+            for (uint32_t step=0;step<15;++step) {
+                input(step,tokens);if (!t.assert_equal(0,native.decode(batch))) return;
+                std::array<record,2> rows;
+                for (uint32_t slot=0;slot<2;++slot) {
+                    const auto * logits=llama_get_logits_ith(&native,int32_t(slot));const auto * values=llama_get_embeddings_nextn_ith(&native,int32_t(slot));
+                    if (!t.assert_true(logits && values)) return;
+                    rows[slot].logits.assign(logits,logits+vocabulary);rows[slot].hidden.assign(values,values+hidden);
+                    rows[slot].token=tokens[slot]=llama_token(std::max_element(logits,logits+vocabulary)-logits);
+                }
+                references[swapped].push_back(std::move(rows));
+            }
+        }
+        group=llama_context_group::create(*model,cp);if (!t.assert_true(group!=nullptr)) return;
+        group->metadata_context()->set_embeddings_nextn(true,false);
+        for (uint32_t slot=0;slot<2;++slot) if (!t.assert_true(group->load_request(slot,snapshots[sources[slot]]))) return;
+        llama_kv_stream_selection selection;
+        if (!t.assert_true(llama_kv_stream_select({cp.n_ctx,2},{{0,lengths[sources[0]]},{1,lengths[sources[1]]}},selection)==llama_kv_stream_selection_status::success)) return;
+        std::array<llama_token,2> tokens{first[sources[0]],first[sources[1]]};input(0,tokens);
+        if (!t.assert_true(group->activate(selection,group->source_handles(),batch,llama_memory_work_phase::target_verify,1,++revision))) return;
+        for (uint32_t step=0;step<15;++step) {
+            input(step,tokens);auto * context=group->context();if (!t.assert_equal(0,context->decode(batch))) return;
+            for (uint32_t slot=0;slot<2;++slot) {
+                const auto & reference=references[swapped][step][slot];
+                const auto * logits=llama_get_logits_ith(context,int32_t(slot));const auto * values=llama_get_embeddings_nextn_ith(context,int32_t(slot));
+                if (!t.assert_true("relocated full logits match ordinary native checkpoint composition",logits && !std::memcmp(logits,reference.logits.data(),vocabulary*sizeof(float))) ||
+                        !t.assert_true("relocated full hidden rows match ordinary native checkpoint composition",values && !std::memcmp(values,reference.hidden.data(),hidden*sizeof(float)))) return;
+                tokens[slot]=reference.token;
+            }
+        }
+        if (!t.assert_true(group->park())) return;
+        group.reset();
+    }
+    size_t different=0;
+    for (uint32_t step=0;step<15;++step) for (uint32_t source=0;source<2;++source) {
+        const auto & original=references[0][step][source], & moved=references[1][step][1-source];
+        if (original.logits!=moved.logits) ++different;
+    }
+    t.out<<"native slot relocation lengths=513,641 full_records=60 native_layout_different_rows="<<different<<std::endl;
 }
 
 static void test_group_reselection(testing & t,llama_model * model) {
@@ -8872,6 +9055,30 @@ int main(int argc,char ** argv) {
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-reselection-only");})) {
         t.test("Group_reselection_parks_the_peer_and_resumes_both_with_native_exact_results",[&](testing & t) {test_group_reselection(t,model.get());});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-checkpoint-large-swap-only");})) {
+        t.test("Unequal_restored_histories_match_native_composition_before_and_after_slot_relocation",[&](testing & t) {test_group_checkpoint_large_swap(t,model.get());});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-checkpoint-swap-only");})) {
+        t.test("Swapped_group_histories_match_native_checkpoints_with_the_same_destination_column_order",[&](testing & t) {test_owned_group_context(t,model.get(),1,true,false,true,false,false,false,true);});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-checkpoint-prefix-only");})) {
+        t.test("Group_prefix_checkpoint_restores_native_state_without_copying_full_host_history",[&](testing & t) {test_owned_group_context(t,model.get(),1,true,false,false,false,false,true);});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-checkpoint-codec-only");})) {
+        t.test("Group_checkpoint_file_relocates_native_state_without_saved_device_or_host_addresses",[&](testing & t) {test_owned_group_context(t,model.get(),1,true,false,true,true,true);});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-checkpoint-relocate-only");})) {
+        t.test("Group_checkpoint_relocates_native_state_and_history_to_another_slot",[&](testing & t) {test_owned_group_context(t,model.get(),1,true,false,true,true);});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-checkpoint-only");})) {
+        t.test("Group_checkpoint_reconstructs_native_state_and_history_at_new_host_addresses",[&](testing & t) {test_owned_group_context(t,model.get(),1,true,false,true);});
         return t.summary();
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-manager-only");})) {

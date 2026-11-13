@@ -8030,18 +8030,29 @@ ggml_backend_buffer_t llama_context_group::prepare_vision_parent() {
     } catch (...) {return nullptr;}
 }
 
-bool llama_context_group::lend_vision(const std::vector<size_t> & bytes,std::vector<ggml_backend_memory_lease_t> & output) {
-    if (!impl || impl->active || impl->active_auxiliary || impl->vision_lent || !impl->parent || bytes.empty() || !output.empty()) return false;
+bool llama_context_group::quote_vision(const std::vector<size_t> & bytes,llama_context_memory_create_result & result) const {
+    result={};
+    if (!impl || impl->active || impl->active_auxiliary || impl->vision_lent || !impl->parent || bytes.empty()) return false;
     const auto capacity=ggml_backend_buffer_get_size(impl->parent.get());
     const auto alignment=ggml_backend_buffer_get_alignment(impl->parent.get());
     if (!alignment) return false;
     size_t cursor=0;
-    for (const auto size:bytes) {
+    for (const auto size : bytes) {
         if (!size || cursor>SIZE_MAX-(alignment-1)) return false;
         cursor=(cursor+alignment-1)/alignment*alignment;
-        if (cursor>capacity || size>capacity-cursor) return false;
+        if (size>SIZE_MAX-cursor) return false;
         cursor+=size;
     }
+    result.available_bytes=capacity;result.required_bytes=cursor;
+    result.additional_bytes=cursor>capacity ? cursor-capacity : 0;
+    result.status=cursor>capacity ? llama_context_memory_create_status::insufficient_budget : llama_context_memory_create_status::success;
+    return result.status==llama_context_memory_create_status::success;
+}
+
+bool llama_context_group::lend_vision(const std::vector<size_t> & bytes,std::vector<ggml_backend_memory_lease_t> & output) {
+    llama_context_memory_create_result quote;
+    if (!output.empty() || !quote_vision(bytes,quote)) return false;
+    const auto alignment=ggml_backend_buffer_get_alignment(impl->parent.get());
     std::vector<ggml_backend_memory_lease_t> candidate;
     bool committed=false;
     const auto fail=[&] {
@@ -8343,6 +8354,296 @@ llama_context * llama_context_group::metadata_context() const noexcept {return i
 llama_context * llama_context_group::auxiliary_metadata_context() const noexcept {return impl ? impl->auxiliary_metadata.get() : nullptr;}
 std::shared_ptr<llama_kv_stream_slot_table> llama_context_group::source_table() const noexcept {return impl ? impl->table : nullptr;}
 const std::vector<llama_kv_stream_slot_handle> & llama_context_group::source_handles() const noexcept {return impl->handles;}
+
+bool llama_context_group::save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes) const {
+    if (!impl || impl->active || impl->vision_lent || slot>=impl->handles.size()) return false;
+    try {
+        llama_context_group_checkpoint saved;
+        saved.model=impl->model;saved.auxiliary_model=impl->block_model ? impl->block_model : impl->shared_model;saved.slot=slot;
+        const auto handle=impl->handles[slot];
+        for (uint32_t role=0;role<=impl->params.kv_stream_auxiliary_layers;++role) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;std::shared_ptr<llama_kv_cells> cells;
+            llama_kv_stream_logical_snapshot history;
+            if (!impl->table->get(handle,role,cache) || !cache->save(history,copy_bytes) ||
+                    !impl->table->get_cells(handle,role,cells) || cells->get_used()!=history.tokens) return false;
+            saved.histories.push_back(std::move(history));saved.cells.push_back(std::make_shared<llama_kv_cells>(*cells));
+        }
+        saved.target=impl->parked[slot];saved.auxiliary=impl->parked_auxiliary[slot];
+        const auto & source=saved.histories.front();
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;
+        if (!impl->table->get(handle,0,cache)) return false;
+        if (source.tokens && (saved.target.model!=impl->model || saved.target.sequence!=llama_seq_id(slot) ||
+                saved.target.request_epoch!=handle.generation || saved.target.tokens!=source.tokens ||
+                saved.target.cache_id!=cache->identity().id || saved.target.cache_generation!=cache->identity().generation)) return false;
+        output=std::move(saved);return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+bool llama_context_group::load_request(uint32_t slot,const llama_context_group_checkpoint & saved) {
+    if (!impl || impl->active || impl->vision_lent || slot>=impl->handles.size() || saved.slot>=impl->handles.size() ||
+            saved.model!=impl->model || saved.auxiliary_model!=(impl->block_model ? impl->block_model : impl->shared_model) ||
+            saved.histories.size()!=size_t(1+impl->params.kv_stream_auxiliary_layers) || saved.cells.size()!=saved.histories.size()) return false;
+    try {
+        auto target=saved.target,auxiliary=saved.auxiliary;
+        std::vector<std::shared_ptr<llama_kv_stream_logical_cache>> caches;
+        std::vector<std::shared_ptr<llama_kv_cells>> cells,relocated;
+        for (uint32_t role=0;role<saved.histories.size();++role) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;std::shared_ptr<llama_kv_cells> metadata;
+            const auto & history=saved.histories[role];
+            if (!impl->table->get(impl->handles[slot],role,cache) || !cache->ready() || !saved.cells[role] ||
+                    !impl->table->get_cells(impl->handles[slot],role,metadata) || saved.cells[role]->size()!=metadata->size() ||
+                    history.tokens>metadata->size() || saved.cells[role]->get_used()!=history.tokens) return false;
+            for (uint32_t row=0;row<metadata->size();++row) {
+                const auto & source=*saved.cells[role];
+                if ((row<history.tokens && (source.is_empty(row) || source.seq_count(row)!=1 || !source.seq_has(row,llama_seq_id(saved.slot)))) ||
+                        (row>=history.tokens && !source.is_empty(row))) return false;
+            }
+            if (!cache->accepts(history)) return false;
+            auto restored=std::make_shared<llama_kv_cells>(*saved.cells[role]);
+            if (slot!=saved.slot) for (uint32_t row=0;row<history.tokens;++row) {
+                restored->seq_add(row,llama_seq_id(slot));restored->seq_rm(row,llama_seq_id(saved.slot));
+            }
+            relocated.push_back(std::move(restored));caches.push_back(std::move(cache));cells.push_back(std::move(metadata));
+        }
+        const auto validate=[&](const llama_context_group_sequence_state & state,const llama_model * model,
+                const llama_kv_stream_logical_snapshot & history,const llama_context * metadata,bool block) {
+            if (state.model!=model || state.sequence!=llama_seq_id(saved.slot) || state.tokens!=history.tokens ||
+                    state.full_columns.size()!=history.tokens || !metadata) return false;
+            const auto & resources=metadata->get_kv_resources();
+            if (history.tokens && (bool(resources.recurrent)!=!state.recurrent.empty() ||
+                    bool(block || resources.bounded)!=!state.bounded.empty())) return false;
+            std::vector<bool> seen(history.tokens,false);
+            for (auto row : state.full_columns) {
+                if (row>=seen.size() || seen[row]) return false;
+                seen[row]=true;
+            }
+            return true;
+        };
+        if (saved.histories.front().tokens && !validate(target,impl->model,saved.histories.front(),impl->metadata.get(),false)) return false;
+        if (impl->params.kv_stream_auxiliary_layers || impl->block_model) {
+            const auto role=impl->params.kv_stream_auxiliary_layers ? 1 : 0;
+            if (saved.histories[role].tokens && !validate(auxiliary,impl->block_model ? impl->block_model : impl->model,
+                    saved.histories[role],impl->auxiliary_metadata.get(),impl->block_model!=nullptr)) return false;
+            if (impl->block_model && auxiliary.full_columns!=target.full_columns) return false;
+        } else if (auxiliary.model || !auxiliary.recurrent.empty() || !auxiliary.bounded.empty() || !auxiliary.full_columns.empty()) return false;
+        const bool prefix=saved.histories.front().prefix!=nullptr;
+        for (const auto & history : saved.histories) if (bool(history.prefix)!=prefix) return false;
+        if (prefix) {
+            llama_kv_stream_slot_handle next;
+            if (!impl->table->advance(impl->handles[slot],next)) return false;
+            impl->handles[slot]=next;
+        } else if (!reset_request(slot)) return false;
+        for (size_t role=0;role<caches.size();++role) {
+            if (!caches[role]->load(saved.histories[role])) return false;
+            *cells[role]=std::move(*relocated[role]);
+        }
+        const auto handle=impl->handles[slot];
+        const auto rebind=[&](llama_context_group_sequence_state & state,uint32_t role) {
+            if (!state.model) return;
+            state.sequence=llama_seq_id(slot);state.request_epoch=handle.generation;
+            state.cache_id=caches[role]->identity().id;state.cache_generation=caches[role]->identity().generation;
+        };
+        rebind(target,0);rebind(auxiliary,impl->params.kv_stream_auxiliary_layers ? 1 : 0);
+        impl->parked[slot]=std::move(target);impl->parked_auxiliary[slot]=std::move(auxiliary);return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+namespace {
+constexpr uint32_t group_checkpoint_magic=0x47534350;
+constexpr uint32_t group_checkpoint_version=2;
+
+std::array<uint64_t,8> group_checkpoint_model(const llama_model * model) {
+    if (!model) return {};
+    return {uint64_t(model->arch),uint64_t(model->ftype()),model->n_elements(),model->size(),
+        model->hparams.n_ctx_train,model->hparams.n_layer(),model->hparams.n_embd,model->vocab.n_tokens()};
+}
+}
+
+bool llama_context_group::write_request(uint32_t slot,llama_io_write_i & io) const {
+    llama_context_group_checkpoint saved;
+    if (!save_request(slot,saved,false)) return false;
+    return write_checkpoint(saved,io,true);
+}
+
+bool llama_context_group::write_checkpoint(const llama_context_group_checkpoint & saved,llama_io_write_i & io,bool copy_bytes) const {
+    if (!impl || impl->active || impl->vision_lent || saved.slot>=impl->handles.size() || saved.model!=impl->model) return false;
+    try {
+        const std::array<uint32_t,3> header={group_checkpoint_magic,group_checkpoint_version,saved.slot};
+        io.write(header.data(),sizeof(header));
+        for (const auto * model : {saved.model,saved.auxiliary_model}) {
+            const auto signature=group_checkpoint_model(model);io.write(signature.data(),sizeof(signature));
+        }
+        const std::array<uint32_t,3> modes={impl->params.n_rs_seq,impl->params.kv_stream_auxiliary_layers,impl->prediction_rows};
+        io.write(modes.data(),sizeof(modes));
+        for (size_t role=0;role<saved.histories.size();++role) {
+            const auto & history=saved.histories[role];const auto & shape=history.shape;
+            const std::array<uint64_t,8> descriptor={uint64_t(shape.type_k),uint64_t(shape.type_v),uint64_t(shape.head_dim_k),
+                uint64_t(shape.head_dim_v),uint64_t(shape.heads),uint64_t(shape.page_tokens),shape.alignment,history.layers};
+            io.write(descriptor.data(),sizeof(descriptor));
+            const uint64_t tokens=history.tokens;io.write(&tokens,sizeof(tokens));
+            const uint32_t copied=copy_bytes;io.write(&copied,sizeof(copied));
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!impl->table->get(impl->handles[saved.slot],uint32_t(role),cache) || !cache->accepts(history) || (!copy_bytes && !history.prefix)) return false;
+            if (copy_bytes) {
+                if (history.prefix) {
+                    for (uint32_t layer=0;layer<history.layers;++layer) {
+                        llama_kv_stream_host_layer planes;if (!cache->host()->layer(layer,planes)) return false;
+                        io.write(planes.k,history.tokens*cache->host()->layout().k_token_bytes);
+                        io.write(planes.v,history.tokens*cache->host()->layout().v_token_bytes);
+                    }
+                } else io.write(history.bytes.data(),history.bytes.size());
+            }
+            for (uint32_t row=0;row<history.tokens;++row) {
+                const auto position=saved.cells[role]->pos_get(row);const auto ext=saved.cells[role]->ext_get(row);
+                io.write(&position,sizeof(position));io.write(&ext.x,sizeof(ext.x));io.write(&ext.y,sizeof(ext.y));io.write(&ext.tok,sizeof(ext.tok));
+            }
+        }
+        for (const auto * state : {&saved.target,&saved.auxiliary}) {
+            const uint32_t present=state->model!=nullptr;io.write(&present,sizeof(present));
+            if (!present) continue;
+            const uint64_t tokens=state->tokens;io.write(&tokens,sizeof(tokens));io.write(&state->draft_position,sizeof(state->draft_position));
+            for (const auto * bytes : {&state->recurrent,&state->bounded}) {
+                const uint64_t size=bytes->size();io.write(&size,sizeof(size));io.write(bytes->data(),bytes->size());
+            }
+            const uint64_t columns=state->full_columns.size();io.write(&columns,sizeof(columns));
+            io.write(state->full_columns.data(),state->full_columns.size()*sizeof(uint32_t));
+        }
+        return true;
+    } catch (const std::exception &) {return false;}
+}
+
+bool llama_context_group::read_request(uint32_t slot,llama_io_read_i & io,size_t available) {
+    llama_context_group_checkpoint saved;
+    return read_checkpoint(slot,io,available,saved) && load_request(slot,saved);
+}
+
+bool llama_context_group::read_checkpoint(uint32_t slot,llama_io_read_i & io,size_t available,
+        llama_context_group_checkpoint & output,bool allow_prefix) {
+    if (!impl || impl->active || impl->vision_lent || slot>=impl->handles.size()) return false;
+    try {
+        const size_t start=io.n_bytes();
+        const auto read=[&](void * destination,size_t bytes) {
+            const auto consumed=io.n_bytes()-start;
+            if (consumed>available || bytes>available-consumed) throw std::runtime_error("truncated group checkpoint");
+            if (bytes) io.read(destination,bytes);
+        };
+        std::array<uint32_t,3> header{};read(header.data(),sizeof(header));
+        if (header[0]!=group_checkpoint_magic || header[1]!=group_checkpoint_version || header[2]>=impl->handles.size()) return false;
+        llama_context_group_checkpoint saved;saved.slot=header[2];saved.model=impl->model;
+        saved.auxiliary_model=impl->block_model ? impl->block_model : impl->shared_model;
+        for (const auto * model : {saved.model,saved.auxiliary_model}) {
+            std::array<uint64_t,8> signature{};read(signature.data(),sizeof(signature));
+            if (signature!=group_checkpoint_model(model)) return false;
+        }
+        std::array<uint32_t,3> modes{};read(modes.data(),sizeof(modes));
+        if (modes!=std::array<uint32_t,3>{impl->params.n_rs_seq,impl->params.kv_stream_auxiliary_layers,impl->prediction_rows}) return false;
+        for (uint32_t role=0;role<=impl->params.kv_stream_auxiliary_layers;++role) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;std::shared_ptr<llama_kv_cells> cells;
+            if (!impl->table->get(impl->handles[slot],role,cache) || !impl->table->get_cells(impl->handles[slot],role,cells)) return false;
+            const auto & shape=cache->host()->config().shape;
+            const std::array<uint64_t,8> expected={uint64_t(shape.type_k),uint64_t(shape.type_v),uint64_t(shape.head_dim_k),
+                uint64_t(shape.head_dim_v),uint64_t(shape.heads),uint64_t(shape.page_tokens),shape.alignment,cache->host()->config().layers};
+            std::array<uint64_t,8> descriptor{};read(descriptor.data(),sizeof(descriptor));
+            uint64_t tokens;read(&tokens,sizeof(tokens));
+            if (descriptor!=expected || tokens>cache->host()->config().context_tokens) return false;
+            const auto & layout=cache->host()->layout();
+            if (layout.k_token_bytes>SIZE_MAX-layout.v_token_bytes) return false;
+            const size_t stride=layout.k_token_bytes+layout.v_token_bytes;
+            if ((stride && tokens>SIZE_MAX/stride) || (tokens && stride && descriptor[7]>SIZE_MAX/(tokens*stride))) return false;
+            const size_t bytes=size_t(tokens)*stride*descriptor[7];
+            uint32_t copied;read(&copied,sizeof(copied));
+            if (copied>1 || (!copied && !allow_prefix)) return false;
+            const auto consumed=io.n_bytes()-start;
+            if (consumed>available || (copied && bytes>available-consumed)) return false;
+            llama_kv_stream_logical_snapshot history;history.shape=shape;history.layers=uint32_t(descriptor[7]);history.tokens=size_t(tokens);
+            if (copied) {history.bytes.resize(bytes);read(history.bytes.data(),bytes);}
+            else if (!cache->save_prefix(size_t(tokens),history)) return false;
+            auto metadata=std::make_shared<llama_kv_cells>();metadata->resize(cells->size());
+            for (uint32_t row=0;row<tokens;++row) {
+                llama_pos position;llama_kv_cell_ext ext;
+                read(&position,sizeof(position));read(&ext.x,sizeof(ext.x));read(&ext.y,sizeof(ext.y));read(&ext.tok,sizeof(ext.tok));
+                if (position<0 || ext.x<0 || ext.y<0 || (ext.tok!=LLAMA_TOKEN_NULL && (ext.tok<0 || uint32_t(ext.tok)>=impl->model->vocab.n_tokens()))) return false;
+                if (!copied && (cells->is_empty(row) || cells->pos_get(row)!=position ||
+                        cells->ext_get(row).x!=ext.x || cells->ext_get(row).y!=ext.y || cells->ext_get(row).tok!=ext.tok)) return false;
+                metadata->pos_set(row,position);metadata->seq_add(row,llama_seq_id(saved.slot));metadata->ext_set(row,ext);
+            }
+            saved.histories.push_back(std::move(history));saved.cells.push_back(std::move(metadata));
+        }
+        const uint64_t metadata_limit=64*(uint64_t(impl->table->limits().slot_limit)+impl->model->hparams.n_layer()+1);
+        if (metadata_limit>SIZE_MAX-impl->params.shared_device_memory_bytes) return false;
+        const size_t native_limit=impl->params.shared_device_memory_bytes+size_t(metadata_limit);
+        for (auto * state : {&saved.target,&saved.auxiliary}) {
+            uint32_t present;read(&present,sizeof(present));if (present>1) return false;
+            if (!present) continue;
+            state->model=state==&saved.target || impl->params.kv_stream_auxiliary_layers ? impl->model : saved.auxiliary_model;
+            if (!state->model) return false;
+            state->sequence=llama_seq_id(saved.slot);
+            uint64_t tokens;read(&tokens,sizeof(tokens));
+            if (tokens>impl->table->limits().slot_limit) return false;
+            state->tokens=size_t(tokens);read(&state->draft_position,sizeof(state->draft_position));
+            for (auto * bytes : {&state->recurrent,&state->bounded}) {
+                uint64_t size;read(&size,sizeof(size));const auto consumed=io.n_bytes()-start;
+                if (size>native_limit || consumed>available || size>available-consumed) return false;
+                bytes->resize(size_t(size));read(bytes->data(),bytes->size());
+            }
+            uint64_t columns;read(&columns,sizeof(columns));const auto consumed=io.n_bytes()-start;
+            if (columns!=tokens || columns>SIZE_MAX/sizeof(uint32_t) || consumed>available || columns*sizeof(uint32_t)>available-consumed) return false;
+            state->full_columns.resize(size_t(columns));read(state->full_columns.data(),state->full_columns.size()*sizeof(uint32_t));
+        }
+        if (saved.slot!=slot) {
+            for (size_t role=0;role<saved.cells.size();++role) for (uint32_t row=0;row<saved.histories[role].tokens;++row) {
+                saved.cells[role]->seq_add(row,llama_seq_id(slot));saved.cells[role]->seq_rm(row,llama_seq_id(saved.slot));
+            }
+            for (auto * state : {&saved.target,&saved.auxiliary}) if (state->model) state->sequence=llama_seq_id(slot);
+            saved.slot=slot;
+        }
+        output=std::move(saved);return true;
+    } catch (const std::exception &) {return false;}
+}
+
+size_t llama_context_group_checkpoint::payload_size() const noexcept {
+    size_t bytes=0;
+    const auto add=[&](size_t count) {bytes=count>SIZE_MAX-bytes ? SIZE_MAX : bytes+count;};
+    for (const auto & history : histories) {
+        add(history.bytes.size());
+        if (history.tokens>SIZE_MAX/(4*sizeof(int32_t))) return SIZE_MAX;
+        add(history.tokens*4*sizeof(int32_t));
+    }
+    for (const auto * state : {&target,&auxiliary}) {
+        add(state->recurrent.size());add(state->bounded.size());
+        if (state->full_columns.size()>SIZE_MAX/sizeof(uint32_t)) return SIZE_MAX;
+        add(state->full_columns.size()*sizeof(uint32_t));
+    }
+    return bytes;
+}
+
+size_t llama_context_group::parked_payload_bytes() const noexcept {
+    if (!impl) return 0;
+    size_t bytes=0;
+    for (const auto * states : {&impl->parked,&impl->parked_auxiliary}) for (const auto & state : *states)
+        bytes+=state.recurrent.size()+state.bounded.size()+state.full_columns.size()*sizeof(uint32_t);
+    return bytes;
+}
+
+bool llama_context_group::advance_request(uint32_t slot) {
+    if (!impl || impl->active || impl->vision_lent || slot>=impl->handles.size()) return false;
+    const auto handle=impl->handles[slot];
+    const auto valid=[&](const llama_context_group_sequence_state & state,const llama_model * model,uint32_t role) {
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;
+        if (!impl->table->get(handle,role,cache) || !cache->ready()) return false;
+        return !cache->tokens() || (state.model==model && state.sequence==llama_seq_id(slot) && state.request_epoch==handle.generation &&
+            state.cache_id==cache->identity().id && state.cache_generation==cache->identity().generation && state.tokens==cache->tokens());
+    };
+    if (!valid(impl->parked[slot],impl->model,0) ||
+            (impl->params.kv_stream_auxiliary_layers && !valid(impl->parked_auxiliary[slot],impl->model,1)) ||
+            (impl->block_model && !valid(impl->parked_auxiliary[slot],impl->block_model,0))) return false;
+    llama_kv_stream_slot_handle next;
+    if (!impl->table->advance(impl->handles[slot],next)) return false;
+    impl->handles[slot]=next;
+    if (impl->parked[slot].model) impl->parked[slot].request_epoch=next.generation;
+    if (impl->parked_auxiliary[slot].model) impl->parked_auxiliary[slot].request_epoch=next.generation;
+    return true;
+}
 
 bool llama_context_group::reset_request(uint32_t slot) {
     if (!impl || impl->active || impl->vision_lent || slot>=impl->handles.size() || impl->handles[slot].generation==UINT64_MAX) return false;

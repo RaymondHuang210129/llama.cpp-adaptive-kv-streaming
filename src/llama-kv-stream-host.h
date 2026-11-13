@@ -54,6 +54,8 @@ public:
     size_t stride() const noexcept;
     size_t bytes() const noexcept;
     size_t committed_bytes() const noexcept;
+    // Explicit demand-backed registrations; eager buffers are owned by their backend allocator.
+    size_t registered_bytes() const noexcept;
     ggml_backend_buffer_type_t buffer_type() const noexcept;
     ggml_backend_buffer_t buffer() const noexcept;
     bool clear(uint8_t value = 0);

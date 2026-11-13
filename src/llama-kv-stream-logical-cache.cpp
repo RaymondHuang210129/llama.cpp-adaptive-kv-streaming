@@ -4,12 +4,15 @@
 #include "llama-memory-phase.h"
 
 #include <new>
+#include <cstring>
+#include <algorithm>
 #include <utility>
 
 llama_kv_stream_logical_cache::llama_kv_stream_logical_cache(std::shared_ptr<llama_kv_stream_host> host) :
     backing(std::move(host)) {}
 
 llama_kv_stream_logical_cache::~llama_kv_stream_logical_cache() {
+    invalidate_prefixes(0,true);
     if (active_writer) {
         try { drain_generated(); } catch (...) {}
     }
@@ -46,6 +49,85 @@ bool llama_kv_stream_logical_cache::ready() const noexcept {
     return !failed && backing->valid() && !pending.pending() && !active_writer &&
         authoritative->generation() == expected_generation && !publications->failed() && !publications->pending() &&
         publications->frontiers().committed == committed;
+}
+
+static bool logical_snapshot_bytes(const llama_kv_stream_host & host, size_t tokens, size_t & bytes) {
+    const auto & layout=host.layout();
+    if (tokens>host.config().context_tokens || layout.k_token_bytes>SIZE_MAX-layout.v_token_bytes) return false;
+    const size_t stride=layout.k_token_bytes+layout.v_token_bytes;
+    if (stride && tokens>SIZE_MAX/stride) return false;
+    const size_t layer_bytes=tokens*stride;
+    if (layer_bytes && host.config().layers>SIZE_MAX/layer_bytes) return false;
+    bytes=layer_bytes*host.config().layers;return true;
+}
+
+bool llama_kv_stream_logical_cache::save(llama_kv_stream_logical_snapshot & output,bool copy_bytes) const {
+    if (!ready()) return false;
+    try {
+        llama_kv_stream_logical_snapshot saved;
+        saved.shape=backing->config().shape;saved.layers=backing->config().layers;saved.tokens=committed;
+        if (!copy_bytes) return save_prefix(committed,output);
+        size_t bytes;
+        if (!logical_snapshot_bytes(*backing,committed,bytes)) return false;
+        saved.bytes.resize(bytes);
+        size_t offset=0;
+        for (uint32_t layer=0;layer<saved.layers;++layer) {
+            llama_kv_stream_host_layer planes;
+            if (!backing->layer(layer,planes)) return false;
+            for (bool value : {false,true}) {
+                const auto operand=value ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k;
+                const size_t count=committed*(value ? backing->layout().v_token_bytes : backing->layout().k_token_bytes);
+                if (!count) continue;
+                std::vector<llama_kv_stream_host_range> ranges;
+                if (!backing->ranges(layer,operand,0,count,ranges)) return false;
+                std::memcpy(saved.bytes.data()+offset,value ? planes.v : planes.k,count);offset+=count;
+            }
+        }
+        output=std::move(saved);return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+bool llama_kv_stream_logical_cache::save_prefix(size_t tokens,llama_kv_stream_logical_snapshot & output) const {
+    if (!ready() || tokens>committed) return false;
+    try {
+        llama_kv_stream_logical_snapshot saved;saved.shape=backing->config().shape;saved.layers=backing->config().layers;saved.tokens=tokens;
+        auto prefix=std::make_shared<llama_kv_stream_logical_prefix>();prefix->cache_id=backing->cache_id();prefix->tokens=tokens;
+        prefixes.erase(std::remove_if(prefixes.begin(),prefixes.end(),[](const auto & prefix) {return prefix.expired();}),prefixes.end());
+        prefixes.push_back(prefix);saved.prefix=std::move(prefix);output=std::move(saved);return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+bool llama_kv_stream_logical_cache::accepts(const llama_kv_stream_logical_snapshot & saved) const noexcept {
+    const auto & shape=backing->config().shape;
+    if (saved.layers!=backing->config().layers || saved.shape.type_k!=shape.type_k || saved.shape.type_v!=shape.type_v ||
+            saved.shape.head_dim_k!=shape.head_dim_k || saved.shape.head_dim_v!=shape.head_dim_v || saved.shape.heads!=shape.heads ||
+            saved.shape.page_tokens!=shape.page_tokens || saved.shape.alignment!=shape.alignment) return false;
+    size_t bytes;
+    if (!logical_snapshot_bytes(*backing,saved.tokens,bytes)) return false;
+    if (saved.prefix) return saved.bytes.empty() && saved.prefix->valid && saved.prefix->cache_id==backing->cache_id() &&
+        saved.prefix->tokens==saved.tokens && saved.tokens<=committed;
+    return saved.bytes.size()==bytes;
+}
+
+bool llama_kv_stream_logical_cache::load(const llama_kv_stream_logical_snapshot & saved) {
+    if (!ready() || expected_generation==UINT64_MAX || !accepts(saved)) return false;
+    if (saved.prefix) return truncate(saved.tokens);
+    try {
+        auto replacement=llama_kv_stream_publications::create({saved.tokens,backing->config().context_tokens,expected_generation+1,1,true});
+        if (!replacement || !backing->prepare(saved.tokens)) return false;
+        std::vector<llama_kv_stream_host_layer> planes(saved.layers);
+        for (uint32_t layer=0;layer<saved.layers;++layer) if (!backing->layer(layer,planes[layer])) return false;
+        if (!authoritative->invalidate()) return false;
+        invalidate_prefixes(0,true);
+        size_t offset=0;
+        for (const auto & plane : planes) for (bool value : {false,true}) {
+            const size_t count=saved.tokens*(value ? backing->layout().v_token_bytes : backing->layout().k_token_bytes);
+            if (!count) continue;
+            std::memcpy(value ? plane.v : plane.k,saved.bytes.data()+offset,count);offset+=count;
+        }
+        expected_generation=authoritative->generation();publications=std::move(replacement);committed=saved.tokens;
+        host_ready=failed=false;return true;
+    } catch (const std::bad_alloc &) {return false;}
 }
 
 bool llama_kv_stream_logical_cache::begin(size_t count) {
@@ -230,11 +312,17 @@ bool llama_kv_stream_logical_cache::finish() {
     return true;
 }
 
+void llama_kv_stream_logical_cache::invalidate_prefixes(size_t tokens,bool all) noexcept {
+    for (const auto & entry : prefixes) if (auto prefix=entry.lock())
+        if (all || prefix->tokens>tokens) prefix->valid=false;
+}
+
 bool llama_kv_stream_logical_cache::reset_frontier(size_t tokens, bool suffix) {
     if (!backing->valid() || pending.pending() || authoritative->generation() == UINT64_MAX) return false;
     auto replacement = llama_kv_stream_publications::create({
         tokens, backing->config().context_tokens, authoritative->generation() + 1, 1, true});
     if (!replacement || !(suffix ? authoritative->invalidate_suffix(tokens) : authoritative->invalidate())) return false;
+    invalidate_prefixes(tokens,!suffix);
     expected_generation = authoritative->generation();
     publications = std::move(replacement);
     committed = tokens;

@@ -291,6 +291,7 @@ size_t llama_kv_stream_host::stride() const noexcept { return layer_stride; }
 // Exclude leading/trailing allocation slack from the canonical storage size.
 size_t llama_kv_stream_host::bytes() const noexcept { return storage_bytes; }
 size_t llama_kv_stream_host::committed_bytes() const noexcept { return demand ? demand->committed_bytes() : storage_bytes; }
+size_t llama_kv_stream_host::registered_bytes() const noexcept { return demand ? demand->registered_bytes() : 0; }
 ggml_backend_buffer_type_t llama_kv_stream_host::buffer_type() const noexcept {
     return demand ? demand->buffer_type() : ggml_backend_buffer_get_type(storage);
 }

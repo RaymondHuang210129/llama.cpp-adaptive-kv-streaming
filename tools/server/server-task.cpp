@@ -1794,6 +1794,47 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    return load(prompt,tokens_new,[&](server_prompt_cache_state & saved) {
+        {
+            auto & data = saved.data.main;
+
+            const size_t size = data.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            if (n != size) {
+                SRV_ERR("failed to restore state with size %zu\n", size);
+
+                return false;
+            }
+
+            data.clear();
+            data.shrink_to_fit();
+        }
+
+        {
+            auto & data = saved.data.drft;
+
+            if (!data.empty()) {
+                GGML_ASSERT(ctx_dft);
+
+                const size_t size = data.size();
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                if (n != size) {
+                    SRV_WRN("failed to restore state with size %zu\n", size);
+
+                    return false;
+                }
+
+                data.clear();
+                data.shrink_to_fit();
+            }
+        }
+
+        return true;
+    });
+}
+
+bool server_prompt_cache::load(server_prompt & prompt,const server_tokens & tokens_new,
+        const std::function<bool(server_prompt_cache_state &)> & restore) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1828,39 +1869,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
-            }
-
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
+        if (!restore(*it_best)) return false;
 
         prompt = std::move(it_best->prompt);
 

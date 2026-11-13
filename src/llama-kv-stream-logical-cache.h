@@ -23,6 +23,23 @@ struct llama_kv_stream_logical_checkpoint {
     size_t tokens = 0;
 };
 
+// A retained prefix survives appends, but not truncation into its rows or unknown replacement.
+class llama_kv_stream_logical_prefix {
+    friend class llama_kv_stream_logical_cache;
+    uint64_t cache_id=0;
+    size_t tokens=0;
+    bool valid=true;
+};
+
+// Exact committed planes, independent of process-local cache IDs and host addresses.
+struct llama_kv_stream_logical_snapshot {
+    ggml_kv_stream_shape shape;
+    uint32_t layers = 0;
+    size_t tokens = 0;
+    std::vector<uint8_t> bytes;
+    std::shared_ptr<const llama_kv_stream_logical_prefix> prefix;
+};
+
 // Owns one authoritative cache and its ordered K/V publication frontier.
 class llama_kv_stream_logical_cache {
 public:
@@ -37,6 +54,13 @@ public:
     size_t tokens() const noexcept;
     // No pending publication or unacknowledged host replacement.
     bool ready() const noexcept;
+
+    // Caller retires all device users first. Failure preserves the output snapshot.
+    bool save(llama_kv_stream_logical_snapshot & output,bool copy_bytes=true) const;
+    // Validate complete geometry and payload before replacing committed bytes at stable addresses.
+    bool save_prefix(size_t tokens,llama_kv_stream_logical_snapshot & output) const;
+    bool accepts(const llama_kv_stream_logical_snapshot & snapshot) const noexcept;
+    bool load(const llama_kv_stream_logical_snapshot & snapshot);
 
     // One append is active at a time. Host publication does not claim a device mirror.
     bool begin(size_t count);
@@ -61,6 +85,8 @@ private:
     bool covers(const std::vector<llama_kv_stream_write *> & writes) const noexcept;
     bool drain_generated();
     bool reset_frontier(size_t tokens, bool suffix = false);
+    void invalidate_prefixes(size_t tokens,bool all) noexcept;
+    mutable std::vector<std::weak_ptr<llama_kv_stream_logical_prefix>> prefixes;
 
     std::shared_ptr<llama_kv_stream_host> backing;
     std::shared_ptr<llama_kv_stream_content> authoritative;

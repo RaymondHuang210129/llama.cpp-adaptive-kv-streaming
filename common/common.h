@@ -10,6 +10,7 @@
 
 #include <array>
 #include <list>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1290,6 +1291,7 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+struct llama_context_group_checkpoint;
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1301,6 +1303,7 @@ struct common_prompt_checkpoint {
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
+    std::shared_ptr<llama_context_group_checkpoint> streamed;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
