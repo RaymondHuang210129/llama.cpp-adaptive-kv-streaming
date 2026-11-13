@@ -255,7 +255,7 @@ def observed_completion(args, url, body, label, grouped=False):
         after = speculative_source_stats(log_path.read_text(errors="replace"))
         fields = ("generated_tokens", "accepted_tokens", "accept_calls", "prediction_forwards")
         delta = {name:{key:row[key] -before.get(name, {}).get(key, 0) for key in fields} for name, row in after.items()}
-        rows = result if grouped else [result]
+        rows = result if isinstance(result, list) else [result]
         timing = {key:sum(row["timings"].get(key, 0) for row in rows) for key in ("draft_n", "draft_n_accepted")}
         args._source_groups.append({"label":label, "members":len(rows), "timings":timing, "source_stats":delta})
     return result
