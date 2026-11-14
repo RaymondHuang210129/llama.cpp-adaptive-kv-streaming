@@ -102,6 +102,9 @@ struct llama_context {
         llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision);
     bool group_submission_allowed() const noexcept;
     bool group_mtp_ready(uint32_t future_tokens) const noexcept;
+    // Selected recurrent destinations are retained outside every draft workspace view.
+    LLAMA_API bool group_recurrent_restore_isolated() const noexcept;
+    bool group_restore_recurrent_after_attention();
     // Borrow already initialized chains from the same model's non-executing metadata context.
     // The frontend retains their RNG/grammar ownership through group retirement.
     bool bind_group_samplers_from(const llama_context & prepared);

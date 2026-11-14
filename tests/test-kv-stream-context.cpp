@@ -3530,7 +3530,8 @@ static void test_two_slot_mtp_image_catchup(testing & t,llama_model * model,cons
 }
 
 static void test_group_mtp_admission(testing & t,llama_model * model,bool resume=false,bool phase_guard=false,bool ring=false,bool partial=false,
-        std::array<uint16_t,2> draft_widths={1,3},std::array<uint16_t,2> accepted_widths={0,2},bool backend_sampling=false,uint32_t cutoff=0) {
+        std::array<uint16_t,2> draft_widths={1,3},std::array<uint16_t,2> accepted_widths={0,2},bool backend_sampling=false,uint32_t cutoff=0,
+        bool prefetch_probe=false,bool restore_order_probe=false) {
     if (!t.assert_true(model && model->arch==LLM_ARCH_QWEN35 && model->hparams.n_layer_nextn==1)) return;
     auto cp=llama_context_default_params();
     const auto maximum_depth=*std::max_element(draft_widths.begin(),draft_widths.end());
@@ -3687,6 +3688,55 @@ static void test_group_mtp_admission(testing & t,llama_model * model,bool resume
             next_positions[slot]=lengths[slot]+1+accepted_count;
         }
         if (partial) {
+            if (prefetch_probe) {
+                for (llama_seq_id slot=0;slot<2;++slot) {
+                    if (!t.assert_true(llama_memory_seq_rm(target.get_memory(),slot,llama_pos(next_positions[slot]),-1)) ||
+                            !t.assert_true(llama_memory_seq_rm(child.get_memory(),slot,llama_pos(next_positions[slot]),-1))) return false;
+                    histories[slot].push_back(anchors[slot]);
+                    histories[slot].insert(histories[slot].end(),proposals[slot].begin(),proposals[slot].begin()+accepted_widths[slot]);
+                    proposals[slot].clear();
+                    common_speculative_get_draft_params(spec.get(),slot)={true,draft_widths[slot],llama_pos(next_positions[slot]),corrections[slot],
+                        &histories[slot],&proposals[slot],nullptr,0.0f,123};
+                }
+                const bool grouped=target.group_parent()!=nullptr;
+                auto * recurrent=target.get_kv_resources().recurrent;
+                if (!t.assert_true(recurrent && recurrent->rs_idx.size()==2)) return false;
+                t.out<<"restore before draft="<<recurrent->rs_idx[0]<<','<<recurrent->rs_idx[1]<<std::endl;
+                if (grouped && accepted_widths[0]==draft_widths[0] && accepted_widths[1]<draft_widths[1] &&
+                        !t.assert_true("second-slot-only restore is exercised",recurrent->rs_idx[0]==0 && recurrent->rs_idx[1]!=0)) return false;
+                size_t attention_begins=0,attention_ends=0;
+                const auto pending=recurrent->rs_idx;
+                if (grouped && restore_order_probe) {
+                    trace.prediction_attention_before=[&] {
+                        if (!attention_begins++) t.assert_true("MTP attention reads its KV before any target restore is queued",recurrent->rs_idx==pending);
+                    };
+                    trace.prediction_attention=[&] {
+                        if (!attention_ends++) t.assert_true("target restores are queued after MTP attention and before its remaining compute",
+                            std::all_of(recurrent->rs_idx.begin(),recurrent->rs_idx.end(),[](uint32_t index) {return index==0;}));
+                    };
+                }
+                struct release_attention_observers {
+                    kv_stream_exact_trace & trace;
+                    ~release_attention_observers() {trace.prediction_attention_before={};trace.prediction_attention={};}
+                } observers{trace};
+                trace.phase=restore_order_probe ? "resume/predict-prefetch" : "resume/prefetch-predict";
+                common_speculative_draft(spec.get());llama_synchronize(&child);trace.check();
+                if (grouped && restore_order_probe && !t.assert_true("prediction attention ordering is observed for every submitted attention",
+                        attention_begins>0 && attention_begins==attention_ends)) return false;
+                if (grouped && !t.assert_true("draft compute queues every selected pending restore",
+                        std::all_of(recurrent->rs_idx.begin(),recurrent->rs_idx.end(),[](uint32_t index) {return index==0;}))) return false;
+                common_batch verification(&target);
+                for (llama_seq_id slot=0;slot<2;++slot) {
+                    if (!t.assert_equal(size_t(expected_widths[slot]),proposals[slot].size())) return false;
+                    oracle.bytes("prefetch/proposals/"+std::to_string(slot),proposals[slot].data(),proposals[slot].size()*sizeof(llama_token));
+                    verification.add(corrections[slot],llama_pos(next_positions[slot]),slot,true);
+                    for (size_t row=0;row<proposals[slot].size();++row)
+                        verification.add(proposals[slot][row],llama_pos(next_positions[slot]+row+1),slot,true);
+                }
+                trace.phase="resume/prefetch-verification";
+                const auto decoded=llama_process(&target,LLAMA_PROCESS_TYPE_DECODE,verification.get());trace.check();
+                trace.phase.clear();return t.assert_equal("prefetched accepted states preserve the next native verification",0,decoded);
+            }
             common_batch correction(&target);
             for (llama_seq_id slot=0;slot<2;++slot) {
                 if (!t.assert_true(llama_memory_seq_rm(target.get_memory(),slot,llama_pos(next_positions[slot]),-1)) ||
@@ -4931,7 +4981,7 @@ static bool test_dflash_after_teacher(testing & t,llama_model & model,llama_mode
 }
 
 static void test_native_dflash_draft_stage(testing & t,llama_model * model,const char * draft_path,const char * input_path,
-        const char * output_path,bool streamed=false,bool negative=false,bool parking=false,bool suffix=false,bool rebind=false,bool k4v=false,bool repeat=false,bool partition=false) {
+        const char * output_path,bool streamed=false,bool negative=false,bool parking=false,bool suffix=false,bool rebind=false,bool k4v=false,bool repeat=false,bool partition=false,bool restore_probe=false) {
     if (!t.assert_true(model && model->arch==LLM_ARCH_QWEN35 && draft_path && input_path && output_path)) return;
     const auto * native_teacher=streamed ? nullptr : std::getenv("LLAMA_TEST_DFLASH_NATIVE_TEACHER_ORACLE");
     auto mp=llama_model_default_params();mp.n_gpu_layers=999;
@@ -5147,7 +5197,14 @@ static void test_native_dflash_draft_stage(testing & t,llama_model * model,const
             proposals[slot].clear();auto & request=common_speculative_get_draft_params(driver.get(),slot);
             request.drafting=true;request.pos0=llama_pos(prompts[slot].size());request.id_last=seeds[slot];
         }
+        auto * recurrent=target->get_kv_resources().recurrent;
+        if (restore_probe) {
+            if (!t.assert_true("DFlash prefetch fixture has a real pending target rollback",streamed && recurrent &&
+                    std::any_of(recurrent->rs_idx.begin(),recurrent->rs_idx.end(),[](uint32_t index) {return index!=0;}))) return;
+        }
         common_speculative_draft(driver.get());child.synchronize();
+        if (restore_probe && !t.assert_true("DFlash queues target restores during prediction before target verification",
+                std::all_of(recurrent->rs_idx.begin(),recurrent->rs_idx.end(),[](uint32_t index) {return index==0;}))) return;
     }
     if (std::getenv("LLAMA_TEST_DFLASH_SHAPE_DUMP")) {
         auto * cache=child.get_kv_resources().bounded;
@@ -5303,7 +5360,10 @@ static void test_native_dflash_draft_stage(testing & t,llama_model * model,const
             for (llama_seq_id slot=0;slot<2;++slot) {
                 proposals[slot].clear();common_speculative_get_draft_params(driver.get(),slot).drafting=true;
             }
-            common_speculative_draft(driver.get());child.synchronize();
+            bool rejected=false;
+            try {common_speculative_draft(driver.get());child.synchronize();}
+            catch (const std::runtime_error & error) {rejected=std::string(error.what())=="selected DFlash execution failed";}
+            if (!t.assert_true("unknown generation reports an explicit speculative execution error",rejected)) return;
             for (const auto & proposed : proposals) if (!t.assert_true("unknown generation cannot produce a draft",proposed.empty())) return;
             unchanged.compare();
             for (llama_seq_id slot=0;slot<2;++slot)
@@ -7762,7 +7822,7 @@ static void test_group_common_dflash_startup(testing & t,const char * target_pat
             case 2:bad.speculative.draft.cache_type_k_explicit=true;break;
             case 3:bad.speculative.draft.cache_type_v_explicit=true;break;
             case 4:bad.shared_device_memory_bytes=1;break;
-            case 5:bad.mmproj.path="not-yet-grouped-vision";break;
+            case 5:bad.embedding=true;break;
             case 6:bad.speculative.ngram_map_k4v.size_m=8;break;
             case 7:bad.speculative.draft.n_max=8;break;
         }
@@ -7862,7 +7922,8 @@ static void test_group_common_dflash_startup(testing & t,const char * target_pat
     t.out<<"common grouped DFlash3/K4V7 startup/prefill/draft/verify/teacher/park completed\n";
 }
 
-static void test_group_common_mtp_startup(testing & t,const char * target_path,const char * assistant_path,bool failure=false,uint32_t maximum=3) {
+static void test_group_common_mtp_startup(testing & t,const char * target_path,const char * assistant_path,bool failure=false,uint32_t maximum=3,
+        llama_seq_id stale_source=-1) {
     common_params params;
     params.model.path=target_path;params.n_gpu_layers=999;params.fit_params=false;params.warmup=true;
     params.n_ctx=4096;params.n_batch=params.n_ubatch=256;params.n_parallel=2;params.kv_unified=true;
@@ -7903,7 +7964,7 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
             case 0:invalid.n_parallel=3;break;
             case 1:invalid.kv_unified=false;break;
             case 2:invalid.embedding=true;break;
-            case 3:invalid.mmproj.path="unused-invalid-projector";break;
+            case 3:invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);break;
             case 4:invalid.shared_device_memory_bytes=1;break;
             case 5:invalid.kv_stream_pool_bytes=1;break;
             case 6:invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);break;
@@ -7927,6 +7988,7 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
     t.assert_true(loading.unallocated && (assistant_path ? loading.calls>0 : loading.calls==0));
     t.assert_true(!group->metadata_context()->group_parent() && !draft->context()->group_parent());
     t.assert_true(draft->context()->group_storage_pending() && !draft->context()->get_cparams().shared_device_memory_bytes);
+    t.assert_true("unbound metadata cannot authorize recurrent prefetch",!draft->context()->group_recurrent_restore_isolated());
     for (const auto & entry : draft->context()->get_memory()->memory_breakdown()) t.assert_equal(size_t(0),entry.second);
     params.speculative.draft.ctx_tgt=group->metadata_context();params.speculative.draft.ctx_dft=draft->context();
     common_speculative_ptr spec(common_speculative_init(params.speculative,2));
@@ -7954,6 +8016,8 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
     auto * active=group->context();auto * child=group->auxiliary_context();
     if (!t.assert_true(active && child && active->group_parent()==child->group_parent() &&
             common_speculative_rebind(spec.get(),active,child))) return;
+    t.assert_equal("only a recurrent target supplies an isolated persistent restore region",
+        active->get_kv_resources().recurrent!=nullptr,child->group_recurrent_restore_isolated());
     common_batch prompt(active);std::array<llama_tokens,2> histories,proposals;
     for (llama_seq_id slot=0;slot<2;++slot) {histories[slot]={llama_token(100+slot)};prompt.add(100+slot,0,slot,true);}
     if (!t.assert_equal(0,llama_process(active,LLAMA_PROCESS_TYPE_DECODE,prompt.get())) ||
@@ -7977,6 +8041,21 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
         common_speculative_draft(spec.get());llama_synchronize(child);prediction_calls=observer.calls;
     } else {common_speculative_draft(spec.get());llama_synchronize(child);}
     t.assert_true(proposals[0].size()==1 && proposals[1].size()==1);
+    if (stale_source>=0) {
+        if (!t.assert_true("completed target sources initially authorize isolated restores",child->group_recurrent_restore_isolated())) return;
+        std::shared_ptr<llama_kv_stream_logical_cache> source;
+        if (!t.assert_true(group->source_table()->get(group->source_handles()[stale_source],0,source))) return;
+        const auto before=source->checkpoint();
+        if (!t.assert_true(source->restore(before) && source->ready())) return;
+        const auto after=source->checkpoint();
+        if (!t.assert_true("semantic generation changes without changing request identity or history length",
+                before.id==after.id && before.tokens==after.tokens && before.generation!=after.generation)) return;
+        t.out<<"restore source invalidated: slot="<<stale_source<<" tokens="<<after.tokens<<" generation="<<before.generation<<"->"<<after.generation<<'\n';
+        t.assert_true("stale target source cannot authorize an asynchronous recurrent restore",!child->group_recurrent_restore_isolated());
+        if (!t.assert_true(common_speculative_rebind(spec.get(),group->metadata_context(),group->auxiliary_metadata_context()))) return;
+        t.assert_true("a stale projection can still be safely discarded",group->discard() && !group->context() && !group->auxiliary_context());
+        return;
+    }
     if (maximum<3) {
         for (llama_seq_id slot=0;slot<2;++slot)
             if (!t.assert_true(llama_memory_seq_rm(child->get_memory(),slot,1,-1))) return;
@@ -8028,8 +8107,16 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
             if (!t.assert_true("a queued MTP error rejects every partial proposal",rejected &&
                     proposals[0].empty() && proposals[1].empty() && fault.queued==fault.calls && fault.calls>=fault.fail_call && fault.injected==1)) return;
         }
-        if (!t.assert_true(common_speculative_rebind(spec.get(),group->metadata_context(),group->auxiliary_metadata_context()))) return;
-        if (!t.assert_true(group->discard() && group->reset_request(0) && group->reset_request(1))) return;
+        if (!assistant_path) {
+            auto foreign=llama_context_group::create(*target->model(),cparams);
+            if (!t.assert_true(foreign && foreign->auxiliary_metadata_context())) return;
+            if (!t.assert_true("failed MTP contexts cannot retire to another request source",
+                    !common_speculative_rebind(spec.get(),foreign->metadata_context(),foreign->auxiliary_metadata_context()))) return;
+        }
+        if (!t.assert_true("failed speculative contexts retire to matching metadata",
+                common_speculative_rebind(spec.get(),group->metadata_context(),group->auxiliary_metadata_context()))) return;
+        if (!t.assert_true("failed selected contexts discard and reset requests",
+                group->discard() && group->reset_request(0) && group->reset_request(1))) return;
         for (llama_seq_id slot=0;slot<2;++slot) common_speculative_begin(spec.get(),slot,{});
         if (!t.assert_true(group->activate(selection,group->source_handles(),input,llama_memory_work_phase::target_prefill,1,2))) return;
         active=group->context();child=group->auxiliary_context();
@@ -8826,19 +8913,29 @@ int main(int argc,char ** argv) {
     const bool group_mtp_confidence=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-confidence-only");});
     const bool group_mtp_phase_guard=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-phase-guard-only");});
     const bool group_mtp_partial=group_mtp_backend_resume || std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-partial-only");});
-    const bool group_mtp_acceptance=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-acceptance-only");});
+    const bool group_mtp_restore_order=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-restore-order-only");});
+    const bool group_mtp_prefetch=group_mtp_restore_order || std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-prefetch-only");});
+    const bool group_mtp_acceptance=group_mtp_prefetch || std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-acceptance-only");});
     const bool group_mtp_resume=group_mtp_confidence || group_mtp_acceptance || group_mtp_partial || group_mtp_phase_guard || std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-resume-only");});
     const bool group_mtp_admission=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-admission-only");});
     const bool group_auxiliary_metadata=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-auxiliary-metadata-only");});
     mparams.load_mtp = group_mtp_image || group_mtp_backend || group_mtp_ring || group_mtp_resume || group_mtp_admission || group_auxiliary_metadata || embedded_mtp_control || mtp_memory_probe || mtp_sustained_control || target_drift_control || rollback_probe || serial_workspace_growth || mtp_bit_exact_control;
     for (int i=3;i<argc;++i) if (!std::strcmp(argv[i],"--group-common-mtp-startup") || !std::strcmp(argv[i],"--group-common-mtp-failure") ||
-            !std::strcmp(argv[i],"--group-common-mtp-width1") || !std::strcmp(argv[i],"--group-common-mtp-width2")) {
+            !std::strcmp(argv[i],"--group-common-mtp-width1") || !std::strcmp(argv[i],"--group-common-mtp-width2") ||
+            !std::strcmp(argv[i],"--group-mtp-restore-source-guard")) {
         const char * assistant=i+1<argc ? argv[i+1] : nullptr;
         const bool failure=!std::strcmp(argv[i],"--group-common-mtp-failure");
-        t.test("Common_model_only_startup_declares_both_group_MTP_roles_before_arena",[&](testing & t) {
+        const bool source_guard=!std::strcmp(argv[i],"--group-mtp-restore-source-guard");
+        t.test(source_guard ? "Isolated_recurrent_restore_requires_current_target_sources" :
+                "Common_model_only_startup_declares_both_group_MTP_roles_before_arena",[&](testing & t) {
             const uint32_t maximum=!std::strcmp(argv[i],"--group-common-mtp-width1") ? 1 :
                 !std::strcmp(argv[i],"--group-common-mtp-width2") ? 2 : 3;
-            test_group_common_mtp_startup(t,argv[2],assistant,failure,maximum);
+            if (source_guard) {
+                for (llama_seq_id slot : {1,0}) {
+                    test_group_common_mtp_startup(t,argv[2],assistant,false,maximum,slot);
+                    if (t.failures) return;
+                }
+            } else test_group_common_mtp_startup(t,argv[2],assistant,failure,maximum);
         });
         return t.summary();
     }
@@ -8869,15 +8966,16 @@ int main(int argc,char ** argv) {
     for (int i=3;i+3<argc;++i) if (!std::strcmp(argv[i],"--group-dflash-staged-exact") || !std::strcmp(argv[i],"--group-dflash-staged-guards") ||
             !std::strcmp(argv[i],"--group-dflash-staged-park") || !std::strcmp(argv[i],"--group-dflash-staged-suffix") ||
             !std::strcmp(argv[i],"--group-dflash-staged-rebind") || !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v") ||
-            !std::strcmp(argv[i],"--group-dflash-staged-widths")) {
+            !std::strcmp(argv[i],"--group-dflash-staged-widths") || !std::strcmp(argv[i],"--group-dflash-prefetch-only")) {
         t.test("Streamed_DFlash_matches_staged_native_target_and_draft_vectors",[&](testing & t) {
             test_native_dflash_draft_stage(t,model.get(),argv[i+1],argv[i+2],argv[i+3],true,
                 !std::strcmp(argv[i],"--group-dflash-staged-guards"),
                 !std::strcmp(argv[i],"--group-dflash-staged-park") || !std::strcmp(argv[i],"--group-dflash-staged-rebind") ||
                     !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v"),
-                !std::strcmp(argv[i],"--group-dflash-staged-suffix"),
+                !std::strcmp(argv[i],"--group-dflash-staged-suffix") || !std::strcmp(argv[i],"--group-dflash-prefetch-only"),
                 !std::strcmp(argv[i],"--group-dflash-staged-rebind") || !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v"),
-                !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v"),false,!std::strcmp(argv[i],"--group-dflash-staged-widths"));
+                !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v"),false,!std::strcmp(argv[i],"--group-dflash-staged-widths"),
+                !std::strcmp(argv[i],"--group-dflash-prefetch-only"));
         });
         return t.summary();
     }
@@ -8995,6 +9093,15 @@ int main(int argc,char ** argv) {
             }
         });
         return t.summary();
+    }
+    if (group_mtp_prefetch) {
+        t.test(group_mtp_restore_order ? "Grouped_MTP_restores_follow_attention_and_precede_remaining_draft_compute" :
+                "Grouped_recurrent_restore_overlaps_drafting_for_each_pending_sequence",[&](testing & t) {
+            for (const auto accepted : {std::array<uint16_t,2>{0,1},{0,3},{3,0},{1,2}}) {
+                test_group_mtp_admission(t,model.get(),true,false,false,true,{3,3},accepted,false,0,true,group_mtp_restore_order);
+                if (t.failures) return;
+            }
+        });return t.summary();
     }
     if (group_mtp_acceptance) {
         t.test("Every_selected_MTP_prefix_preserves_native_correction_and_next_draft",[&](testing & t) {

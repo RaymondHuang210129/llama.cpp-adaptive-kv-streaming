@@ -294,19 +294,24 @@ struct kv_stream_exact_trace {
     std::string role, phase;
     size_t outputs = 0;
     std::exception_ptr failure;
+    std::function<void()> prediction_attention_before;
     std::function<void()> prediction_attention;
     kv_stream_exact_trace(kv_stream_bit_oracle & oracle, std::string role) : oracle(oracle), role(std::move(role)) {}
     static bool callback(ggml_tensor * tensor, bool ask, void * opaque) {
         auto & trace = *static_cast<kv_stream_exact_trace *>(opaque);
-        const bool attention = trace.prediction_attention && tensor && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
+        const bool attention = (trace.prediction_attention_before || trace.prediction_attention) && tensor && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
             trace.phase.find("/predict") != std::string::npos;
         if (!tensor || trace.phase.empty() || trace.failure ||
                 (!attention && std::strcmp(tensor->name, "result_output") && std::strcmp(tensor->name, "h_nextn") &&
                  (trace.role != "target" || std::strcmp(tensor->name, "result_norm")))) return false;
-        if (ask) return true;
+        if (ask && !attention) return true;
         try {
+            if (ask) {
+                if (trace.prediction_attention_before) trace.prediction_attention_before();
+                return true;
+            }
             if (attention) {
-                trace.prediction_attention();
+                if (trace.prediction_attention) trace.prediction_attention();
                 return true;
             }
             trace.oracle.tensor(trace.phase + "/" + trace.role + "/" + tensor->name, tensor, true);

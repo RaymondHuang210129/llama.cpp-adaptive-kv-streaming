@@ -534,9 +534,11 @@ bool llama_speculative_rebind_compatible(const llama_context * old_target,const 
             (draft->mtp_target_ctx && draft->mtp_target_ctx!=target) ||
             (draft->cparams.ctx_other && draft->cparams.ctx_other!=target) ||
             target->group_initializing!=draft->group_initializing || target->group_selected!=draft->group_selected) return false;
-    const bool retiring_dflash=draft->model.arch==LLM_ARCH_DFLASH && target->group_storage_pending() &&
+    const auto retirement_source=target->group_source_table.lock();
+    const bool retiring_group=(draft->model.arch==LLM_ARCH_DFLASH || draft->cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP) && target->group_storage_pending() &&
         draft->group_storage_pending() && !target->group_execution && !draft->group_execution &&
-        !target->group_source_table.expired() && target->group_source_table.lock()==old_target->group_source_table.lock();
+        retirement_source && old_target->group_execution && old_draft->group_execution &&
+        retirement_source==old_target->group_execution->table && retirement_source==old_draft->group_execution->table;
     const std::pair<const llama_context *,const llama_context *> pairs[]={{old_target,target},{old_draft,draft}};
     for (const auto & pair : pairs) {
         const auto & old=*pair.first;const auto & next=*pair.second;const auto & a=old.cparams;const auto & b=next.cparams;
@@ -550,7 +552,7 @@ bool llama_speculative_rebind_compatible(const llama_context * old_target,const 
                 a.embeddings_nextn!=b.embeddings_nextn || a.embeddings_nextn_masked!=b.embeddings_nextn_masked ||
                 !old_cache || !next_cache || old_cache->type_k()!=next_cache->type_k() ||
                 old_cache->type_v()!=next_cache->type_v() || old.group_restore_failed || next.group_restore_failed ||
-                (old.group_execution && ((old.group_execution->failed && !retiring_dflash) || old.group_execution->admission)) ||
+                (old.group_execution && ((old.group_execution->failed && !retiring_group) || old.group_execution->admission)) ||
                 (next.group_execution && (next.group_execution->failed || next.group_execution->admission))) return false;
     }
     if (draft->model.arch==LLM_ARCH_DFLASH) {
@@ -2876,10 +2878,21 @@ llm_graph_result * llama_context::process_ubatch(
         LLAMA_LOG_ERROR("%s: grouped append cell mapping rejected\n",__func__);
         ret=GGML_STATUS_FAILED;return nullptr;
     }
-    auto * restore_target=serial_target_ctx ? serial_target_ctx : cparams.mtp_publish_host ? mtp_target_ctx : nullptr;
-    auto * restore=restore_target && restore_target->get_cparams().kv_streaming() ? restore_target->kv_resources.recurrent : nullptr;
+    const bool group_restore_phase=group_execution && group_execution->shared_roles && group_target &&
+        (group_execution->phase==llama_memory_work_phase::mtp_draft ||
+         group_execution->phase==llama_memory_work_phase::draft_block_prediction);
+    auto * group_recurrent=group_restore_phase ? group_target->kv_resources.recurrent : nullptr;
+    const bool group_restore=group_recurrent &&
+        std::any_of(group_recurrent->rs_idx.begin(),group_recurrent->rs_idx.end(),[](uint32_t index) {return index!=0;}) &&
+        group_recurrent_restore_isolated();
+    auto * restore_target=group_restore ? &group_execution->peer->context :
+        serial_target_ctx ? serial_target_ctx : cparams.mtp_publish_host ? mtp_target_ctx : nullptr;
+    auto * restore=restore_target && (group_restore || restore_target->get_cparams().kv_streaming()) ? restore_target->kv_resources.recurrent : nullptr;
     llama_memory_recurrent * deferred_restore=nullptr;
-    if (restore && restore->staged_publication_enabled() && !restore->rs_idx.empty() && restore->rs_idx[0]) {
+    const bool restore_pending=restore && (group_restore ?
+        std::any_of(restore->rs_idx.begin(),restore->rs_idx.end(),[](uint32_t index) {return index!=0;}) :
+        !restore->rs_idx.empty() && restore->rs_idx[0]);
+    if (restore_pending && restore->staged_publication_enabled()) {
         const auto disjoint=[&](ggml_backend_buffer_t scratch) {
             if (!scratch) return false;
             const size_t bytes=ggml_backend_buffer_get_size(scratch);
@@ -2897,18 +2910,19 @@ llm_graph_result * llama_context::process_ubatch(
             }
             return true;
         };
-        bool isolated=compute_memory && restore_target->compute_memory &&
-            disjoint(restore_target->compute_memory->shared_parent());
-        if (compute_memory) for (auto * lease : compute_memory->workspace_leases())
+        bool isolated=group_restore || (compute_memory && restore_target->compute_memory &&
+            disjoint(restore_target->compute_memory->shared_parent()));
+        if (!group_restore && compute_memory) for (auto * lease : compute_memory->workspace_leases())
             isolated=isolated && lease && disjoint(ggml_backend_memory_lease_buffer(lease));
-        // Live recurrent state is outside the serial arena used by the draft.
+        // Group state has its own persistent lease; serial state is outside the draft arena.
         if (isolated) restore_target->synchronize();
         if (!isolated) {
             LLAMA_LOG_ERROR("%s: target recurrent restore overlaps draft storage\n",__func__);
             ret=GGML_STATUS_FAILED;
             return nullptr;
         }
-        deferred_restore=restore;
+        // MTP loads its own KV before bulk target restores use the copy engine.
+        if (!group_restore || group_execution->phase!=llama_memory_work_phase::mtp_draft) deferred_restore=restore;
     }
     if (cparams.kv_shared_read && !prepare_shared_kv_read()) {
         LLAMA_LOG_ERROR("%s: failed to acquire shared target KV sources\n",__func__);
@@ -3026,7 +3040,7 @@ llm_graph_result * llama_context::process_ubatch(
     if (deferred_restore) {
         ggml_backend_sched_set_pre_compute_callback(sched.get(),[](ggml_backend_t backend,ggml_cgraph *,void * opaque) {
             auto * memory=static_cast<llama_memory_recurrent *>(opaque);
-            if (memory->rs_idx.empty() || !memory->rs_idx[0]) return true;
+            if (std::none_of(memory->rs_idx.begin(),memory->rs_idx.end(),[](uint32_t index) {return index!=0;})) return true;
             for (auto * state : memory->r_l) if (state) {
                 if (ggml_backend_get_device(backend) != ggml_backend_buft_get_device(ggml_backend_buffer_get_type(state->buffer))) return true;
                 return memory->restore_spill_async(nullptr,false);
@@ -7513,6 +7527,7 @@ struct group_execution_resources {
     ggml_backend_t backend=nullptr;
     llama_compute_arena_ptr parent,graph,host;
     std::vector<group_lease_ptr> leases;
+    ggml_backend_memory_lease_t recurrent_state=nullptr;
     std::vector<std::shared_ptr<void>> prepared;
     std::vector<llama_kv_stream_group_reader_source> sources;
     std::unique_ptr<llama_kv_stream_group_reader> reader;
@@ -7589,6 +7604,9 @@ struct group_execution_resources {
         }
         const auto okay=reader->attention(layer,columns,op,workspace,reader_admission ? true :
             shared_roles ? context.get_cparams().kv_stream_decode : decode);
+        if (okay && layer+1==visible.front().host->config().layers && !context.group_restore_recurrent_after_attention()) {
+            LLAMA_LOG_ERROR("%s: grouped recurrent restore after attention failed\n",__func__);return false;
+        }
         if (!okay) LLAMA_LOG_ERROR("%s: grouped role %u layer %u attention failed\n",__func__,projection->role,layer);
         return okay;
     }
@@ -7712,8 +7730,11 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
                 region.offset,region.size,region.alignment,region.flags,nullptr)) return false;
         if (!ggml_backend_memory_arena_commit(resources->parent.get())) return false;
         if (child) child->parent.reset(ggml_backend_memory_arena_retain(resources->parent.get()));
-        if (kv_resources.recurrent && (!kv_resources.recurrent->bind_current_storage(resources->acquire(101)) ||
-                (quote.target.publication_bytes && !kv_resources.recurrent->bind_spill_stage(resources->acquire(205))))) return false;
+        if (kv_resources.recurrent) {
+            resources->recurrent_state=resources->acquire(101);
+            if (!kv_resources.recurrent->bind_current_storage(resources->recurrent_state) ||
+                    (quote.target.publication_bytes && !kv_resources.recurrent->bind_spill_stage(resources->acquire(205)))) return false;
+        }
         if (kv_resources.bounded && !kv_resources.bounded->bind_bounded_storage(resources->acquire(102))) return false;
         if (block && (!auxiliary->kv_resources.bounded ||
                 !auxiliary->kv_resources.bounded->bind_bounded_storage(child->acquire(102)))) return false;
@@ -7991,6 +8012,65 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
 ggml_backend_buffer_t llama_context::group_parent() const noexcept {
     const auto storage=group_execution ? static_cast<const group_execution_resources *>(group_execution->resources.get()) : nullptr;
     return storage && storage->parent ? ggml_backend_memory_arena_parent(storage->parent.get()) : nullptr;
+}
+
+bool llama_context::group_recurrent_restore_isolated() const noexcept {
+    const auto * target=group_target;
+    if (!target || !group_execution || !target->group_execution || !compute_memory || !target->compute_memory ||
+            !group_execution->shared_roles || !target->group_execution->shared_roles ||
+            group_execution->failed || target->group_execution->failed || target->group_execution->admission ||
+            group_execution->peer!=target->group_execution.get() || target->group_execution->peer!=group_execution.get() ||
+            group_execution->owner!=target->group_execution->owner || group_selected!=target->group_selected ||
+            group_execution->table!=target->group_execution->table ||
+            !target->group_execution->table->projection_current(*target->group_execution->projection) ||
+            group_execution->projection->handles.size()!=target->group_execution->projection->handles.size()) return false;
+    // The draft append can be active; request epochs and the completed target must still be current.
+    for (size_t i=0;i<group_execution->projection->handles.size();++i) {
+        const auto a=group_execution->projection->handles[i],b=target->group_execution->projection->handles[i];
+        std::shared_ptr<llama_kv_stream_logical_cache> source,destination;
+        if (a.slot!=b.slot || a.generation!=b.generation ||
+                !group_execution->table->get(a,group_execution->projection->role,source) ||
+                !target->group_execution->table->get(b,target->group_execution->projection->role,destination) ||
+                !destination->ready()) return false;
+    }
+    const auto * recurrent=target->kv_resources.recurrent;
+    const auto * state=static_cast<const group_execution_resources *>(target->group_execution->resources.get());
+    const auto * draft=static_cast<const group_execution_resources *>(group_execution->resources.get());
+    if (!recurrent || recurrent->current_storage_pending() || !state || !draft || !state->recurrent_state ||
+            !state->parent || !draft->parent ||
+            ggml_backend_memory_arena_parent(state->parent.get())!=ggml_backend_memory_arena_parent(draft->parent.get())) return false;
+    auto * region=ggml_backend_memory_lease_buffer(state->recurrent_state);
+    if (!region) return false;
+    const auto first=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(region));
+    const auto bytes=ggml_backend_buffer_get_size(region);
+    if (!first || !bytes || bytes>UINTPTR_MAX-first) return false;
+    bool seen=false;
+    for (size_t layer=0;layer<recurrent->r_l.size();++layer) if (recurrent->r_l[layer]) {
+        for (const auto * tensor : {recurrent->r_l[layer],recurrent->s_l[layer]}) {
+            if (!tensor || !tensor->buffer) return false;
+            const auto data=reinterpret_cast<uintptr_t>(tensor->data);
+            if (data<first || data>first+bytes || ggml_nbytes(tensor)>first+bytes-data) return false;
+            seen=true;
+        }
+    }
+    const auto disjoint=[&](ggml_backend_memory_lease_t lease) {
+        auto * buffer=lease ? ggml_backend_memory_lease_buffer(lease) : nullptr;
+        if (!buffer) return false;
+        const auto start=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer));
+        const auto size=ggml_backend_buffer_get_size(buffer);
+        return !size || (start && size<=UINTPTR_MAX-start && (start>=first+bytes || first>=start+size));
+    };
+    for (const auto & lease : draft->leases) if (!disjoint(lease.get())) return false;
+    for (auto * lease : compute_memory->workspace_leases()) if (!disjoint(lease)) return false;
+    return seen;
+}
+
+bool llama_context::group_restore_recurrent_after_attention() {
+    if (!group_execution || !group_execution->shared_roles || !group_target ||
+            group_execution->phase!=llama_memory_work_phase::mtp_draft) return true;
+    auto * restore=group_target->kv_resources.recurrent;
+    if (!restore || std::none_of(restore->rs_idx.begin(),restore->rs_idx.end(),[](uint32_t index) {return index!=0;})) return true;
+    return restore->staged_publication_enabled() && group_recurrent_restore_isolated() && restore->restore_spill_async(nullptr,false);
 }
 
 struct llama_context_group::implementation {
