@@ -206,7 +206,12 @@ static int benchmark(ggml_backend_t backend, bool overlap, size_t span_pages, si
     return 0;
 }
 
-static int gather_copy_contract(ggml_backend_t backend) {
+#ifdef KV_COPY_BATCH_TRACE
+void kv_copy_capture_batch(bool enabled);
+size_t kv_copy_batch_launches();
+#endif
+
+static int gather_copy_contract(ggml_backend_t backend,bool batch=false) {
     testing t;
     t.test("producer_stream_gather_preserves_private_sources_and_native_byte_order", [&](testing & t) {
         auto * device=ggml_backend_get_device(backend);
@@ -315,13 +320,48 @@ static int gather_copy_contract(ggml_backend_t backend) {
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(&output,observed.data(),0,observed.size());
         t.assert_true("a later private-page packet preserves the earlier packet",observed==expected);
+        if (batch) {
+            for (size_t count : {33u,65u,127u,256u,512u}) for (size_t width : {1u,3u,8u,16u}) {
+                if (count*width>4096) continue;
+                std::vector<ggml_kv_stream_copy_rectangle> packets;
+                std::vector<uint8_t> reference(4096,0);
+                for (size_t i=0;i<count;++i) {
+                    const size_t offset=(i*19%(4096/width))*width;
+                    const size_t stride=i%2 ? SIZE_MAX : width;
+                    packets.push_back({i%2 ? b.get() : a.get(),offset,stride,i*width,stride,width,1});
+                    std::memcpy(reference.data()+i*width,(i%2 ? right : left).data()+offset,width);
+                }
+#ifdef KV_COPY_BATCH_TRACE
+                kv_copy_capture_batch(true);
+#endif
+                const bool copied=ops->gather(backend,scratch.get(),packets.data(),packets.size(),true);
+#ifdef KV_COPY_BATCH_TRACE
+                kv_copy_capture_batch(false);
+                const size_t launches=kv_copy_batch_launches();
+                t.out<<"scatter count="<<count<<" width="<<width<<" launches="<<launches<<std::endl;
+                t.assert_true("a scattered tile uses at most one kernel submission per64 rectangles",launches>0 && launches<=(count+63)/64);
+#else
+                t.assert_true("native kernel entry tracing is required",false);
+#endif
+                if (!t.assert_true(copied)) return;
+                ggml_backend_synchronize(backend);
+                ggml_backend_tensor_get(&output,observed.data(),0,observed.size());
+                t.assert_true("aligned and unaligned scattered bytes retain their exact native order",observed==reference);
+            }
+            ggml_backend_tensor_get(&ta,observed.data(),0,observed.size());t.assert_true(observed==left);
+            ggml_backend_tensor_get(&tb,observed.data(),0,observed.size());t.assert_true(observed==right);
+            ggml_backend_tensor_get(&root,all.data(),0,all.size());
+            t.assert_true(std::all_of(all.begin(),all.begin()+128,[](uint8_t x) {return x==0xa5;}) &&
+                std::all_of(all.begin()+12416,all.end(),[](uint8_t x) {return x==0xa5;}));
+        }
     });
     return t.summary();
 }
 
 int main(int argc, char ** argv) {
     const bool registered = argc > 1 && std::strcmp(argv[1], "--cuda-registered") == 0;
-    const bool gather = argc > 1 && std::strcmp(argv[1], "--cuda-gather") == 0;
+    const bool batch = argc>1 && !std::strcmp(argv[1],"--cuda-gather-batch");
+    const bool gather = batch || (argc > 1 && std::strcmp(argv[1], "--cuda-gather") == 0);
     const bool wide = argc > 1 && std::strcmp(argv[1],"--bench-wide") == 0;
     const bool ordered = argc > 1 && std::strcmp(argv[1],"--bench-ordered") == 0;
     const bool spans = argc > 1 && std::strcmp(argv[1],"--bench-span") == 0;
@@ -339,7 +379,7 @@ int main(int argc, char ** argv) {
         backend.reset(ggml_backend_dev_init(dev,nullptr));
     } else backend.reset(ggml_backend_cpu_init());
     if (!backend) return 1;
-    if (gather) return gather_copy_contract(backend.get());
+    if (gather) return gather_copy_contract(backend.get(),batch);
     if (registered) return registered_copy_contract(backend.get());
     if (bench) {
         const size_t span_pages = argc > 2 ? std::strtoull(argv[2],nullptr,10) : (spans ? 2 : 1);

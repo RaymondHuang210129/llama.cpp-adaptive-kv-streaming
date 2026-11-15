@@ -7557,9 +7557,55 @@ struct group_execution_resources {
         }
         return context.group_submission_allowed() && producer && producer->layer_ready(layer);
     }
+    void refresh_reader() {
+        if (!reader) return;
+        std::vector<llama_kv_stream_group_frontier> frontiers;
+        frontiers.reserve(reader_sources.size());
+        for (const auto index : reader_sources) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (index>=sources.size() || index>=projection->handles.size() ||
+                    !table->get(projection->handles[index],projection->role,cache) || !cache->ready() ||
+                    cache->host()!=sources[index].host || cache->content()!=sources[index].content) {
+                reader.reset();return;
+            }
+            frontiers.push_back({cache->frontiers().reserved,cache->tokens()});
+        }
+        if (!reader->update_frontiers(frontiers)) reader.reset();
+    }
+    bool decode_transport(size_t rows) const {
+        const auto & params=context.get_cparams();
+        // Small MTP catch-up batches keep their native graph phase and use the decode transport.
+        return (shared_roles ? params.kv_stream_decode : decode) ||
+            (shared_roles && params.ctx_type==LLAMA_CONTEXT_TYPE_MTP && rows && rows<=8);
+    }
+    bool prepare_publication(ggml_backend_memory_lease_t encoding,uint32_t layer,
+            const llama_kv_stream_group_producer::publication_rows & rows) {
+        if (!reader || !decode_transport(rows.size()) ||
+                !context.group_submission_allowed() || reader_sources.size()!=sources.size()) return false;
+        std::vector<llama_kv_stream_group_frontier> frontiers;
+        for (size_t index=0;index<sources.size();++index) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (reader_sources[index]!=index || !table->get(projection->handles[index],projection->role,cache) ||
+                    cache->host()!=sources[index].host || cache->content()!=sources[index].content) {reader.reset();return false;}
+            sources[index].tokens=cache->frontiers().reserved;sources[index].stable_tokens=cache->tokens();
+            frontiers.push_back({sources[index].tokens,sources[index].stable_tokens});
+        }
+        if (!reader->update_frontiers(frontiers)) {reader.reset();return false;}
+        return reader->can_publish(encoding,layer,rows);
+    }
+    bool complete_publication(uint32_t layer,const llama_kv_stream_group_producer::publication_rows & rows,bool committed) {
+        if (!reader) return false;
+        for (size_t index=0;index<sources.size();++index) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!table->get(projection->handles[index],projection->role,cache) || cache->host()!=sources[index].host ||
+                    cache->content()!=sources[index].content || cache->tokens()!=projection->sources[index].tokens ||
+                    cache->content()->generation()!=projection->sources[index].generation) return false;
+        }
+        return reader->complete_publication(layer,rows,committed);
+    }
     bool attention(uint32_t layer,ggml_tensor * op,ggml_backend_memory_lease_t staging,
             ggml_backend_memory_lease_t workspace) {
-        if (!op || !op->src[1] || op->src[1]->ne[1]<=0 ||
+        if (!op || !op->src[0] || op->src[0]->ne[1]<=0 || !op->src[1] || op->src[1]->ne[1]<=0 ||
                 size_t(op->src[1]->ne[1])>projection->columns.size() ||
                 projection->cells->used_max_p1()>uint32_t(op->src[1]->ne[1]) ||
                 !layer_ready(layer)) return false;
@@ -7602,8 +7648,9 @@ struct group_execution_resources {
             if (column.source>=remap.size() || remap[column.source]==UINT32_MAX) return false;
             column.source=remap[column.source];
         }
-        const auto okay=reader->attention(layer,columns,op,workspace,reader_admission ? true :
-            shared_roles ? context.get_cparams().kv_stream_decode : decode);
+        const bool decode_mode=reader_admission || decode_transport(size_t(op->src[0]->ne[1]));
+        const auto okay=decode_mode && !reader_admission ? reader->enqueue_attention(layer,columns,op,workspace,true) :
+            reader->attention(layer,columns,op,workspace,decode_mode);
         if (okay && layer+1==visible.front().host->config().layers && !context.group_restore_recurrent_after_attention()) {
             LLAMA_LOG_ERROR("%s: grouped recurrent restore after attention failed\n",__func__);return false;
         }
@@ -7762,6 +7809,19 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
         resources->writer=llama_kv_stream_writer::create(resources->backend,ggml_backend_memory_lease_buffer(encoding),
             quote.target.writer_bytes,shape,cparams.n_ubatch);
         resources->producer=llama_kv_stream_group_producer::create(table,resources->writer,cparams.n_ubatch,verify_rows,uint32_t(count));
+        const auto bind_publication=[](const std::shared_ptr<group_execution_resources> & state,ggml_backend_memory_lease_t encoding) {
+            const auto weak=std::weak_ptr<group_execution_resources>(state);
+            return state->producer && state->producer->bind_consumer(state->backend) && state->producer->bind_publication(
+                [weak,encoding](uint32_t layer,const auto & rows) {
+                    auto retained=weak.lock();return retained && retained->prepare_publication(encoding,layer,rows);
+                },[weak,encoding](uint32_t layer,bool value,const ggml_tensor * source,size_t first,size_t count,const auto & rows) {
+                    auto retained=weak.lock();return retained && retained->reader && retained->context.group_submission_allowed() &&
+                        retained->reader->publish_encoded(encoding,layer,value,source,first,count,rows);
+                },[weak](uint32_t layer,const auto & rows,bool committed) {
+                    auto retained=weak.lock();return retained && retained->complete_publication(layer,rows,committed);
+                });
+        };
+        if (!bind_publication(resources,encoding)) return false;
         const auto allowed=[this] {return group_submission_allowed();};
         if (!kv_resources.full->get_group_model()->bind(resources->producer,[resources,attention,staging](uint32_t layer,ggml_tensor * op) {
                 return resources->attention(layer,op,staging,attention);
@@ -7781,6 +7841,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
             child->writer=llama_kv_stream_writer::create(child->backend,ggml_backend_memory_lease_buffer(child_encoding),
                 quote.target.writer_bytes,shape,auxiliary->cparams.n_ubatch);
             child->producer=llama_kv_stream_group_producer::create(table,child->writer,auxiliary->cparams.n_ubatch,1,uint32_t(count));
+            if (!bind_publication(child,child_encoding)) return false;
             if (!auxiliary->kv_resources.full->get_group_model()->bind(child->producer,[child,child_attention,child_staging](uint32_t layer,ggml_tensor * op) {
                     return child->attention(layer,op,child_staging,child_attention);
                 },[auxiliary] {return auxiliary->group_submission_allowed();})) return false;
@@ -7949,7 +8010,8 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
                 auto retained=weak.lock();
                 return retained && auxiliary->group_execution && auxiliary->group_execution->mutate([&] {
                     if (retained->reader && !retained->reader->finish()) return false;
-                    retained->reader.reset();return mutation();
+                    if (!mutation()) {retained->reader.reset();return false;}
+                    retained->refresh_reader();return true;
                 });
             };
             if (owned) auxiliary->kv_resources.full->get_group_model()->bind_mutation(child_mutate);
@@ -7975,7 +8037,6 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
             auto retained=weak.lock();
             return retained && group_execution && group_execution->mutate([&] {
                 if (retained->reader && !retained->reader->finish()) return false;
-                retained->reader.reset();
                 auto * child=group_execution->shared_block ? group_execution->peer : nullptr;
                 std::vector<llama_kv_stream_logical_checkpoint> before;
                 if (child) for (const auto & handle : group_execution->projection->handles) {
@@ -7983,7 +8044,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
                     if (!group_execution->table->get(handle,0,cache) || !cache->ready()) return false;
                     before.push_back(cache->checkpoint());
                 }
-                if (!mutation()) return false;
+                if (!mutation()) {retained->reader.reset();return false;}
                 if (child) for (size_t i=0;i<before.size();++i) {
                     std::shared_ptr<llama_kv_stream_logical_cache> cache;
                     if (!group_execution->table->get(group_execution->projection->handles[i],0,cache) || !cache->ready()) return false;
@@ -7993,6 +8054,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
                             before[i].generation!=UINT64_MAX && after.generation==before[i].generation+1 &&
                             after.tokens<before[i].tokens) child->draft_suffixes[i]=after;
                 }
+                retained->refresh_reader();
                 return true;
             });
         };

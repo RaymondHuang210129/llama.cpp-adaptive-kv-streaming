@@ -751,6 +751,39 @@ static ggml_kv_stream_copy_feedback feedback(void * handle) {
 static void destroy(void * handle) { delete static_cast<copy_queue *>(handle); }
 
 // Reorder encoded rows in borrowed attention scratch without changing native KV pages.
+struct gather_rectangle {
+    const char * source;
+    char * destination;
+    uint32_t source_stride,destination_stride,row_bytes,rows;
+};
+
+static constexpr size_t gather_batch_size=96;
+struct gather_batch {
+    gather_rectangle rectangles[gather_batch_size];
+};
+static_assert(sizeof(gather_batch)<=3072,"gather parameters fit the legacy CUDA parameter limit");
+
+// Small scattered rows share a launch; their validated destination ranges do not overlap.
+static __global__ void gather_rectangles(const gather_batch batch) {
+    const gather_rectangle rectangle=batch.rectangles[blockIdx.x];
+    if (!((uintptr_t(rectangle.source)|uintptr_t(rectangle.destination)|rectangle.source_stride|
+            rectangle.destination_stride|rectangle.row_bytes)&15)) {
+        const size_t width=rectangle.row_bytes/sizeof(uint4),words=width*rectangle.rows;
+        for (size_t index=threadIdx.x;index<words;index+=blockDim.x) {
+            const size_t row=index/width,column=index%width;
+            reinterpret_cast<uint4 *>(rectangle.destination+row*rectangle.destination_stride)[column]=
+                reinterpret_cast<const uint4 *>(rectangle.source+row*rectangle.source_stride)[column];
+        }
+        return;
+    }
+    const size_t bytes=rectangle.row_bytes*rectangle.rows;
+    for (size_t index=threadIdx.x;index<bytes;index+=blockDim.x) {
+        const size_t row=index/rectangle.row_bytes,column=index%rectangle.row_bytes;
+        rectangle.destination[row*rectangle.destination_stride+column]=
+            rectangle.source[row*rectangle.source_stride+column];
+    }
+}
+
 static bool gather(ggml_backend_t backend,ggml_backend_buffer_t destination,
         const ggml_kv_stream_copy_rectangle * rectangles,size_t count,bool initialize) {
     if (!backend || !ggml_backend_is_cuda(backend) ||
@@ -765,16 +798,33 @@ static bool gather(ggml_backend_t backend,ggml_backend_buffer_t destination,
     if (capture!=cudaStreamCaptureStatusNone) return false;
     auto * target=static_cast<char *>(ggml_backend_buffer_get_base(destination));
     if (initialize) CUDA_CHECK(cudaMemsetAsync(target,0,ggml_backend_buffer_get_size(destination),ctx.stream()));
+    gather_batch batch{};
+    size_t pending=0;
+    const auto flush=[&] {
+        if (pending) {
+            gather_rectangles<<<pending,256,0,ctx.stream()>>>(batch);
+            CUDA_CHECK(cudaGetLastError());pending=0;
+        }
+    };
     for (size_t i=0;i<count;++i) {
         const auto & r=rectangles[i];
         const auto * source=static_cast<const char *>(ggml_backend_buffer_get_base(r.source))+r.source_offset;
-        if (r.rows==1) {
-            CUDA_CHECK(cudaMemcpyAsync(target+r.destination_offset,source,r.row_bytes,cudaMemcpyDeviceToDevice,ctx.stream()));
+        const size_t bytes=r.row_bytes*r.rows;
+        if (r.rows<=16 && bytes<=65536) {
+            batch.rectangles[pending++]={source,target+r.destination_offset,uint32_t(r.rows==1 ? r.row_bytes : r.source_stride),
+                uint32_t(r.rows==1 ? r.row_bytes : r.destination_stride),uint32_t(r.row_bytes),uint32_t(r.rows)};
+            if (pending==gather_batch_size) flush();
+            continue;
+        }
+        flush();
+        if (r.rows==1 || (r.source_stride==r.row_bytes && r.destination_stride==r.row_bytes)) {
+            CUDA_CHECK(cudaMemcpyAsync(target+r.destination_offset,source,bytes,cudaMemcpyDeviceToDevice,ctx.stream()));
         } else {
             CUDA_CHECK(cudaMemcpy2DAsync(target+r.destination_offset,r.destination_stride,source,r.source_stride,
                 r.row_bytes,r.rows,cudaMemcpyDeviceToDevice,ctx.stream()));
         }
     }
+    flush();
     return true;
 }
 } // namespace

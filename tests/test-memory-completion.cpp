@@ -66,6 +66,21 @@ struct fake_backend {
 int main(int argc, char ** argv) {
     testing t;
 
+    t.test("retained_producer_outlives_completion_event_and_waiters",[](testing & t) {
+        fake_backend consumer;bool released=false;
+        std::shared_ptr<fake_backend> producer(new fake_backend,[&](fake_backend * value) {
+            t.assert_equal(size_t(1),value->event_free);
+            t.assert_equal(size_t(1),value->event_sync);
+            t.assert_equal(size_t(1),consumer.backend_sync);
+            released=true;delete value;
+        });
+        consumer.backend.device=&producer->device;
+        auto completion=llama_memory_completion::create_retained(producer->get(),producer);
+        if (!t.assert_true(completion && completion->record() && completion->wait(consumer.get()))) return;
+        producer.reset();t.assert_true(!released);
+        completion.reset();t.assert_true(released);
+    });
+
     t.test("invalid_and_synchronous_fallback_are_explicit", [](testing & t) {
         t.assert_true(!llama_memory_completion::create(nullptr));
         fake_backend producer(false),consumer(false);

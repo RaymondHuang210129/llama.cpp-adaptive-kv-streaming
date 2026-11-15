@@ -133,9 +133,11 @@ static std::vector<uint8_t> native_rows(ggml_backend_t backend, bool cuda, ggml_
 }
 
 int main(int argc,char ** argv) {
+    const bool consumer_frame=argc==2 && (!std::strcmp(argv[1],"--cuda-group-consumer-stream") || !std::strcmp(argv[1],"--cuda-group-publication-stream"));
+    const bool publication_frame=argc==2 && (!std::strcmp(argv[1],"--cuda-group-publication") || !std::strcmp(argv[1],"--cuda-group-publication-stream"));
     const bool auxiliary=argc==2 && std::strcmp(argv[1],"--cuda-auxiliary-producer")==0;
     const bool proxy_read=argc==2 && std::strcmp(argv[1],"--cuda-group-proxy-read")==0;
-    const bool proxy_frame=proxy_read || (argc==2 && std::strcmp(argv[1],"--cuda-group-proxy-frame")==0);
+    const bool proxy_frame=consumer_frame || publication_frame || proxy_read || (argc==2 && std::strcmp(argv[1],"--cuda-group-proxy-frame")==0);
     const bool proxy=argc==2 && std::strcmp(argv[1],"--cuda-group-proxy")==0;
     const bool cuda=auxiliary || proxy_frame || proxy || (argc==2 && std::strcmp(argv[1],"--cuda-group-producer")==0);
     if (argc>1 && !cuda) return 1;
@@ -410,6 +412,33 @@ int main(int argc,char ** argv) {
                     ++attention_calls;return producer->layer_ready(layer);},[&] {return admitted;}))) return;
         }
         if (!t.assert_true(producer!=nullptr)) return;
+        if (consumer_frame) {
+            ggml_backend_ptr other(ggml_backend_dev_init(ggml_backend_get_device(backend),nullptr));
+            if (!t.assert_true(other && !producer->bind_consumer(other.get()) && producer->bind_consumer(backend))) return;
+        }
+        size_t publication_copies=0,publication_ready=0,publication_committed=0;
+        std::vector<std::vector<uint8_t>> published[2];published[0].resize(2);published[1].resize(2);
+        if (publication_frame && !t.assert_true(producer->bind_publication(
+                [&](uint32_t,const auto & rows) {return rows.size()==3;},
+                [&](uint32_t layer,bool value,const ggml_tensor * encoded,size_t first,size_t count,const auto & rows) {
+                    if (!t.assert_true(layer<2 && rows.size()==3 && rows[0].source==0 && rows[1].source==1 && rows[2].source==0 &&
+                            rows[0].token==0 && rows[1].token==0 && rows[2].token==1)) return false;
+                    const size_t stride=ggml_row_size(encoded->type,int64_t(width));
+                    published[value][layer].resize(3*stride);
+                    ggml_backend_synchronize(backend);
+                    ggml_backend_tensor_get(encoded,published[value][layer].data()+first*stride,0,count*stride);
+                    ++publication_copies;return true;
+                },[&](uint32_t,const auto & rows,bool committed) {
+                    t.out<<"publication completion committed="<<committed<<" tokens="<<a->tokens()<<','<<b->tokens()
+                        <<" ready="<<a->ready()<<','<<b->ready()<<" projection="<<table->projection_current(*projection)<<std::endl;
+                    if (!t.assert_true(rows.size()==3)) return false;
+                    if (committed) {
+                        ++publication_committed;
+                        return t.assert_true(a->ready() && b->ready() && a->tokens()==2 && b->tokens()==1 && table->projection_current(*projection));
+                    }
+                    ++publication_ready;
+                    return t.assert_true(!a->ready() && !b->ready() && !a->tokens() && !b->tokens());
+                }))) return;
         auto allocator=llama_batch_allocr(1);auto batch=allocator.ubatch_reserve(3,1);
         llama_seq_id ids[3]={0,1,0};
         for (size_t row=0;row<3;++row) {
@@ -425,6 +454,8 @@ int main(int argc,char ** argv) {
             t.assert_true(!begin(batch,{0,1,2}) && a->ready() && b->ready());admitted=true;
         }
         if (!t.assert_true(begin(batch,{0,1,2}))) return;
+        if (publication_frame) t.assert_true("active publication bindings cannot be replaced",!producer->bind_publication({}, {}, {}));
+        if (consumer_frame) t.assert_true("an active consumer dependency cannot be replaced",!producer->bind_consumer(nullptr));
         t.assert_true(!a->ready() && !b->ready());
         generated_source source(backend,3,width);
         std::vector<float> keys(3*width),values(3*width);
@@ -459,11 +490,28 @@ int main(int argc,char ** argv) {
         for (uint32_t layer=0;layer<2;++layer) {
             for (auto & value : keys) value+=0.5f;
             for (auto & value : values) value-=0.25f;
-            ggml_backend_tensor_set(source.k,keys.data(),0,keys.size()*sizeof(float));
-            ggml_backend_tensor_set(source.v,values.data(),0,values.size()*sizeof(float));
+            if (consumer_frame) {
+                ggml_backend_tensor_set_async(backend,source.k,keys.data(),0,keys.size()*sizeof(float));
+                ggml_backend_tensor_set_async(backend,source.v,values.data(),0,values.size()*sizeof(float));
+            } else {
+                ggml_backend_tensor_set(source.k,keys.data(),0,keys.size()*sizeof(float));
+                ggml_backend_tensor_set(source.v,values.data(),0,values.size()*sizeof(float));
+            }
             expected_keys[layer]=native_rows(backend,cuda,GGML_TYPE_Q8_0,keys,width);
             expected_values[layer]=native_rows(backend,cuda,GGML_TYPE_Q4_0,values,width);
-            if (!t.assert_true(publish(layer,source,{0,1,2}) && producer->layer_ready(layer))) return;
+#ifdef KV_STREAM_CONSUMER_TRACE
+            if (consumer_frame) kv_stream_consumer_capture(true);
+#endif
+            const bool produced=publish(layer,source,{0,1,2}) && producer->layer_ready(layer);
+#ifdef KV_STREAM_CONSUMER_TRACE
+            if (consumer_frame) {
+                kv_stream_consumer_capture(false);
+                t.assert_true("an ordered GPU consumer does not wait on the CPU at publication",kv_stream_consumer_syncs()==0);
+            }
+#else
+            if (consumer_frame) t.assert_true("native completion tracing is required",false);
+#endif
+            if (!t.assert_true(produced)) return;
             if (model) {
                 llama_kv_stream_host_layer planes;if (!t.assert_true(model->layer(layer,planes))) return;
                 ggml_tensor query{},key{},value{},mask{},op{};
@@ -494,11 +542,23 @@ int main(int argc,char ** argv) {
                 llama_kv_stream_host_layer layer;
                 if (!t.assert_true(cache->host()->layer(layer_index,layer))) return;
                 const auto * address=static_cast<const uint8_t *>(value ? layer.v : layer.k)+token*stride;
-                t.assert_true(!std::memcmp(encoded.data()+row*stride,address,stride));
+                t.assert_true("canonical producer bytes match the native row encoder",!std::memcmp(encoded.data()+row*stride,address,stride));
                 t.assert_equal(uint32_t(row==1 ? 1 : 0),projection->columns[row].source);
                 t.assert_equal(token,projection->columns[row].token);
             }
         }
+        if (publication_frame) {
+            const bool copies=t.assert_equal("every encoded plane is published on device",size_t(4),publication_copies);
+            const bool ready=t.assert_equal("device readiness precedes canonical commit",size_t(2),publication_ready);
+            const bool committed=t.assert_equal("host completion closes every published layer",size_t(2),publication_committed);
+            if (!copies || !ready || !committed) return;
+            for (size_t layer=0;layer<2;++layer) {
+                t.assert_true("published key bytes match native encoding",published[0][layer]==expected_keys[layer]);
+                t.assert_true("published value bytes match native encoding",published[1][layer]==expected_values[layer]);
+            }
+            if (!t.assert_true(producer->bind_publication({}, {}, {}))) return;
+        }
+        if (consumer_frame && !t.assert_true(producer->bind_consumer(nullptr))) return;
         const auto before_a=a->checkpoint(),before_b=b->checkpoint();
         if (model) {
             admitted=false;

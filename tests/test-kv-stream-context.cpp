@@ -3268,14 +3268,16 @@ struct group_ring_probe {
     decltype(ggml_backend_reg_i::get_proc_address) original;
     ggml_kv_stream_copy_ops copy;
     decltype(ggml_kv_stream_copy_ops::acquire_span) acquire;
+    decltype(ggml_kv_stream_copy_ops::gather) gather;
     const std::string & phase;
     std::array<size_t,3> spans{};
+    size_t device_publications=0;
     group_ring_probe(ggml_backend_dev_t device,const std::string & phase) : registry(ggml_backend_dev_backend_reg(device)),
         original(registry->iface.get_proc_address),phase(phase) {
         GGML_ASSERT(!active);
         const auto get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(original(registry,"ggml_backend_kv_stream_copy_ops"));
         GGML_ASSERT(get && get() && get()->acquire_span);
-        copy=*get();acquire=copy.acquire_span;active=this;
+        copy=*get();acquire=copy.acquire_span;gather=copy.gather;active=this;
         copy.acquire_span=[](void * queue,size_t first,size_t count) {
             const bool okay=active->acquire(queue,first,count);
             if (okay) {
@@ -3284,6 +3286,11 @@ struct group_ring_probe {
                 if (phase=="catchup") active->spans[1]+=count;
                 if (phase=="predict") active->spans[2]+=count;
             }
+            return okay;
+        };
+        if (gather) copy.gather=[](ggml_backend_t backend,ggml_backend_buffer_t output,const ggml_kv_stream_copy_rectangle * rectangles,size_t count,bool initialize) {
+            const bool okay=active->gather(backend,output,rectangles,count,initialize);
+            if (okay && active->phase=="publication" && ggml_backend_buffer_get_size(output)>1048576) ++active->device_publications;
             return okay;
         };
         registry->iface.get_proc_address=[](ggml_backend_reg_t registry,const char * name) -> void * {
@@ -3529,9 +3536,18 @@ static void test_two_slot_mtp_image_catchup(testing & t,llama_model * model,cons
     t.out<<"group image MTP continuation native_exact=1 draft_widths=1,3 full_parent_overwrite=1\n";
 }
 
+#ifdef KV_STREAM_MTP_TRANSPORT_TRACE
+void kv_stream_mtp_transport_reset();
+size_t kv_stream_mtp_transport_seen();
+size_t kv_stream_mtp_transport_slow();
+#endif
+
 static void test_group_mtp_admission(testing & t,llama_model * model,bool resume=false,bool phase_guard=false,bool ring=false,bool partial=false,
         std::array<uint16_t,2> draft_widths={1,3},std::array<uint16_t,2> accepted_widths={0,2},bool backend_sampling=false,uint32_t cutoff=0,
         bool prefetch_probe=false,bool restore_order_probe=false) {
+#ifdef KV_STREAM_MTP_TRANSPORT_TRACE
+    kv_stream_mtp_transport_reset();
+#endif
     if (!t.assert_true(model && model->arch==LLM_ARCH_QWEN35 && model->hparams.n_layer_nextn==1)) return;
     auto cp=llama_context_default_params();
     const auto maximum_depth=*std::max_element(draft_widths.begin(),draft_widths.end());
@@ -3916,6 +3932,10 @@ static void test_group_mtp_admission(testing & t,llama_model * model,bool resume
     }
     oracle.finish();
     t.out<<"streamed joint MTP exact_records="<<oracle.records()<<" bytes="<<oracle.byte_count()<<'\n';
+#ifdef KV_STREAM_MTP_TRANSPORT_TRACE
+    t.assert_true("the real MTP continuation includes small catch-up reads",kv_stream_mtp_transport_seen()>0);
+    t.assert_true("small MTP catch-up reads use ordered decode transport",kv_stream_mtp_transport_slow()==0);
+#endif
 }
 static void test_group_gemma_assistant_metadata(testing & t,llama_model * model,const char * path,bool late_attachment=false,
         bool joint_quote=false,bool joint_factory=false,bool joint_execution=false,bool manager_mode=false,bool ring=false,
@@ -4981,12 +5001,15 @@ static bool test_dflash_after_teacher(testing & t,llama_model & model,llama_mode
 }
 
 static void test_native_dflash_draft_stage(testing & t,llama_model * model,const char * draft_path,const char * input_path,
-        const char * output_path,bool streamed=false,bool negative=false,bool parking=false,bool suffix=false,bool rebind=false,bool k4v=false,bool repeat=false,bool partition=false,bool restore_probe=false) {
+        const char * output_path,bool streamed=false,bool negative=false,bool parking=false,bool suffix=false,bool rebind=false,bool k4v=false,bool repeat=false,bool partition=false,bool restore_probe=false,bool resident_probe=false,bool publication_probe=false) {
     if (!t.assert_true(model && model->arch==LLM_ARCH_QWEN35 && draft_path && input_path && output_path)) return;
     const auto * native_teacher=streamed ? nullptr : std::getenv("LLAMA_TEST_DFLASH_NATIVE_TEACHER_ORACLE");
     auto mp=llama_model_default_params();mp.n_gpu_layers=999;
     model_ptr draft(llama_model_load_from_file(draft_path,mp),llama_model_free);
     if (!t.assert_true(draft && draft->arch==LLM_ARCH_DFLASH)) return;
+    std::string publication_phase;
+    std::unique_ptr<group_ring_probe> publication_transport;
+    if (publication_probe) publication_transport=std::make_unique<group_ring_probe>(model->devices.front().dev,publication_phase);
     kv_stream_bit_oracle input;
     std::unique_ptr<FILE,kv_stream_exact_file_free> source(std::fopen(input_path,"rb"));
     if (!t.assert_true(source!=nullptr)) return;
@@ -5063,6 +5086,12 @@ static void test_native_dflash_draft_stage(testing & t,llama_model * model,const
         auto child_params=cp;child_params.ctx_other=metadata.get();
         native_child=std::make_unique<llama_context>(*draft,child_params);
         target=metadata.get();child_pointer=native_child.get();
+    }
+    std::array<uint64_t,2> resident_epochs{};
+    if (resident_probe) for (size_t slot=0;slot<resident_epochs.size();++slot) {
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;
+        if (!t.assert_true(group && group->source_table()->get(group->source_handles()[slot],0,cache))) return;
+        resident_epochs[slot]=cache->content()->mirror_epoch();
     }
     auto & child=*child_pointer;
     common_params_speculative params;params.types={COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
@@ -5251,6 +5280,22 @@ static void test_native_dflash_draft_stage(testing & t,llama_model * model,const
     }
     if (streamed) {
         output.finish();
+        if (resident_probe) {
+            common_batch verify(target);
+            for (llama_seq_id slot=0;slot<2;++slot) verify.add(seeds[slot],llama_pos(prompts[slot].size()),slot,true);
+            llama_set_kv_stream_decode(target,true);
+            if (publication_probe) publication_phase="publication";
+            if (!t.assert_equal(0,llama_process(target,LLAMA_PROCESS_TYPE_DECODE,verify.get()))) return;
+            target->synchronize();
+            if (publication_probe && !t.assert_true("real target verification publishes native encoded rows directly to resident storage",
+                    publication_transport->device_publications>0)) return;
+            for (size_t slot=0;slot<resident_epochs.size();++slot) {
+                std::shared_ptr<llama_kv_stream_logical_cache> cache;
+                if (!t.assert_true(group->source_table()->get(group->source_handles()[slot],0,cache))) return;
+                t.assert_equal("suffix rollback keeps the selected physical resident mirror",resident_epochs[slot],cache->content()->mirror_epoch());
+            }
+            return;
+        }
         if (const auto * verify_path=std::getenv("LLAMA_TEST_DFLASH_TARGET_VERIFY_ORACLE")) {
             std::unique_ptr<FILE,kv_stream_exact_file_free> reference(std::fopen(verify_path,"rb"));
             if (!t.assert_true(reference!=nullptr)) return;
@@ -8966,16 +9011,19 @@ int main(int argc,char ** argv) {
     for (int i=3;i+3<argc;++i) if (!std::strcmp(argv[i],"--group-dflash-staged-exact") || !std::strcmp(argv[i],"--group-dflash-staged-guards") ||
             !std::strcmp(argv[i],"--group-dflash-staged-park") || !std::strcmp(argv[i],"--group-dflash-staged-suffix") ||
             !std::strcmp(argv[i],"--group-dflash-staged-rebind") || !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v") ||
-            !std::strcmp(argv[i],"--group-dflash-staged-widths") || !std::strcmp(argv[i],"--group-dflash-prefetch-only")) {
+            !std::strcmp(argv[i],"--group-dflash-staged-widths") || !std::strcmp(argv[i],"--group-dflash-prefetch-only") ||
+            !std::strcmp(argv[i],"--group-dflash-resident-retention-only") || !std::strcmp(argv[i],"--group-dflash-device-publication-only")) {
         t.test("Streamed_DFlash_matches_staged_native_target_and_draft_vectors",[&](testing & t) {
             test_native_dflash_draft_stage(t,model.get(),argv[i+1],argv[i+2],argv[i+3],true,
                 !std::strcmp(argv[i],"--group-dflash-staged-guards"),
                 !std::strcmp(argv[i],"--group-dflash-staged-park") || !std::strcmp(argv[i],"--group-dflash-staged-rebind") ||
                     !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v"),
-                !std::strcmp(argv[i],"--group-dflash-staged-suffix") || !std::strcmp(argv[i],"--group-dflash-prefetch-only"),
+                !std::strcmp(argv[i],"--group-dflash-staged-suffix") || !std::strcmp(argv[i],"--group-dflash-prefetch-only") ||
+                    !std::strcmp(argv[i],"--group-dflash-resident-retention-only") || !std::strcmp(argv[i],"--group-dflash-device-publication-only"),
                 !std::strcmp(argv[i],"--group-dflash-staged-rebind") || !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v"),
                 !std::strcmp(argv[i],"--group-dflash-staged-rebind-k4v"),false,!std::strcmp(argv[i],"--group-dflash-staged-widths"),
-                !std::strcmp(argv[i],"--group-dflash-prefetch-only"));
+                !std::strcmp(argv[i],"--group-dflash-prefetch-only"),!std::strcmp(argv[i],"--group-dflash-resident-retention-only") ||
+                    !std::strcmp(argv[i],"--group-dflash-device-publication-only"),!std::strcmp(argv[i],"--group-dflash-device-publication-only"));
         });
         return t.summary();
     }

@@ -13,6 +13,7 @@ struct llama_memory_completion::implementation {
     std::vector<ggml_backend_t> waiters;
     bool submitted = false;
     bool ready = false;
+    std::shared_ptr<void> owner;
 
     ~implementation() {
         if (event) {
@@ -42,6 +43,11 @@ std::unique_ptr<llama_memory_completion> llama_memory_completion::create(ggml_ba
     } catch (const std::bad_alloc &) {
         return {};
     }
+}
+std::unique_ptr<llama_memory_completion> llama_memory_completion::create_retained(ggml_backend_t producer,std::shared_ptr<void> owner) {
+    auto result=create(producer);
+    if (result) result->impl->owner=std::move(owner);
+    return result;
 }
 std::unique_ptr<llama_memory_completion> llama_memory_completion::completed(ggml_backend_t producer) {
     if (!producer || !producer->device) return {};

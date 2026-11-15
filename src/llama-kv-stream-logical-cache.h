@@ -156,10 +156,17 @@ private:
 // native cell placement and model completion; this object owns only K/V publication.
 class llama_kv_stream_group_producer {
 public:
+    using publication_rows = std::vector<ggml_kv_stream_gather_row>;
+    using publication_admit = std::function<bool(uint32_t,const publication_rows &)>;
+    using publication_copy = std::function<bool(uint32_t,bool,const ggml_tensor *,size_t,size_t,const publication_rows &)>;
+    using publication_complete = std::function<bool(uint32_t,const publication_rows &,bool)>;
     static std::unique_ptr<llama_kv_stream_group_producer> create(
         std::shared_ptr<llama_kv_stream_slot_table> table, std::shared_ptr<llama_kv_stream_writer> writer,
         uint32_t maximum_rows, uint32_t maximum_verify_rows, uint32_t maximum_selected);
     ~llama_kv_stream_group_producer();
+    bool bind_publication(publication_admit admit,publication_copy copy,publication_complete complete);
+    // The GPU reader must use this exact ordered backend and fence it before ring uploads.
+    bool bind_consumer(ggml_backend_t backend);
     bool begin(std::shared_ptr<llama_kv_stream_slot_projection> projection, const llama_ubatch & batch,
         const std::vector<uint32_t> & native_indices, llama_memory_work_phase phase);
     bool produce(uint32_t layer, const ggml_tensor * key, const ggml_tensor * value);

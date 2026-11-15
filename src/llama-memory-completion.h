@@ -9,6 +9,8 @@
 class llama_memory_completion {
 public:
     static std::unique_ptr<llama_memory_completion> create(ggml_backend_t producer);
+    // Keep a dynamically owned producer alive until its event and consumers retire.
+    static std::unique_ptr<llama_memory_completion> create_retained(ggml_backend_t producer,std::shared_ptr<void> owner);
     // Represent work that the caller already completed without another backend synchronization.
     static std::unique_ptr<llama_memory_completion> completed(ggml_backend_t producer);
     ~llama_memory_completion();

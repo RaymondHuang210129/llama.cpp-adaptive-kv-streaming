@@ -1,6 +1,7 @@
 #include "llama-kv-stream-writer.h"
 #include "llama-memory-executor-cuda.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-backend-execution.h"
 
 #include <algorithm>
 #include <limits>
@@ -13,6 +14,7 @@ struct write_graph {
     size_t width = 0, rows = 0;
     ggml_tensor * output = nullptr;
     ggml_cgraph * graph = nullptr;
+    ggml_tensor * root = nullptr;
     // Captures retire before metadata and source-buffer ownership disappear.
     std::unique_ptr<llama_memory_cuda_executor> execution;
 };
@@ -25,36 +27,87 @@ struct llama_kv_stream_writer::implementation {
     size_t maximum = 0, capacity = 0, scratch_bytes = 0;
     ggml_context_ptr context;
     ggml_tensor * roots[2] = {};
+    ggml_tensor * routed_roots[2] = {};
+    size_t routed_capacity = 0;
+    std::shared_ptr<ggml_backend> host_backend;
+    ggml_backend_event_t host_ready[2] = {}, host_consumed[2] = {};
+    bool host_busy[2] = {};
     ggml_tensor * indices = nullptr;
     // Plans drain before these destination registrations are released during destruction.
     std::vector<ggml_backend_buffer_ptr> destinations;
     // Cached executions drain before this upload storage is released.
     std::vector<int64_t> index_data;
     std::array<std::vector<std::unique_ptr<write_graph>>,2> plans;
+    std::array<std::vector<std::unique_ptr<write_graph>>,2> cached;
     llama_kv_stream_write_stats last;
+
+    ~implementation() {
+        if (host_backend) ggml_backend_synchronize(host_backend.get());
+        for (auto * event : host_ready) if (event) ggml_backend_event_free(event);
+        for (auto * event : host_consumed) if (event) ggml_backend_event_free(event);
+    }
+
+    bool prepare_host_backend() {
+        if (host_backend) return true;
+        auto * device=ggml_backend_get_device(backend);
+        std::shared_ptr<ggml_backend> next(ggml_backend_dev_init(device,nullptr),ggml_backend_free);
+        if (!next) return false;
+        for (size_t side=0;side<2;++side) {
+            host_ready[side]=ggml_backend_event_new(device);host_consumed[side]=ggml_backend_event_new(device);
+            if (!host_ready[side] || !host_consumed[side]) {
+                for (auto & event : host_ready) if (event) {ggml_backend_event_free(event);event=nullptr;}
+                for (auto & event : host_consumed) if (event) {ggml_backend_event_free(event);event=nullptr;}
+                return false;
+            }
+            ggml_backend_event_record(host_ready[side],next.get());ggml_backend_event_record(host_consumed[side],next.get());
+        }
+        ggml_backend_synchronize(next.get());host_backend=std::move(next);return true;
+    }
 
     size_t width(bool value) const { return size_t(value ? shape.head_dim_v : shape.head_dim_k)*size_t(shape.heads); }
     ggml_type type(bool value) const { return ggml_type(value ? shape.type_v : shape.type_k); }
     size_t row_bytes(bool value) const { return ggml_row_size(type(value), int64_t(width(value))); }
 
     // Immutable per-tile metadata remains valid until every queued launch reaches its completion event.
-    write_graph * prepare(const ggml_tensor * source, bool value, size_t tile, size_t offset, size_t count) {
+    write_graph * prepare(const ggml_tensor * source, bool value, size_t tile, size_t offset, size_t count,bool routed=false,bool cache_source=false) {
+        auto * root=routed ? routed_roots[value] : roots[value];
+        const size_t root_rows=routed ? routed_capacity : capacity;
         auto * owner=source->view_src ? source->view_src->buffer : source->buffer;
         auto * data=static_cast<char *>(source->data)+offset*source->nb[1];
-        auto & cache=plans[value];
-        if (cache.size() <= tile) cache.resize(tile+1);
-        auto & plan=cache[tile];
-        if (plan && plan->source_owner.get() == owner && plan->data == data && plan->type == type(value) &&
-                plan->rows == count && plan->width == width(value)) return plan.get();
+        const auto storage=[](ggml_backend_buffer_t buffer) {
+            while (buffer->parent) buffer=buffer->parent;
+            return buffer;
+        };
+        // Extra cached sources must retain the writer's own parent, not another GPU allocation.
+        const bool shared=cache_source && !cpu && !ggml_backend_buft_is_execution(ggml_backend_buffer_get_type(owner)) &&
+            storage(owner)==storage(buffer.get());
+        auto & cache=shared ? cached[value] : plans[value];
+        const auto matches=[&](const auto & plan) {
+            return plan && (shared ? ggml_backend_buffer_get_type(plan->source_owner.get())==ggml_backend_buffer_get_type(owner) :
+                plan->source_owner.get()==owner) && plan->data==data && plan->type==type(value) &&
+                plan->rows==count && plan->width==width(value) && plan->root==root;
+        };
+        if (shared) {
+            const auto found=std::find_if(cache.begin(),cache.end(),matches);
+            if (found!=cache.end()) {
+                auto * result=found->get();std::rotate(found,found+1,cache.end());return result;
+            }
+            if (cache.size()==64) cache.erase(cache.begin());
+            cache.emplace_back();
+        } else {
+            if (cache.size()<=tile) cache.resize(tile+1);
+            if (matches(cache[tile])) return cache[tile].get();
+        }
+        auto & plan=shared ? cache.back() : cache[tile];
         plan.reset();
         auto next=std::make_unique<write_graph>();
         next->source_owner.reset(ggml_backend_buffer_retain(owner));
         next->context.reset(ggml_init({65536,nullptr,true}));
         if (!next->context) return nullptr;
-        next->data=data; next->type=type(value); next->rows=count; next->width=width(value);
+        next->data=data; next->type=type(value); next->rows=count; next->width=width(value);next->root=root;
         auto * input=ggml_new_tensor_2d(next->context.get(),GGML_TYPE_F32,int64_t(width(value)),int64_t(count));
         if (ggml_backend_tensor_alloc(owner,input,data) != GGML_STATUS_SUCCESS) return nullptr;
-        auto * dst=ggml_view_2d(next->context.get(),roots[value],int64_t(width(value)),int64_t(capacity),row_bytes(value),0);
+        auto * dst=ggml_view_2d(next->context.get(),root,int64_t(width(value)),int64_t(root_rows),row_bytes(value),0);
         auto * idx=ggml_view_1d(next->context.get(),indices,int64_t(count),0);
         if (ggml_backend_view_init(dst) != GGML_STATUS_SUCCESS || ggml_backend_view_init(idx) != GGML_STATUS_SUCCESS) return nullptr;
         next->output=ggml_set_rows(next->context.get(),dst,input,idx);
@@ -159,6 +212,20 @@ std::unique_ptr<llama_kv_stream_writer> llama_kv_stream_writer::create(ggml_back
             s.roots[value] = ggml_new_tensor_1d(s.context.get(), s.type(value), int64_t(s.width(value)*s.capacity));
             if (ggml_backend_tensor_alloc(buffer, s.roots[value], base) != GGML_STATUS_SUCCESS) return {};
         }
+        if (!s.cpu && s.capacity>=2) {
+            const size_t count=s.capacity/2;
+            auto * key=ggml_new_tensor_1d(s.context.get(),s.type(false),int64_t(s.width(false)*count));
+            auto * value=ggml_new_tensor_1d(s.context.get(),s.type(true),int64_t(s.width(true)*count));
+            const size_t key_bytes=ggml_backend_buffer_get_alloc_size(buffer,key),value_bytes=ggml_backend_buffer_get_alloc_size(buffer,value);
+            if (key_bytes<=SIZE_MAX-127) {
+                const size_t offset=(key_bytes+127)/128*128;
+                if (offset<=index_offset && value_bytes<=index_offset-offset &&
+                        ggml_backend_tensor_alloc(buffer,key,base)==GGML_STATUS_SUCCESS &&
+                        ggml_backend_tensor_alloc(buffer,value,base+offset)==GGML_STATUS_SUCCESS) {
+                    s.routed_roots[0]=key;s.routed_roots[1]=value;s.routed_capacity=count;
+                }
+            }
+        }
         s.indices = ggml_new_tensor_1d(s.context.get(), GGML_TYPE_I64, int64_t(s.capacity));
         if (ggml_backend_tensor_alloc(buffer, s.indices, base + index_offset) != GGML_STATUS_SUCCESS) return {};
         s.index_data.resize(s.capacity);
@@ -175,6 +242,10 @@ bool llama_kv_stream_writer::matches_shape(const ggml_kv_stream_shape & shape) c
         actual.head_dim_k == shape.head_dim_k && actual.head_dim_v == shape.head_dim_v &&
         actual.heads == shape.heads && actual.page_tokens == shape.page_tokens &&
         actual.alignment == shape.alignment;
+}
+
+bool llama_kv_stream_writer::matches_backend(ggml_backend_t backend) const noexcept {
+    return impl && backend && impl->backend==backend;
 }
 
 
@@ -227,6 +298,7 @@ bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, boo
     s.last.host_payload_bytes=rows*stride;
     const auto fail=[&] {
         ggml_backend_synchronize(s.backend);
+        if (s.host_backend) ggml_backend_synchronize(s.host_backend.get());
         release_completed();
         return false;
     };
@@ -273,25 +345,35 @@ bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, boo
                 if (found == s.destinations.end()) s.destinations.emplace_back(ggml_backend_buffer_retain(range.buffer.get()));
             }
         }
+        const bool asynchronous=routed && publish && !s.cpu && rows<=s.routed_capacity && s.prepare_host_backend();
+        if (s.host_backend) for (size_t side=0;side<2;++side)
+            if (s.host_busy[side] && (!asynchronous || side==size_t(value))) ggml_backend_event_wait(s.backend,s.host_consumed[side]);
         // Another execution phase may have overwritten the shared scratch.
         ggml_backend_tensor_set_async(s.backend,s.indices,s.index_data.data(),0,std::min(rows,s.capacity)*sizeof(int64_t));
         size_t tile=0;
         size_t destination=0, destination_offset=0;
         for (size_t first=0; first < rows; first += std::min(s.capacity,rows-first)) {
             const size_t count=std::min(s.capacity,rows-first);
-            auto * plan=s.prepare(source,value,tile++,first,count);
+            auto * plan=s.prepare(source,value,tile++,first,count,asynchronous,routed);
             if (!plan) return fail();
             ++s.last.graph_submissions;
             if (s.cpu) {
                 if (ggml_backend_graph_compute(s.backend,plan->graph) != GGML_STATUS_SUCCESS) return fail();
             } else if (plan->execution->compute_async({},1) != GGML_STATUS_SUCCESS) return fail();
+            auto * download=s.backend;
+            if (asynchronous) {
+                if (!publish(s.routed_roots[value],first,count)) return fail();
+                s.last.d2d_bytes+=count*stride;++s.last.d2d_calls;
+                ggml_backend_event_record(s.host_ready[value],s.backend);
+                ggml_backend_event_wait(s.host_backend.get(),s.host_ready[value]);download=s.host_backend.get();
+            }
             if (destinations) {
                 size_t copied=0;
                 while (copied < count*stride) {
                     const auto & range=(*destinations)[destination];
                     const size_t bytes=std::min(range.bytes-destination_offset,count*stride-copied);
                     auto * target=static_cast<char *>(ggml_backend_buffer_get_base(range.buffer.get()))+range.offset+destination_offset;
-                    ggml_backend_tensor_get_async(s.backend,plan->output,target,copied,bytes);
+                    ggml_backend_tensor_get_async(download,plan->output,target,copied,bytes);
                     s.last.d2h_bytes += bytes; ++s.last.d2h_calls;
                     copied += bytes; destination_offset += bytes;
                     if (destination_offset == range.bytes) { ++destination; destination_offset=0; }
@@ -300,9 +382,12 @@ bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, boo
                 ggml_backend_tensor_get_async(s.backend,plan->output,static_cast<char *>(host)+first*stride,0,count*stride);
                 s.last.d2h_bytes += count*stride; ++s.last.d2h_calls;
             }
-            const bool published=!publish || publish(s.roots[value],first,count);
+            const bool published=asynchronous || !publish || publish(s.roots[value],first,count);
             if (!published) return fail();
-            if (publish) { s.last.d2d_bytes += count*stride; ++s.last.d2d_calls; }
+            if (publish && !asynchronous) { s.last.d2d_bytes += count*stride; ++s.last.d2d_calls; }
+        }
+        if (asynchronous) {
+            ggml_backend_event_record(s.host_consumed[value],s.host_backend.get());s.host_busy[value]=true;
         }
         llama_kv_stream_writer_completion next;
         if (s.cpu) {
@@ -310,7 +395,7 @@ bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, boo
             next.host=llama_memory_completion::completed(s.backend);
         } else {
             next.device=llama_memory_completion::create(s.backend);
-            next.host=llama_memory_completion::create(s.backend);
+            next.host=asynchronous ? llama_memory_completion::create_retained(s.host_backend.get(),s.host_backend) : llama_memory_completion::create(s.backend);
             if (!next.device || !next.host || !next.device->record() || !next.host->record()) return fail();
         }
         if (!next.device || !next.host) return fail();
@@ -318,6 +403,7 @@ bool llama_kv_stream_writer::generate_async_impl(const ggml_tensor * source, boo
         return true;
     } catch (...) {
         ggml_backend_synchronize(s.backend);
+        if (s.host_backend) ggml_backend_synchronize(s.host_backend.get());
         release_completed();
         throw;
     }
@@ -335,9 +421,13 @@ bool llama_kv_stream_writer::generate(const ggml_tensor * source, bool value, vo
 
 void llama_kv_stream_writer::release_completed() noexcept {
     if (!impl) return;
-    if (!impl->cpu) for (auto & cache : impl->plans) for (auto & plan : cache)
-        if (plan && plan->execution) plan->execution->release_completed();
+    const auto release=[](auto & caches) {
+        for (auto & cache : caches) for (auto & plan : cache)
+            if (plan && plan->execution) plan->execution->release_completed();
+    };
+    if (!impl->cpu) {release(impl->plans);release(impl->cached);}
     impl->destinations.clear();
+    impl->host_busy[0]=impl->host_busy[1]=false;
 }
 
 llama_kv_stream_write_stats llama_kv_stream_writer::stats() const { return impl->last; }

@@ -543,12 +543,18 @@ struct llama_kv_stream_group_producer::implementation {
         std::vector<ggml_kv_stream_gather_row> previous_columns;
         llama_kv_cells previous_cells;
         std::vector<bool> ready;
+        std::vector<bool> device_published;
+        std::vector<std::array<llama_kv_stream_writer_completion,2>> transfers;
         bool admitted=false,columns_changed=false;
     };
     std::shared_ptr<llama_kv_stream_slot_table> table;
     std::shared_ptr<llama_kv_stream_writer> writer;
     uint32_t maximum_rows=0,maximum_verify_rows=0,maximum_selected=0;
     std::unique_ptr<frame> active;
+    llama_kv_stream_group_producer::publication_admit publication_admit;
+    llama_kv_stream_group_producer::publication_copy publication_copy;
+    llama_kv_stream_group_producer::publication_complete publication_complete;
+    ggml_backend_t consumer=nullptr;
     bool failed=false;
 };
 
@@ -569,6 +575,18 @@ std::unique_ptr<llama_kv_stream_group_producer> llama_kv_stream_group_producer::
 }
 
 llama_kv_stream_group_producer::~llama_kv_stream_group_producer() {if (impl) abort();}
+
+bool llama_kv_stream_group_producer::bind_publication(publication_admit admit,publication_copy copy,publication_complete complete) {
+    auto & s=*impl;
+    if (s.active || s.failed || (bool(admit)!=bool(copy)) || (bool(copy)!=bool(complete))) return false;
+    s.publication_admit=std::move(admit);s.publication_copy=std::move(copy);s.publication_complete=std::move(complete);return true;
+}
+
+bool llama_kv_stream_group_producer::bind_consumer(ggml_backend_t backend) {
+    auto & s=*impl;
+    if (s.active || s.failed || (backend && !s.writer->matches_backend(backend))) return false;
+    s.consumer=backend;return true;
+}
 
 bool llama_kv_stream_group_producer::begin(std::shared_ptr<llama_kv_stream_slot_projection> projection,
         const llama_ubatch & batch,const std::vector<uint32_t> & indices,llama_memory_work_phase phase) {
@@ -593,7 +611,7 @@ bool llama_kv_stream_group_producer::begin(std::shared_ptr<llama_kv_stream_slot_
             if (!count || (layers && layers!=count)) return false;
             layers=count;source.writes.resize(layers);source.before=source.cache->checkpoint();
         }
-        next->ready.resize(layers,false);
+        next->ready.resize(layers,false);next->device_published.resize(layers,false);next->transfers.resize(layers);
         for (uint32_t row=0;row<batch.n_tokens;++row) {
             if (batch.n_seq_id[row]!=1 || !batch.seq_id[row] || batch.seq_id[row][0]<0 ||
                     indices[row]>=next->projection->columns.size() || !next->projection->cells->is_empty(indices[row])) return false;
@@ -639,16 +657,27 @@ bool llama_kv_stream_group_producer::produce(uint32_t layer,const ggml_tensor * 
                 current->content()->generation()!=source.before.generation || source.cells->get_used()!=source.before.tokens ||
                 (source.begun ? current->frontiers().reserved!=source.before.tokens+source.indices.size() : !current->ready())) return false;
     }
-    llama_kv_stream_writer_completion completions[2];
+    auto & completions=s.active->transfers[layer];
     const auto drain=[&] {
         bool okay=true;
         for (auto & completion : completions) {
             if (completion.host) okay=completion.host->synchronize() && okay;
             if (completion.device) okay=completion.device->synchronize() && okay;
         }
-        s.writer->release_completed();return okay;
+        return okay;
     };
     try {
+        publication_rows publication;
+        bool device_publication=false;
+        if (s.publication_admit) {
+            for (const auto & row : s.active->rows) publication.push_back({row.source,row.token});
+            device_publication=s.publication_admit(layer,publication);
+        }
+        std::function<bool(const ggml_tensor *,size_t,size_t)> publish[2];
+        if (device_publication) for (size_t side=0;side<2;++side)
+            publish[side]=[&,side](const ggml_tensor * encoded,size_t first,size_t count) {
+                return s.publication_copy(layer,side,encoded,first,count,publication);
+            };
         std::vector<llama_kv_stream_host_range> routes[2];
         for (bool side : {false,true}) for (const auto & row : s.active->rows) {
             const auto host=s.active->sources[row.source].cache->host();
@@ -657,19 +686,30 @@ bool llama_kv_stream_group_producer::produce(uint32_t layer,const ggml_tensor * 
             if (!host->ranges(layer,side ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,row.token*stride,stride,ranges)) return false;
             for (auto & range : ranges) routes[side].push_back(std::move(range));
         }
-        if (!s.writer->generate_async_routed(key,false,routes[0],{},completions[0]) ||
-                !s.writer->generate_async_routed(value,true,routes[1],{},completions[1]) || !drain()) {
+        if (!s.writer->generate_async_routed(key,false,routes[0],publish[0],completions[0]) ||
+                !s.writer->generate_async_routed(value,true,routes[1],publish[1],completions[1])) {
             drain();abort();return false;
+        }
+        // The bound reader uses this producer stream, including the ring queue's begin fence.
+        if (s.consumer) {
+            if (!s.writer->matches_backend(s.consumer)) {abort();return false;}
+        } else if (device_publication) {
+            for (auto & completion : completions) if (!completion.device || !completion.device->synchronize()) {abort();return false;}
+        } else {
+            if (!drain()) {abort();return false;}
+            completions={};
         }
         for (auto & source : s.active->sources) if (source.begun) {
             const auto & layout=source.cache->host()->layout();
             const size_t first=source.before.tokens,count=source.indices.size();
-            // The routed writer completed these exact bytes before the direct ticket is created.
+            // Retained transfer completions gate these native bytes before canonical publication.
             if (!source.cache->content()->prepare_direct_generated({
                     {layer,ggml_kv_stream_operand::k,first*layout.k_token_bytes,nullptr,count*layout.k_token_bytes},
                     {layer,ggml_kv_stream_operand::v,first*layout.v_token_bytes,nullptr,count*layout.v_token_bytes}},
                     [](const auto &,void *) {return true;},source.writes[layer])) {abort();return false;}
         }
+        if (device_publication && !s.publication_complete(layer,publication,false)) {abort();return false;}
+        s.active->device_published[layer]=device_publication;
         s.active->ready[layer]=true;return true;
     } catch (...) {drain();abort();return false;}
 }
@@ -682,6 +722,10 @@ bool llama_kv_stream_group_producer::finish() {
     auto & s=*impl;
     if (!s.active || !s.active->admitted || !std::all_of(s.active->ready.begin(),s.active->ready.end(),[](bool ready) {return ready;})) return false;
     try {
+        for (auto & pair : s.active->transfers) for (auto & completion : pair) {
+            if ((completion.host && !completion.host->synchronize()) || (completion.device && !completion.device->synchronize())) {abort();return false;}
+        }
+        s.writer->release_completed();
         std::vector<llama_kv_cells> metadata;
         for (size_t i=0;i<s.active->sources.size();++i) {
             const auto & source=s.active->sources[i];
@@ -707,6 +751,12 @@ bool llama_kv_stream_group_producer::finish() {
             if (source.begun) source.cells->set(uint32_t(source.before.tokens),metadata[i]);
             s.active->projection->sources[i]=source.cache->checkpoint();
         }
+        if (s.publication_complete) {
+            publication_rows publication;
+            for (const auto & row : s.active->rows) publication.push_back({row.source,row.token});
+            for (uint32_t layer=0;layer<s.active->device_published.size();++layer)
+                if (s.active->device_published[layer] && !s.publication_complete(layer,publication,true)) {s.failed=true;abort();return false;}
+        }
         s.active.reset();return true;
     } catch (...) {s.failed=true;abort();return false;}
 }
@@ -716,6 +766,10 @@ bool llama_kv_stream_group_producer::abort() noexcept {
     if (!s.active) return !s.failed;
     bool okay=true;
     try {
+        for (auto & pair : s.active->transfers) for (auto & completion : pair) {
+            if (completion.host) okay=completion.host->synchronize() && okay;
+            if (completion.device) okay=completion.device->synchronize() && okay;
+        }
         s.writer->release_completed();
         for (auto & source : s.active->sources) if (source.begun) {
             okay=(source.published ? source.cache->truncate(source.before.tokens) : source.cache->cancel()) && okay;

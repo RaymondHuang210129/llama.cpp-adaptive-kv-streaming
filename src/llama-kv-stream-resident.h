@@ -162,18 +162,28 @@ public:
         const std::vector<llama_kv_stream_group_reader_source> & sources,
         ggml_backend_memory_lease_t staging, std::function<bool(uint32_t)> source_current);
     ~llama_kv_stream_group_reader();
-    // Update a completed prefix or the enclosing producer's append while no read is queued.
+    // Update an append or completed prefix while idle. A rewind needs a newer content generation and the same mirror epoch.
     bool update_frontiers(const std::vector<llama_kv_stream_group_frontier> & sources);
+    bool can_publish(ggml_backend_memory_lease_t encoded,uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & rows) const;
+    bool publish_encoded(ggml_backend_memory_lease_t encoded,uint32_t layer,bool value,const ggml_tensor * source,
+        size_t first,size_t count,const std::vector<ggml_kv_stream_gather_row> & rows);
+    // The owner orders device writes before this reader and completes canonical host publication before the second acknowledgement.
+    bool complete_publication(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & rows,bool host_committed);
     bool begin(uint32_t layer, const std::vector<ggml_kv_stream_gather_row> & columns);
     // Submit one 256-column tile in increasing native order. Attention consumes it before the next tile.
     bool gather(size_t first);
     // Consume the exact native column order with the original query, mask and checkpoint plan.
     bool attention(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,
         ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode);
+    // Keep caller-owned inputs and workspace live until finish; subsequent GPU work uses this same backend.
+    bool enqueue_attention(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,
+        ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode);
     bool finish() noexcept;
     size_t resident_upload_bytes() const noexcept;
 private:
     llama_kv_stream_group_reader() = default;
+    bool attention_impl(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,
+        ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode,bool queued);
     struct implementation;
     std::unique_ptr<implementation> impl;
 };

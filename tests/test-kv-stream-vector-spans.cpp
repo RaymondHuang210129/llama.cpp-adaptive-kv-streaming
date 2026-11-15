@@ -1121,7 +1121,7 @@ struct group_pipeline_probe {
     ggml_kv_stream_partial_ops partial_probe;
     std::vector<char> events;
     std::map<void *,size_t> held;
-    size_t maximum_held=0,fail_seen=0;
+    size_t maximum_held=0,fail_seen=0,maximum_attention_span=0,maximum_stream_span=0,small_native_copies=0;
     int fail_kind=-1;
     bool fail_fired=false;
     bool inject(int kind) {
@@ -1137,7 +1137,14 @@ struct group_pipeline_probe {
         copy_probe=*copy;registered_probe=*registered;partial_probe=*partial;
         copy_probe.gather=[](ggml_backend_t backend,ggml_backend_buffer_t output,
                 const ggml_kv_stream_copy_rectangle * rectangles,size_t count,bool initialize) {
+#ifdef KV_STREAM_COPY_ENTRY_TRACE
+            kv_stream_copy_capture_entries(true);
+#endif
             const bool okay=active->copy->gather(backend,output,rectangles,count,initialize);
+#ifdef KV_STREAM_COPY_ENTRY_TRACE
+            active->small_native_copies+=kv_stream_copy_small_native_entries();
+            kv_stream_copy_capture_entries(false);
+#endif
             if (okay) active->events.push_back('G');
             return okay;
         };
@@ -1160,10 +1167,16 @@ struct group_pipeline_probe {
         };
         partial_probe.resume=[](ggml_backend_t backend,const ggml_tensor * op,ggml_backend_buffer_t workspace,
                 const ggml_kv_stream_resume_plan & plan,size_t tokens,size_t first,bool last) {
+            active->maximum_attention_span=std::max(active->maximum_attention_span,size_t(op->src[1]->ne[1]));
+            if (std::any_of(active->held.begin(),active->held.end(),[](const auto & item) {return item.second!=0;}))
+                active->maximum_stream_span=std::max(active->maximum_stream_span,size_t(op->src[1]->ne[1]));
             active->events.push_back('A');return active->partial->resume(backend,op,workspace,plan,tokens,first,last);
         };
         partial_probe.resume_spans=[](ggml_backend_t backend,const ggml_tensor * op,ggml_backend_buffer_t workspace,
                 const ggml_kv_stream_resume_plan & plan,const ggml_kv_stream_span_plan_view & view,size_t first,size_t end) {
+            active->maximum_attention_span=std::max(active->maximum_attention_span,end-first);
+            if (std::any_of(active->held.begin(),active->held.end(),[](const auto & item) {return item.second!=0;}))
+                active->maximum_stream_span=std::max(active->maximum_stream_span,end-first);
             active->events.push_back('A');return active->partial->resume_spans(backend,op,workspace,plan,view,first,end);
         };
         reg->iface.get_proc_address=[](ggml_backend_reg_t reg,const char * name) -> void * {
@@ -1280,12 +1293,12 @@ static void check_owned_cache_groups(testing & t,bool complete=false) {
     t.assert_equal(size_t(complete ? 256 : 8),profiles);t.out<<"owned-cache profiles="<<profiles<<std::endl;
 }
 
-static void check_slot_joint_attention(testing & t,bool small,bool wide_only=false,bool managed=false,bool reader_errors=false,bool reader_grid=false,bool attention_adapter=false,size_t resident_pool_pages=0,bool pending_append=false,bool pipeline_probe=false,uint32_t prefill_queries=0,uint32_t pipeline_dimension=0) {
+static void check_slot_joint_attention(testing & t,bool small,bool wide_only=false,bool managed=false,bool reader_errors=false,bool reader_grid=false,bool attention_adapter=false,size_t resident_pool_pages=0,bool pending_append=false,bool pipeline_probe=false,uint32_t prefill_queries=0,uint32_t pipeline_dimension=0,bool resident_direct=false,bool require_resident_wave=true,bool resident_rewind=false,bool stream_direct=false,bool large_stream_wave=false,bool device_publication=false,bool require_batched_gather=false,bool enqueue=false) {
     ggml_backend_load_all();auto * device=ggml_backend_dev_by_name("CUDA0");
     if (!t.assert_true(device!=nullptr)) return;
     ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
     std::unique_ptr<group_pipeline_probe> pipeline;
-    if (pipeline_probe) pipeline=std::make_unique<group_pipeline_probe>(backend.get());
+    if (pipeline_probe || resident_direct) pipeline=std::make_unique<group_pipeline_probe>(backend.get());
     auto * reg=ggml_backend_dev_backend_reg(device);
     const auto partial_get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_partial_ops"));
     const auto copy_get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_copy_ops"));
@@ -1298,13 +1311,13 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
         const bool extended=(key==GGML_TYPE_Q8_0 && (value==GGML_TYPE_Q4_0 || value==GGML_TYPE_Q8_0)) ||
             (key==GGML_TYPE_Q5_1 && value==GGML_TYPE_Q5_1);
         if (small && !extended) continue;
-        if ((reader_errors || pipeline_probe) && (width!=(pipeline_dimension ? pipeline_dimension : 256) ||
+        if ((reader_errors || pipeline_probe || resident_direct) && (width!=(pipeline_dimension ? pipeline_dimension : 256) ||
                 key!=GGML_TYPE_Q8_0 || value!=GGML_TYPE_Q4_0)) continue;
         const ggml_kv_stream_shape shape{key,value,width,width,4,256,128};
         ggml_kv_stream_layout tile;
         if (!t.assert_true(ggml_kv_stream_layout_make(shape,256,tile).status==ggml_kv_stream_status::success)) return;
         for (size_t selected : {size_t(1),size_t(2)}) {
-            if ((reader_errors || reader_grid || pipeline_probe) && selected!=2) continue;
+            if ((reader_errors || reader_grid || pipeline_probe || resident_direct) && selected!=2) continue;
             if (wide_only && selected!=2) continue;
             std::vector<std::pair<uint32_t,uint32_t>> widths={{1,1}};
             if (extended) {
@@ -1313,6 +1326,7 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
             }
             if (wide_only) widths={{8,8}};
             if (reader_errors || reader_grid || pipeline_probe) widths={{1,3}};
+            if (resident_direct) widths={{1,1},{4,4},{8,8},{1,3}};
             if (prefill_queries) widths={{prefill_queries/2,prefill_queries/2}};
             for (auto query_counts : widths) for (size_t layout=0;layout<(selected==1 ? 1u : 5u);++layout)
             for (bool compact : {false,true}) {
@@ -1422,7 +1436,7 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                 struct retirement {ggml_backend_t backend;void (*release)(ggml_backend_t);
                     ~retirement() {ggml_backend_synchronize(backend);release(backend);}} captures{backend.get(),retire};
                 const auto generation_a=sources[0]->content->generation(),generation_b=selected==2 ? sources[1]->content->generation() : 0;
-                size_t max_sources=0;bool appended=false;
+                size_t max_sources=0;bool appended=false,compact_active=compact,rewound=false;
                 for (uint32_t layer : {0u,1u}) {
                     llama_kv_stream_host_layer origin[2],native;
                     for (size_t slot=0;slot<selected;++slot) if (!t.assert_true(sources[slot]->host->layer(layer,origin[slot]))) return;
@@ -1438,9 +1452,22 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                         ggml_backend_tensor_set(control.k_storage,native.k,0,ggml_nbytes(control.k_storage));
                         ggml_backend_tensor_set(control.v_storage,native.v,0,ggml_nbytes(control.v_storage));
                     }
-                    for (size_t replay=0;replay<3;++replay) {
+                    for (size_t replay=0;replay<(resident_rewind ? 4u : 3u);++replay) {
                         llama_kv_stream_write pending;
                         const bool publishing=pending_append && !layer && replay==1;
+                        if (resident_rewind && !layer && replay==3) {
+                            const size_t keep=lengths[0]-17;
+                            const std::vector<llama_kv_stream_group_frontier> shorter={{keep,keep},{lengths[1],lengths[1]}};
+                            t.assert_true("an unproven backward frontier is rejected",!reader->update_frontiers(shorter));
+                            if (!t.assert_true(sources[0]->content->invalidate_suffix(keep))) return;
+                            if (!t.assert_true("completed suffix invalidation preserves the reader",reader->update_frontiers(shorter))) return;
+                            for (size_t col=0;col<columns.size();++col) if (columns[col].source==0 && columns[col].token>=keep) {
+                                columns[col]={UINT32_MAX,0};
+                                for (size_t q=0;q<queries;++q) mask[q*padded+col]=ggml_fp32_to_fp16(-INFINITY);
+                            }
+                            ggml_backend_tensor_set(input.mask,mask.data(),0,mask.size()*sizeof(mask[0]));
+                            compact_active=false;rewound=true;
+                        }
                         if (publishing) {
                             std::vector<std::vector<uint8_t>> encoded(2);
                             std::vector<llama_kv_stream_write_span> spans;
@@ -1464,9 +1491,41 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                             }
                             columns[active]={0,lengths[0]};mask[active]=ggml_fp32_to_fp16(0);
                             ggml_backend_tensor_set(input.mask,mask.data(),0,mask.size()*sizeof(mask[0]));
+                            if (compact_active) {
+                                for (size_t q=0;q<queries;++q) {
+                                    ggml_backend_execution_mask_interval interval;
+                                    if (!ggml_backend_execution_mask_interval_encode(mask.data()+q*padded,padded,interval)) {
+                                        compact_active=false;break;
+                                    }
+                                    std::memcpy(intervals.data()+4*q,&interval,sizeof(interval));
+                                }
+                                t.assert_true("a separated appended token requires the exact dense mask",!compact_active);
+                                if (compact_active) ggml_backend_tensor_set(bounds,intervals.data(),0,intervals.size()*sizeof(intervals[0]));
+                            }
                             ggml_backend_tensor_set(control.k_storage,native.k,0,ggml_nbytes(control.k_storage));
                             ggml_backend_tensor_set(control.v_storage,native.v,0,ggml_nbytes(control.v_storage));
                             if (!t.assert_true(reader->update_frontiers({{lengths[0]+1,lengths[0]},{lengths[1],lengths[1]}}))) return;
+                            if (device_publication) {
+                                const std::vector<ggml_kv_stream_gather_row> rows={{0,lengths[0]}};
+                                auto wrong=rows;wrong[0].source=2;t.assert_true(!reader->can_publish(staging.get(),layer,wrong));
+                                wrong=rows;--wrong[0].token;t.assert_true(!reader->can_publish(staging.get(),layer,wrong));
+                                if (!t.assert_true("a complete resident append admits native device publication",reader->can_publish(staging.get(),layer,rows))) return;
+                                t.assert_true(!reader->complete_publication(layer,rows,false));
+                                ggml_context_ptr encoded_metadata(ggml_init({4096,nullptr,true}));
+                                for (bool side : {false,true}) {
+                                    auto * tensor=ggml_new_tensor_1d(encoded_metadata.get(),side ? value : key,int64_t(width*4));
+                                    auto * buffer=ggml_backend_memory_lease_buffer(staging.get());
+                                    if (!t.assert_true(ggml_backend_tensor_alloc(buffer,tensor,static_cast<char *>(ggml_backend_buffer_get_base(buffer))+(side ? tile.v_offset : 0))==GGML_STATUS_SUCCESS)) return;
+                                    ggml_backend_tensor_set(tensor,encoded[side].data(),0,encoded[side].size());
+                                    t.assert_true(!reader->publish_encoded(source_lease[0].get(),layer,side,tensor,0,1,rows));
+                                    t.assert_true(!reader->publish_encoded(staging.get(),layer,side,tensor,1,1,rows));
+                                    if (!t.assert_true(reader->publish_encoded(staging.get(),layer,side,tensor,0,1,rows))) return;
+                                    if (!side) t.assert_true(!reader->complete_publication(layer,rows,false));
+                                }
+                                ggml_backend_synchronize(backend.get());
+                                if (!t.assert_true(reader->complete_publication(layer,rows,false))) return;
+                                t.assert_true("device readiness is not a host-commit proof",!reader->complete_publication(layer,rows,true));
+                            }
                             t.assert_equal(generation_a,sources[0]->content->generation());
                             appended=true;
                         }
@@ -1479,7 +1538,7 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                         auto logical_k=*control.k,logical_v=*control.v;
                         logical_k.buffer=logical_v.buffer=nullptr;logical_k.data=logical_v.data=nullptr;
                         op.src[1]=&logical_k;op.src[2]=&logical_v;
-                        if (compact) {op.src[3]=nullptr;if (!t.assert_true(ggml_backend_execution_set_mask_bounds(&op,bounds))) return;}
+                        if (compact_active) {op.src[3]=nullptr;if (!t.assert_true(ggml_backend_execution_set_mask_bounds(&op,bounds))) return;}
                         std::vector<ggml_kv_stream_copy_rectangle> rectangles;
                         size_t next_physical[2]={0,1};
                         if (attention_adapter) {
@@ -1523,8 +1582,22 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                                     pipeline->fail_kind=-1;
                                 }
                             }
-                            if (pipeline) pipeline->events.clear();
-                            if (!t.assert_true(reader->attention(layer,columns,&op,scratch.get(),!prefill_queries))) return;
+                            if (pipeline) {pipeline->events.clear();pipeline->maximum_held=0;pipeline->maximum_attention_span=0;pipeline->maximum_stream_span=0;pipeline->small_native_copies=0;}
+#ifdef KV_STREAM_READER_SYNC_TRACE
+                            if (enqueue) kv_stream_reader_capture_syncs(true);
+#endif
+                            const bool read=enqueue ? reader->enqueue_attention(layer,columns,&op,scratch.get(),!prefill_queries) :
+                                reader->attention(layer,columns,&op,scratch.get(),!prefill_queries);
+#ifdef KV_STREAM_READER_SYNC_TRACE
+                            if (enqueue) {
+                                kv_stream_reader_capture_syncs(false);
+                                if (replay==2 && (!t.assert_true("the repeated resident read has no host refresh",reader->resident_upload_bytes()==0) ||
+                                        !t.assert_true("a clean resident attention enqueues without a CPU backend wait",kv_stream_reader_syncs()==0))) return;
+                            }
+#else
+                            if (enqueue) {t.assert_true("native backend synchronization tracing is required",false);return;}
+#endif
+                            if (!t.assert_true(read)) return;
                         } else for (size_t first=0;first<padded;first+=256) {
                             if (managed) {
                                 if (!t.assert_true(reader->gather(first))) return;
@@ -1589,21 +1662,64 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                                 tensor->data=static_cast<char *>(ggml_backend_buffer_get_base(tensor->buffer))+(side ? tile.v_offset : 0);
                             }
                             auto step=op;step.src[1]=&k;step.src[2]=&v;ggml_tensor slice;
-                            if (!compact) {slice=*input.mask;slice.ne[0]=256;slice.data=static_cast<uint8_t *>(input.mask->data)+first*sizeof(ggml_fp16_t);step.src[3]=&slice;}
+                            if (!compact_active) {slice=*input.mask;slice.ne[0]=256;slice.data=static_cast<uint8_t *>(input.mask->data)+first*sizeof(ggml_fp16_t);step.src[3]=&slice;}
                             if (!t.assert_true(partial->resume(backend.get(),&step,ggml_backend_memory_lease_buffer(scratch.get()),plan,padded,first,first+256==padded))) return;
                         }
-                        if (managed) reader->finish();
-                        else for (size_t slot=0;slot<selected;++slot) copy->drain(queues[slot].get());
+                        if (managed) {
+#ifdef KV_STREAM_READER_SYNC_TRACE
+                            if (enqueue) kv_stream_reader_capture_syncs(true);
+#endif
+                            if (!t.assert_true(reader->finish())) return;
+#ifdef KV_STREAM_READER_SYNC_TRACE
+                            if (enqueue) {
+                                kv_stream_reader_capture_syncs(false);
+                                if (replay==2 && !t.assert_true("finish fences a pending resident read even after logical close",kv_stream_reader_syncs()>0)) return;
+                            }
+#endif
+                        } else for (size_t slot=0;slot<selected;++slot) copy->drain(queues[slot].get());
                         ggml_backend_synchronize(backend.get());
-                        if (!t.assert_true("shared native attention preserves every output bit",same_float_bits(expected,input.read()))) return;
-                        if (pipeline && !t.assert_true("next-wave copies are queued before the current attention dispatch",
+                        const auto actual=input.read();
+                        if (!same_float_bits(expected,actual)) {
+                            size_t different=0;float worst=0;
+                            for (size_t i=0;i<expected.size();++i) if (std::memcmp(&expected[i],&actual[i],sizeof(float))) {
+                                ++different;worst=std::max(worst,std::abs(expected[i]-actual[i]));
+                            }
+                            t.out<<"joint mismatch layer="<<layer<<" replay="<<replay<<" layout="<<layout<<" compact="<<compact_active
+                                <<" different="<<different<<" max_abs="<<worst<<std::endl;
+                        }
+                        if (!t.assert_true("shared native attention preserves every output bit",same_float_bits(expected,actual))) return;
+                        if (device_publication && publishing && !t.assert_true("device-published append needs no host refresh",reader->resident_upload_bytes()==0)) return;
+                        if (pipeline_probe && !t.assert_true("next-wave copies are queued before the current attention dispatch",
                                 pipeline->copy_between_gather_and_attention())) return;
+                        if (resident_direct && require_resident_wave && layout!=4 && !t.assert_true(stream_direct ? large_stream_wave ?
+                                "a native wave retains more than three ring pages across physical wrap" :
+                                "several ring pages stay protected through one native continuation wave" :
+                                "contiguous resident rows share one native continuation wave",
+                                stream_direct && large_stream_wave ? pipeline->maximum_held>3 && (!plan.span_resume || pipeline->maximum_stream_span>768) :
+                                stream_direct && resident_pool_pages==3 ? pipeline->maximum_stream_span==256 && pipeline->maximum_held<=1 :
+                                (stream_direct ? pipeline->maximum_stream_span : pipeline->maximum_attention_span)>(large_stream_wave ? 768u : 256u))) return;
+#ifdef KV_STREAM_COPY_ENTRY_TRACE
+                        if (require_batched_gather && !t.assert_true("small gather rectangles do not issue separate native DMA calls",pipeline->small_native_copies==0)) return;
+#else
+                        if (require_batched_gather) {t.assert_true("copy entry tracing is required",false);return;}
+#endif
+                        if (resident_rewind && rewound && replay==3 && !t.assert_true("rollback uploads at most one discarded padding page, retaining the unchanged prefix",
+                                reader->resident_upload_bytes()<=tile.bytes)) return;
+                        if (device_publication && resident_rewind && rewound && replay==3 && !t.assert_true("masked discarded padding does not require an upload",
+                                reader->resident_upload_bytes()==0)) return;
                         if (pipeline && prefill_queries>=128) t.assert_true("wide prefill ready waves use at most half the ring",
                             pipeline->maximum_held<=(resident_pool_pages-2)/2+(resident_pool_pages-2)%2);
                         if (resident_pool_pages==26 && !t.assert_true("resident prefix uploads only initially or after a pending append",
                                 (!replay || publishing) ? reader->resident_upload_bytes()>0 : reader->resident_upload_bytes()==0)) return;
                         if (publishing) {
                             if (!t.assert_true(pending.pending() && sources[0]->content->commit(pending))) return;
+                            if (device_publication) {
+                                if (!t.assert_true(reader->complete_publication(layer,{{0,lengths[0]}},true))) return;
+                                for (auto operand : {ggml_kv_stream_operand::k,ggml_kv_stream_operand::v}) {
+                                    bool dirty=true;
+                                    t.assert_true(sources[0]->content->dirty({layer,operand,lengths[0],1},dirty) && !dirty);
+                                }
+                            }
                             t.assert_true(sources[0]->content->flush({{layer,ggml_kv_stream_operand::k,lengths[0],1},
                                 {layer,ggml_kv_stream_operand::v,lengths[0],1}},[](const auto &) {return true;}));
                             if (!t.assert_true(reader->update_frontiers({{lengths[0]+1,lengths[0]+1},{lengths[1],lengths[1]}}))) return;
@@ -1636,7 +1752,7 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                     t.assert_true(!reader->gather(padded) && reader->finish());
                 }
                 if (layout==4 && !managed) t.assert_equal(size_t(3),max_sources);
-                t.assert_equal(generation_a+uint64_t(appended),sources[0]->content->generation());
+                t.assert_equal(generation_a+uint64_t(appended)+uint64_t(rewound),sources[0]->content->generation());
                 if (selected==2) t.assert_equal(generation_b,sources[1]->content->generation());
                 for (size_t slot=0;slot<selected;++slot) t.assert_true("joint reads preserve all canonical host bytes",
                     !std::memcmp(canonical[slot].data(),ggml_backend_buffer_get_base(sources[slot]->host->buffer()),canonical[slot].size()));
@@ -1647,6 +1763,11 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
                     std::vector<uint8_t> bytes(guard);ggml_backend_tensor_get(&raw,bytes.data(),offset,bytes.size());
                     t.assert_true(std::all_of(bytes.begin(),bytes.end(),[](uint8_t x) {return x==0xa5;}));
                 }
+                if (resident_rewind) {
+                    t.assert_true(sources[0]->content->reset_mirror());
+                    t.assert_true("a different physical mirror epoch cannot reuse this reader",!reader->update_frontiers(
+                        {{lengths[0]-17,lengths[0]-17},{lengths[1],lengths[1]}}));
+                }
                 ++profiles;
                 t.out << "slot joint D="<<width<<" K="<<ggml_type_name(key)<<" V="<<ggml_type_name(value)<<" selected="<<selected
                       <<" queries="<<own_queries[0]<<'+'<<(selected==2 ? own_queries[1] : 0)<<" layout="<<layout<<" compact="<<compact
@@ -1654,10 +1775,25 @@ static void check_slot_joint_attention(testing & t,bool small,bool wide_only=fal
             }
         }
     }
-    t.assert_equal(size_t((reader_errors || pipeline_probe) ? 1 : reader_grid ? 128 : wide_only ? 128 : small ? 216 : 1192),profiles);
+    t.assert_equal(size_t(resident_direct ? 24 : (reader_errors || pipeline_probe) ? 1 : reader_grid ? 128 : wide_only ? 128 : small ? 216 : 1192),profiles);
 }
 
 int main(int argc, char ** argv) {
+    if (argc>1 && (!std::strcmp(argv[1],"--cuda-slot-group-resident-direct") || !std::strcmp(argv[1],"--cuda-slot-group-stream-direct") ||
+            !std::strcmp(argv[1],"--cuda-slot-group-stream-wide") || !std::strcmp(argv[1],"--cuda-slot-group-stream-single") ||
+            !std::strcmp(argv[1],"--cuda-slot-group-device-publication") || !std::strcmp(argv[1],"--cuda-slot-group-resident-gather-batch") || !std::strcmp(argv[1],"--cuda-slot-group-resident-enqueue"))) {
+        const bool streaming=std::strcmp(argv[1],"--cuda-slot-group-resident-direct") && std::strcmp(argv[1],"--cuda-slot-group-device-publication") && std::strcmp(argv[1],"--cuda-slot-group-resident-gather-batch") && std::strcmp(argv[1],"--cuda-slot-group-resident-enqueue");
+        testing t;t.test(streaming ? "ring_ranges_preserve_native_columns_masks_and_output_bits" :
+                "resident_ranges_preserve_native_columns_masks_and_output_bits",[&](testing & t) {
+            for (auto dimension : {256u,512u})
+                check_slot_joint_attention(t,false,false,true,false,false,true,streaming ?
+                    !std::strcmp(argv[1],"--cuda-slot-group-stream-single") ? 3 : 10 : 128,true,false,0,dimension,true,
+                    !(argc>2 && !std::strcmp(argv[2],"--reference")),argc>2 && !std::strcmp(argv[2],"--rewind"),streaming,
+                    !std::strcmp(argv[1],"--cuda-slot-group-stream-wide"),!std::strcmp(argv[1],"--cuda-slot-group-device-publication"),
+                    !std::strcmp(argv[1],"--cuda-slot-group-resident-gather-batch"),!std::strcmp(argv[1],"--cuda-slot-group-resident-enqueue"));
+        });
+        return t.summary();
+    }
     if (argc>1 && !std::strcmp(argv[1],"--cuda-selected-workspace")) {
         testing t;
         t.test("aggregate_K7_verification_workspace_covers_all_native_widths_without_enabling_K15",[&](testing & t) {
