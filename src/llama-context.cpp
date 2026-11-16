@@ -183,6 +183,8 @@ struct llama_context::group_execution_binding {
     std::vector<source_append> source_appends = {};
     std::function<bool(const llama_ubatch &)> read_prepare={};
     std::function<bool(bool)> read_release={};
+    std::function<bool(uint32_t)> reader_prepare={};
+    std::function<bool()> reader_finish={};
     group_execution_binding * peer=nullptr;
 
     ~group_execution_binding() {
@@ -2867,8 +2869,22 @@ llm_graph_result * llama_context::process_ubatch(
         llama_kv_stream_model * stream;
         llama_kv_stream_group_model * grouped;
         bool completed = false;
-        ~stream_guard() {if (!completed) {if (stream) stream->abort();if (grouped) grouped->abort();}}
-    } streaming{stream,grouped};
+        std::function<bool()> finish_readers;
+        ~stream_guard() {
+            if (!completed) {
+                try {if (finish_readers) finish_readers();} catch (...) {}
+                if (stream) stream->abort();
+                if (grouped) grouped->abort();
+            }
+        }
+    } streaming{stream,grouped,false,{}};
+    if (grouped && group_execution) {
+        streaming.finish_readers=group_execution->reader_finish;
+        if (group_execution->reader_prepare && !group_execution->reader_prepare(ubatch.n_tokens)) {
+            LLAMA_LOG_ERROR("%s: grouped reader frame preparation failed\n",__func__);
+            ret=GGML_STATUS_FAILED;return nullptr;
+        }
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -3072,7 +3088,7 @@ llm_graph_result * llama_context::process_ubatch(
         return nullptr;
     }
 
-    if (grouped && !grouped->finish()) {
+    if (grouped && ((streaming.finish_readers && !streaming.finish_readers()) || !grouped->finish())) {
         LLAMA_LOG_ERROR("%s: grouped graph publication did not complete\n",__func__);
         ret=GGML_STATUS_FAILED;return nullptr;
     }
@@ -7603,23 +7619,18 @@ struct group_execution_resources {
         }
         return reader->complete_publication(layer,rows,committed);
     }
-    bool attention(uint32_t layer,ggml_tensor * op,ggml_backend_memory_lease_t staging,
-            ggml_backend_memory_lease_t workspace) {
-        if (!op || !op->src[0] || op->src[0]->ne[1]<=0 || !op->src[1] || op->src[1]->ne[1]<=0 ||
-                size_t(op->src[1]->ne[1])>projection->columns.size() ||
-                projection->cells->used_max_p1()>uint32_t(op->src[1]->ne[1]) ||
-                !layer_ready(layer)) return false;
+    bool ensure_reader(ggml_backend_memory_lease_t reader_staging,bool prepare,uint32_t rows=1) {
         std::vector<llama_kv_stream_group_frontier> frontiers;
         frontiers.reserve(sources.size());
         std::vector<llama_kv_stream_group_reader_source> visible;
-        std::vector<uint32_t> selected_sources,remap(sources.size(),UINT32_MAX);
+        std::vector<uint32_t> selected_sources;
         for (size_t i=0;i<sources.size();++i) {
             std::shared_ptr<llama_kv_stream_logical_cache> cache;
             if (!table->get(projection->handles[i],projection->role,cache)) return false;
             sources[i].content=cache->content();sources[i].tokens=cache->frontiers().reserved;
             sources[i].stable_tokens=cache->tokens();
             if (sources[i].tokens) {
-                remap[i]=uint32_t(visible.size());visible.push_back(sources[i]);selected_sources.push_back(uint32_t(i));
+                visible.push_back(sources[i]);selected_sources.push_back(uint32_t(i));
                 frontiers.push_back({sources[i].tokens,sources[i].stable_tokens});
             }
         }
@@ -7628,7 +7639,7 @@ struct group_execution_resources {
             if (!reader->finish()) return false;
             reader.reset();
         }
-        if (!reader) reader=llama_kv_stream_group_reader::create(backend,visible,staging,[this](uint32_t reading) {
+        if (!reader) reader=llama_kv_stream_group_reader::create(backend,visible,reader_staging,[this](uint32_t reading) {
             if (!layer_ready(reading)) return false;
             for (size_t i=0;i<sources.size();++i) {
                 std::shared_ptr<llama_kv_stream_logical_cache> cache;
@@ -7640,7 +7651,18 @@ struct group_execution_resources {
         });
         if (!reader) {LLAMA_LOG_ERROR("%s: grouped reader creation failed for role %u\n",__func__,projection->role);return false;}
         reader_sources=std::move(selected_sources);
-        if (!reader->update_frontiers(frontiers)) {LLAMA_LOG_ERROR("%s: grouped reader frontier update failed\n",__func__);return false;}
+        if (!(prepare ? reader->prepare_frame(frontiers,{rows,decode_transport(rows),false}) : reader->update_frontiers(frontiers))) {LLAMA_LOG_ERROR("%s: grouped reader frontier update failed\n",__func__);return false;}
+        return true;
+    }
+    bool attention(uint32_t layer,ggml_tensor * op,ggml_backend_memory_lease_t staging,
+            ggml_backend_memory_lease_t workspace) {
+        if (!op || !op->src[0] || op->src[0]->ne[1]<=0 || !op->src[1] || op->src[1]->ne[1]<=0 ||
+                size_t(op->src[1]->ne[1])>projection->columns.size() ||
+                projection->cells->used_max_p1()>uint32_t(op->src[1]->ne[1]) ||
+                !layer_ready(layer)) return false;
+        if (!ensure_reader(staging,false)) return false;
+        std::vector<uint32_t> remap(sources.size(),UINT32_MAX);
+        for (size_t i=0;i<reader_sources.size();++i) remap[reader_sources[i]]=uint32_t(i);
         std::vector<ggml_kv_stream_gather_row> columns(projection->columns.begin(),
             projection->columns.begin()+op->src[1]->ne[1]);
         // Empty histories have no native columns. Keep column order and remap only reader ordinals.
@@ -7651,7 +7673,7 @@ struct group_execution_resources {
         const bool decode_mode=reader_admission || decode_transport(size_t(op->src[0]->ne[1]));
         const auto okay=decode_mode && !reader_admission ? reader->enqueue_attention(layer,columns,op,workspace,true) :
             reader->attention(layer,columns,op,workspace,decode_mode);
-        if (okay && layer+1==visible.front().host->config().layers && !context.group_restore_recurrent_after_attention()) {
+        if (okay && layer+1==sources[reader_sources.front()].host->config().layers && !context.group_restore_recurrent_after_attention()) {
             LLAMA_LOG_ERROR("%s: grouped recurrent restore after attention failed\n",__func__);return false;
         }
         if (!okay) LLAMA_LOG_ERROR("%s: grouped role %u layer %u attention failed\n",__func__,projection->role,layer);
@@ -7752,23 +7774,15 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
                 (quote.target.publication_bytes && !reserve(205,quote.target.publication_bytes))) return false;
         if (cursor>SIZE_MAX-(alignment-1)) return false;
         const size_t pools_first=(cursor+alignment-1)/alignment*alignment,count=projection->handles.size();
-        if (page.bytes%alignment || conversion%alignment || count>SIZE_MAX/std::max(size_t(1),conversion) ||
-                pools_first>cparams.shared_device_memory_bytes || count*conversion>cparams.shared_device_memory_bytes-pools_first) return false;
-        const size_t pages=(cparams.shared_device_memory_bytes-pools_first-count*conversion)/page.bytes;
-        if (pages>UINT32_MAX) return false;
-        std::vector<llama_kv_stream_page_minimum> minima;
-        for (const auto & handle : projection->handles) minima.push_back({handle.slot,minimum.budget.pages});
-        llama_kv_stream_page_partition partition;
-        if (llama_kv_stream_partition_pages(projection->selected,uint32_t(pages),minima,partition).status!=
-                llama_kv_stream_page_partition_status::success) return false;
-        for (size_t i=0;i<count;++i) {
-            if (!reserve(301+i,size_t(partition.slots[i].pages)*page.bytes+conversion)) return false;
-            resources->prepared.emplace_back(copies->prepare(resources->backend,partition.slots[i].pages,false),copies->free_prepared);
-            if (!resources->prepared.back()) return false;
-            if (owned) {
-                child->prepared.emplace_back(copies->prepare(child->backend,partition.slots[i].pages,false),copies->free_prepared);
-                if (!child->prepared.back()) return false;
-            }
+        if (page.bytes%alignment || conversion%alignment || pools_first>cparams.shared_device_memory_bytes ||
+                conversion>cparams.shared_device_memory_bytes-pools_first) return false;
+        const size_t pages=(cparams.shared_device_memory_bytes-pools_first-conversion)/page.bytes;
+        if (pages>UINT32_MAX || pages<=policy.layers || !reserve(301,pages*page.bytes+conversion)) return false;
+        resources->prepared.emplace_back(copies->prepare(resources->backend,pages,true),copies->free_prepared);
+        if (!resources->prepared.back()) return false;
+        if (owned) {
+            child->prepared.emplace_back(copies->prepare(child->backend,pages,true),copies->free_prepared);
+            if (!child->prepared.back()) return false;
         }
         resources->parent.reset(existing_parent ? ggml_backend_memory_arena_new_from_buffer(existing_parent) :
             ggml_backend_memory_arena_new(quote.target.buffer_type,cparams.shared_device_memory_bytes));
@@ -7787,18 +7801,36 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
                 !auxiliary->kv_resources.bounded->bind_bounded_storage(child->acquire(102)))) return false;
         auto graph=resources->acquire(201),encoding=resources->acquire(202),attention=resources->acquire(203),staging=resources->acquire(204);
         if (block) child->leases.emplace_back(ggml_backend_memory_lease_retain(graph),ggml_backend_memory_lease_free);
+        std::vector<std::vector<std::shared_ptr<llama_kv_stream_content>>> contents;
         for (size_t i=0;i<count;++i) {
             std::shared_ptr<llama_kv_stream_logical_cache> cache;
             if (!table->get(projection->handles[i],projection->role,cache)) return false;
-            resources->sources.push_back({cache->host(),resources->acquire(301+i),partition.slots[i].pages,0,resources->prepared[i]});
+            resources->sources.push_back({cache->host(),resources->acquire(301),pages,0,resources->prepared.front()});
             if (owned) {
                 std::shared_ptr<llama_kv_stream_logical_cache> other;
                 if (!table->get(auxiliary_projection->handles[i],1,other)) return false;
-                child->sources.push_back({other->host(),child->acquire(301+i),partition.slots[i].pages,0,child->prepared[i]});
+                child->sources.push_back({other->host(),child->acquire(301),pages,0,child->prepared.front()});
                 resources->sources.back().owning_caches={cache->host(),other->host()};
                 child->sources.back().owning_caches=resources->sources.back().owning_caches;
             }
+            std::vector<std::shared_ptr<llama_kv_stream_content>> owners{cache->content()};
+            if (owned) {
+                std::shared_ptr<llama_kv_stream_logical_cache> other;
+                if (!table->get(auxiliary_projection->handles[i],1,other)) return false;
+                owners.push_back(other->content());
+            }
+            contents.push_back(std::move(owners));
         }
+        // Prefer full residency for the prediction cache reused between target passes.
+        auto buffering=llama_kv_stream_group_buffering::create_aggregate(contents,
+            [target=std::weak_ptr<group_execution_resources>(resources),draft=std::weak_ptr<group_execution_resources>(child)] {
+                for (const auto & weak:{target,draft}) if (auto state=weak.lock())
+                    if (state->reader && !state->reader->finish()) return false;
+                return true;
+            },owned ? std::vector<uint32_t>{1} : std::vector<uint32_t>{});
+        if (!buffering) return false;
+        for (auto & source:resources->sources) source.buffering=buffering;
+        if (owned) for (auto & source:child->sources) source.buffering=buffering;
         const uint32_t verify_rows=group_verify_rows(cparams);
         auto source_model=llama_kv_stream_group_model::create({resources->backend,table,shape,uint32_t(layers.size()),model.hparams.n_head(first),
             cparams.n_ubatch,verify_rows,uint32_t(count)});
@@ -8060,6 +8092,23 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
         };
         kv_resources.full->get_group_model()->bind_mutation(mutate);
         if (auto * hybrid=dynamic_cast<llama_memory_hybrid *>(memory.get())) hybrid->bind_group_mutation(mutate);
+        const auto bind_readers=[](llama_context & context,const std::shared_ptr<group_execution_resources> & state,
+                ggml_backend_memory_lease_t staging) {
+            const auto weak=std::weak_ptr<group_execution_resources>(state);
+            context.group_execution->reader_prepare=[weak,staging](uint32_t rows) {
+                auto retained=weak.lock();return retained && retained->ensure_reader(staging,true,rows);
+            };
+            context.group_execution->reader_finish=[weak] {
+                auto retained=weak.lock();return retained && (!retained->reader || retained->reader->finish());
+            };
+        };
+        bind_readers(*this,resources,staging);
+        if (owned) {
+            auto child_staging=ggml_backend_memory_arena_acquire(child->parent.get(),204);
+            if (!child_staging) return false;
+            child->leases.emplace_back(child_staging,ggml_backend_memory_lease_free);
+            bind_readers(*auxiliary,child,child_staging);
+        }
         group_execution->resources=std::move(resources);
         if (result) result->status=llama_context_memory_create_status::success;
         return true;

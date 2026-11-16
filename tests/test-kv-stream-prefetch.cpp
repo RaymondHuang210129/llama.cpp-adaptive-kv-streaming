@@ -154,16 +154,98 @@ int main(int argc, char ** argv) {
     const bool bench = sequence || (argc > 1 && std::strcmp(argv[1],"--bench") == 0);
     const bool ring_guard_only = argc > 1 && std::strcmp(argv[1], "--cuda-ring-guard") == 0;
     const bool read_feedback_only = argc > 1 && std::strcmp(argv[1],"--cuda-read-feedback") == 0;
+    const bool double_buffer_only = argc > 1 && std::strcmp(argv[1],"--cuda-double-buffer") == 0;
     const bool pipeline_only = argc > 1 && std::strcmp(argv[1],"--cuda-prefill-pipeline") == 0;
-    const bool cuda = pipeline_only || read_feedback_only || bench || ring_guard_only || (argc > 1 && std::strcmp(argv[1],"--cuda") == 0);
+    const bool cuda = double_buffer_only || pipeline_only || read_feedback_only || bench || ring_guard_only || (argc > 1 && std::strcmp(argv[1],"--cuda") == 0);
     ggml_backend_ptr backend;
     if (cuda) { ggml_backend_load_all(); auto * dev = ggml_backend_dev_by_name("CUDA0"); if (!dev) return 1; backend.reset(ggml_backend_dev_init(dev,nullptr)); }
     else backend.reset(ggml_backend_cpu_init());
     if (bench) return benchmark(backend.get(),sequence,measured,fallback);
     testing t;
+    t.test("fragment_boundaries_and_pending_rows_shape_upload_requests",[&](testing & t) {
+        llama_kv_stream_prefetch_plan plan;
+        const std::vector<llama_kv_stream_prefetch_segment> spans={{0,3*256,2*256},{3*256,8*256,7*256}};
+        if (!t.assert_true(plan.start({0,0},8*256,8*256,256,6,6,8*256,{},&spans,true))) return;
+        llama_kv_stream_prefetch_request request;
+        if (!t.assert_true(plan.reserve(request))) return;
+        t.assert_equal(size_t(2),request.pages);t.assert_true(request.stable);
+        if (!t.assert_true(plan.reserve(request))) return;
+        t.assert_equal(size_t(2*256),request.first);t.assert_equal(size_t(1),request.pages);t.assert_true(!request.stable && !plan.can_submit(request));
+        if (!t.assert_true(plan.reserve(request))) return;
+        t.assert_equal(size_t(3*256),request.first);t.assert_equal(size_t(3),request.pages);t.assert_true(request.stable);
+    });
+    t.test("consumed_later_fragments_refill_around_a_pinned_earlier_page",[&](testing & t) {
+        llama_kv_stream_prefetch_plan plan;
+        const std::vector<llama_kv_stream_prefetch_segment> spans={{0,256,0},{256,6*256,6*256}};
+        if (!t.assert_true(plan.start({0,0},6*256,6*256,256,6,5,6*256,{},&spans,true) && plan.make_ready(0))) return;
+        llama_kv_stream_prefetch_request request;
+        if (!t.assert_true(plan.reserve(request) && request.pages==1 && plan.mark_submitted(0) &&
+                plan.reserve(request) && request.pages==5 && plan.mark_submitted(1))) return;
+        if (!t.assert_true("a held first request does not prevent reclaiming later consumed data",plan.consume_at(1,3))) return;
+        t.assert_equal(size_t(3),plan.used());
+        if (!t.assert_true(plan.reserve(request))) return;
+        t.assert_equal(size_t(1),request.slot);t.assert_equal(size_t(1),request.pages);t.assert_equal(size_t(1),request.layer);
+        t.assert_true(!request.stable && !plan.can_submit(request));
+        if (!t.assert_true(plan.reserve(request))) return;
+        t.assert_equal(size_t(2),request.slot);t.assert_equal(size_t(2),request.pages);t.assert_true(request.stable);
+        t.assert_true(!plan.consume_at(plan.pending(),1));
+    });
+    t.test("invalid_fragment_maps_leave_existing_reservations_unchanged",[&](testing & t) {
+        llama_kv_stream_prefetch_plan plan;llama_kv_stream_prefetch_request request;
+        if (!t.assert_true(plan.start({0},4*256,4*256,256,3,3,4*256) && plan.reserve(request))) return;
+        for (auto spans : {std::vector<llama_kv_stream_prefetch_segment>{{256,4*256,4*256}},
+                {{0,2*256,3*256},{2*256,4*256,4*256}},{{0,256,256},{2*256,4*256,4*256}}}) {
+            t.assert_true(!plan.start({0},4*256,4*256,256,3,3,4*256,{},&spans,true));
+            t.assert_equal(size_t(3),plan.used());t.assert_equal(size_t(1),plan.pending());
+        }
+    });
     if (ring_guard_only) t.set_filter("(retained_mtp_slots_are_not_overwritten_by_target_prefetch|full_mtp_ring_rejects_target_sequence_without_submission|mapped_target_stream_avoids_mtp_ring_in_shared_pool)");
     if (read_feedback_only) t.set_filter("borrowed_reads_preserve_target_feedback_identity_and_samples");
     if (pipeline_only) t.set_filter("wide_prefill_pipelines_two_encoded_waves");
+    if (double_buffer_only) t.set_filter("serial_double_buffer_keeps_future_layers_and_multi_query_feedback");
+    if (double_buffer_only) t.test("serial_double_buffer_keeps_future_layers_and_multi_query_feedback",[&](testing & t) {
+        for (size_t pool_pages : {80u,100u}) for (uint32_t dimension : {256u,512u}) for (uint32_t queries : {1u,3u,8u}) for (auto pair : {
+                std::pair{GGML_TYPE_Q8_0,GGML_TYPE_Q4_0},std::pair{GGML_TYPE_F16,GGML_TYPE_F16}}) {
+            constexpr size_t active=40*256;
+            fixture f(backend.get(),true,pair.first,pair.second,active,false,4,4,pool_pages,dimension,dimension);
+            f.policy.double_buffer=true;
+            llama_kv_stream_policy_state initial;
+            llama_kv_stream_policy_decision decision;
+            if (!t.assert_true(llama_kv_stream_policy_initialize(f.policy,initial).status==llama_kv_stream_policy_status::success &&
+                    llama_kv_stream_policy_step(f.policy,initial,{active,queries,{},true},decision).status==llama_kv_stream_policy_status::success &&
+                    f.attach(&decision.next) && f.resident->configure_native_graph_attention(true) &&
+                    f.resident->configure_resumed_decode(true) && f.resident->configure_feedback(true,2))) return;
+            auto pin=f.binding->acquire();
+            const size_t tail=40-decision.next.resident_pages_per_layer;
+            if (!t.assert_true(bool(pin) && tail && decision.next.ring_slots>=2*tail)) return;
+            const auto get=reinterpret_cast<ggml_kv_stream_partial_ops_get>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get())),"ggml_backend_kv_stream_partial_ops"));
+            size_t bytes=0;
+            if (!t.assert_true(get && get() && ggml_kv_stream_workspace_query(get(),backend.get(),
+                    {f.policy.shape,32,queries,active},ggml_kv_stream_workspace_kind::decode,bytes))) return;
+            block_workspace workspace(f,bytes);
+            block_inputs input(f,active,queries,false,32);
+            std::vector<std::vector<float>> expected;
+            for (uint32_t layer=0;layer<4;++layer) expected.push_back(stock_attention(f,input,layer));
+            std::vector<uint8_t> host_bytes(f.host->bytes());
+            std::memcpy(host_bytes.data(),ggml_backend_buffer_get_base(f.host->buffer()),host_bytes.size());
+            const auto generation=f.content->generation();
+            if (!t.assert_true(f.resident->begin_sequence({0,1,2,3},active,decision.next.ring_slots,active,{queries,true}))) return;
+            if (!t.assert_true("serial submits the next complete layer before first attention",
+                    f.resident->sequence_stats().max_layer_distance>=1 && f.resident->sequence_stats().peak_pages>=2*tail)) return;
+            for (uint32_t layer=0;layer<4;++layer) {
+                if (!t.assert_true(f.resident->compute_streamed(layer,input.q,input.mask,input.output,active,1.0f/16,
+                        workspace.lease.get(),true,decision.next.ring_slots))) return;
+                ggml_backend_synchronize(backend.get());
+                if (!t.assert_true("double buffering retains native output bits",same_float_bits(expected[layer],input.read()))) return;
+            }
+            const auto stats=f.resident->sequence_stats();
+            if (!t.assert_true("multi-query decode trains adaptive ring growth",stats.feedback_uploads &&
+                    wait_feedback(*f.resident,stats.feedback_uploads)) ||
+                    !t.assert_equal(generation,f.content->generation()) ||
+                    !t.assert_true(!std::memcmp(host_bytes.data(),ggml_backend_buffer_get_base(f.host->buffer()),host_bytes.size()))) return;
+        }
+    });
     if (pipeline_only) t.test("wide_prefill_pipelines_two_encoded_waves",[&](testing & t) {
         for (uint32_t dimension : {256u,512u}) for (size_t active : {2049u,8193u})
         for (size_t slots : {1u,2u,3u,12u,13u}) for (const auto & pair : {

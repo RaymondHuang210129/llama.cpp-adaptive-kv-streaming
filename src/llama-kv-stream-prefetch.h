@@ -60,23 +60,52 @@ private:
     uint64_t generation=0,epoch=0;
 };
 
+struct llama_kv_stream_prefetch_segment {
+    size_t first=0,end=0,stable_end=0;
+};
+
 // Owner-thread FIFO reservations. Deferred tails occupy slots, so speculative work cannot starve demand.
 class llama_kv_stream_prefetch_plan {
 public:
     // Allocate metadata by layer/slot count, never by context length. Failure preserves the old plan.
     bool start(const std::vector<size_t> & prefixes, size_t active, size_t padded, size_t page,
-            size_t slots, size_t ceiling, size_t stable, const std::vector<uint8_t> & blocked = {}) {
+            size_t slots, size_t ceiling, size_t stable, const std::vector<uint8_t> & blocked = {},
+            const std::vector<llama_kv_stream_prefetch_segment> * segments=nullptr,bool reuse_released=false,
+            const std::vector<std::vector<llama_kv_stream_prefetch_segment>> * layer_segments=nullptr) {
         if (prefixes.empty() || !active || padded < active || !page || padded-active >= page || !slots || !ceiling ||
                 stable > active || (!blocked.empty() && blocked.size() != slots)) return false;
         if ((active-1)/page != (padded-1)/page) return false;
         for (auto prefix : prefixes) if (prefix > padded || (prefix != padded && prefix%page)) return false;
+        if (segments && layer_segments) return false;
+        if (layer_segments) {
+            if (layer_segments->size()!=prefixes.size()) return false;
+            for (const auto & list:*layer_segments) {
+                size_t end=0;
+                for (const auto & segment:list) {
+                    if (segment.first<end || segment.first%page || segment.end<=segment.first || segment.end>padded ||
+                            segment.end%page || segment.stable_end<segment.first || segment.stable_end>segment.end || segment.stable_end%page) return false;
+                    end=segment.end;
+                }
+            }
+        }
+        if (segments) {
+            size_t end=0;
+            for (const auto & segment : *segments) {
+                if (segment.first!=end || segment.end<=end || segment.end>padded || segment.end%page ||
+                        segment.stable_end<segment.first || segment.stable_end>segment.end || segment.stable_end%page) return false;
+                end=segment.end;
+            }
+            if (end!=padded) return false;
+        }
         try {
             llama_kv_stream_prefetch_plan next;
             next.prefixes = prefixes; next.ready.resize(prefixes.size(),false);
             next.records.resize(slots);
             next.occupied = blocked.empty() ? std::vector<uint8_t>(slots, 0) : blocked;
-            next.has_blocked_slots = std::any_of(blocked.begin(), blocked.end(), [](uint8_t value) { return value != 0; });
+            next.has_blocked_slots = reuse_released || std::any_of(blocked.begin(), blocked.end(), [](uint8_t value) { return value != 0; });
             next.active = active; next.padded = padded; next.page = page; next.ceiling = ceiling; next.stable = stable;
+            if (segments) next.segments=*segments;
+            if (layer_segments) next.layer_segments=*layer_segments;
             next.token = prefixes[0]; *this = std::move(next); return true;
         } catch (const std::bad_alloc &) { return false; }
           catch (const std::length_error &) { return false; }
@@ -85,8 +114,17 @@ public:
     bool preview(llama_kv_stream_prefetch_request & output) const {
         if (records.empty() || used_pages == records.size()) return false;
         size_t next_layer=layer,next_token=token,next_write=write;
-        while (next_layer < prefixes.size() && next_token == padded) {
-            if (++next_layer < prefixes.size()) next_token = prefixes[next_layer];
+        if (layer_segments.empty()) {
+            while (next_layer < prefixes.size() && next_token == padded) {
+                if (++next_layer < prefixes.size()) next_token = prefixes[next_layer];
+            }
+        } else {
+            while (next_layer<prefixes.size()) {
+                const auto & list=layer_segments[next_layer];
+                const auto found=std::find_if(list.begin(),list.end(),[&](const auto & segment) {return next_token<segment.end;});
+                if (found!=list.end()) {next_token=std::max(next_token,found->first);break;}
+                ++next_layer;next_token=0;
+            }
         }
         if (next_layer == prefixes.size()) return false;
         if (!has_blocked_slots && occupied[next_write]) return false;
@@ -100,10 +138,22 @@ public:
         while (available < records.size()-next_write && !occupied[next_write+available]) ++available;
         size_t pages = std::min({ceiling,available,(padded-next_token)/page+((padded-next_token)%page != 0)});
         const size_t boundary = stable == active ? padded : stable/page*page;
-        if (next_token < boundary) pages = std::min(pages,(boundary-next_token)/page+((boundary-next_token)%page != 0));
+        bool immutable=false;
+        if (segments.empty() && layer_segments.empty()) {
+            if (next_token < boundary) pages = std::min(pages,(boundary-next_token)/page+((boundary-next_token)%page != 0));
+        } else {
+            const auto & list=layer_segments.empty() ? segments : layer_segments[next_layer];
+            const auto found=std::find_if(list.begin(),list.end(),[&](const auto & segment) {
+                return next_token>=segment.first && next_token<segment.end;
+            });
+            if (found==list.end()) return false;
+            immutable=next_token<found->stable_end;
+            const size_t end=immutable ? found->stable_end : found->end;
+            pages=std::min(pages,(end-next_token)/page);
+        }
         if (!pages) return false;
         const size_t tokens = pages > (padded-next_token)/page ? padded-next_token : pages*page;
-        output={next_layer,next_token,tokens,pages,next_write,next_token+std::min(tokens,active-next_token) <= stable,false};
+        output={next_layer,next_token,tokens,pages,next_write,segments.empty() && layer_segments.empty() ? next_token+std::min(tokens,active-next_token) <= stable : immutable,false};
         return true;
     }
     // Split a reservation only at a retained/missing boundary; its logical and physical order is unchanged.
@@ -121,7 +171,7 @@ public:
     bool make_ready(size_t i) { if (i >= ready.size()) return false; ready[i] = true; return true; }
     // Historical uploads are query-independent when the padded extent does not change.
     bool retarget(size_t next_active) {
-        if (next_active <= stable || next_active > padded || !page ||
+        if (!segments.empty() || !layer_segments.empty() || next_active <= stable || next_active > padded || !page ||
                 (next_active-1)/page != (padded-1)/page) return false;
         active=next_active;
         return true;
@@ -134,14 +184,20 @@ public:
         r.submitted = true; r.reused=reused; return true;
     }
     // Release a consumed prefix immediately; the remaining request stays at the demand head.
-    bool consume(size_t pages) {
-        if (!count || !pages) return false;
-        auto & r = records[head];
-        if (!r.submitted || pages > r.pages) return false;
-        for (size_t i = 0; i < pages; ++i) occupied[r.slot+i] = false;
-        const size_t tokens = pages > r.tokens/page ? r.tokens : pages*page;
-        r.first += tokens; r.tokens -= tokens; r.slot += pages; r.pages -= pages; used_pages -= pages;
-        if (!r.pages) { head = (head+1)%records.size(); --count; }
+    bool consume(size_t pages) {return consume_at(0,pages);}
+    // Fragmented consumers may keep an earlier page pinned while later requests finish.
+    bool consume_at(size_t index,size_t pages) {
+        if (index>=count || !pages) return false;
+        auto & r=records[(head+index)%records.size()];
+        if (!r.submitted || pages>r.pages) return false;
+        for (size_t i=0;i<pages;++i) occupied[r.slot+i]=false;
+        const size_t tokens=pages>r.tokens/page ? r.tokens : pages*page;
+        r.first+=tokens;r.tokens-=tokens;r.slot+=pages;r.pages-=pages;used_pages-=pages;
+        if (!r.pages) {
+            if (!index) head=(head+1)%records.size();
+            else for (size_t i=index;i+1<count;++i) records[(head+i)%records.size()]=records[(head+i+1)%records.size()];
+            --count;
+        }
         return true;
     }
     const llama_kv_stream_prefetch_request * request(size_t i) const { return i < count ? &records[(head+i)%records.size()] : nullptr; }
@@ -170,6 +226,8 @@ public:
     }
 private:
     std::vector<size_t> prefixes;
+    std::vector<llama_kv_stream_prefetch_segment> segments;
+    std::vector<std::vector<llama_kv_stream_prefetch_segment>> layer_segments;
     std::vector<uint8_t> ready, occupied;
     std::vector<llama_kv_stream_prefetch_request> records;
     size_t active = 0, padded = 0, page = 0, ceiling = 0, stable = 0;

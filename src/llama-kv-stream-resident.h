@@ -138,6 +138,26 @@ private:
     std::unique_ptr<implementation> impl;
 };
 
+class llama_kv_stream_group_buffering {
+public:
+    static std::shared_ptr<llama_kv_stream_group_buffering> create(
+        const std::vector<std::shared_ptr<llama_kv_stream_content>> & owners,
+        std::function<bool()> quiesce = {});
+    static std::shared_ptr<llama_kv_stream_group_buffering> create_aggregate(
+        const std::vector<std::vector<std::shared_ptr<llama_kv_stream_content>>> & requests,
+        std::function<bool()> quiesce = {});
+    static std::shared_ptr<llama_kv_stream_group_buffering> create_aggregate(
+        const std::vector<std::vector<std::shared_ptr<llama_kv_stream_content>>> & requests,
+        std::function<bool()> quiesce,const std::vector<uint32_t> & resident_roles);
+    ~llama_kv_stream_group_buffering();
+    llama_kv_stream_policy_state snapshot() const;
+private:
+    friend class llama_kv_stream_group_reader;
+    llama_kv_stream_group_buffering() = default;
+    struct implementation;
+    std::unique_ptr<implementation> impl;
+};
+
 struct llama_kv_stream_group_reader_source {
     std::shared_ptr<llama_kv_stream_host> host;
     ggml_backend_memory_lease_t pool = nullptr;
@@ -148,6 +168,7 @@ struct llama_kv_stream_group_reader_source {
     size_t stable_tokens = SIZE_MAX;
     // Homogeneous owning caches sharing this pool, in native layer order.
     std::vector<std::shared_ptr<llama_kv_stream_host>> owning_caches = {};
+    std::shared_ptr<llama_kv_stream_group_buffering> buffering = {};
 };
 
 struct llama_kv_stream_group_frontier {
@@ -162,7 +183,11 @@ public:
         const std::vector<llama_kv_stream_group_reader_source> & sources,
         ggml_backend_memory_lease_t staging, std::function<bool(uint32_t)> source_current);
     ~llama_kv_stream_group_reader();
-    // Update an append or completed prefix while idle. A rewind needs a newer content generation and the same mirror epoch.
+    // Replan only before a producer starts publishing a new frame.
+    bool prepare_frame(const std::vector<llama_kv_stream_group_frontier> & sources,
+        llama_kv_stream_feedback_context context={1,true,false});
+    // Update live rows while idle. Aggregate bindings need prepare_frame before adding a new page.
+    // A rewind needs a newer content generation and the same mirror epoch.
     bool update_frontiers(const std::vector<llama_kv_stream_group_frontier> & sources);
     bool can_publish(ggml_backend_memory_lease_t encoded,uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & rows) const;
     bool publish_encoded(ggml_backend_memory_lease_t encoded,uint32_t layer,bool value,const ggml_tensor * source,
@@ -180,6 +205,7 @@ public:
         ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode);
     bool finish() noexcept;
     size_t resident_upload_bytes() const noexcept;
+    llama_kv_stream_prefetch_stats sequence_stats() const noexcept;
 private:
     llama_kv_stream_group_reader() = default;
     bool attention_impl(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,

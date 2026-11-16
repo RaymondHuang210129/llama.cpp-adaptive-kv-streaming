@@ -147,6 +147,7 @@ struct copy_queue {
     ggml_backend_cuda_context * context;
     ggml_backend_buffer_t device = nullptr, host = nullptr;
     ggml_kv_stream_registered_copy_source source;
+    std::vector<ggml_kv_stream_registered_copy_source> additional_sources;
     ggml_backend_buffer_type_t source_type = nullptr;
     std::unordered_set<ggml_backend_buffer_t> registrations;
     ggml_kv_stream_layout page, ring;
@@ -275,9 +276,16 @@ static void free_prepared(void * prepared) { delete static_cast<std::shared_ptr<
 
 // Source spans must remain inside the retained pinned allocation; zero or wrapping ranges are invalid.
 static bool source_range(const copy_queue & q, const void * pointer, size_t bytes) {
-    const auto base = uintptr_t(q.host ? ggml_backend_buffer_get_base(q.host) : q.source.base), p = uintptr_t(pointer);
-    const size_t capacity = q.host ? ggml_backend_buffer_get_size(q.host) : q.source.bytes;
-    return pointer && bytes && p >= base && p-base <= capacity && bytes <= capacity-(p-base) && p <= UINTPTR_MAX-bytes;
+    const auto p=uintptr_t(pointer);
+    if (!pointer || !bytes || bytes>UINTPTR_MAX-p) return false;
+    const auto contains=[&](uintptr_t base,size_t capacity) {
+        return p>=base && p-base<=capacity && bytes<=capacity-(p-base);
+    };
+    const auto base=uintptr_t(q.host ? ggml_backend_buffer_get_base(q.host) : q.source.base);
+    const size_t capacity=q.host ? ggml_backend_buffer_get_size(q.host) : q.source.bytes;
+    if (contains(base,capacity)) return true;
+    for (const auto & source:q.additional_sources) if (contains(uintptr_t(source.base),source.bytes)) return true;
+    return false;
 }
 
 // Allocate only stream/event bookkeeping. KV bytes already belong to the caller's device and host buffers.
@@ -352,6 +360,24 @@ static void * create_registered(ggml_backend_t backend, void * prepared, ggml_ba
         const ggml_kv_stream_registered_copy_source & source, const ggml_kv_stream_shape & shape, size_t slots) {
     return create_queue(backend, device, nullptr, shape, slots, prepared ?
         *static_cast<std::shared_ptr<copy_resources> *>(prepared) : std::shared_ptr<copy_resources>{}, &source);
+}
+
+static void * create_registered_multi(ggml_backend_t backend,void * prepared,ggml_backend_buffer_t device,
+        const ggml_kv_stream_registered_copy_source * sources,size_t count,
+        const ggml_kv_stream_shape & shape,size_t slots) {
+    if (!sources || !count || count>ggml_kv_stream_registered_copy_max_sources || !shape.alignment) return nullptr;
+    for (size_t i=0;i<count;++i) {
+        const auto base=uintptr_t(sources[i].base);const auto bytes=sources[i].bytes;
+        if (!base || !bytes || base%shape.alignment || bytes>UINTPTR_MAX-base) return nullptr;
+        for (size_t j=0;j<i;++j) {
+            const auto other=uintptr_t(sources[j].base);
+            if (base<other+sources[j].bytes && other<base+bytes) return nullptr;
+        }
+    }
+    auto * queue=static_cast<copy_queue *>(create_registered(backend,prepared,device,sources[0],shape,slots));
+    if (!queue) return nullptr;
+    try {queue->additional_sources.assign(sources+1,sources+count);return queue;}
+    catch (const std::bad_alloc &) {delete queue;return nullptr;}
 }
 
 static bool fragments_valid(const copy_queue & q, const ggml_kv_stream_registered_copy_fragment * parts,
@@ -836,7 +862,7 @@ const ggml_kv_stream_copy_ops * ggml_cuda_kv_stream_copy_ops() {
 }
 
 const ggml_kv_stream_registered_copy_ops * ggml_cuda_kv_stream_registered_copy_ops() {
-    static const ggml_kv_stream_registered_copy_ops ops{1,create_registered,enqueue_registered};
+    static const ggml_kv_stream_registered_copy_ops ops{2,create_registered,enqueue_registered,create_registered_multi};
     return &ops;
 }
 #endif

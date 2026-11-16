@@ -3271,6 +3271,7 @@ struct group_ring_probe {
     decltype(ggml_kv_stream_copy_ops::gather) gather;
     const std::string & phase;
     std::array<size_t,3> spans{};
+    size_t prediction_gathers=0;
     size_t device_publications=0;
     group_ring_probe(ggml_backend_dev_t device,const std::string & phase) : registry(ggml_backend_dev_backend_reg(device)),
         original(registry->iface.get_proc_address),phase(phase) {
@@ -3290,6 +3291,7 @@ struct group_ring_probe {
         };
         if (gather) copy.gather=[](ggml_backend_t backend,ggml_backend_buffer_t output,const ggml_kv_stream_copy_rectangle * rectangles,size_t count,bool initialize) {
             const bool okay=active->gather(backend,output,rectangles,count,initialize);
+            if (okay && active->phase=="predict") active->prediction_gathers+=count;
             if (okay && active->phase=="publication" && ggml_backend_buffer_get_size(output)>1048576) ++active->device_publications;
             return okay;
         };
@@ -3544,7 +3546,7 @@ size_t kv_stream_mtp_transport_slow();
 
 static void test_group_mtp_admission(testing & t,llama_model * model,bool resume=false,bool phase_guard=false,bool ring=false,bool partial=false,
         std::array<uint16_t,2> draft_widths={1,3},std::array<uint16_t,2> accepted_widths={0,2},bool backend_sampling=false,uint32_t cutoff=0,
-        bool prefetch_probe=false,bool restore_order_probe=false) {
+        bool prefetch_probe=false,bool restore_order_probe=false,bool double_buffer=false) {
 #ifdef KV_STREAM_MTP_TRANSPORT_TRACE
     kv_stream_mtp_transport_reset();
 #endif
@@ -3858,6 +3860,12 @@ static void test_group_mtp_admission(testing & t,llama_model * model,bool resume
             100,SIZE_MAX,plan,group->auxiliary_metadata_context(),auxiliary);
         if (!t.assert_true(quoted.status==llama_context_memory_create_status::success)) return;
         cp.shared_device_memory_bytes=quoted.required_bytes;
+        if (double_buffer) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;ggml_kv_stream_layout page;
+            if (!t.assert_true(group->source_table()->get(group->source_handles().front(),0,cache) &&
+                    ggml_kv_stream_layout_make(cache->host()->config().shape,256,page).status==ggml_kv_stream_status::success)) return;
+            cp.shared_device_memory_bytes+=6*page.bytes;
+        }
         group=llama_context_group::create(*model,cp);
         if (!t.assert_true(group!=nullptr)) return;
         t.out<<"explicit ring profile: context="<<cp.n_ctx<<" batch="<<cp.n_batch<<" ubatch="<<cp.n_ubatch
@@ -3871,8 +3879,9 @@ static void test_group_mtp_admission(testing & t,llama_model * model,bool resume
             !child->get_cparams().shared_device_memory_bytes)) return;
     if (!execute(*target,*child,stream_spec)) return;
     if (ring) {
-        t.assert_true("prefill, catchup and drafting each acquired real nonresident KV spans",
-            transport->spans[0]>0 && transport->spans[1]>0 && transport->spans[2]>0);
+        t.assert_true("prefill and catchup stream KV; drafting reads streamed or resident KV",
+            transport->spans[0]>0 && transport->spans[1]>0 &&
+            (transport->spans[2]>0 || transport->prediction_gathers>0));
         t.out<<"actual ring spans: prefill="<<transport->spans[0]<<" catchup="<<transport->spans[1]
             <<" predict="<<transport->spans[2]<<'\n';
         t.assert_equal(cp.shared_device_memory_bytes,ggml_backend_buffer_get_size(target->group_parent()));
@@ -8950,7 +8959,8 @@ int main(int argc,char ** argv) {
             !std::strcmp(arg,"--native-dflash-draft-repeat") || !std::strcmp(arg,"--native-dflash-draft-widths") || !std::strcmp(arg,"--native-dflash-k4v-routes");
     }))
         mparams.tensor_buft_overrides=staged_draft_weights;
-    const bool group_mtp_ring=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-ring-only");});
+    const bool group_mtp_double=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-double-buffer-only");});
+    const bool group_mtp_ring=group_mtp_double || std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-ring-only");});
     const bool group_mtp_image_workspace=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-image-workspace");});
     const bool group_mtp_image=group_mtp_image_workspace || std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-image-catchup");});
     const bool group_mtp_backend=std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-mtp-backend-only");});
@@ -9167,7 +9177,7 @@ int main(int argc,char ** argv) {
         return t.summary();
     }
     if (group_mtp_backend || group_mtp_ring || group_mtp_admission || group_mtp_resume) {
-        t.test("Selected_target_and_MTP_head_share_one_admitted_workspace",[&](testing & t) {test_group_mtp_admission(t,model.get(),group_mtp_resume,group_mtp_phase_guard,group_mtp_ring,group_mtp_partial,{1,3},{0,2},group_mtp_backend || group_mtp_backend_resume);});
+        t.test("Selected_target_and_MTP_head_share_one_admitted_workspace",[&](testing & t) {test_group_mtp_admission(t,model.get(),group_mtp_resume,group_mtp_phase_guard,group_mtp_ring,group_mtp_partial,{1,3},{0,2},group_mtp_backend || group_mtp_backend_resume,0,false,false,group_mtp_double);});
         return t.summary();
     }
     if (group_auxiliary_metadata) {

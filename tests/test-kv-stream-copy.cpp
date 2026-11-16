@@ -31,6 +31,67 @@ struct delayed_event {
 };
 #endif
 
+static int registered_multi_contract(ggml_backend_t backend) {
+    testing t;auto * device=ggml_backend_get_device(backend);auto * reg=ggml_backend_dev_backend_reg(device);
+    auto get=reinterpret_cast<ggml_kv_stream_registered_copy_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_registered_copy_ops"));
+    auto copy_get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_copy_ops"));
+    if (!t.assert_true(get && get() && get()->version>=2 && get()->create_multi && copy_get && copy_get())) return t.summary();
+    const auto * copies=copy_get();const auto * registered=get();
+    const ggml_kv_stream_shape shape{GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,256,256,4,256,128};ggml_kv_stream_layout page,ring;
+    if (!t.assert_true(ggml_kv_stream_layout_make(shape,256,page).status==ggml_kv_stream_status::success &&
+            ggml_kv_stream_layout_make(shape,512,ring).status==ggml_kv_stream_status::success)) return t.summary();
+    ggml_backend_buffer_ptr gpu(ggml_backend_buft_alloc_buffer(llama_kv_stream_device_buffer_type(device),ring.bytes));
+    std::unique_ptr<void,void (*)(void *)> prepared(copies->prepare(backend,2,false),copies->free_prepared);
+    if (!t.assert_true(gpu && prepared)) return t.summary();
+    llama_kv_stream_host_config config{99,shape,{{GGML_TYPE_Q8_0,true,true,true,true},{GGML_TYPE_Q4_0,true,true,true,true},true,true},256,1};
+    std::vector<decltype(llama_kv_stream_host_reservation::create(config,device,65536))> hosts;
+    std::vector<ggml_kv_stream_registered_copy_source> scopes;
+    std::vector<ggml_kv_stream_registered_copy_fragment> parts[3][2];
+    for (size_t source=0;source<3;++source) {
+        hosts.push_back(llama_kv_stream_host_reservation::create(config,device,65536));llama_kv_stream_host_layer layer;
+        if (!t.assert_true(hosts.back() && hosts.back()->prepare(256) && hosts.back()->layer(0,layer))) return t.summary();
+        scopes.push_back({layer.k,hosts.back()->bytes()});
+        for (size_t side=0;side<2;++side) {
+            std::vector<llama_kv_stream_host_range> ranges;
+            if (!t.assert_true(hosts.back()->ranges(0,side ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,
+                    0,side ? page.v_bytes : page.k_bytes,ranges))) return t.summary();
+            for (const auto & range:ranges) {
+                std::memset(static_cast<char *>(ggml_backend_buffer_get_base(range.buffer.get()))+range.offset,int(0x50+source+16*side),range.bytes);
+                parts[source][side].push_back({range.buffer.get(),range.offset,range.bytes});
+            }
+        }
+    }
+    std::vector<size_t> order={0,1,2};std::sort(order.begin(),order.end(),[&](size_t a,size_t b) {return uintptr_t(scopes[a].base)<uintptr_t(scopes[b].base);});
+    const ggml_kv_stream_registered_copy_source allowed[]={scopes[order[0]],scopes[order[2]]};
+    t.assert_true(!registered->create_multi(backend,prepared.get(),gpu.get(),nullptr,2,shape,2));
+    t.assert_true(!registered->create_multi(backend,prepared.get(),gpu.get(),allowed,0,shape,2));
+    auto duplicate=std::vector<ggml_kv_stream_registered_copy_source>{allowed[0],allowed[0]};
+    t.assert_true(!registered->create_multi(backend,prepared.get(),gpu.get(),duplicate.data(),2,shape,2));
+    std::unique_ptr<void,void (*)(void *)> queue(registered->create_multi(backend,prepared.get(),gpu.get(),allowed,2,shape,2),copies->free);
+    if (!t.assert_true("one ring accepts multiple disjoint registered sources",queue!=nullptr)) return t.summary();
+    ggml_backend_buffer_clear(gpu.get(),0xa5);
+    if (!t.assert_true(copies->begin(queue.get()))) return t.summary();
+    const auto & foreign_k=parts[order[1]][0];const auto & foreign_v=parts[order[1]][1];
+    t.assert_true("the gap between authorized sources does not authorize another cache",!registered->enqueue(queue.get(),0,
+        foreign_k.data(),foreign_k.size(),foreign_v.data(),foreign_v.size(),256,256,false));
+    t.assert_equal(size_t(0),copies->stats(queue.get()).bytes);
+    for (size_t slot=0;slot<2;++slot) {
+        const auto owner=order[slot*2];const auto & k=parts[owner][0];const auto & v=parts[owner][1];
+        if (!t.assert_true(registered->enqueue(queue.get(),slot,k.data(),k.size(),v.data(),v.size(),256,256,false) &&
+                copies->acquire_span(queue.get(),slot,1))) return t.summary();
+    }
+    ggml_backend_synchronize(backend);
+    ggml_context_ptr metadata(ggml_init({ggml_tensor_overhead(),nullptr,true}));auto * tensor=ggml_new_tensor_1d(metadata.get(),GGML_TYPE_I8,int64_t(ring.bytes));
+    if (!t.assert_true(ggml_backend_tensor_alloc(gpu.get(),tensor,ggml_backend_buffer_get_base(gpu.get()))==GGML_STATUS_SUCCESS)) return t.summary();
+    std::vector<uint8_t> observed(ring.bytes);ggml_backend_tensor_get(tensor,observed.data(),0,observed.size());
+    for (size_t slot=0;slot<2;++slot) for (size_t side=0;side<2;++side) {
+        const size_t first=(side ? ring.v_offset : 0)+slot*(side ? page.v_bytes : page.k_bytes);
+        const size_t bytes=side ? page.v_bytes : page.k_bytes;const auto pattern=uint8_t(0x50+order[slot*2]+16*side);
+        t.assert_true(std::all_of(observed.begin()+first,observed.begin()+first+bytes,[&](uint8_t value) {return value==pattern;}));
+    }
+    t.assert_true(copies->release_span(queue.get(),0,2));copies->drain(queue.get());return t.summary();
+}
+
 static int registered_copy_contract(ggml_backend_t backend) {
     testing t;
     auto * device = ggml_backend_get_device(backend);
@@ -359,6 +420,7 @@ static int gather_copy_contract(ggml_backend_t backend,bool batch=false) {
 }
 
 int main(int argc, char ** argv) {
+    const bool multi = argc > 1 && std::strcmp(argv[1],"--cuda-registered-multi") == 0;
     const bool registered = argc > 1 && std::strcmp(argv[1], "--cuda-registered") == 0;
     const bool batch = argc>1 && !std::strcmp(argv[1],"--cuda-gather-batch");
     const bool gather = batch || (argc > 1 && std::strcmp(argv[1], "--cuda-gather") == 0);
@@ -367,7 +429,7 @@ int main(int argc, char ** argv) {
     const bool spans = argc > 1 && std::strcmp(argv[1],"--bench-span") == 0;
     const bool fallback = argc > 1 && std::strcmp(argv[1],"--bench-fallback") == 0;
     const bool bench = wide || ordered || spans || fallback || (argc > 1 && std::strcmp(argv[1],"--bench") == 0);
-    const bool cuda = gather || registered || bench || (argc > 1 && std::strcmp(argv[1],"--cuda") == 0);
+    const bool cuda = multi || gather || registered || bench || (argc > 1 && std::strcmp(argv[1],"--cuda") == 0);
     const bool queue_only = cuda && !bench && argc == 3 && std::strcmp(argv[2],"--queue-only") == 0;
     ggml_backend_ptr backend;
     if (cuda) {
@@ -380,6 +442,7 @@ int main(int argc, char ** argv) {
     } else backend.reset(ggml_backend_cpu_init());
     if (!backend) return 1;
     if (gather) return gather_copy_contract(backend.get(),batch);
+    if (multi) return registered_multi_contract(backend.get());
     if (registered) return registered_copy_contract(backend.get());
     if (bench) {
         const size_t span_pages = argc > 2 ? std::strtoull(argv[2],nullptr,10) : (spans ? 2 : 1);

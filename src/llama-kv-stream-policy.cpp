@@ -60,6 +60,7 @@ static llama_kv_stream_policy_result budget_make(
         return {status::allocation_failed, {}};
     }
     b.layers = c.layers;
+    b.double_buffer = c.double_buffer;
     b.minimum_ring_slots = b.pages - ((b.pages - hint)/b.layers)*b.layers;
     b.conversion_offset = pages*page.bytes;
     b.unused_bytes = c.pool_bytes - b.conversion_offset - b.page.conversion.bytes;
@@ -118,7 +119,7 @@ static bool state_valid(const llama_kv_stream_policy_budget & b, const llama_kv_
     return same_shape(b.shape, old.shape) && same_planes(b.page.storage, old.page.storage) &&
         same_planes(b.page.conversion, old.page.conversion) && b.page.attention == old.page.attention &&
         b.pool_bytes == old.pool_bytes && b.pages == old.pages && b.layers == old.layers &&
-        b.minimum_ring_slots == old.minimum_ring_slots && b.conversion_offset == old.conversion_offset &&
+        b.minimum_ring_slots == old.minimum_ring_slots && b.double_buffer == old.double_buffer && b.conversion_offset == old.conversion_offset &&
         b.unused_bytes == old.unused_bytes && s.ring_slots >= b.minimum_ring_slots &&
         uint64_t(s.resident_pages_per_layer)*b.layers + s.ring_slots == b.pages &&
         (!s.decode_active_pages || s.decode_active_pages > s.resident_pages_per_layer) &&
@@ -140,8 +141,9 @@ static capacity_profile profile(const llama_kv_stream_policy_state & s) {
     if (p.active <= p.mean) return p;
     const uint64_t deficit = uint64_t(p.active - p.mean)*p.layers;
     const uint64_t minimum = ceil_div(deficit, p.active);
+    const uint32_t buffered_span = s.budget.double_buffer ? std::max(1u,s.ring_slots/2) : s.ring_slots;
     p.splits = s.spread_streaming ? p.layers : uint32_t(std::max(
-        std::min(uint64_t(p.layers), ceil_div(deficit, s.ring_slots)),
+        std::min(uint64_t(p.layers), ceil_div(deficit, buffered_span)),
         minimum));
     p.streamed_base = uint32_t(deficit/p.splits);
     p.remainder = uint32_t(deficit % p.splits);
@@ -254,12 +256,14 @@ llama_kv_stream_policy_result llama_kv_stream_policy_step(
     const bool pressure = active > s.resident_pages_per_layer;
     const uint32_t requested_decode = !observation.uniform_prefill && observation.query_tokens <= DECODE_QUERY_LIMIT && pressure ? active : 0;
     const bool entering = requested_decode && requested_decode != previous.decode_active_pages;
-    d.target_resident_pages = overlap_target(b, active, c.overlap_ratio);
+    const double overlap=c.double_buffer ? std::max(2.0,c.overlap_ratio) : c.overlap_ratio;
+    d.target_resident_pages = overlap_target(b, active, overlap);
+    const uint32_t target=std::max(c.double_buffer ? uint32_t(double(b.pages)<overlap*double(active)) : 1u,d.target_resident_pages);
     if (!pressure) {
         s.starved = s.overprovisioned = 0; s.spread_streaming = false;
-    } else if (!c.fixed_ring && (entering || d.feedback_used)) {
+    } else if (!c.fixed_ring && (entering || d.feedback_used ||
+            (c.double_buffer && s.resident_pages_per_layer > target))) {
         if (d.feedback_used) s.evaluations_since_repartition = increment(s.evaluations_since_repartition);
-        const uint32_t target = std::max(1u, d.target_resident_pages);
         const bool below = s.resident_pages_per_layer > target;
         const bool feedback_starved = d.feedback_used && miss_ratio > MISS_THRESHOLD &&
             observation.feedback.copy_busy_ratio < COPY_SATURATED;
@@ -271,7 +275,7 @@ llama_kv_stream_policy_result llama_kv_stream_policy_step(
         }
         const bool cooldown = s.evaluations_since_repartition >= c.cooldown_evaluations;
         const bool hard_deadline = d.layer_feedback_used && feedback_starved;
-        if (entering && below) {
+        if ((c.double_buffer || entering) && below) {
             s.resident_pages_per_layer = target;
         } else if ((cooldown || hard_deadline) && d.feedback_used && (below || feedback_starved) &&
                 s.starved >= c.grow_evaluations && s.resident_pages_per_layer > 1) {
@@ -317,14 +321,14 @@ llama_kv_stream_policy_result llama_kv_stream_policy_reserve_layer(
     } catch (const std::bad_alloc &) {
         return {status::allocation_failed, {}};
     }
-    if (double(previous.ring_slots) >= c.overlap_ratio * double(streamed) ||
+    if (double(previous.ring_slots) >= (c.double_buffer ? std::max(2.0,c.overlap_ratio) : c.overlap_ratio) * double(streamed) ||
             (c.fixed_ring && previous.ring_slots >= streamed)) {
         output = std::move(next);
         return {};
     }
     if (c.fixed_ring) return {status::invalid_budget, {}};
     auto & state = next.next;
-    next.target_resident_pages = overlap_target(b, uint32_t(active), c.overlap_ratio);
+    next.target_resident_pages = overlap_target(b, uint32_t(active), c.double_buffer ? std::max(2.0,c.overlap_ratio) : c.overlap_ratio);
     state.resident_pages_per_layer = std::min(previous.resident_pages_per_layer, next.target_resident_pages);
     state.ring_slots = b.pages - state.resident_pages_per_layer * b.layers;
     // Concentrated placement can leave this layer with no resident capacity.

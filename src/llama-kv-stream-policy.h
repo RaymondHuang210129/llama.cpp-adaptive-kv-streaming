@@ -20,6 +20,7 @@ struct llama_kv_stream_policy_config {
     // Zero uses the reference's automatic (up to eight slots) startup hint.
     uint32_t initial_ring_slots = 0;
     bool fixed_ring = false;
+    bool double_buffer = false;
     double overlap_ratio = 1.10;
     uint32_t grow_evaluations = 3, shrink_evaluations = 8, cooldown_evaluations = 64;
 };
@@ -29,6 +30,7 @@ struct llama_kv_stream_policy_budget {
     ggml_kv_stream_execution page;
     size_t pool_bytes = 0, conversion_offset = 0, unused_bytes = 0;
     uint32_t pages = 0, layers = 0, minimum_ring_slots = 0;
+    bool double_buffer = false;
     std::vector<llama_kv_stream_policy_cache> caches;
 };
 
