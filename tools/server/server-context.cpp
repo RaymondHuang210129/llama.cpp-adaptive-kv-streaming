@@ -1074,7 +1074,12 @@ private:
     std::vector<std::array<uint32_t,2>> stream_shape;
     bool stream_embedded = false;
     bool stream_vision_primed = false;
-    uint32_t stream_preparing = UINT32_MAX;
+    llama_kv_stream_prefill_plan stream_prefill;
+    struct stream_prefill_attempt {
+        int task = -1;
+        size_t rows = 0, members = 0;
+    };
+    std::vector<stream_prefill_attempt> stream_deferred_prefills;
     uint64_t stream_binding_revision = 0;
 
     llama_context * ctx_tgt = nullptr;
@@ -1141,7 +1146,7 @@ private:
         vision_arena = false;
         stream_requests.reset();stream_contexts.reset();stream_shape.clear();stream_selection={};stream_proposal={};
         stream_embedded=false;stream_vision_primed=false;
-        stream_preparing=UINT32_MAX;stream_binding_revision=0;
+        stream_prefill={};stream_deferred_prefills.clear();stream_binding_revision=0;
         spec_init.reset();
         llama_init.reset();
 
@@ -3538,7 +3543,7 @@ private:
                 if (stream_requests && stream_requests->phase()==llama_kv_stream_group_phase::retiring) {
                     park_stream_context();
                     if (!stream_requests->release()) throw std::runtime_error("idle request group could not retire");
-                    stream_preparing=UINT32_MAX;stream_selection={};stream_proposal={};
+                    stream_prefill={};stream_deferred_prefills.clear();stream_selection={};stream_proposal={};
                 }
                 SRV_TRC("%s", "all slots are idle\n");
 
@@ -3732,15 +3737,37 @@ private:
         slot.image_outputs=std::move(outputs);return true;
     }
 
-    static bool admit_stream_selection(const llama_kv_stream_selection & selection,void * data) {
-        auto & server=*static_cast<server_context_impl *>(data);
+    void fill_stream_work_batch(llama_batch & input, const llama_kv_stream_selection & selection,
+            size_t rows, llama_memory_work_phase phase) const {
+        input.n_tokens = 0;
+        for (const auto & member : selection.slots) {
+            const auto & slot = slots[member.id];
+            for (size_t query = 0; query < rows; ++query) {
+                const int row = input.n_tokens++;
+                const size_t token = slot.prompt.n_tokens() + query;
+                const bool prefill = phase == llama_memory_work_phase::target_prefill;
+                if (prefill && (token >= slot.task->tokens.size() || slot.task->tokens[token] == LLAMA_TOKEN_NULL))
+                    throw std::runtime_error("invalid text prefill representative");
+                input.token[row] = prefill ? slot.task->tokens[token] : slot.sampled;
+                input.pos[row] = slot.prompt.tokens.pos_next() + llama_pos(query);
+                input.n_seq_id[row] = 1;
+                input.seq_id[row][0] = llama_seq_id(member.id);
+                input.logits[row] = (!prefill || !spec) ? query + 1 == rows :
+                    slot.need_embd() || token + 1 == slot.task->tokens.size();
+            }
+        }
+    }
+
+    bool quote_stream_work(const llama_kv_stream_selection & selection, size_t rows, llama_memory_work_phase phase) {
+        auto & server = *this;
+        if (selection.slots.empty() || !rows || rows > size_t(INT32_MAX) / selection.slots.size()) return false;
         const auto table=server.stream_contexts->source_table();
         auto params=common_context_params_to_llama(server.params_base,server.model_tgt);params.n_ctx=table->limits().slot_limit;
         std::vector<llama_seq_id> selected;
         std::vector<llama_memory_phase_cache_identity> identities,auxiliary_identities;
-        auto batch=llama_batch_init(int32_t(selection.slots.size()),0,1);
+        auto batch=llama_batch_init(int32_t(rows * selection.slots.size()),0,1);
         struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{batch};
-        batch.n_tokens=int32_t(selection.slots.size());
+        fill_stream_work_batch(batch, selection, rows, phase);
         for (size_t row=0;row<selection.slots.size();++row) {
             const auto id=selection.slots[row].id;
             const auto handle=server.stream_contexts->source_handles()[id];
@@ -3751,9 +3778,6 @@ private:
                 if (!table->get(handle,1,cache) || !cache->ready()) throw std::runtime_error("selected MTP history is stale during admission");
                 auxiliary_identities.push_back({cache->host()->cache_id(),cache->content()->generation()});
             }
-            const auto & slot=server.slots[id];
-            batch.token[row]=slot.sampled;batch.pos[row]=slot.prompt.tokens.pos_next();
-            batch.n_seq_id[row]=1;batch.seq_id[row][0]=llama_seq_id(id);batch.logits[row]=1;
         }
         llama_context pending(*server.model_tgt,params,selected);llama_context_group_plan quote;
         if (!pending.bind_group_samplers_from(*server.stream_contexts->metadata_context()))
@@ -3781,7 +3805,7 @@ private:
             if (!child->bind_group_samplers_from(*metadata)) throw std::runtime_error("selected speculative sampling graph could not be measured");
         }
         const auto result=pending.quote_target_group(batch,identities,{identities.front().id*4+1,1},
-            llama_memory_work_phase::target_verify,1,params.shared_device_memory_bytes,quote,child.get(),auxiliary_identities);
+            phase,1,params.shared_device_memory_bytes,quote,child.get(),auxiliary_identities);
         if (result.status==llama_context_memory_create_status::insufficient_budget) {
             SRV_INF("stream selection capacity: selected=%zu required=%zu available=%zu\n",selected.size(),result.required_bytes,result.available_bytes);
             return false;
@@ -3791,61 +3815,192 @@ private:
         return true;
     }
 
+    static bool admit_stream_selection(const llama_kv_stream_selection & selection, void * data) {
+        return static_cast<server_context_impl *>(data)->quote_stream_work(selection, 1, llama_memory_work_phase::target_verify);
+    }
+
+    size_t stream_text_prefill_tokens(const server_slot & slot, size_t maximum) const {
+        const size_t used = slot.prompt.tokens.size();
+        if (used >= slot.task->tokens.size()) return 0;
+        const size_t limit = std::min(maximum, slot.task->tokens.size() - used);
+        size_t count = 0;
+        while (count < limit && slot.task->tokens[used + count] != LLAMA_TOKEN_NULL) ++count;
+        return count;
+    }
+
+    size_t stream_prefill_rows(const llama_kv_stream_selection & selection) const {
+        if (selection.slots.empty()) return 0;
+        size_t rows = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt)) / selection.slots.size();
+        for (const auto & member : selection.slots) {
+            const auto & slot = slots[member.id];
+            rows = std::min({rows, member.growth_tokens, stream_text_prefill_tokens(slot, rows)});
+        }
+        return rows;
+    }
+
+    static bool admit_stream_prefill(const llama_kv_stream_selection & selection, void * data) {
+        auto & server = *static_cast<server_context_impl *>(data);
+        const size_t rows = server.stream_prefill_rows(selection);
+        if (!rows) return false;
+        auto * active = server.stream_contexts->context();
+        if (active && !active->get_cparams().kv_stream_decode && !server.stream_embedded &&
+                server.stream_selection.slots.size() == selection.slots.size()) {
+            bool same = true;
+            for (size_t i = 0; i < selection.slots.size(); ++i) {
+                const auto & member = selection.slots[i];
+                same &= server.stream_selection.slots[i].id == member.id && server.stream_shape[member.id][0] == rows;
+            }
+            if (same) return true;
+        }
+        return server.quote_stream_work(selection, rows, llama_memory_work_phase::target_prefill);
+    }
+
+    llama_kv_stream_group_request prepare_stream_request(server_slot & slot) {
+        bool reused=false;slot.stream_cached_tokens=0;
+        std::vector<uint8_t> speculative_state;
+        if (slot.task->params.cache_prompt && !slot.task->tokens.empty() && !slot.prompt.tokens.empty()) {
+            const auto prefix=std::min(slot.prompt.tokens.get_common_prefix(slot.task->tokens),slot.task->tokens.size()-1);
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!stream_contexts->source_table()->get(stream_contexts->source_handles()[slot.id],0,cache))
+                throw std::runtime_error("cached source is unavailable");
+            if (cache->tokens() && cache->tokens()<=prefix && cache->tokens()==slot.prompt.tokens.size()) {
+                reused=stream_contexts->advance_request(uint32_t(slot.id));
+                if (reused) {slot.stream_cached_tokens=cache->tokens();speculative_state=slot.prompt.speculative_state;}
+            }
+            if (!reused) for (auto it=slot.prompt.checkpoints.rbegin();it!=slot.prompt.checkpoints.rend();++it) {
+                if (it->n_tokens<=0 || uint64_t(it->n_tokens)>prefix) continue;
+                if (it->streamed && stream_contexts->load_request(uint32_t(slot.id),*it->streamed)) {
+                    slot.stream_cached_tokens=size_t(it->n_tokens);speculative_state=it->data_spec;reused=true;break;
+                }
+            }
+        }
+        if (reused) slot.prompt.tokens.keep_first(slot.stream_cached_tokens);
+        else {
+            if (!stream_contexts->reset_request(uint32_t(slot.id))) throw std::runtime_error("slot namespace could not reset");
+            slot.prompt.clear();
+        }
+        if (spec) {
+            common_speculative_begin(spec.get(),slot.id,{});
+            if (!speculative_state.empty()) common_speculative_set_state(spec.get(),slot.id,speculative_state);
+        }
+        const auto handle=stream_contexts->source_handles()[slot.id];
+        bool images=false;
+        for (size_t index=slot.stream_cached_tokens;index<slot.task->tokens.size();++index)
+            if (slot.task->tokens[index]==LLAMA_TOKEN_NULL) {images=true;break;}
+        return {handle.slot,handle.generation,slot.stream_cached_tokens,0,images};
+    }
+
+    bool plan_stream_prefill(const llama_kv_stream_request_group & requests, llama_kv_stream_prefill_plan & output,
+            bool check_resources = true) {
+        std::vector<llama_kv_stream_prefill_slot> pending;
+        const size_t maximum = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+        const auto table = stream_contexts->source_table();
+        for (const auto & slot : slots) {
+            const auto handle = stream_contexts->source_handles()[slot.id];
+            if (!requests.preparing(handle.slot, handle.generation) || slot.state == SLOT_STATE_GENERATING) continue;
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!table->get(handle, 0, cache) || !cache->ready()) throw std::runtime_error("prefill source is unavailable");
+            const size_t used = slot.prompt.tokens.size();
+            if (used > slot.task->tokens.size()) throw std::runtime_error("prefill frontier exceeds its prompt");
+            if (used == slot.task->tokens.size() || slot.task->tokens[used] == LLAMA_TOKEN_NULL) {
+                llama_kv_stream_prefill_plan next;
+                if (llama_kv_stream_select({table->limits().group_limit, 1}, {{handle.slot, cache->tokens()}},
+                        next.selected) != llama_kv_stream_selection_status::success) return false;
+                next.tokens_per_slot = maximum;
+                output = std::move(next);
+                return true;
+            }
+            pending.push_back({handle.slot, cache->tokens(), stream_text_prefill_tokens(slot, maximum)});
+        }
+        return llama_kv_stream_prefill_plan_make({table->limits().group_limit, 2}, pending, maximum,
+            output, check_resources ? admit_stream_prefill : nullptr, this) == llama_kv_stream_selection_status::success;
+    }
+
+    void admit_stream_prefill_arrivals() {
+        for (const auto & member : slots) {
+            const auto handle = stream_contexts->source_handles()[member.id];
+            if (!stream_requests->preparing(handle.slot, handle.generation) || member.state == SLOT_STATE_GENERATING) continue;
+            const size_t used = member.prompt.tokens.size();
+            if (used < member.task->tokens.size() && member.task->tokens[used] == LLAMA_TOKEN_NULL) return;
+        }
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_STARTED || slot.task->tokens.empty()) continue;
+            auto handle = stream_contexts->source_handles()[slot.id];
+            if (stream_requests->busy(handle.slot, handle.generation)) continue;
+            bool needs_vision = false;
+            for (size_t i = 0; i < slot.task->tokens.size(); ++i) needs_vision |= slot.task->tokens[i] == LLAMA_TOKEN_NULL;
+            if (needs_vision) continue;
+            auto & attempted = stream_deferred_prefills.at(size_t(slot.id));
+            if (attempted.task != slot.task->id) {
+                park_stream_context();
+                prepare_stream_request(slot);
+                attempted = {slot.task->id, 0, 0};
+            }
+            handle = stream_contexts->source_handles()[slot.id];
+            const llama_kv_stream_group_request incoming{handle.slot, handle.generation, slot.stream_cached_tokens, 0, false};
+            auto proposed = *stream_requests;
+            llama_kv_stream_prefill_plan next;
+            bool accepted = proposed.admit({incoming}) && plan_stream_prefill(proposed, next, false);
+            size_t unfinished = 0;
+            for (const auto & member : slots) {
+                const auto source = stream_contexts->source_handles()[member.id];
+                unfinished += proposed.preparing(source.slot, source.generation) && member.state != SLOT_STATE_GENERATING;
+            }
+            if (attempted.rows == next.tokens_per_slot && attempted.members == unfinished) continue;
+            attempted.rows = next.tokens_per_slot;
+            attempted.members = unfinished;
+            accepted &= next.selected.slots.size() == unfinished;
+            if (accepted) {
+                park_stream_context();
+                accepted = plan_stream_prefill(proposed, next) && next.selected.slots.size() == unfinished;
+            }
+            if (accepted) {
+                auto previous = stream_selection;
+                stream_selection = next.selected;
+                auto input = llama_batch_init(int32_t(next.tokens_per_slot * next.selected.slots.size()), 0, 1);
+                struct release_batch {llama_batch & batch; ~release_batch() {llama_batch_free(batch);}} release{input};
+                fill_stream_work_batch(input, next.selected, next.tokens_per_slot, llama_memory_work_phase::target_prefill);
+                llama_context_memory_create_result rejected;
+                if (ensure_stream_execution(&input, true, &rejected)) {
+                    *stream_requests = std::move(proposed);
+                    stream_prefill = std::move(next);
+                    SRV_INF("stream prefill join: slot=%d request=%" PRIu64 " selected=%zu\n", slot.id,
+                        incoming.request, stream_prefill.selected.slots.size());
+                    continue;
+                }
+                stream_selection = std::move(previous);
+                SRV_INF("stream prefill join deferred: slot=%d reason=%s\n", slot.id,
+                    llama_context_memory_create_status_name(rejected.status));
+            }
+        }
+    }
+
     void prepare_stream_slots() {
         if (!stream_contexts) return;
         auto & requests=*stream_requests;
         using phase=llama_kv_stream_group_phase;
         auto current=requests.phase();
-        if (current==phase::prefill && stream_preparing!=UINT32_MAX) {
-            auto & slot=slots[stream_preparing];
-            const auto handle=stream_contexts->source_handles()[stream_preparing];
-            if (slot.state==SLOT_STATE_GENERATING && requests.busy(handle.slot,handle.generation)) {
+        if (current == phase::prefill) {
+            admit_stream_prefill_arrivals();
+            for (auto & slot : slots) {
+                const auto handle = stream_contexts->source_handles()[slot.id];
+                if (slot.state != SLOT_STATE_GENERATING || !requests.preparing(handle.slot, handle.generation)) continue;
                 if (!requests.prepared(handle.slot,handle.generation,phase::prefill,size_t(slot.prompt.n_tokens())+1))
                     throw std::runtime_error("prefill frontier could not be published to the request group");
-                park_stream_context();stream_preparing=UINT32_MAX;
+                park_stream_context();
             }
         }
         current=requests.phase();
         if (current==phase::retiring) {
             park_stream_context();
             if (!requests.release()) throw std::runtime_error("request group could not retire");
-            stream_preparing=UINT32_MAX;stream_selection={};stream_proposal={};current=phase::idle;
+            stream_prefill={};stream_selection={};stream_proposal={};current=phase::idle;
         }
         if (current==phase::idle) {
+            stream_deferred_prefills.assign(slots.size(), {});
             std::vector<llama_kv_stream_group_request> admitted;
             for (auto & slot : slots) if (slot.state==SLOT_STATE_STARTED) {
-                bool reused=false;slot.stream_cached_tokens=0;
-                std::vector<uint8_t> speculative_state;
-                if (slot.task->params.cache_prompt && !slot.task->tokens.empty() && !slot.prompt.tokens.empty()) {
-                    const auto prefix=std::min(slot.prompt.tokens.get_common_prefix(slot.task->tokens),slot.task->tokens.size()-1);
-                    std::shared_ptr<llama_kv_stream_logical_cache> cache;
-                    if (!stream_contexts->source_table()->get(stream_contexts->source_handles()[slot.id],0,cache))
-                        throw std::runtime_error("cached source is unavailable");
-                    if (cache->tokens() && cache->tokens()<=prefix && cache->tokens()==slot.prompt.tokens.size()) {
-                        reused=stream_contexts->advance_request(uint32_t(slot.id));
-                        if (reused) {slot.stream_cached_tokens=cache->tokens();speculative_state=slot.prompt.speculative_state;}
-                    }
-                    if (!reused) for (auto it=slot.prompt.checkpoints.rbegin();it!=slot.prompt.checkpoints.rend();++it) {
-                        if (it->n_tokens<=0 || uint64_t(it->n_tokens)>prefix) continue;
-                        if (it->streamed && stream_contexts->load_request(uint32_t(slot.id),*it->streamed)) {
-                            slot.stream_cached_tokens=size_t(it->n_tokens);speculative_state=it->data_spec;reused=true;break;
-                        }
-                    }
-                }
-                if (reused) slot.prompt.tokens.keep_first(slot.stream_cached_tokens);
-                else {
-                    if (!stream_contexts->reset_request(uint32_t(slot.id))) throw std::runtime_error("slot namespace could not reset");
-                    slot.prompt.clear();
-                }
-                if (spec) {
-                    common_speculative_begin(spec.get(),slot.id,{});
-                    if (!speculative_state.empty()) common_speculative_set_state(spec.get(),slot.id,speculative_state);
-                }
-                const auto handle=stream_contexts->source_handles()[slot.id];
-                bool images=false;
-                for (size_t index=slot.stream_cached_tokens;index<slot.task->tokens.size();++index)
-                    if (slot.task->tokens[index]==LLAMA_TOKEN_NULL) {images=true;break;}
-                admitted.push_back({handle.slot,handle.generation,slot.stream_cached_tokens,0,images});
+                admitted.push_back(prepare_stream_request(slot));
             }
             if (admitted.empty()) return;
             if (!requests.admit(admitted)) throw std::runtime_error("request group admission failed");
@@ -3868,21 +4023,22 @@ private:
             current=requests.phase();
             if (current==phase::retiring) {
                 if (!requests.release()) throw std::runtime_error("failed image group could not retire");
-                stream_preparing=UINT32_MAX;stream_selection={};stream_proposal={};return;
+                stream_prefill={};stream_selection={};stream_proposal={};return;
             }
         }
         if (current==phase::prefill) {
-            llama_kv_stream_group_request next;
-            if (!requests.next_preparation(next)) throw std::runtime_error("missing group prefill");
-            if (stream_preparing!=next.slot) {
-                park_stream_context();stream_preparing=next.slot;
-                std::shared_ptr<llama_kv_stream_logical_cache> cache;
-                const auto handle=stream_contexts->source_handles()[next.slot];
-                if (!stream_contexts->source_table()->get(handle,0,cache) ||
-                        llama_kv_stream_select({stream_contexts->source_table()->limits().group_limit,1},
-                            {{next.slot,cache->tokens()}},stream_selection)!=llama_kv_stream_selection_status::success)
-                    throw std::runtime_error("prefill selection is unavailable");
+            llama_kv_stream_prefill_plan next;
+            if (!plan_stream_prefill(requests, next)) throw std::runtime_error("prefill selection is unavailable");
+            bool same = next.selected.slots.size() == stream_selection.slots.size();
+            for (size_t i = 0; same && i < next.selected.slots.size(); ++i) {
+                const auto & old = stream_selection.slots[i];
+                const auto & incoming = next.selected.slots[i];
+                same = old.id == incoming.id && old.offset_tokens == incoming.offset_tokens &&
+                    old.history_tokens + old.growth_tokens == incoming.history_tokens + incoming.growth_tokens;
             }
+            if (!same) park_stream_context();
+            stream_selection = next.selected;
+            stream_prefill = std::move(next);
             return;
         }
         if (current!=phase::decode) throw std::runtime_error("unsupported request-group phase");
@@ -3896,14 +4052,16 @@ private:
             if (requests.plan(plan,admit_stream_selection,this)!=llama_kv_stream_selection_status::success) throw std::runtime_error("no request selection can progress");
             stream_selection=plan.selected;stream_proposal=std::move(plan);
         }
-        stream_preparing=UINT32_MAX;
+        stream_prefill={};
     }
 
     bool stream_can_batch(const server_slot & slot) const {
         if (!stream_contexts) return true;
         const auto handle=stream_contexts->source_handles()[slot.id];
         if (stream_requests->phase()==llama_kv_stream_group_phase::prefill)
-            return uint32_t(slot.id)==stream_preparing && slot.state!=SLOT_STATE_GENERATING;
+            return slot.state != SLOT_STATE_GENERATING && stream_requests->preparing(handle.slot, handle.generation) &&
+                std::any_of(stream_prefill.selected.slots.begin(), stream_prefill.selected.slots.end(),
+                    [&](const auto & member) { return member.id == uint32_t(slot.id); });
         if (stream_proposal.epoch) {
             return stream_requests->busy(uint32_t(slot.id),handle.generation) &&
                 std::any_of(stream_proposal.selected.slots.begin(),stream_proposal.selected.slots.end(),
@@ -3912,8 +4070,9 @@ private:
         return stream_requests->selected(uint32_t(slot.id),handle.generation);
     }
 
-    void ensure_stream_execution(llama_batch * supplied=nullptr,bool causal=true) {
-        if (!stream_contexts) return;
+    bool ensure_stream_execution(llama_batch * supplied=nullptr, bool causal=true,
+            llama_context_memory_create_result * rejected=nullptr) {
+        if (!stream_contexts) return true;
         const auto phase=stream_requests->phase()==llama_kv_stream_group_phase::decode ?
             llama_memory_work_phase::target_verify : llama_memory_work_phase::target_prefill;
         std::unique_ptr<llama_batch_compat> translated;
@@ -3942,7 +4101,7 @@ private:
         const bool embedded=representative.embd!=nullptr;
         if (active && embedded==stream_embedded && active->get_cparams().causal_attn==causal &&
                 (shape==stream_shape || (spec && phase==llama_memory_work_phase::target_verify)) &&
-                active->get_cparams().kv_stream_decode==(phase==llama_memory_work_phase::target_verify)) return;
+                active->get_cparams().kv_stream_decode==(phase==llama_memory_work_phase::target_verify)) return true;
         park_stream_context();
         llama_set_causal_attn(stream_contexts->metadata_context(),causal);
         auto selection=stream_selection;selection.history_tokens=0;
@@ -3959,8 +4118,10 @@ private:
         }
         if (stream_binding_revision==UINT64_MAX) throw std::runtime_error("selection revision exhausted");
         llama_context_memory_create_result admission;
-        if (!stream_contexts->activate(selection,handles,representative,phase,1,++stream_binding_revision,&admission))
+        if (!stream_contexts->activate(selection,handles,representative,phase,1,++stream_binding_revision,&admission)) {
+            if (rejected) { *rejected = admission; return false; }
             throw std::runtime_error(std::string("selected workload admission failed: ")+llama_context_memory_create_status_name(admission.status));
+        }
         if (stream_proposal.epoch) {
             auto proposal=std::move(stream_proposal);stream_proposal={};
             if (!stream_requests->activate(std::move(proposal))) {
@@ -3970,6 +4131,7 @@ private:
         bind_stream_context(stream_contexts->context());stream_shape=std::move(shape);stream_embedded=embedded;
         SRV_INF("stream group bind: selected=%zu rows=%d phase=%s revision=%" PRIu64 "\n",selection.slots.size(),
             representative.n_tokens,phase==llama_memory_work_phase::target_verify ? "decode" : "prefill",stream_binding_revision);
+        return true;
     }
 
     int process_stream_image(server_slot & slot,size_t index,size_t & count) {
@@ -4740,7 +4902,9 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    const size_t prompt_limit = stream_contexts ?
+                        std::min(size_t(n_batch), size_t(batch.size()) + stream_prefill.tokens_per_slot) : size_t(n_batch);
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && size_t(batch.size()) < prompt_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

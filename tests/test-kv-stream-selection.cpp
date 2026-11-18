@@ -116,7 +116,147 @@ static selection projected_selection(const std::vector<uint32_t> & weights) {
 
 int main() {
     testing t;
-    t.test("request_groups_freeze_membership_and_finish_exclusive_preparation_before_decode", [](testing & t) {
+    t.test("prefill_plan_batches_different_histories_within_one_total_token_budget", [](testing & t) {
+        llama_kv_stream_prefill_plan plan;
+        if (!t.assert_true(llama_kv_stream_prefill_plan_make({65536, 2},
+                {{0, 4096, 4096}, {1, 0, 32768}}, 256, plan) == selection_status::success)) return;
+        t.assert_true(ids(plan.selected) == std::vector<uint32_t>({0, 1}));
+        t.assert_equal(size_t(128), plan.tokens_per_slot);
+        t.assert_equal(size_t(4096), plan.selected.history_tokens);
+        t.assert_equal(size_t(256), plan.tokens_per_slot * plan.selected.slots.size());
+        uint32_t forbidden = 2;
+        if (!t.assert_true(llama_kv_stream_prefill_plan_make({65536, 2},
+                {{0, 4096, 4096}, {1, 0, 32768}}, 256, plan, admit, &forbidden) == selection_status::success)) return;
+        t.assert_true(ids(plan.selected) == std::vector<uint32_t>({0}));
+        t.assert_equal(size_t(256), plan.tokens_per_slot);
+    });
+    t.test("prefill_plan_preserves_native_equal_rows_for_tails_and_finished_members", [](testing & t) {
+        llama_kv_stream_prefill_plan plan;
+        if (!t.assert_true(llama_kv_stream_prefill_plan_make({65536, 2},
+                {{0, 8192, 4}, {1, 1024, 8000}}, 256, plan) == selection_status::success)) return;
+        t.assert_equal(size_t(4), plan.tokens_per_slot);
+        t.assert_equal(size_t(2), plan.selected.slots.size());
+        if (!t.assert_true(llama_kv_stream_prefill_plan_make({65536, 2},
+                {{0, 8196, 0}, {1, 1028, 7996}}, 256, plan) == selection_status::success)) return;
+        t.assert_true(ids(plan.selected) == std::vector<uint32_t>({1}));
+        t.assert_equal(size_t(256), plan.tokens_per_slot);
+        if (!t.assert_true(llama_kv_stream_prefill_plan_make({1024, 2},
+                {{0, 500, 100}, {1, 500, 100}}, 255, plan) == selection_status::success)) return;
+        t.assert_equal(size_t(12), plan.tokens_per_slot);
+        t.assert_true(plan.tokens_per_slot <= plan.selected.slots[0].growth_tokens);
+        t.assert_true(plan.tokens_per_slot <= plan.selected.slots[1].growth_tokens);
+    });
+    t.test("prefill_plan_small_budgets_and_unequal_lengths_match_balanced_oracle", [](testing & t) {
+        for (size_t budget = 1; budget <= 33; ++budget) {
+            for (size_t left = 1; left <= 9; ++left) for (size_t right = 1; right <= 9; ++right) {
+                llama_kv_stream_prefill_plan plan;
+                if (!t.assert_true(llama_kv_stream_prefill_plan_make({1024, 2},
+                        {{0, 0, left}, {1, 0, right}}, budget, plan) == selection_status::success)) return;
+                const size_t count = budget == 1 ? 1 : 2;
+                const size_t expected = count == 1 ? 1 : std::min({budget / count, left, right});
+                t.assert_equal(count, plan.selected.slots.size());
+                t.assert_equal(expected, plan.tokens_per_slot);
+                t.assert_true(plan.tokens_per_slot * count <= budget);
+            }
+        }
+    });
+    t.test("prefill_plan_rejects_invalid_inputs_without_replacing_previous_plan", [](testing & t) {
+        llama_kv_stream_prefill_plan plan;
+        plan.tokens_per_slot = 77;
+        plan.selected.context_tokens = 99;
+        for (const auto & slots : std::vector<std::vector<llama_kv_stream_prefill_slot>>{
+                {{0, 0, 2}, {0, 1, 3}}, {{0, SIZE_MAX, 1}}}) {
+            t.assert_true(llama_kv_stream_prefill_plan_make({1024, 2}, slots, 256, plan) == selection_status::invalid_config);
+            t.assert_equal(size_t(77), plan.tokens_per_slot);
+            t.assert_equal(size_t(99), plan.selected.context_tokens);
+        }
+        t.assert_true(llama_kv_stream_prefill_plan_make({1024, 2}, {{0, 0, 1}}, 0, plan) == selection_status::invalid_config);
+        t.assert_true(llama_kv_stream_prefill_plan_make({1024, 2}, {{0, 0, 0}}, 256, plan) == selection_status::idle);
+        t.assert_equal(size_t(77), plan.tokens_per_slot);
+    });
+    t.test("request_group_accepts_a_prefill_arrival_without_restarting_its_peer", [](testing & t) {
+        using phase = llama_kv_stream_group_phase;
+        llama_kv_stream_request_group group({32768, 2});
+        if (!t.assert_true(group.admit({{0, 11, 256, 0, false}}))) return;
+        llama_kv_stream_group_request next;
+        t.assert_true(group.next_preparation(next) && next.slot == 0 && next.history_tokens == 256);
+        if (!t.assert_true("a prefill-time arrival joins the existing group", group.admit({{1, 21, 64, 0, false}}))) return;
+        t.assert_true(group.phase() == phase::prefill);
+        t.assert_true(group.busy(0, 11) && group.busy(1, 21));
+        t.assert_true(group.next_preparation(next) && next.slot == 0 && next.history_tokens == 256);
+        t.assert_true(group.prepared(0, 11, phase::prefill, 8193));
+        t.assert_true(group.phase() == phase::prefill);
+        t.assert_true(group.next_preparation(next) && next.slot == 1 && next.history_tokens == 64);
+        t.assert_true(group.prepared(1, 21, phase::prefill, 16385));
+        t.assert_true(group.phase() == phase::decode);
+        llama_kv_stream_group_plan plan;
+        if (!t.assert_true(group.plan(plan) == selection_status::success)) return;
+        t.assert_equal(size_t(2), plan.selected.slots.size());
+        t.assert_true(group.activate(std::move(plan)));
+        t.assert_true(group.selected(0, 11) && group.selected(1, 21));
+    });
+    t.test("request_group_prefill_members_can_finish_in_either_order", [](testing & t) {
+        using phase = llama_kv_stream_group_phase;
+        llama_kv_stream_request_group group({32768, 2});
+        if (!t.assert_true(group.admit({{0, 11, 4096, 0, false}, {1, 21, 0, 0, false}}))) return;
+        if (!t.assert_true("the shorter higher-ID prompt can finish first", group.prepared(1, 21, phase::prefill, 129))) return;
+        t.assert_true(group.phase() == phase::prefill && group.busy(0, 11));
+        t.assert_true(!group.prepared(1, 21, phase::prefill, 130));
+        llama_kv_stream_group_request next;
+        t.assert_true(group.next_preparation(next) && next.slot == 0 && next.history_tokens == 4096);
+        t.assert_true(group.prepared(0, 11, phase::prefill, 8193));
+        t.assert_true(group.phase() == phase::decode);
+    });
+    t.test("request_group_rejected_prefill_joins_leave_existing_frontiers_intact", [](testing & t) {
+        using phase = llama_kv_stream_group_phase;
+        llama_kv_stream_request_group group({32768, 2});
+        if (!t.assert_true(group.admit({{0, 11, 256, 0, false}}))) return;
+        for (const auto & incoming : std::vector<std::vector<llama_kv_stream_group_request>>{
+                {{0, 12, 0, 0, false}}, {{1, 0, 0, 0, false}}, {{1, 21, 32769, 0, false}},
+                {{1, 21, 0, 0, false}, {2, 31, 0, 0, false}}, {{1, 21, 0, 0, true}}}) {
+            t.assert_true(!group.admit(incoming));
+            llama_kv_stream_group_request next;
+            t.assert_true(group.phase() == phase::prefill && group.busy(0, 11) && !group.busy(1, 21));
+            t.assert_true(group.next_preparation(next) && next.slot == 0 && next.history_tokens == 256);
+        }
+        if (!t.assert_true("rejected joins do not consume the incoming request epoch", group.admit({{1, 21, 0, 0, false}}))) return;
+        t.assert_true(group.busy(0, 11) && group.busy(1, 21));
+    });
+    t.test("request_group_freezes_new_arrivals_after_decode_starts", [](testing & t) {
+        using phase = llama_kv_stream_group_phase;
+        llama_kv_stream_request_group group({32768, 2});
+        t.assert_true(group.admit({{0, 11, 256, 0, false}}));
+        t.assert_true(group.prepared(0, 11, phase::prefill, 513));
+        t.assert_true(group.phase() == phase::decode);
+        t.assert_true(!group.admit({{1, 21, 0, 0, false}}));
+        t.assert_true(!group.busy(1, 21));
+        t.assert_true(group.finish(0, 11) && group.release());
+        t.assert_true(group.admit({{1, 21, 0, 0, false}}));
+    });
+    t.test("request_group_reuses_a_cancelled_prefill_slot_with_a_fresh_generation", [](testing & t) {
+        using phase = llama_kv_stream_group_phase;
+        llama_kv_stream_request_group group({32768, 2});
+        t.assert_true(group.admit({{0, 11, 256, 0, false}, {1, 21, 64, 0, false}}));
+        t.assert_true(group.finish(0, 11));
+        t.assert_true(!group.admit({{0, 11, 0, 0, false}}));
+        t.assert_true(group.admit({{0, 12, 0, 0, false}}));
+        t.assert_true(!group.busy(0, 11) && group.preparing(0, 12) && group.preparing(1, 21));
+        t.assert_true(group.prepared(1, 21, phase::prefill, 513));
+        t.assert_true(group.preparing(0, 12) && !group.preparing(1, 21));
+        t.assert_true(group.prepared(0, 12, phase::prefill, 257));
+        t.assert_true(group.phase() == phase::decode && !group.finish(0, 11));
+    });
+    t.test("request_group_keeps_completed_decode_slots_closed_until_the_group_retires", [](testing & t) {
+        using phase = llama_kv_stream_group_phase;
+        llama_kv_stream_request_group group({32768, 2});
+        t.assert_true(group.admit({{0, 11, 0, 0, false}, {1, 21, 0, 0, false}}));
+        t.assert_true(group.prepared(0, 11, phase::prefill, 257) && group.prepared(1, 21, phase::prefill, 257));
+        t.assert_true(group.finish(0, 11) && group.phase() == phase::decode);
+        t.assert_true(!group.admit({{0, 12, 0, 0, false}}));
+        t.assert_true(group.finish(1, 21) && group.release());
+        t.assert_true(group.admit({{0, 12, 0, 0, false}}));
+    });
+    t.test("request_groups_finish_vision_before_prefill_and_decode", [](testing & t) {
         using phase=llama_kv_stream_group_phase;
         llama_kv_stream_request_group group({128,2});
         t.assert_true(group.phase()==phase::idle);
@@ -130,7 +270,7 @@ int main() {
         t.assert_true(!group.prepared(1,13,phase::vision,0));
         t.assert_true(group.prepared(1,12,phase::vision,0));
         t.assert_true(group.phase()==phase::prefill);
-        t.assert_true(!group.prepared(1,12,phase::prefill,90));
+        t.assert_true(!group.prepared(1,13,phase::prefill,90));
         t.assert_true(group.prepared(0,11,phase::prefill,30));
         t.assert_true(group.prepared(1,12,phase::prefill,90));
         t.assert_true(group.phase()==phase::decode);

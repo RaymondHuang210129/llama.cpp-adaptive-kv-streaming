@@ -14,6 +14,37 @@ bool llama_kv_stream_context_limits_make(size_t logical_tokens, size_t padded_to
     return true;
 }
 
+llama_kv_stream_selection_status llama_kv_stream_prefill_plan_make(
+        const llama_kv_stream_selection_config & config,
+        const std::vector<llama_kv_stream_prefill_slot> & slots, size_t maximum_tokens,
+        llama_kv_stream_prefill_plan & output,
+        llama_kv_stream_selection_admit admit, void * user_data) {
+    using status = llama_kv_stream_selection_status;
+    if (!maximum_tokens || maximum_tokens > size_t(INT32_MAX)) return status::invalid_config;
+    try {
+        std::vector<llama_kv_stream_selection_slot> pending;
+        for (const auto & slot : slots) {
+            pending.push_back({slot.id, slot.history_tokens, 1, slot.compatibility, slot.remaining_tokens != 0});
+        }
+        auto limits = config;
+        limits.maximum_slots = std::min(limits.maximum_slots, maximum_tokens);
+        llama_kv_stream_prefill_plan next;
+        const auto result = llama_kv_stream_select(limits, pending, next.selected, admit, user_data);
+        if (result != status::success) return result;
+        next.tokens_per_slot = maximum_tokens / next.selected.slots.size();
+        for (const auto & selected : next.selected.slots) {
+            const auto slot = std::find_if(slots.begin(), slots.end(), [&](const auto & value) { return value.id == selected.id; });
+            if (slot == slots.end()) return status::invalid_config;
+            next.tokens_per_slot = std::min({next.tokens_per_slot, selected.growth_tokens, slot->remaining_tokens});
+        }
+        if (!next.tokens_per_slot) return status::no_progress;
+        output = std::move(next);
+        return status::success;
+    } catch (const std::bad_alloc &) {
+        return status::allocation_failed;
+    }
+}
+
 bool llama_kv_stream_generation_budget_make(size_t headroom, uint32_t maximum_proposals, size_t remaining_outputs,
         llama_kv_stream_generation_budget & output) noexcept {
     if (!headroom || !remaining_outputs || maximum_proposals > 7) return false;
@@ -180,16 +211,20 @@ llama_kv_stream_page_partition_result llama_kv_stream_partition_pages(
 }
 
 bool llama_kv_stream_request_group::admit(const std::vector<llama_kv_stream_group_request> & requests) {
-    if (!members.empty() || !config.context_tokens || config.context_tokens>size_t(INT32_MAX) ||
+    const bool joining = !members.empty();
+    if ((joining && phase() != llama_kv_stream_group_phase::prefill) || !config.context_tokens || config.context_tokens>size_t(INT32_MAX) ||
             !config.maximum_slots || config.maximum_slots>LLAMA_MAX_SEQ || requests.empty() ||
             requests.size()>config.maximum_slots || epoch==UINT64_MAX || revision==UINT64_MAX) return false;
     try {
         std::vector<member> next;
         auto epochs=request_epochs;
-        next.reserve(requests.size());
+        next.reserve(config.maximum_slots);
+        for (const auto & member : members) if (!member.finished) next.push_back(member);
+        if (requests.size() > config.maximum_slots - next.size()) return false;
         for (const auto & request : requests) {
             if (request.slot>=LLAMA_MAX_SEQ || !request.request || request.history_tokens>config.context_tokens ||
-                    (request.slot<epochs.size() && request.request<=epochs[request.slot])) return false;
+                    (request.slot<epochs.size() && request.request<=epochs[request.slot]) ||
+                    (joining && request.needs_vision)) return false;
             for (const auto & prior : next) if (prior.request.slot==request.slot) return false;
             if (epochs.size()<=request.slot) epochs.resize(size_t(request.slot)+1,0);
             epochs[request.slot]=request.request;
@@ -221,6 +256,12 @@ const llama_kv_stream_request_group::member * llama_kv_stream_request_group::fin
 
 bool llama_kv_stream_request_group::busy(uint32_t slot,uint64_t request) const noexcept {return find(slot,request)!=nullptr;}
 
+bool llama_kv_stream_request_group::preparing(uint32_t slot, uint64_t request) const noexcept {
+    const auto * member = find(slot, request);
+    return member && phase() == llama_kv_stream_group_phase::prefill &&
+        member->pending == llama_kv_stream_group_phase::prefill;
+}
+
 bool llama_kv_stream_request_group::next_preparation(llama_kv_stream_group_request & output) const noexcept {
     const auto pending=phase();
     if (pending!=llama_kv_stream_group_phase::vision && pending!=llama_kv_stream_group_phase::prefill) return false;
@@ -233,7 +274,12 @@ bool llama_kv_stream_request_group::next_preparation(llama_kv_stream_group_reque
 bool llama_kv_stream_request_group::prepared(uint32_t slot,uint64_t request,llama_kv_stream_group_phase completed,
         size_t history_tokens) noexcept {
     llama_kv_stream_group_request next;
-    if (!next_preparation(next) || next.slot!=slot || next.request!=request || phase()!=completed ||
+    if (completed == llama_kv_stream_group_phase::prefill) {
+        const auto * member = find(slot, request);
+        if (!preparing(slot, request) || !member) return false;
+        next = member->request;
+    } else if (!next_preparation(next)) return false;
+    if (next.slot!=slot || next.request!=request || phase()!=completed ||
             history_tokens<next.history_tokens || history_tokens>config.context_tokens ||
             (completed==llama_kv_stream_group_phase::vision && history_tokens!=next.history_tokens)) return false;
     for (auto & member : members) if (member.request.slot==slot) {
