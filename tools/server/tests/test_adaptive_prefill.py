@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -140,6 +141,8 @@ def qualify(args):
                 body = {"prompt": late_image if index == 1 and late_image else prompts[index], "n_predict": args.outputs, "temperature": 0, "seed": 1234,
                         "ignore_eos": True, "cache_prompt": args.cached_prefix, "stream": True, "return_tokens": True,
                         "return_progress": True, "id_slot": slot_ids[index]}
+                if args.check_finite_probs:
+                    body["n_probs"] = 16
                 req = urllib.request.Request(f"http://127.0.0.1:{port}/completion", data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
                 events = []
@@ -187,6 +190,13 @@ def qualify(args):
                     continue
                 final = next(value for value in reversed(events) if value.get("stop"))
                 assert final["tokens_predicted"] == args.outputs and final["id_slot"] == slot_ids[index]
+                if args.check_finite_probs:
+                    probabilities = [entry for value in events for entry in value.get("completion_probabilities", [])
+                                     if entry.get("top_logprobs")]
+                    assert probabilities, "missing pre-sampling probabilities"
+                    assert all(item["logprob"] is not None and math.isfinite(item["logprob"])
+                        for entry in probabilities for item in entry["top_logprobs"]), "non-finite model probabilities"
+                    report["finite_probabilities"] = True
                 if args.mode != "target":
                     assert final["timings"]["draft_n"] > 0
                 if args.cached_prefix and index == 1:
@@ -270,6 +280,7 @@ if __name__ == "__main__":
     parser.add_argument("--arrival-delay-seconds", type=float, default=0)
     parser.add_argument("--closed-group-reference", action="store_true")
     parser.add_argument("--expect-prefill-fallback", action="store_true")
+    parser.add_argument("--check-finite-probs", action="store_true")
     parser.add_argument("--cached-prefix", action="store_true")
     parser.add_argument("--context-size", type=int, default=32768)
     parser.add_argument("--context-checkpoints", type=int)
