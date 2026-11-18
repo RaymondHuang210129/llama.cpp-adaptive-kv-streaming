@@ -2852,6 +2852,146 @@ static void test_owned_group_context(testing & t,llama_model * model,uint32_t qu
     }
 }
 
+static void test_group_prefill_join(testing & t, llama_model * model, uint32_t first_slot, bool streamed = false) {
+    const uint32_t prefix_tokens = streamed ? 8192 : 256;
+    const uint32_t rounds = streamed ? 1 : 2;
+    auto cp = llama_context_default_params();
+    cp.n_ctx = streamed ? prefix_tokens + 512 : 1024;
+    cp.n_batch = cp.n_ubatch = 256; cp.n_seq_max = 2; cp.kv_unified = true; cp.swa_full = false;
+    cp.type_k = GGML_TYPE_Q8_0; cp.type_v = GGML_TYPE_Q4_0; cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.n_threads = cp.n_threads_batch = 4;
+    const size_t vocabulary = model->vocab.n_tokens();
+    auto input = llama_batch_init(256, 0, 1);
+    struct release_batch {llama_batch & batch; ~release_batch() {llama_batch_free(batch);}} release{input};
+    const auto fill = [&](bool prefix, uint32_t round) {
+        input.n_tokens = 0;
+        for (uint32_t slot = 0; slot < (prefix ? 1u : 2u); ++slot) {
+            const uint32_t source = prefix ? first_slot : slot;
+            const uint32_t rows = prefix ? 256 : 128;
+            const uint32_t first = prefix ? round * 256 : (source == first_slot ? prefix_tokens : 0) + round * 128;
+            for (uint32_t row = 0; row < rows; ++row) {
+                const int index = input.n_tokens++;
+                input.token[index] = llama_token(100 + source * 40 + (first + row) % 31);
+                input.pos[index] = llama_pos(first + row);
+                input.n_seq_id[index] = 1; input.seq_id[index][0] = llama_seq_id(source);
+                input.logits[index] = row + 1 == rows;
+            }
+        }
+    };
+    std::array<std::array<std::vector<float>, 2>, 2> reference;
+    std::array<std::vector<uint8_t>, 2> native_states;
+    std::vector<uint8_t> prefix_state;
+    {
+        auto prefix_params = cp;
+        prefix_params.n_seq_max = 1;
+        llama_context native(*model, prefix_params);
+        for (uint32_t block = 0; block < prefix_tokens / 256; ++block) {
+            fill(true, block);
+            for (int row = 0; row < input.n_tokens; ++row) input.seq_id[row][0] = 0;
+            if (!t.assert_equal(0, native.decode(input))) return;
+        }
+        prefix_state.resize(llama_state_seq_get_size(&native, 0));
+        if (!t.assert_true(!prefix_state.empty() && llama_state_seq_get_data(&native, prefix_state.data(), prefix_state.size(), 0) == prefix_state.size())) return;
+    }
+    for (uint32_t round = 0; round < rounds; ++round) {
+        llama_context native(*model, cp);
+        if (!round) {
+            if (!t.assert_equal(prefix_state.size(), llama_state_seq_set_data(&native, prefix_state.data(), prefix_state.size(), llama_seq_id(first_slot)))) return;
+        } else {
+            // Reactivation packs canonical histories in destination slot order.
+            for (uint32_t slot = 0; slot < 2; ++slot) {
+                const auto & state = native_states[slot];
+                if (!t.assert_equal(state.size(), llama_state_seq_set_data(&native, state.data(), state.size(), llama_seq_id(slot)))) return;
+            }
+        }
+        fill(false, round);
+        if (!t.assert_equal(0, native.decode(input))) return;
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            const auto * logits = llama_get_logits_ith(&native, int32_t(slot * 128 + 127));
+            if (!t.assert_true(logits != nullptr)) return;
+            reference[round][slot].assign(logits, logits + vocabulary);
+        }
+        if (round + 1 < rounds) {
+            for (uint32_t slot = 0; slot < 2; ++slot) {
+                auto & state = native_states[slot];
+                state.resize(llama_state_seq_get_size(&native, llama_seq_id(slot)));
+                if (!t.assert_true(!state.empty() && llama_state_seq_get_data(&native, state.data(), state.size(), llama_seq_id(slot)) == state.size())) return;
+            }
+        }
+    }
+    size_t shared_matmuls = 0;
+    cp.cb_eval_user_data = &shared_matmuls;
+    cp.cb_eval = [](ggml_tensor * tensor, bool ask, void * opaque) {
+        if (tensor->op != GGML_OP_MUL_MAT || tensor->ne[1] != 256) return false;
+        if (!ask) ++*static_cast<size_t *>(opaque);
+        return true;
+    };
+    cp.shared_device_memory_bytes = size_t(1024) * 1024 * 1024;
+    if (streamed) {
+        llama_context probe(*model, cp, {0, 1});
+        fill(false, 0);
+        llama_context_group_plan quote;
+        const auto result = probe.quote_target_group(input, {{101, 1}, {102, 1}}, {999, 1},
+            llama_memory_work_phase::target_prefill, 1, SIZE_MAX, quote);
+        if (!t.assert_true(result.status == llama_context_memory_create_status::success && result.required_bytes < SIZE_MAX - 17 * 1024 * 1024)) return;
+        const size_t unit = 1024 * 1024;
+        cp.shared_device_memory_bytes = (result.required_bytes + 17 * unit - 1) / unit * unit;
+        size_t per_token = 0;
+        const auto * full = probe.get_kv_resources().full;
+        for (auto layer : full->get_layer_ids()) {
+            per_token += ggml_row_size(cp.type_k, model->hparams.n_embd_head_k(layer) * model->hparams.n_head_kv(layer));
+            per_token += ggml_row_size(cp.type_v, model->hparams.n_embd_head_v(layer) * model->hparams.n_head_kv(layer));
+        }
+        const size_t maximum_pool = quote.target.pool_minimum_bytes + cp.shared_device_memory_bytes - result.required_bytes;
+        if (!t.assert_true("the joined history cannot fit in the available KV pool", (prefix_tokens + 256) * per_token > maximum_pool)) return;
+        t.out << "streamed joined prefill: arena=" << cp.shared_device_memory_bytes << " kv_pool_upper_bound=" << maximum_pool
+              << " live_kv_bytes=" << (prefix_tokens + 256) * per_token << '\n';
+    }
+    auto group = llama_context_group::create(*model, cp);
+    if (!t.assert_true(group != nullptr)) return;
+    llama_kv_stream_selection selected;
+    fill(true, 0);
+    if (!t.assert_true(llama_kv_stream_select({cp.n_ctx, 1}, {{first_slot, 0}}, selected) == llama_kv_stream_selection_status::success &&
+            group->activate(selected, {group->source_handles()[first_slot]}, input, llama_memory_work_phase::target_prefill, 1, 1))) return;
+    auto * parent = group->context()->group_parent();
+    for (uint32_t block = 0; block < prefix_tokens / 256; ++block) {
+        fill(true, block);
+        if (!t.assert_equal(0, group->context()->decode(input))) return;
+    }
+    if (!t.assert_true(group->park())) return;
+    llama_context_group_checkpoint before, after;
+    if (!t.assert_true(group->save_request(first_slot, before))) return;
+    const uint32_t second_slot = 1 - first_slot;
+    const auto stale = group->source_handles()[second_slot];
+    if (!t.assert_true(group->reset_request(second_slot) && group->save_request(first_slot, after))) return;
+    t.assert_true(before.histories[0].bytes == after.histories[0].bytes &&
+        before.target.recurrent == after.target.recurrent && before.target.bounded == after.target.bounded &&
+        before.target.full_columns == after.target.full_columns);
+    for (uint32_t round = 0; round < rounds; ++round) {
+        fill(false, round);
+        if (!t.assert_true(llama_kv_stream_select({cp.n_ctx, 2}, {{0, (first_slot == 0 ? prefix_tokens : 0) + round * 128},
+                {1, (first_slot == 1 ? prefix_tokens : 0) + round * 128}}, selected) ==
+                llama_kv_stream_selection_status::success)) return;
+        if (!round) {
+            auto invalid = group->source_handles();
+            invalid[second_slot] = stale;
+            t.assert_true(!group->activate(selected, invalid, input, llama_memory_work_phase::target_prefill, 1, 2));
+        }
+        if (!t.assert_true(group->activate(selected, group->source_handles(), input,
+                llama_memory_work_phase::target_prefill, 1, 3 + round))) return;
+        t.assert_true(group->context()->group_parent() == parent);
+        shared_matmuls = 0;
+        if (!t.assert_equal(0, group->context()->decode(input))) return;
+        t.assert_true("the real joined prefill executes matrix multiplications over both 128-row sources", shared_matmuls > 0);
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            const auto * logits = llama_get_logits_ith(group->context(), int32_t(slot * 128 + 127));
+            t.assert_true("joined prefill logits at round " + std::to_string(round) + " slot " + std::to_string(slot),
+                logits && !std::memcmp(logits, reference[round][slot].data(), vocabulary * sizeof(float)));
+        }
+        if (!t.assert_true(group->park())) return;
+    }
+}
+
 static void test_group_checkpoint_large_swap(testing & t,llama_model * model) {
     auto cp=llama_context_default_params();cp.n_ctx=4096;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=2;cp.kv_unified=true;cp.swa_full=false;
     cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;cp.n_threads=cp.n_threads_batch=4;
@@ -9248,6 +9388,20 @@ int main(int argc,char ** argv) {
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-manager-only");})) {
         t.test("Group_manager_parks_native_state_and_reuses_one_physical_parent",[&](testing & t) {test_owned_group_context(t,model.get(),1,true);});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-prefill-stream-join-only");})) {
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            t.test("Streamed_group_prefill_join_preserves_native_logits_" + std::to_string(slot),
+                [&](testing & t) {test_group_prefill_join(t, model.get(), slot, true);});
+        }
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-prefill-join-only");})) {
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            t.test("Group_prefill_join_preserves_partial_native_state_and_executes_shared_kernels_" + std::to_string(slot),
+                [&](testing & t) {test_group_prefill_join(t, model.get(), slot);});
+        }
         return t.summary();
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-prefill-silent-only");})) {

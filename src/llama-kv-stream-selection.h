@@ -66,6 +66,23 @@ llama_kv_stream_selection_status llama_kv_stream_select(
         llama_kv_stream_selection & output,
         llama_kv_stream_selection_admit admit = nullptr, void * user_data = nullptr);
 
+struct llama_kv_stream_prefill_slot {
+    uint32_t id = 0;
+    size_t history_tokens = 0, remaining_tokens = 0;
+    uint64_t compatibility = 0;
+};
+
+struct llama_kv_stream_prefill_plan {
+    llama_kv_stream_selection selected;
+    size_t tokens_per_slot = 0;
+};
+
+llama_kv_stream_selection_status llama_kv_stream_prefill_plan_make(
+        const llama_kv_stream_selection_config & config,
+        const std::vector<llama_kv_stream_prefill_slot> & slots, size_t maximum_tokens,
+        llama_kv_stream_prefill_plan & output,
+        llama_kv_stream_selection_admit admit = nullptr, void * user_data = nullptr);
+
 struct llama_kv_stream_page_minimum {
     uint32_t slot = 0, pages = 0;
 };
@@ -127,6 +144,7 @@ public:
     bool admit(const std::vector<llama_kv_stream_group_request> & requests);
     llama_kv_stream_group_phase phase() const noexcept;
     bool next_preparation(llama_kv_stream_group_request & request) const noexcept;
+    bool preparing(uint32_t slot, uint64_t request) const noexcept;
     bool prepared(uint32_t slot, uint64_t request, llama_kv_stream_group_phase phase, size_t history_tokens) noexcept;
     bool busy(uint32_t slot, uint64_t request) const noexcept;
     bool selected(uint32_t slot, uint64_t request) const noexcept;
@@ -139,7 +157,7 @@ public:
         llama_kv_stream_generation_budget & output) const noexcept;
     bool advance(const std::vector<llama_kv_stream_group_progress> & progress) noexcept;
     bool finish(uint32_t slot, uint64_t request) noexcept;
-    // Release the frozen group only after its last GPU users are retired.
+    // Release the group only after its last GPU users are retired.
     bool release() noexcept;
 private:
     struct member {

@@ -1,6 +1,6 @@
 # Multi-slot adaptive KV streaming and phase-arena roadmap
 
-Status: MS1-MS14 have accepted implementations. The latest MS14 follow-up retains the original serial adaptive policy and applies it to combined per-layer KV demand through one shared grouped ring. At two 64K histories, all four Qwen modes improve aggregate throughput by 1.45%-9.19% over validated double buffering; eight single-slot controls remain within -0.10% to +0.34% of the original serial runtime. Earlier measurements below retain their original configurations and limitations. MS15 remains planned: investigate a 4,096-token physical growth reserve and safe quota rebalancing against this retained baseline. MS15 implementation and its subsequent benchmark have not started. Documentation/release closeout remains deferred.
+Status: MS1-MS14 have accepted implementations. The latest MS14 follow-up retains the original serial adaptive policy and applies it to combined per-layer KV demand through one shared grouped ring. At two 64K histories, all four Qwen modes improve aggregate throughput by 1.45%-9.19% over validated double buffering; eight single-slot controls remain within -0.10% to +0.34% of the original serial runtime. Earlier measurements below retain their original configurations and limitations. MS15 implements admission during prefill at safe microbatch boundaries, shared native prefill chunks and handoff to grouped decode; its TDD, qualification and focused SWE measurements are recorded below. Membership remains frozen after decode starts. The former 4,096-token growth-reserve proposal is withdrawn from MS15. MS15 functional qualification is complete within the recorded two-slot scope. Performance acceptance remains open: speculative staggered pairs have higher end-to-end latency despite faster aggregate decode. Documentation/release closeout remains deferred.
 
 Inspected baseline: `f6ca3e8a172473578b909a4691e616bb2234fb54`, on `feature/ci-workflow-migration`. Recheck the implementation base and local changes before starting work on a dedicated feature branch. Historical measurements retain their original source, binaries, models and configuration; they are not new multi-slot evidence.
 
@@ -32,7 +32,7 @@ Preserve native arithmetic, conversion, masks, accumulator precision, checkpoint
 | Growth allowance | An allowance is logical generation headroom, not dedicated VRAM for that many tokens. |
 | Host addresses | Reserve maximum host virtual ranges during startup/preflight in the actual server process. Grow backing without moving existing history addresses. |
 | Phases | Vision, prefill and decode execute separately. Do not retain a mixed prefill/decode workspace profile to serve incoming requests. |
-| Request groups | Admit currently queued requests up to the slot limit, freeze membership, finish their required vision, then their prefill, then their decode. |
+| Request groups | Retained MS14 freezes membership at initial admission. MS15 additionally admits prefill-ready arrivals during prefill at safe microbatch boundaries, then freezes membership when decode starts. |
 | Reselection | Trigger on allowance exhaustion, lack of space for the next operation, completion, cancellation or an individual context boundary. |
 | Waiting policy | Return paused requests to eligibility at the next selection. No periodic rotation, waiting-time override or forced turn. Prefer parallelism; a long context may wait. |
 | Generation | No new finite output cap. Existing EOS, stop strings, requested output limits, cancellation and individual context limits still apply. Context shifting remains outside the supported streaming profile. |
@@ -41,7 +41,7 @@ Preserve native arithmetic, conversion, masks, accumulator precision, checkpoint
 
 These decisions replace earlier suggestions for mixed-phase scheduling, equal resident quotas, borrowing pages within a selection, or periodic fairness rotation.
 
-The allocation entries above describe the original per-slot implementation. The retained MS14 aggregate-ring follow-up supersedes per-slot KV pool/ring partitioning: resident slices are source-specific, one fenced ring serves combined live demand, and the controller does not reserve a ring per request. Logical append allowances, admission and host histories retain their existing semantics. MS15 must remeasure physical placement against this baseline before implementing its explicit growth-reserve/rebalance extension. Mixed phases and request rotation remain outside that scope.
+The allocation entries above describe the original per-slot implementation. The retained MS14 aggregate-ring follow-up supersedes per-slot KV pool/ring partitioning: resident slices are source-specific, one fenced ring serves combined live demand, and the controller does not reserve a ring per request. Logical append allowances and host histories retain their existing semantics. MS15 extends admission during prefill and prefill execution against this retained baseline; it keeps the accepted decode allocation/controller policy. Mixed prefill/decode execution and request rotation remain outside that scope.
 
 ## 2. Baseline mechanisms and limitations
 
@@ -71,7 +71,7 @@ Use distinct fields and diagnostics for these quantities. Do not overload one in
 | --- | --- |
 | `C` | Effective per-slot context limit and selected-group logical-context budget. Derive unset values through existing native model limits; preserve model/position bounds. |
 | `N` | Configured request-slot limit, initially at most two in the new mode. |
-| `A` | Frozen admitted request group, containing at most N live requests. |
+| `A` | Admitted request group, containing at most N live requests. Retained MS14 freezes membership at admission; MS15 permits joins during prefill and freezes it for decode. |
 | `S` | Currently selected subset of A for one phase's execution. |
 | `L_i` | Slot i's occupied logical target-context capacity. Include accepted output positions that are pending their next target invocation; keep committed KV and pending-token counters separately. |
 | `H_i` | Remaining logical growth allowance assigned to slot i for this selection. |
@@ -101,7 +101,7 @@ Record requested/effective limits and native allocation alignment explicitly. Ph
 
 ### Selection objective
 
-At a selection event, consider eligible requests from the admitted group, not new requests waiting for another group. Prefer the greatest number of compatible requests that can make progress under C and the measured arena contract. Prefer smaller combined history among equal-cardinality choices, with a deterministic slot-order tie break. This implements the agreed preference to park a large context rather than reduce the number of other active slots.
+At a selection event, consider eligible requests from the admitted group. Under MS15, a validated prefill-time join can extend that group before selection; decode-time arrivals remain queued for another group. Prefer the greatest number of compatible requests that can make progress under C and the measured arena contract. Prefer smaller combined history among equal-cardinality choices, with a deterministic slot-order tie break. This implements the agreed preference to park a large context rather than reduce the number of other active slots.
 
 There is no age-based override or periodic rotation. Reconsider parked requests at later selection events. A request rejected by one selection remains live and must not receive a final response merely because it is parked.
 
@@ -237,18 +237,19 @@ Parking changes physical binding generations; it does not by itself change seman
 
 ### Admitted groups and phases
 
-Form an admitted group from requests already queued, up to N, without an artificial wait to fill it. Freeze membership. Requests arriving later wait for the next group, even if one member finishes early.
+Retained MS14 forms an admitted group from requests already queued, up to N, without an artificial wait to fill it, then freezes membership. MS15 amends this rule only during prefill: admit eligible prefill-ready arrivals at completed microbatch boundaries, preserving existing progress and bounded resources. Check eligible arrivals before committing prefill to decode, then freeze membership. Requests arriving after decode starts wait for the next group, even if one member finishes early. The retained implementation and qualification are recorded under MS15 below.
 
 | Transition | Required condition |
 | --- | --- |
 | Idle to vision | The admitted group needs image encoding. |
 | Idle to prefill | No encoding is required. |
 | Vision to prefill | All required embeddings for the group are ready; encoder loans and work have completed. |
-| Prefill to decode | Every remaining member has completed prefill. A completed prefill can wait with state parked while other prefills finish. |
+| Prefill to expanded prefill (MS15) | A queued prefill-ready request fits a free slot and passes transactional admission at a safe microbatch boundary. |
+| Prefill to decode | Every remaining admitted member has completed prefill. A completed prefill can wait with state parked while other prefills finish. MS15 checks visible eligible arrivals before committing this transition. |
 | Decode to next group | All admitted members, including temporarily parked decoders, completed, cancelled or reached their native context boundary. |
 | Any phase to idle | No admitted work remains and no next group is queued. |
 
-Only one global phase executes at a time. Within prefill, select chunks/subsets with the same logical and physical bounds; combined histories need not fit all at once merely because they are admitted. Within decode, change selected subsets without admitting new prefills or vision work.
+Only one global phase executes at a time. Within prefill, select chunks/subsets with the same logical and physical bounds; MS15 packs compatible unfinished prefills into shared native microbatches. Combined histories need not fit all at once merely because they are admitted. Within decode, change selected subsets without admitting new prefills or vision work.
 
 Reselection is not a global phase transition. Retain the decode workspace layout when possible; state/page rebinding may still require a checked transition. Do not retain the earlier proposed mixed-serving workspace profile, introduce periodic prefill service or impose a new generation quantum.
 
@@ -604,7 +605,7 @@ The investigations found three additional costs after restore overlap was implem
 
 The chosen implementation keeps the original serial scalar controller and feeds grouped execution the sum of page-padded request extents. Attention-layer count reflects owning cache roles, not the number of requests. One shared ring serves source-aware fragments, and resident planes are sliced by live page demand. The combined current tail can pipeline with a partial next layer; two complete tails are not an unconditional minimum. Deadline feedback can still enlarge the ring when prefetch falls behind. The double-buffer policy remains an internal opt-in reference.
 
-The executor keeps cyclic FIFO placement, separate upload-event fences, pending-row producer fences and one joint readiness sample before attention. When feasible within the existing resident quota and current-tail ring bound, the repeatedly used owned prediction-cache role stays fully resident. Layout changes drain affected readers before mirror invalidation and view replacement. Stale layouts and unprepared page growth fail before publication or reads. Registered copies authorize only the declared disjoint host source ranges. Authoritative host histories, one fixed GPU arena, native arithmetic, masks, column order, rollback and logical scheduling remain unchanged. MS15's 4,096-token growth-reserve policy is not implemented here.
+The executor keeps cyclic FIFO placement, separate upload-event fences, pending-row producer fences and one joint readiness sample before attention. When feasible within the existing resident quota and current-tail ring bound, the repeatedly used owned prediction-cache role stays fully resident. Layout changes drain affected readers before mirror invalidation and view replacement. Stale layouts and unprepared page growth fail before publication or reads. Registered copies authorize only the declared disjoint host source ranges. Authoritative host histories, one fixed GPU arena, native arithmetic, masks, column order, rollback and logical scheduling remain unchanged. MS14 leaves group admission and single-source prefill scheduling unchanged; MS15 extends them as recorded below.
 
 Final throughput on the RTX 5070 Ti is in tokens/s. Serial columns compare original serial -> retained implementation; parallel compares validated double buffer -> retained implementation and counts both slots over one wall interval.
 
@@ -699,87 +700,102 @@ Grouped decode now carries registered, multi-page prefetch across owning layers 
 
 Test-first evidence is under `benchmarks/results/multi-slot-20261109/double-buffer-policy-tdd-v1/` and `double-buffer-group-tdd-v1/`: baseline floor, grouped queue-ahead and serial multi-query feedback regressions were preserved before the respective fixes. Qualification includes native bit comparisons, canonical host bytes, arena canaries, mixed query widths, partial pages, failed transfers and shared-owner repartition. A full-model DFlash fixture exceeds VRAM under eager loading on both the frozen baseline and candidate; lazy-loading strict memcheck passes with zero errors. This experiment makes no speedup claim before matched serial/parallel cost measurements. Larger rings consume residency and may increase streamed bytes; both costs must be measured.
 
-### MS15 - Bounded KV growth reserve and GPU quota rebalancing (planned)
+### MS15 - Admit arriving requests during prefill and batch their prefill execution (implemented, functional qualification complete)
 
-User direction, 2026-11-14: reduce unused resident capacity reserved for a short-history slot when that reservation forces another slot to stream. Start with a growth reserve of **4,096 tokens**, measure the cost of rebalancing against its frequency, and benchmark two-slot decode after implementation. Host RAM allocation is unchanged. This section defines the target; it does not report an implementation or authorize running the benchmark now.
+User direction, 2026-11-16; implementation and qualification, 2026-11-16/17. A text request arriving during another slot's prefill can join at a completed microbatch boundary. Subsequent compatible chunks execute together, then prepared members enter the retained grouped decoder. Membership freezes when decode starts. This replaces the former 4,096-token growth-reserve and quota-rebalancing proposal; that proposal remains withdrawn. Earlier dated MS14 checkpoints remain historical records.
 
-#### Target and limits
+The source baseline is eb2ee04bb5d3194b0c3e1581eb30a65c7dfafa69. Frozen MS14 binaries and their original build stamps remain unchanged. MS15 is ready for review; this entry does not close the milestone, commit, push or deploy it.
 
-Allocate useful GPU resident capacity from actual KV history plus a bounded reserve for growth, instead of using the entire logical append allowance as the physical allocation weight. Reassign capacity that another selected slot can use, and renew the reserve through safe GPU layout transitions as decoding advances.
-
-Success means less avoidable streaming in asymmetric histories at the same arena budget, with exact numerical/state semantics and measured rebalance overhead. It does not mean every history must fit in VRAM, every slot must always receive the full reserve, or Qwen MTP3 must exceed its single-slot speed. Streaming remains necessary when live demand exceeds available residency. No specific speedup is claimed before the post-implementation benchmark.
+#### Retained contract
 
 | Item | MS15 contract |
 | --- | --- |
-| Initial growth reserve | `G = 4096` tokens. It is an initial policy parameter, not a proven optimum. |
-| Logical context | Keep the existing per-slot and selected-group C limits, equal logical append allowances, request eligibility and context-end behavior. |
-| Physical reserve | Account separately from logical allowance. It is not a generation/output cap, a ring size, or a logical token offset. |
-| Host RAM | Keep authoritative KV buffers, virtual addresses, maximum reservations, lazy commitment and registration policy unchanged. No host-history moves or new full-history staging buffers. |
-| GPU budget | One existing parent arena; charge resident KV, rings, current state, workspaces, conversion, padding and any migration scratch to that same budget. |
-| Ownership | Exclusive whole-page grants for each owning cache/slot while its physical layout epoch is active. Change grants only through an explicit completed transition. |
-| Model semantics | Preserve token/RoPE positions, native attention-column order, masks, checkpoint/reduction plans, cache formats, proposal widths, sampling and accepted output. |
-| Current state | Preserve recurrent/SWA, speculative carry, grammar/RNG and output cursors. Prefer retaining current state in place during a KV-only transition. |
-| Concurrency | Same admitted group and phase policy. No new arrivals, fairness rotation, hidden serialization, or silent disabling of speculation. |
+| Initial request | Start immediately, without an artificial wait to collect a partner. |
+| Admission window | Accept an eligible request into a free configured slot while the global phase is prefill. Inspect arrivals at completed microbatch boundaries and before committing the transition to decode. |
+| Admission cutoff | Freeze membership when decode starts. Later arrivals, including replacements for completed members, wait for the next group. No decode-to-prefill transition or mixed prefill/decode execution. |
+| Shared prefill | Submit real rows from both compatible unfinished prefills through shared native microbatches whenever both can legally progress. |
+| Batch budget | Keep total logical and physical batch limits unchanged. With both limits at 256, a normal balanced chunk is 128 real tokens per slot. Use available capacity when only one unfinished prefill remains. |
+| Unequal histories | Support different prompt lengths, cached prefixes and current positions. Respect native chunk constraints, including Qwen's equal sequence-row counts within recurrent microbatches. No fake tokens or position resets. |
+| Completed prefill | Preserve the earlier slot's prepared state, existing first-token emission, pending sampled anchor and open response while its peer finishes. Subsequent decode waits for all remaining admitted prefills. |
+| Resources | Same context limits and one GPU arena. Quote selected target, recurrent/SWA, speculative, mask, conversion and transfer resources before publishing a binding. |
+| Canonical state | Preserve existing host addresses, KV bytes/frontiers, request generations, checkpoints, speculative carry, sampler/grammar/RNG state and output cursors. Joining never restarts the existing prefill. |
+| Vision | Retain vision-before-prefill ordering. Late requests needing fresh image encoding wait for the next group; already encoded inputs may join only through a qualified prefill-ready path. Preserve existing image modes. |
+| Supported modes | Qwen/Gemma target-only and supported MTP; Qwen DFlash7 and DFlash7+K4V. No new model pairing, slot count, kernel arithmetic, decode policy, growth reserve or quota-rebalancing policy. |
 
-#### Physical allocation policy
+#### Retained implementation
 
-1. Quote mandatory state/workspace and native reader/ring minima first. Only the remaining usable KV pool is elastic. Logical context capacity is not the size of that pool.
-2. Derive physical demand from each owning cache's actual committed/reserved KV rows, plus the desired 4,096-token growth reserve where applicable. Use checked arithmetic and native page rounding; the current 256-token page makes 4,096 tokens equal to 16 pages per owning attention layer. Include all required target/MTP cache layers; count read-only aliases once. A ring is shared across a slot's layers and is budgeted separately.
-3. A short slot whose history fits should not retain a large unused growth allocation while a peer has useful nonresident history. Cap that excess near its live history plus G, subject to native working minima, and give reclaimable pages to the peer. Apply the rule symmetrically to slot IDs.
-4. Do not merely replace the current weight with `history + G` and assume that guarantees G resident tokens. Compute actual page grants and per-layer capacities. Preserve the existing within-slot resident/ring placement policy initially; the new work concerns grants between slots.
-5. Treat G as a desired reserve, not an additional hard admission minimum. When demand is too large, preserve currently legal progress and normal ring streaming. Do not reject a previously admissible two-slot workload, reduce C, or force a single-slot selection solely because G cannot be fully provided.
-6. With one selected slot, retain the existing usable KV budget. With no useful recipient for spare pages, retain a stable layout or explicitly account for spare KV capacity; do not compact simply to reduce unused counters. No ring should be activated merely to enforce a reserve cap.
+- Request-group admission appends live members only during prefill, preserves existing generations/frontiers, and permits either prefill completion order. Vision preparation retains its existing ordering. Decode-phase arrivals remain queued even after a member finishes.
+- The arena owner inspects arrivals before publishing final prefill completion. It parks/drains current work, initializes only the incoming namespace, builds a proposed group, quotes the actual target/auxiliary work and activates its binding before committing membership. Rejected admission keeps the existing request valid.
+- The planner shares the existing total batch/ubatch budget: normally 128 real rows per slot within 256 total. It balances recurrent rows, caps unequal tails, stops at media markers, and uses full chunks when one unfinished source remains. Positions and histories remain independent; no padding tokens or arithmetic changes were added.
+- Deferred attempts are bounded per configured slot and keyed by task, balanced row count and unfinished-member count. An identical infeasible attempt is not repeated every chunk. A changed tail shape is reconsidered; a prepared cached prefix survives those retries.
+- A completed prefill preserves its first emitted token, pending anchor and response while peers finish. The existing grouped decoder, ring controller, context limits, host allocation and one fixed GPU arena are retained.
+- Late image-bearing requests queue for the next group. This also conservatively queues fully cached image requests: an encoded-image late-join path is not qualified. Existing initial-group image execution remains supported.
 
-Historical illustration for the earlier per-slot MS14 policy, using a combined resident capacity of 80K tokens per layer after other reservations, C=128K, and histories of 1K and 60K: its weights yield approximately 21.6K/58.4K resident capacities. A 4K reserve for the short slot permits approximately 5K/75K instead, allowing both live histories to fit. The retained aggregate-ring implementation changes those physical weights; remeasure this example before choosing the MS15 implementation. Actual byte/page grants depend on model geometry, arena/workspace requirements and ring rounding; C=128K alone does not imply 80K of GPU residency.
+#### TDD record
 
-#### Rebalance boundary and state transition
+Evidence root: `benchmarks/results/multi-slot-20261109/ms15-prefill-tdd-v1/`. Original failed attempts are retained; fixture/setup failures are not counted as production reds.
 
-- Track accepted growth and the existing pending-anchor accounting. Inspect the complete next native operation, including provisional MTP/DFlash verification rows. Rebalance before that operation outgrows a reserve when a useful new layout is feasible; do not shorten the configured proposal schedule just to fit a physical epoch.
-- A consumed reserve is a planning trigger, not EOS, context exhaustion, request completion, or permission to drop/replay tokens. If no beneficial or feasible change exists, continue safely with the current layout/ring policy and avoid a zero-progress replan loop.
-- Construct and validate candidate page accounting before changing live storage. An unchanged plan is a no-op, without graph teardown or a decode pause. Add hysteresis/progress accounting sufficient to avoid repeated identical transitions; automatic headroom tuning is not required for the first implementation.
-- At an actual change, stop new submissions and drain all users of affected storage: target/draft compute, KV publication, gather/streaming transfers, and recurrent restore/capture activity. `rs_idx == 0` is not proof that a queued restore has completed; use the existing completion interfaces.
-- Retire or update readers, prepared copy resources, tensor views and captured graph references before their GPU addresses/strides change. Reuse the existing memory owner, lease and transition mechanisms. Do not allocate a second GPU arena or a hidden private KV bank.
-- Preserve the existing logical projection and native column order. A generic full park/reactivate path must not be assumed suitable if it repacks logical columns, exports unnecessary state, or refills all resident data. Prefer a physical KV-only rebind; account for every unavoidable migration/refill and existing state-lifecycle cost.
-- Layout-only movement changes physical ownership/revisions and mirror validity, not canonical content, request namespaces or host addresses. Do not manufacture a semantic cache-generation change merely to invalidate GPU views; MS14's source-validity checks remain mandatory.
-- Publish the new grants and resume the same responses only after the transition is valid. On failure, restore a valid old mapping from unchanged authoritative storage or remain safely quiescent with an explicit error. No partially moved layout may execute, corrupt a peer, or emit accepted output twice.
+| Red | Retained green |
+| --- | --- |
+| Original selection implementation fails the new join, completion-order and rejected-join epoch tests. | Full selection suite: 31 tests, 146,821 assertions; normal and ASAN/UBSAN pass. |
+| New planner interface returning no progress fails seven assertions across four planner tests. This is an interface red, separate from the original-runtime reproduction. | Balanced/unequal tails, odd budgets, finished members, limits, rejection and exhaustive small-budget oracle pass. |
+| Frozen MS14 completes staggered requests but has no shared prefill or joint decode. | All six supported text modes demonstrate shared prefill followed by grouped decode. |
+| Text batching across an image marker returns HTTP 500. | Contiguous text spans stop at the marker; existing image plus text cases pass across all six modes. |
+| A rejected 2 x 128 join is never reconsidered when a small final chunk becomes feasible. | A 384 MiB arena rejects the initial quote, then admits 2 x 4 rows and joint decode; cached-prefix and ASAN variants pass. |
 
-#### Cost accounting and tuning
+- [x] Freeze source/runtime/configuration identities and reproduce the original scheduling failure.
+- [x] Qualify deterministic membership, stale/reused generations, cancellation, completion order, decode cutoff and chunk-planner tests.
+- [x] Prove actual GPU matrix work over both 128-row sources, exact target logits against matching native layouts, unchanged peer canonical state after incoming reset, stale-handle rejection and reuse of the same physical parent.
+- [x] Qualify normal public JSON/SSE across Qwen target/MTP3/DFlash7/K4V and Gemma target/MTP3, including unequal prompts, swapped IDs, cached prefixes, cancellation/reuse, resource rejection and smaller-tail retry.
+- [x] Qualify simultaneous arrivals, the committed decode cutoff, and late-vision queuing. The final small-tail retry covers an arrival accepted immediately before the peer completes; CPU ordering fixes admission before completion publication without an HTTP timing threshold.
+- [x] Run affected image controls, host sanitizers, strict CUDA and fixed-budget streamed-history controls. Close source/runtime/input pins and review scope, bounds, ownership and failure recovery.
+- [x] Run the focused SWE comparison after functional qualification, with no warmups, retries, reverse-order repetitions or comprehensive context sweep.
 
-Separate steady decode from transition cost. Record each rebalance's reason, old/new grants, actual reserve, accepted growth since the previous transition, and counts of genuine changes versus no-ops. Measure GPU/CPU time and bytes for draining, state handling, migration/reload, view/reader rebind, graph retirement/recreation and first-use refill. Do not sum overlapping GPU activity as wall time.
+Native short-prefix tests pass both insertion orders for both models with exact full logit vectors; the final fixture passes strict CUDA memcheck with API reporting all, exit99, default graphs/PDL and no kernel filters. Forced-streaming tests use an 8,192-token existing prefix and prove live full-attention KV exceeds the available resident-pool upper bound: Qwen 224,919,552 versus 32,292,608 bytes; Gemma 281,149,440 versus 35,698,816 bytes. Both orders pass exact logits. References explicitly match native cache geometry and destination packing: the initial one-source SWA cache and later two-source cache differ physically. Earlier mismatched-reference failures remain recorded; no numerical tolerance or kernel change was used to make them pass.
 
-Also report live versus reserved resident pages per slot/layer, shared ring capacities, streamed pages/bytes, high-water memory, and the amount of unused reservation reclaimed. Distinguish current residency from future reserve and distinguish model/state costs from full-attention KV costs.
+Final ASAN/UBSAN host/control cases cover cached-prefix retry, image/cancellation/reuse with K4V and Gemma MTP prefix reuse. Strict public-server MTP and K4V controls have explicit zero-error summaries. ASAN instruments the rebuilt server/control code; the native core is the unchanged qualified binary. Exact native logit/state comparisons newly added here cover target prefill; speculative qualification combines supported-mode server execution, positive draft counters, lifecycle/strict controls and exact single-slot output/draft-counter preservation. It is not a new exhaustive bitwise inspection of every speculative internal tensor or poisoned-device fault path.
 
-Start at G=4096. Keep the parameter available to controlled tests/benchmarking without choosing a public CLI name in this writeup. After the default implementation is qualified, use a small explicitly scoped headroom comparison if needed to judge pause frequency against wasted reservation. No adaptive predictor, broad context sweep or claim that 4,096 is optimal is included by default.
+Gemma Q8/Q8 at a 1,024 MiB arena cannot fit shared prefill: its initial two-source quote requires 1,213,548,416 bytes versus 1,073,741,824 available. The preserved failed positive fixture is a capacity finding. A separate explicit fallback case passes separate prefill followed by joint decode at that budget; the 1,200 MiB case passes shared prefill. Qwen Q8/Q8, Q5/Q5 and FP16, and Gemma Q5/Q5 also pass. The speed comparison below uses Q8/Q4 and matching budgets, not that larger-format counterfactual.
 
-#### TDD implementation sequence
+#### Focused SWE performance
 
-- [ ] Freeze the current retained MS14 commit, its qualified runtime identities and source before implementation. Record baseline allocation and streaming counters for the same model/arena/configuration; retain older MS14 checkpoints as historical controls.
-- [ ] Write CPU planner reds for equal and unequal histories, swapped slot IDs, zero/short histories, one selected slot, small arenas, page tails, exact/one-page-short grants, arithmetic limits and required minima. Prove physical grants can change while logical C, equal append allowances and host addresses stay unchanged.
-- [ ] Prove the asymmetric wasted-reservation case gets useful resident capacity rather than merely different logical offsets. Cover both all-live-history-fitting and unavoidable-streaming cases; report when the full desired reserve cannot fit.
-- [ ] Write epoch/progress reds for the 4,096-token default, the last legal full verification block, provisional rollback, unequal acceptance, repeated refill opportunities, no-op plans, exhausted logical allowance and no-benefit fallback. Do not consume physical-growth counters with rejected speculative tokens.
-- [ ] Write deterministic transition reds using controllable transfer queues and lease/view failures: pending publication/restore, both ring wraps, exact boundary and failed partial migration. Require correct draining, stale-view rejection, unchanged canonical KV, intact peer state and safe recovery. Do not use timing thresholds or sleeps as unit-test assertions.
-- [ ] Implement the smallest planner and transactional rebind satisfying those tests. Preserve existing state and reuse buffers where possible; expose measured overhead rather than hiding it in a fallback.
-- [ ] Compare actual proposals, target vectors, hidden/carry state, visible KV and outputs against unchanged native references. Exercise one and multiple physical transitions while preserving native column order and proposal schedules. Keep synthetic component results separate from real generation throughput.
-- [ ] Run relevant normal/ASAN/UBSAN, lifecycle, cancellation/retry, checkpoint/restore, legacy single-slot, supported neural/K4V and affected image controls. Retain strict CUDA API reporting all, error exit99, graphs, default PDL and no kernel filters; keep established model/profile-specific sanitizer identities explicit.
-- [ ] Review the implementation and record instrumentation, current-source provenance, unsupported/missing hardware and remaining limitations. Do not mark speedup or broad release qualification complete from functional test success.
+Two pinned SWE tasks, A and B, each supply 8,192 native prompt IDs and 512 outputs. Single-slot speed is the arithmetic mean of A and B. B arrives about one second after A, while A is still prefilling. Each model/mode has MS14/MS15 serial and staggered pairs: 24 runs, one trial each, no warmup/retry/reversed repetition. Model/sidecar files, input IDs, sampling, batch/ubatch 256 and budgets match within each comparison. Qwen uses C=262,144 and a 2,048 MiB arena; Gemma uses C=32,768 and a 1,024 MiB arena. Gemma's previously known 256K preflight issue is not resolved or reclassified by this shorter-context qualification.
 
-MS15 implementation exit: a qualified GPU allocation/rebalance policy with initial G=4096, unchanged host KV allocation and logical semantics, deterministic progress/failure handling, and trustworthy rebalance-cost instrumentation. Performance confirmation remains pending until the next benchmark phase; flagged regressions must remain visible and be investigated before claiming a successful optimization or promoting the milestone.
+| Model / mode | Single MS14 / MS15 tok/s | Single change | Staggered pair MS14 / MS15 seconds | Pair speedup | MS15 joint decode tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen Target only | 46.58 / 46.58 | -0.02% | 34.17 / 28.18 | 1.212x | 75.90 |
+| Qwen MTP3 | 116.58 / 116.19 | -0.33% | 24.18 / 27.26 | 0.887x | 152.53 |
+| Qwen DFlash7 | 146.88 / 146.82 | -0.03% | 25.22 / 37.27 | 0.677x | 176.04 |
+| Qwen DFlash7+K4V | 146.89 / 146.48 | -0.28% | 25.08 / 36.98 | 0.678x | 174.09 |
+| Gemma Target only | 39.63 / 39.63 | +0.00% | 44.87 / 42.01 | 1.068x | 56.02 |
+| Gemma MTP3 | 77.62 / 77.64 | +0.02% | 31.75 / 34.31 | 0.925x | 118.65 |
 
-#### Next step after implementation: two-slot decode benchmark
+The frozen MS14 staggered pairs have no overlapping decode window because B waits for A's group to finish. MS15 joint throughput uses a common window after both requests emit at least 32 tokens and before either reaches 480. It demonstrates access to the retained parallel decoder, not a new decoder-kernel speedup. Pair wall time includes queueing, prefill, planning, drains, rebind/refill and decoding. Different native paired shapes can change continuation and draft acceptance; parallel output is not asserted identical to serial. All six serial controls preserve all 512 output IDs and generated/accepted draft counters for both inputs exactly.
 
-The user requests this benchmark after MS15 implementation. Do not run it as part of the writeup. Compare MS14 and MS15 at identical arena size, model/sidecar hashes, KV formats, context, native batches, sampling, prompts and output counts. Report serial one-slot speed and parallel aggregate speed over a common accepted-token wall interval; retain TTFT/prefill/end-to-end results separately.
+| Model / mode | A TTFT MS14 / MS15 seconds | B TTFT MS14 / MS15 seconds |
+| --- | ---: | ---: |
+| Qwen Target only | 5.78 / 11.90 | 21.83 / 13.32 |
+| Qwen MTP3 | 6.74 / 15.72 | 17.77 / 17.71 |
+| Qwen DFlash7 | 7.56 / 22.94 | 20.15 / 25.72 |
+| Qwen DFlash7+K4V | 7.57 / 22.68 | 20.07 / 25.41 |
+| Gemma Target only | 8.28 / 18.76 | 29.81 / 21.93 |
+| Gemma MTP3 | 8.44 / 19.76 | 23.31 / 22.72 |
 
-Initial context limit: 128K. Use the discussed 1K/1K, 30K/30K and 1K/30K histories, including the swapped asymmetric case. Select a small arena where the actual MS14 layout exhibits the avoidable-streaming condition; log actual per-layer capacities rather than assuming the context limit determines them. Include a case that already fits, a case with unavoidable streaming, and targeted reserve-exhaustion runs long enough to measure multiple physical transitions where feasible. Keep both histories jointly eligible throughout the comparison window; serialized over-budget work is separately labeled.
+A joined prefill can delay A's first token and completion even when pair wall time improves. The table retains that latency cost. Raw SSE traces, uncached token counts, first-progress delays, server join/binding events, TTFT, completion times, draft acceptance and common-window calculations are in `swe-benchmark/measurements.json` and `swe-benchmark/latency-and-stage-events.json`. Progress spans are observations, not isolated GPU kernel time. Per-copy transfer instrumentation was not enabled in speed runs. These are observations for one RTX 5070 Ti and two tasks, not confidence intervals or a new full context sweep.
 
-Cover the existing six text modes: Qwen/Gemma target-only, supported Qwen/Gemma MTP3, Qwen DFlash7, and Qwen DFlash7 plus K4V. Use single-slot controls to preserve compatibility; the primary MS15 performance question is matched MS14-versus-MS15 two-slot generation. Keep same-source proposal/accepted-token work exact so a different continuation or lower draft workload is not mislabeled as a placement speedup.
+#### Performance acceptance remains open
 
-Use warmup, repeated measured trials and alternating process order. **Include every rebalance pause, migration, reader/graph rebind and refill occurring during decode in the main throughput denominator.** Report per-slot rates, aggregate rates, pauses/latency gaps, rebalance count, amortized transition time, host/GPU memory, transfer bytes and speculative counters. A longer no-rebalance-only timing window is not the performance result. Tune headroom/frequency only from these measurements and retain negative/no-benefit results.
+Target-only pair completion improves on both models, but all four speculative pairs regress in end-to-end wall time. This is not a serial output or single-slot decode regression: the six serial means range from -0.331% to +0.023%, and IDs/draft counters match exactly. The common decode window improves aggregate throughput, while prefill/handoff costs outweigh the saved decode time for these 8K/512 speculative workloads. Qwen MTP draft acceptance is 95.707% versus 95.828%; Qwen DFlash7 acceptance is identical at 63.957%. Acceptance does not explain the large DFlash wall-time loss.
 
-The post-implementation report must state whether useful streaming was reduced and whether savings exceeded transition overhead. It must not claim MTP exceeds its serial baseline unless that separately measured result is actually achieved. Documentation/release closeout, production deployment, pushes, delegation and a new full-context sweep remain outside this planning request.
+Source and event review identify mandatory checkpoint-driven drains and rebindings: `create_checkpoint()` parks the selected group before exporting state; with two unfinished sources, a checkpoint for either retires both. Shared 128-row chunks and different prompt frontiers also create additional tail shapes, and speculative contexts increase binding/restoration work. The Qwen DFlash case has nine prefill bindings versus six on the closed-admission baseline. This is a mechanism supported by the code and trace, not a measured attribution of every millisecond to checkpoints.
+
+A separately labeled checkpoint-policy diagnostic runs each runtime once with checkpoints disabled. MS14/MS15 pair wall time is 23.79/30.04 seconds, compared with 25.22/37.27 under the retained default. MS15 prefill bindings drop from nine to five, but a deficit remains. This removes checkpoint drains and changes native batch tails; output IDs and draft counters also change. It cannot be called an isolated checkpoint-copy benchmark or used as a same-output acceptance result. Checkpoints remain enabled in production code and the main matrix. The remaining split among shared-prefill kernels, residency, state restoration and graph setup is not measured here. The implementation satisfies the scoped scheduling behavior; no universal latency gain or performance closure is claimed.
+
+The rebuilt runtime contains all current server translation units plus the selection implementation, linked to the frozen qualified native/common/CUDA libraries. The manifests pin 109 compiled project inputs and verify 14 unchanged native runtime files; original build/version stamps are retained. This is not claimed as a fresh full native build or full CI/platform qualification. `qualification.json` records coverage, preserved failures and limits; `provenance-after.json` closes source, test, runtime and input identities. Production/container state was not changed. Milestone closure and committing remain separate user decisions.
 
 ### Deferred - Documentation and release review (previous MS14)
 
-- [ ] Document opt-in configuration, context semantics, phases, fixed group membership, pauses/heartbeats, proportional pages, host address/commit/pin accounting and actual mode/platform limits.
+- [ ] Document opt-in configuration, context semantics, phases, the implemented prefill-only admission window and membership frozen for decode, pauses/heartbeats, proportional pages, host address/commit/pin accounting and actual mode/platform limits.
 - [ ] Publish measured finder examples and reproducible performance summaries without committing raw benchmark artifacts or local server-AB harness additions.
 - [ ] Consolidate status only after reviewing stage evidence; no complete checkbox based solely on a process exit.
 - [ ] Review the final regression ledger and ensure no new failure, confirmed slowdown, capacity reduction or missing applicable gate is concealed by a scope change or marked resolved solely by explanation.
