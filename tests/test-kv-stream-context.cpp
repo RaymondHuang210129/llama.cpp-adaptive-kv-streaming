@@ -2852,6 +2852,72 @@ static void test_owned_group_context(testing & t,llama_model * model,uint32_t qu
     }
 }
 
+static void test_group_fresh_recurrent_initialization(testing & t, llama_model * model, uint32_t count) {
+    if (!t.assert_true(model->arch == LLM_ARCH_QWEN35 && count >= 1 && count <= 2)) return;
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 4096; cp.n_batch = cp.n_ubatch = 256; cp.n_seq_max = 2; cp.kv_unified = true;
+    cp.type_k = GGML_TYPE_Q8_0; cp.type_v = GGML_TYPE_Q4_0;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.n_threads = cp.n_threads_batch = 4;
+    auto input = llama_batch_init(256, 0, 1);
+    struct release_batch {llama_batch & batch; ~release_batch() {llama_batch_free(batch);}} release{input};
+    input.n_tokens = count * 128;
+    std::vector<llama_kv_stream_selection_slot> candidates;
+    for (uint32_t slot = 0; slot < count; ++slot) {
+        candidates.push_back({slot, 0});
+        for (uint32_t row = 0; row < 128; ++row) {
+            const auto index = slot * 128 + row;
+            input.token[index] = llama_token(100 + slot * 40 + row % 31);
+            input.pos[index] = row; input.n_seq_id[index] = 1;
+            input.seq_id[index][0] = slot; input.logits[index] = row == 127;
+        }
+    }
+    const size_t vocabulary = model->vocab.n_tokens();
+    std::vector<std::vector<float>> reference;
+    {
+        llama_context native(*model, cp);
+        if (!t.assert_equal(0, native.decode(input))) return;
+        for (uint32_t slot = 0; slot < count; ++slot) {
+            const auto * values = llama_get_logits_ith(&native, slot * 128 + 127);
+            if (!t.assert_true(values && std::all_of(values, values + vocabulary, [](float v) {return std::isfinite(v);}))) return;
+            reference.emplace_back(values, values + vocabulary);
+        }
+    }
+    cp.shared_device_memory_bytes = size_t(1024) * 1024 * 1024;
+    auto group = llama_context_group::create(*model, cp);
+    if (!t.assert_true(group != nullptr)) return;
+    llama_kv_stream_selection selected;
+    if (!t.assert_true(llama_kv_stream_select({cp.n_ctx, count}, candidates, selected) == llama_kv_stream_selection_status::success)) return;
+    std::vector<llama_kv_stream_slot_handle> handles(group->source_handles().begin(), group->source_handles().begin() + count);
+    if (!t.assert_true(group->activate(selected, handles, input, llama_memory_work_phase::target_prefill, 1, 1))) return;
+    auto * recurrent = group->context()->get_kv_resources().recurrent;
+    if (!t.assert_true(recurrent != nullptr)) return;
+    ggml_backend_buffer_ptr state;
+    {
+        auto current = recurrent->init_full();
+        auto * view = dynamic_cast<llama_memory_recurrent_context *>(current.get());
+        if (!t.assert_true(view != nullptr)) return;
+        for (uint32_t layer = 0; layer < model->hparams.n_layer() && !state; ++layer) {
+            if (auto * tensor = view->get_s_l(layer)) state.reset(ggml_backend_buffer_retain(tensor->buffer));
+        }
+    }
+    if (!t.assert_true(state != nullptr && group->park())) return;
+    for (uint32_t slot = 0; slot < count; ++slot) if (!t.assert_true(group->reset_request(slot))) return;
+    // Retired arena bytes can contain NaNs from unrelated previous work.
+    ggml_backend_buffer_clear(state.get(), 0xff);
+    handles.assign(group->source_handles().begin(), group->source_handles().begin() + count);
+    if (!t.assert_true(group->activate(selected, handles, input, llama_memory_work_phase::target_prefill, 1, 2))) return;
+    if (!t.assert_equal(0, group->context()->decode(input))) return;
+    for (uint32_t slot = 0; slot < count; ++slot) {
+        const auto * values = llama_get_logits_ith(group->context(), slot * 128 + 127);
+        t.assert_true("fresh requests ignore poisoned recurrent arena bytes", values &&
+            std::all_of(values, values + vocabulary, [](float v) {return std::isfinite(v);}));
+        t.assert_true("fresh request logits match zero-initialized native execution", values &&
+            !std::memcmp(values, reference[slot].data(), vocabulary * sizeof(float)));
+    }
+    t.assert_true(group->park());
+}
+
 static void test_group_prefill_join(testing & t, llama_model * model, uint32_t first_slot, bool streamed = false) {
     const uint32_t prefix_tokens = streamed ? 8192 : 256;
     const uint32_t rounds = streamed ? 1 : 2;
@@ -9388,6 +9454,13 @@ int main(int argc,char ** argv) {
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-manager-only");})) {
         t.test("Group_manager_parks_native_state_and_reuses_one_physical_parent",[&](testing & t) {test_owned_group_context(t,model.get(),1,true);});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-fresh-recurrent-only");})) {
+        for (uint32_t count = 1; count <= 2; ++count) {
+            t.test("Fresh_recurrent_state_is_initialized_on_reused_arena_" + std::to_string(count),
+                [&](testing & t) {test_group_fresh_recurrent_initialization(t, model.get(), count);});
+        }
         return t.summary();
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-prefill-stream-join-only");})) {

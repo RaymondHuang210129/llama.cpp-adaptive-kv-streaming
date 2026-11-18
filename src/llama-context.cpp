@@ -7835,7 +7835,18 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
         auto source_model=llama_kv_stream_group_model::create({resources->backend,table,shape,uint32_t(layers.size()),model.hparams.n_head(first),
             cparams.n_ubatch,verify_rows,uint32_t(count)});
         if (!source_model || !kv_resources.full->bind_group_model(source_model,*projection)) return false;
-        if (!states.empty() && !restore_group_sequences(states,*projection)) {
+        const auto restore_selected=[](llama_context & context,const std::vector<llama_context_group_sequence_state> & saved,
+                const llama_kv_stream_slot_projection & selected) {
+            if (!saved.empty()) return context.restore_group_sequences(saved,selected);
+            // Fresh arena leases may contain NaNs from a previous layout.
+            if (context.model.arch==LLM_ARCH_DFLASH) context.memory->clear(true);
+            else {
+                if (context.kv_resources.recurrent) context.kv_resources.recurrent->clear(true);
+                if (context.kv_resources.bounded) context.kv_resources.bounded->clear(true);
+            }
+            context.synchronize();return true;
+        };
+        if (!restore_selected(*this,states,*projection)) {
             LLAMA_LOG_ERROR("%s: selected target state restore rejected\n",__func__);return false;
         }
         resources->writer=llama_kv_stream_writer::create(resources->backend,ggml_backend_memory_lease_buffer(encoding),
@@ -7858,7 +7869,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
         if (!kv_resources.full->get_group_model()->bind(resources->producer,[resources,attention,staging](uint32_t layer,ggml_tensor * op) {
                 return resources->attention(layer,op,staging,attention);
             },allowed)) return false;
-        if (block && !auxiliary_states.empty() && !auxiliary->restore_group_sequences(auxiliary_states,*auxiliary_projection)) {
+        if (block && !restore_selected(*auxiliary,auxiliary_states,*auxiliary_projection)) {
             LLAMA_LOG_ERROR("%s: bounded draft state restore rejected\n",__func__);return false;
         }
         if (child && !states.empty() && !kv_resources.full->get_group_model()->bind_projection(projection)) return false;
@@ -7869,7 +7880,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
             auto child_model=llama_kv_stream_group_model::create({child->backend,table,shape,uint32_t(child_layers.size()),
                 model.hparams.n_head(child_layers.front()),auxiliary->cparams.n_ubatch,1,uint32_t(count)});
             if (!child_model || !auxiliary->kv_resources.full->bind_group_model(child_model,*auxiliary_projection)) return false;
-            if (!auxiliary_states.empty() && !auxiliary->restore_group_sequences(auxiliary_states,*auxiliary_projection)) return false;
+            if (!restore_selected(*auxiliary,auxiliary_states,*auxiliary_projection)) return false;
             child->writer=llama_kv_stream_writer::create(child->backend,ggml_backend_memory_lease_buffer(child_encoding),
                 quote.target.writer_bytes,shape,auxiliary->cparams.n_ubatch);
             child->producer=llama_kv_stream_group_producer::create(table,child->writer,auxiliary->cparams.n_ubatch,1,uint32_t(count));
