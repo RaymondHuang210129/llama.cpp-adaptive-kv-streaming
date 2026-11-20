@@ -598,7 +598,7 @@ int main(int argc, char ** argv) {
         for (int change=0;change<8;++change) {
             auto params=streamed_dflash_params(3,7);
             switch (change) {
-                case 0: params.n_parallel=3; break;
+                case 0: params.n_parallel=int32_t(llama_max_parallel_sequences()+1); break;
                 case 1: params.kv_stream_auxiliary_layers=1; break;
                 case 2: params.fit_params=true; break;
                 case 3: params.mmproj.path="vision.gguf"; params.speculative.ngram_map_k4v.size_m=8; break;
@@ -686,6 +686,22 @@ int main(int argc, char ** argv) {
         t.assert_true(common_streamed_dflash_verification_error(params, depth) != nullptr);
     });
 
+    t.test("N_slot_speculative_admission_preserves_mode_and_per_sequence_depth",[&](testing & t) {
+        for (int slots : {3, 4, 8}) {
+            auto params = streamed_dflash_params(3, 7);
+            params.n_parallel = slots; params.kv_unified = true;
+            t.assert_true("N-slot DFlash/K4V reaches loaded-model admission", !common_streamed_dflash_config_error(params));
+            t.assert_equal(uint32_t(slots), common_context_params_to_llama(params).n_seq_max);
+            t.assert_equal(uint32_t(7), common_context_params_to_llama(params).n_rs_seq);
+            params.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+            params.speculative.draft.n_max = 3;
+            params.speculative.draft.mparams.path = "matching-gemma-assistant.gguf";
+            bool accepted = false;
+            try { accepted = common_kv_stream_verify_max(params, true) == 4; }
+            catch (const std::invalid_argument &) {}
+            t.assert_true("N slots do not change the per-sequence MTP verification depth", accepted);
+        }
+    });
     t.test("two_slot_dflash_admission_inherits_types_and_keeps_independent_widths",[&](testing & t) {
         for (int maximum=1;maximum<=7;++maximum) for (uint16_t copied=1;copied<=7;++copied) {
             auto params=streamed_dflash_params(maximum,copied);params.n_parallel=2;params.kv_unified=true;

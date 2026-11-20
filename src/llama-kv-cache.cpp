@@ -111,7 +111,7 @@ bool llama_kv_cache::release_shared_stream_reader() noexcept {
 }
 
 bool llama_kv_cache::attach_shared_bounded_reader(const llama_memory_bounded_kv_read & source) {
-    if (!source || !other || !n_swa || !n_seq_max || n_seq_max>2 || n_stream != 1 || v_trans || kv_stream || mtp_proxy ||
+    if (!source || !other || !n_swa || !n_seq_max || n_seq_max>LLAMA_MAX_SEQ || n_stream != 1 || v_trans || kv_stream || mtp_proxy ||
             bounded_pending || shared_read_metadata || !other->bounded_lease || layers.empty() ||
             layers.size() > LLAMA_MAX_LAYERS || source.layout()->allocation.capacity_rows != get_size()) return false;
     if (n_seq_max>1 && (n_seq_max!=other->n_seq_max || other->storage_selected_sequences.empty() ||

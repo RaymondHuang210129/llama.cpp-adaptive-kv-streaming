@@ -14,6 +14,37 @@ static server_task_result_ptr result(int id) {
 
 int main() {
     testing t;
+    t.test("selection_can_observe_a_declined_mutation_without_consuming_it",[](testing & t) {
+        server_queue queue;
+        std::promise<void> initial_read,after_cancel;
+        auto first=initial_read.get_future(),second=after_cancel.get_future();
+        bool clean_before=false,mutation_after=false,stopped=false;
+        size_t cancellations=0,reads=0;
+        queue.on_new_task([&](server_task && task,bool yielding) {
+            if (yielding && task.type==SERVER_TASK_TYPE_SLOT_GET) {
+                if (++reads==1) initial_read.set_value();else after_cancel.set_value();
+                return true;
+            }
+            if (yielding) return false;
+            if (task.type==SERVER_TASK_TYPE_CANCEL) {++cancellations;queue.terminate();}
+            return true;
+        });
+        const auto post=[&](server_task_type type) {
+            server_task task(type);task.id=queue.get_new_id();queue.post(std::move(task));
+        };
+        queue.on_update_slots([&] {
+            queue.yield_to_queue([&] {
+                post(SERVER_TASK_TYPE_NEXT_RESPONSE);post(SERVER_TASK_TYPE_SLOT_GET);
+                first.wait();clean_before=!queue.has_pending_mutation();
+                post(SERVER_TASK_TYPE_CANCEL);post(SERVER_TASK_TYPE_SLOT_GET);
+                second.wait();mutation_after=queue.has_pending_mutation();
+            });
+        });
+        post(SERVER_TASK_TYPE_NEXT_RESPONSE);
+        queue.start_loop();stopped=queue.has_pending_mutation();
+        t.assert_true(clean_before && mutation_after && stopped);
+        t.assert_equal(size_t(2),reads);t.assert_equal(size_t(1),cancellations);
+    });
     t.test("responses_keep_their_request_identity",[](testing & t) {
         server_response queue;
         queue.add_waiting_task_ids({1,2});

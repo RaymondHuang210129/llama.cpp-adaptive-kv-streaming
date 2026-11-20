@@ -103,6 +103,9 @@ public:
     // tasks declined by callback_new_task are put back in the queue once this returns
     void yield_to_queue(std::function<void()> && work);
 
+    // Selection work can stop before queued mutations are processed on the owner thread.
+    bool has_pending_mutation();
+
     // for metrics
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);

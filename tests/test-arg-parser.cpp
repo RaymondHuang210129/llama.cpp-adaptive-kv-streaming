@@ -104,7 +104,7 @@ static void test(void) {
         for (int change=0;change<7;++change) {
             auto invalid=dflash;
             switch (change) {
-                case 0: invalid.n_parallel=3; break;
+                case 0: invalid.n_parallel=int32_t(llama_max_parallel_sequences()+1); break;
                 case 1: invalid.speculative.draft.n_max=8; break;
                 case 2: invalid.kv_stream_auxiliary_layers=1; break;
                 case 3: invalid.fit_params=true; break;
@@ -209,7 +209,7 @@ static void test(void) {
             catch (const std::invalid_argument &) {}
             assert(accepted && "two-slot unified arena MTP retains per-sequence verification width");
         }
-        auto invalid_group=grouped;invalid_group.n_parallel=3;assert(rejects(invalid_group));
+        auto invalid_group=grouped;invalid_group.n_parallel=int32_t(llama_max_parallel_sequences()+1);assert(rejects(invalid_group));
         invalid_group=grouped;invalid_group.kv_unified=false;assert(rejects(invalid_group));
         invalid_group=grouped;invalid_group.shared_device_memory_bytes=0;invalid_group.kv_stream_pool_bytes=1024;
         assert(rejects(invalid_group));

@@ -54,6 +54,24 @@ int main(int argc, char ** argv) {
         t.assert_true(checkpoint.empty() && !checkpoint.streamed);
         t.assert_equal(size_t(0),checkpoint.size());
     });
+    t.test("N_slot_vision_admission_retains_supported_modes",[](testing & t) {
+        for (int slots : {3, 4, 8}) for (int mode = 0; mode < 5; ++mode) {
+            auto p = qualified();
+            p.n_parallel = slots; p.kv_unified = true; p.n_batch = p.n_ubatch = 256;
+            if (mode == 1 || mode == 2) {
+                p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP}; p.speculative.draft.n_max = 3;
+                if (mode == 2) p.speculative.draft.mparams.path = "matching-gemma-assistant.gguf";
+            } else if (mode >= 3) {
+                p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH}; p.speculative.draft.n_max = 7;
+                p.speculative.draft.mparams.path = "matching-dflash.gguf";
+                if (mode == 4) {
+                    p.speculative.types.insert(p.speculative.types.begin(), COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
+                    p.speculative.ngram_map_k4v.size_n = 12; p.speculative.ngram_map_k4v.size_m = 7;
+                }
+            }
+            t.assert_true("configured N does not disable an existing image/speculative mode", !server_vision_arena_config_error(p));
+        }
+    });
     t.test("two_slot_vision_admission_keeps_unified_gpu_and_inherited_speculation_guards",[](testing & t) {
         for (int mode=0;mode<5;++mode) {
             auto p=qualified();p.n_parallel=2;p.kv_unified=true;p.cache_ram_mib=0;p.n_batch=p.n_ubatch=256;
@@ -70,7 +88,7 @@ int main(int argc, char ** argv) {
             }
             t.assert_true("a unified two-slot image profile reaches loaded-model validation",!server_vision_arena_config_error(p));
             auto bad=p;bad.kv_unified=false;t.assert_true(server_vision_arena_config_error(bad));
-            bad=p;bad.n_parallel=3;t.assert_true(server_vision_arena_config_error(bad));
+            bad=p;bad.n_parallel=int32_t(llama_max_parallel_sequences()+1);t.assert_true(server_vision_arena_config_error(bad));
             bad=p;bad.mmproj_use_gpu=false;t.assert_true(server_vision_arena_config_error(bad));
             bad=p;bad.fit_params=true;t.assert_true(server_vision_arena_config_error(bad));
         }
