@@ -20,6 +20,86 @@ class MultiSlotFinder(unittest.TestCase):
         self.assertEqual(command[command.index('--ctx-size') + 1], '8192')
         self.assertEqual(finder.context_semantics(args), {'slots': 2, 'per_slot': 8192, 'selected_group': 8192, 'all_histories': 16384})
 
+    def test_configured_N_probes_every_logical_id_and_a_real_joint_group(self):
+        for count in (3, 4, 8, 256):
+            with self.subTest(count=count):
+                args = self.args('--parallel', str(count), '--context-size', '262144', '--probe-mode', 'preflight')
+                command = finder.server_command(args, 1024)
+                self.assertIn('--kv-unified', command)
+                self.assertEqual(finder.context_semantics(args)['all_histories'], 262144 * count)
+                profiles = finder.multi_slot_probe_profiles(args)
+                self.assertEqual([row['slots'] for row in profiles[:count]], [[slot] for slot in range(count)])
+                joint = next(row for row in profiles if row['label'] == 'joint')
+                self.assertEqual(joint['slots'], list(range(count)))
+                self.assertEqual(joint['selected_max'], count)
+                self.assertLessEqual(sum(joint['prompt_tokens']) + count * (args.decode_tokens + 15), args.context_size)
+                props = {'total_slots': count, 'stream_context_limits': dict(finder.context_semantics(args), selected_storage=262144)}
+                finder.validate_context_semantics(args, props)
+                props['stream_context_limits']['all_histories'] -= 1
+                with self.assertRaisesRegex(RuntimeError, 'context'):
+                    finder.validate_context_semantics(args, props)
+
+    def test_joint_probes_respect_complete_native_verification_blocks(self):
+        args = self.args('--parallel', '64', '--context-size', '262144', '--spec-mode', 'dflash',
+                         '--model-draft', 'draft.gguf', '--batch-size', '16', '--ubatch-size', '16', '--probe-mode', 'preflight')
+        profiles = finder.multi_slot_probe_profiles(args)
+        joint = next(row for row in profiles if row['label'] == 'joint')
+        self.assertEqual(joint['selected_max'], 2)
+        self.assertEqual(joint['slots'], [0,1])
+        self.assertEqual(len([row for row in profiles if row['label'].startswith('single-')]), 64)
+        unequal = next(row for row in profiles if row['label'] == 'asymmetric')
+        self.assertNotEqual(unequal['prompt_tokens'][0], unequal['prompt_tokens'][1])
+        self.assertEqual(unequal['selected_max'], 2)
+
+    def test_selected_probe_count_is_distinct_from_logical_capacity(self):
+        args = self.args('--parallel','4','--probe-selected','2','--probe-mode','preflight')
+        self.assertEqual(finder.context_semantics(args)['slots'],4)
+        self.assertEqual(finder.context_semantics(args)['all_histories'],32768)
+        profiles=finder.multi_slot_probe_profiles(args)
+        self.assertEqual([row['slots'] for row in profiles[:4]],[[0],[1],[2],[3]])
+        joint=next(row for row in profiles if row['label']=='joint')
+        self.assertEqual(joint['slots'],[0,1])
+        self.assertEqual(joint['selected_max'],2)
+        for selected in ('0','5'):
+            with self.assertRaises(SystemExit):
+                self.args('--parallel','4','--probe-selected',selected)
+
+    def test_rejects_counts_outside_native_sequence_contract(self):
+        for count in (0, -1, 257):
+            with self.subTest(count=count), self.assertRaises(SystemExit):
+                self.args('--parallel', str(count))
+
+    def test_explicit_no_warmup_is_forwarded_without_changing_probe_count(self):
+        args=self.args('--parallel','4','--probe-selected','2','--no-warmup')
+        self.assertIn('--no-warmup',finder.server_command(args,1024))
+        self.assertNotIn('--no-warmup',finder.server_command(self.args(),1024))
+        self.assertEqual(next(row for row in finder.multi_slot_probe_profiles(args) if row['label']=='joint')['selected_max'],2)
+
+    def test_explicit_server_loads_its_own_runtime_instead_of_an_older_build(self):
+        server=Path('/tmp/ms16-runtime/bin/llama-server')
+        old=str(root/'build-upstream-attention-port/bin')
+        with patch.object(finder.SWEEP,'server_environment',return_value={'LD_LIBRARY_PATH':old+':/usr/local/cuda/lib64',
+                         'GGML_CUDA_ENABLE_UNIFIED_MEMORY':'1'}):
+            env=finder.environment(server)
+        paths=env['LD_LIBRARY_PATH'].split(':')
+        self.assertEqual(paths[0],str(server.parent))
+        self.assertNotIn(old,paths)
+        self.assertIn('/usr/local/cuda/lib64',paths)
+        self.assertNotIn('GGML_CUDA_ENABLE_UNIFIED_MEMORY',env)
+
+    def test_runtime_library_hashing_handles_spaces_without_python_311(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory=Path(temporary)
+            library=directory/'libllama runtime.so'
+            library.write_bytes(b'pinned native runtime')
+            maps=directory/'maps'
+            maps.write_text('0-1 r-xp 0 00:00 0 '+str(library)+'\n')
+            def path(value):
+                return maps if value=='/proc/12345/maps' else Path(value)
+            with patch.object(finder,'Path',side_effect=path), patch.object(finder.hashlib,'file_digest',None,create=True):
+                rows=finder.loaded_runtime_libraries(12345)
+            self.assertEqual(rows,[{'path':str(library),'sha256':finder.hashlib.sha256(library.read_bytes()).hexdigest()}])
+
     def test_single_slot_command_and_workload_remain_the_default(self):
         args = self.args()
         self.assertEqual(args.parallel, 1)

@@ -2789,7 +2789,9 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_dflash=std::find(params.speculative.types.begin(),params.speculative.types.end(),
         COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)!=params.speculative.types.end();
     if (group && ((!spec_mtp && !spec_dflash) || (spec_mtp && spec_dflash) || !model_tgt || !ctx_tgt || ctx_tgt!=group->metadata_context() ||
-            llama_get_model(ctx_tgt)!=model_tgt || group->context() || params.n_parallel!=2 || !params.kv_unified ||
+            llama_get_model(ctx_tgt)!=model_tgt || group->context() || params.n_parallel<2 ||
+            uint32_t(params.n_parallel)>llama_max_parallel_sequences() ||
+            uint32_t(params.n_parallel)!=llama_n_seq_max(ctx_tgt) || !params.kv_unified ||
             params.embedding || params.shared_device_memory_bytes || params.kv_stream_pool_bytes ||
             params.kv_stream_auxiliary_layers || params.speculative.draft.cache_type_k_explicit ||
             params.speculative.draft.cache_type_v_explicit ||
@@ -2829,7 +2831,8 @@ common_speculative_init_result::common_speculative_init_result(
         char architecture[32]={};
         if (llama_model_meta_val_str(model_tgt,"general.architecture",architecture,sizeof(architecture)) == 6 &&
                 !std::strcmp(architecture,"gemma4")) {
-            cparams.n_batch=cparams.n_ubatch=group ? 2 : 1;
+            cparams.n_batch=cparams.n_ubatch=group ?
+                std::min({llama_n_seq_max(ctx_tgt),llama_n_batch(ctx_tgt),llama_n_ubatch(ctx_tgt)}) : 1;
             cparams.kv_stream_verify_max=0;
             shared_gemma_mtp=true;
         }

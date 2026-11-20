@@ -1321,12 +1321,12 @@ const char * common_streamed_dflash_config_error(const common_params & params) {
     if (const auto * error = common_streamed_kv_config_error(params)) return error;
     if (!params.shared_device_memory_bytes || params.kv_stream_pool_bytes || params.fit_params)
         return "adaptive DFlash2 requires a declared --kv-stream-arena-mib budget and --fit off";
-    const bool grouped=params.n_parallel==2 && params.kv_unified;
+    const bool grouped=params.n_parallel>1 && uint32_t(params.n_parallel)<=llama_max_parallel_sequences() && params.kv_unified;
     if ((params.n_parallel != 1 && !grouped) || params.kv_stream_auxiliary_layers ||
             std::any_of(params.speculative.types.begin(),params.speculative.types.end(),[](auto type) {
                 return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
                     type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
-            })) return "adaptive DFlash2 requires serial or unified two-slot execution, no auxiliary MTP layers and optional ngram-map-k4v only";
+            })) return "adaptive DFlash2 requires serial or valid unified multi-slot execution, no auxiliary MTP layers and optional ngram-map-k4v only";
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED)
         return "adaptive DFlash2 requires -fa on";
     uint32_t depth = 0;
@@ -1390,10 +1390,11 @@ uint32_t common_kv_stream_verify_max(const common_params & params,bool shares_ta
     const int32_t depth=params.speculative.draft.n_max;
     if (depth < 1 || depth > 3) throw std::invalid_argument("shared-target MTP supports 1-3 draft tokens");
     const int32_t rows=depth+1;
-    const bool grouped=params.n_parallel==2 && params.shared_device_memory_bytes && !params.kv_stream_pool_bytes && params.kv_unified;
+    const bool grouped=params.n_parallel>1 && uint32_t(params.n_parallel)<=llama_max_parallel_sequences() &&
+        params.shared_device_memory_bytes && !params.kv_stream_pool_bytes && params.kv_unified;
     if ((params.n_parallel != 1 && !grouped) || params.n_batch <= 0 || params.n_ubatch < 0 ||
             (params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch,params.n_ubatch)) < rows) {
-        throw std::invalid_argument("shared-target MTP requires one serial slot or two unified arena slots and verification within the target microbatch");
+        throw std::invalid_argument("shared-target MTP requires serial or valid unified arena slots and verification within the target microbatch");
     }
     return uint32_t(rows);
 }

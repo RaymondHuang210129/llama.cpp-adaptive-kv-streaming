@@ -642,6 +642,8 @@ public:
     // The caller retains model weights. Declare the shared child before allocating the parent.
     bool prepare_shared_mtp(const llama_model & model,llama_context_params params);
     bool prepare_dflash(const llama_model & model,llama_context_params params,uint32_t prediction_rows);
+    // Necessary native state-bank bound only; complete workload admission remains required.
+    LLAMA_API bool selected_state_limit(uint32_t maximum,uint32_t & output) const;
     // Borrow the retained parent only while all selected states are parked.
     LLAMA_API ggml_backend_buffer_t prepare_vision_parent();
     LLAMA_API bool quote_vision(const std::vector<size_t> & bytes,llama_context_memory_create_result & result) const;

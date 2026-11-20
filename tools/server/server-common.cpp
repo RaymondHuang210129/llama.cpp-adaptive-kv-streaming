@@ -44,10 +44,10 @@ const char * server_vision_arena_config_error(const common_params & params) {
     if (!server_uses_vision_arena(params)) return nullptr;
     if (!params.shared_device_memory_bytes || params.kv_stream_pool_bytes)
         return "vision KV streaming requires a shared device memory arena, not a fixed KV pool";
-    const bool grouped=params.n_parallel==2 && params.kv_unified;
+    const bool grouped=params.n_parallel>1 && uint32_t(params.n_parallel)<=llama_max_parallel_sequences() && params.kv_unified;
     if (params.fit_params || (params.n_parallel != 1 && !grouped) || !params.mmproj_use_gpu || params.embedding ||
             params.no_kv_offload || !params.lora_adapters.empty())
-        return "vision arena requires serial or unified two-slot GPU execution, --fit off, KV offload, no embeddings and no LoRA";
+        return "vision arena requires serial or valid unified multi-slot GPU execution, --fit off, KV offload, no embeddings and no LoRA";
     if (const auto * error = common_streamed_kv_config_error(params)) return error;
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED)
         return "vision arena requires -fa on; cache support is checked during context initialization";

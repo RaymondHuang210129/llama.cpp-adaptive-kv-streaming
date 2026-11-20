@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <set>
+#include <tuple>
 
 using phase_status = llama_memory_text_phase_status;
 using text_phase = llama_memory_text_phase;
@@ -153,6 +155,116 @@ static void benchmark(ggml_backend_dev_t dev) {
 
 int main(int argc, char ** argv) {
     testing t;
+    t.test("group_graph_catalog_covers_native_shapes_with_bounded_count", [](testing & t) {
+        using shape=std::tuple<uint32_t,uint32_t,uint32_t>;
+        for (uint32_t selected : {3u,4u,8u,64u,256u}) for (bool recurrent : {false,true}) {
+            std::set<shape> shapes;
+            size_t profiles=0;
+            const uint32_t width=8,maximum=256;
+            const bool made=llama_context_group_graph_profiles(selected,width,maximum,maximum,width,recurrent,
+                [&](const llama_context_group_graph_profile & profile) {
+                    uint32_t rows=0,outputs=0,active=0;
+                    for (size_t i=0;i<profile.rows.size();++i) {
+                        rows+=profile.rows[i];outputs+=profile.outputs[i];active+=profile.rows[i]!=0;
+                        if (profile.rows[i]>width || profile.outputs[i]>profile.rows[i]) return false;
+                    }
+                    ++profiles;
+                    return shapes.emplace(recurrent ? active : 1,rows,outputs).second;
+                });
+            t.assert_true("no duplicate native graph geometry",made);
+            t.assert_true("catalog is bounded by physical microbatch shapes",profiles<300000);
+            for (uint32_t active=1;active<=std::min(selected,maximum);++active)
+                for (uint32_t rows=1;rows<=width && active*rows<=maximum;++rows)
+                    for (uint32_t outputs=0;outputs<=active*rows;++outputs)
+                        if (!shapes.count({recurrent ? active : 1,active*rows,outputs})) {
+                            t.assert_true("missing legal native graph",false);return;
+                        }
+        }
+        size_t calls=0;
+        t.assert_true("callback failure propagates",!llama_context_group_graph_profiles(4,8,256,32,8,true,
+            [&](const auto &) {++calls;return false;}));
+        t.assert_equal(size_t(1),calls);
+        t.assert_true("invalid native count",!llama_context_group_graph_profiles(257,8,256,32,8,true,[](const auto &) {return true;}));
+        t.assert_true("invalid row capacity",!llama_context_group_graph_profiles(4,8,UINT32_MAX,32,8,true,[](const auto &) {return true;}));
+    });
+    t.test("bounded_cache_identity_preserves_legacy_ids_without_colliding_with_any_source", [](testing & t) {
+        using identity=llama_memory_phase_cache_identity;
+        identity result{99,77};
+        const auto check=[&](const std::vector<identity> & sources,const std::vector<identity> & auxiliary,uint64_t expected) {
+            if (!t.assert_true(llama_context_group_bounded_identity(sources,auxiliary,result))) return;
+            t.assert_equal(expected,result.id);t.assert_equal(uint64_t(1),result.generation);
+            for (const auto & source : sources) t.assert_true(source.id!=result.id);
+            for (const auto & source : auxiliary) t.assert_true(source.id!=result.id);
+        };
+        check({{1,1},{2,1}},{},5);
+        check({{1,1},{5,1}},{},6);
+        check({{1,1},{2,1}},{{5,1},{6,1}},7);
+        check({{1,1},{5,1},{6,1},{7,1},{8,1}},{},9);
+        std::vector<identity> sources,auxiliary;
+        for (uint32_t slot=0;slot<LLAMA_MAX_SEQ;++slot) {
+            sources.push_back({slot+1,3});auxiliary.push_back({LLAMA_MAX_SEQ+slot+1,7});
+        }
+        check(sources,auxiliary,2*LLAMA_MAX_SEQ+1);
+        check({{UINT64_MAX,1},{1,1},{2,1}},{},3);
+        check({{(UINT64_MAX-1)/4,1},{UINT64_MAX-2,1},{UINT64_MAX-1,1},{UINT64_MAX,1},{1,1}},{},2);
+        result={99,77};
+        t.assert_true(!llama_context_group_bounded_identity({},auxiliary,result));
+        t.assert_true(!llama_context_group_bounded_identity({{0,1}},{},result));
+        t.assert_true(!llama_context_group_bounded_identity({{1,0}},{},result));
+        t.assert_true(!llama_context_group_bounded_identity({{1,1}},{{2,0}},result));
+        sources.push_back({999,1});t.assert_true(!llama_context_group_bounded_identity(sources,{},result));
+        t.assert_equal(uint64_t(99),result.id);t.assert_equal(uint64_t(77),result.generation);
+    });
+    t.test("mandatory_state_bound_limits_execution_without_limiting_logical_slots", [](testing & t) {
+        llama_hparams hp{};hp.n_layer_all=60;hp.n_swa=1024;hp.swa_type=LLAMA_SWA_TYPE_STANDARD;
+        hp.n_embd_head_k_full=hp.n_embd_head_v_full=512;hp.n_embd_head_k_swa=hp.n_embd_head_v_swa=256;
+        for (uint32_t layer=0;layer<60;++layer) {
+            hp.is_swa_impl[layer]=layer%6!=5;hp.n_head_arr[layer]=32;hp.n_head_kv_arr[layer]=hp.is_swa_impl[layer] ? 16 : 4;
+        }
+        llama_memory_params params{};params.type_k=GGML_TYPE_Q8_0;params.type_v=GGML_TYPE_Q4_0;
+        llama_cparams cp{};cp.n_ctx=cp.n_ctx_seq=65536;cp.n_seq_max=LLAMA_MAX_SEQ;cp.n_ubatch=256;cp.flash_attn=true;cp.kv_unified=true;
+        const auto native=[&](uint32_t count,size_t & bytes) {
+            params.kv_stream_selected_sequences.clear();
+            for (uint32_t slot=0;slot<count;++slot) params.kv_stream_selected_sequences.push_back(llama_seq_id(LLAMA_MAX_SEQ-1-slot));
+            llama_memory_bounded_kv_layout layout;
+            if (!llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,ggml_backend_cpu_buffer_type(),{9,1},layout)) return false;
+            bytes=layout.allocation.bytes;return true;
+        };
+        for (const auto & types : std::vector<std::pair<ggml_type,ggml_type>>{{GGML_TYPE_Q8_0,GGML_TYPE_Q4_0},
+                {GGML_TYPE_Q8_0,GGML_TYPE_Q8_0},{GGML_TYPE_Q5_1,GGML_TYPE_Q5_1},{GGML_TYPE_F16,GGML_TYPE_F16}}) {
+            params.type_k=types.first;params.type_v=types.second;
+            for (size_t capacity : {size_t(1014)*1048576,size_t(1496)*1048576,size_t(8192)*1048576}) {
+                uint32_t expected=0;size_t previous=0;
+                for (uint32_t count=1;count<=LLAMA_MAX_SEQ;++count) {
+                    size_t bytes=0;if (!t.assert_true(native(count,bytes))) return;
+                    if (!t.assert_true(bytes>=previous)) return;
+                    previous=bytes;if (bytes<=capacity) expected=count;
+                }
+                uint32_t maximum=999;size_t calls=0;
+                const auto query=[&](uint32_t count,size_t & bytes) {++calls;return native(count,bytes);};
+                if (!t.assert_true(llama_context_group_state_limit(LLAMA_MAX_SEQ,capacity,query,maximum))) return;
+                t.assert_equal(expected,maximum);t.assert_true("native metadata search has bounded query count",calls<=9);
+                if (capacity==size_t(1014)*1048576) {
+                    const uint32_t expected_count=types.first==GGML_TYPE_F16 ? 1 : types.first==GGML_TYPE_Q5_1 ? 3 : 2;
+                    t.assert_equal(expected_count,maximum);
+                }
+                if (capacity==size_t(8192)*1048576) t.assert_true("state bound is not a fixed small slot cap",maximum>4);
+                t.assert_equal(uint32_t(LLAMA_MAX_SEQ),cp.n_seq_max);
+            }
+        }
+        uint32_t result=99;size_t calls=0;
+        const auto query=[&](uint32_t count,size_t & bytes) {++calls;bytes=count*10;return true;};
+        t.assert_true(llama_context_group_state_limit(256,1000,query,result));t.assert_equal(uint32_t(100),result);
+        t.assert_true(llama_context_group_state_limit(256,9,query,result));t.assert_equal(uint32_t(0),result);
+        t.assert_true(llama_context_group_state_limit(1,10,query,result));t.assert_equal(uint32_t(1),result);
+        result=99;calls=0;
+        t.assert_true(!llama_context_group_state_limit(257,1000,query,result));
+        t.assert_true(!llama_context_group_state_limit(0,1000,query,result));
+        t.assert_true(!llama_context_group_state_limit(4,0,query,result));
+        t.assert_equal(uint32_t(99),result);t.assert_equal(size_t(0),calls);
+        t.assert_true(!llama_context_group_state_limit(4,1000,[](uint32_t,size_t &) {return false;},result));
+        t.assert_equal(uint32_t(99),result);
+    });
     t.test("selected_swa_quote_matches_native_group_storage_not_divided_slot_context", [](testing & t) {
         llama_hparams hp{};
         hp.n_layer_all=60;hp.n_swa=1024;hp.swa_type=LLAMA_SWA_TYPE_STANDARD;
@@ -193,6 +305,23 @@ int main(int argc, char ** argv) {
         t.assert_true(!llama_kv_cache_iswa::bounded_storage_requirements(hp,params,cp,type,{9,3},result));
         t.assert_equal(bytes,result.allocation.bytes);
     });
+    t.test("streamed_context_limits_support_configured_N_without_multiplying_group_capacity", [&](testing & t) {
+        for (uint32_t slots : {3u, 4u, 8u, uint32_t(LLAMA_MAX_SEQ)}) {
+            llama_cparams p{};
+            p.n_ctx = 4352; p.n_seq_max = slots; p.kv_unified = true;
+            p.shared_device_memory_bytes = 1024;
+            if (!t.assert_true("N logical slots reach checked adaptive context resolution", p.set_stream_limits(4097))) continue;
+            t.assert_equal(uint32_t(4097), p.n_ctx_seq);
+            t.assert_equal(uint32_t(4097), p.stream_limits.slot_limit);
+            t.assert_equal(uint32_t(4097), p.stream_limits.group_limit);
+            t.assert_equal(uint32_t(4352 * slots), p.stream_limits.history_storage);
+            t.assert_equal(slots, p.stream_limits.slots);
+            const auto saved = p.stream_limits.history_storage;
+            p.n_ctx = INT32_MAX;
+            t.assert_true(!p.set_stream_limits(4097));
+            t.assert_equal(saved, p.stream_limits.history_storage);
+        }
+    });
     t.test("streamed_context_limits_keep_slot_group_and_storage_independent", [&](testing & t) {
         llama_cparams p{};
         p.n_ctx = 4352;
@@ -208,7 +337,7 @@ int main(int argc, char ** argv) {
         t.assert_equal(uint32_t(4352), p.stream_limits.slot_storage);
         t.assert_equal(uint32_t(8704), p.stream_limits.history_storage);
         t.assert_equal(uint32_t(2), p.stream_limits.slots);
-        for (uint32_t slots : {0u, 3u, 256u}) {
+        for (uint32_t slots : {0u, uint32_t(LLAMA_MAX_SEQ + 1), UINT32_MAX}) {
             p.n_seq_max = slots;
             t.assert_true(!p.set_stream_limits(4097));
             t.assert_equal(uint32_t(4097), p.n_ctx_seq);

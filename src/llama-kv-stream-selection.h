@@ -24,6 +24,9 @@ bool llama_kv_stream_generation_budget_make(size_t headroom, uint32_t maximum_pr
 struct llama_kv_stream_selection_config {
     size_t context_tokens = 0;
     size_t maximum_slots = 0;
+    size_t maximum_selected_slots = 0; // Zero retains the logical capacity as the selection limit.
+    bool (*continue_search)(void *) = nullptr;
+    void * control_data = nullptr;
 };
 
 struct llama_kv_stream_selection_slot {
@@ -51,7 +54,7 @@ struct llama_kv_stream_selection {
 bool llama_kv_stream_selection_valid(const llama_kv_stream_selection & selection) noexcept;
 
 enum class llama_kv_stream_selection_status {
-    success, idle, no_progress, invalid_config, allocation_failed,
+    success, idle, no_progress, invalid_config, allocation_failed, interrupted,
 };
 
 // Pure admission of a complete candidate; it must not mutate resources or request state.

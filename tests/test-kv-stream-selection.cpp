@@ -116,6 +116,120 @@ static selection projected_selection(const std::vector<uint32_t> & weights) {
 
 int main() {
     testing t;
+    t.test("resource_search_interruption_never_publishes_a_partial_selection", [](testing & t) {
+        struct control {size_t quotes=0;bool stop=false;} state;
+        llama_kv_stream_selection_config config{65536,12,6};
+        config.continue_search=[](void * data) {return !static_cast<control *>(data)->stop;};
+        config.control_data=&state;
+        const auto rejecting=[](const selection &,void * data) {
+            auto & state=*static_cast<control *>(data);
+            if (++state.quotes==7) state.stop=true;
+            return false;
+        };
+        std::vector<selection_slot> slots;
+        for (uint32_t id=0;id<12;++id) slots.push_back({id,0});
+        selection output;output.context_tokens=123;output.slots.push_back({99,1,1,0});
+        t.assert_true(llama_kv_stream_select(config,slots,output,rejecting,&state)==selection_status::interrupted);
+        t.assert_equal(size_t(7),state.quotes);
+        t.assert_equal(size_t(123),output.context_tokens);t.assert_true(ids(output)==std::vector<uint32_t>{99});
+        state={0,true};
+        t.assert_true(llama_kv_stream_select(config,slots,output,rejecting,&state)==selection_status::interrupted);
+        t.assert_equal(size_t(0),state.quotes);
+        state={};
+        const auto accepting=[](const selection &,void * data) {
+            auto & state=*static_cast<control *>(data);++state.quotes;state.stop=true;return true;
+        };
+        t.assert_true(llama_kv_stream_select(config,slots,output,accepting,&state)==selection_status::interrupted);
+        t.assert_true(ids(output)==std::vector<uint32_t>{99});
+        state={};
+        t.assert_true(llama_kv_stream_select(config,{{0,0}},output,accepting,&state)==selection_status::interrupted);
+        t.assert_true(ids(output)==std::vector<uint32_t>{99});
+        state={};config.continue_search=nullptr;
+        t.assert_true(llama_kv_stream_select(config,slots,output,accepting,&state)==selection_status::success);
+        t.assert_true(ids(output)==std::vector<uint32_t>({0,1,2,3,4,5}));
+    });
+    t.test("prefill_and_decode_interruption_preserves_plans_and_request_epochs", [](testing & t) {
+        bool stop=true;
+        llama_kv_stream_selection_config config{1024,4,3};
+        config.continue_search=[](void * data) {return !*static_cast<bool *>(data);};config.control_data=&stop;
+        llama_kv_stream_prefill_plan prefill;prefill.tokens_per_slot=99;
+        t.assert_true(llama_kv_stream_prefill_plan_make(config,{{0,0,256},{1,0,256},{3,0,256}},256,prefill)==selection_status::interrupted);
+        t.assert_equal(size_t(99),prefill.tokens_per_slot);
+        llama_kv_stream_request_group group(config);
+        t.assert_true(group.admit({{0,1,0,0,false},{1,1,0,0,false},{3,1,0,0,false}}));
+        for (auto id : {0u,1u,3u}) t.assert_true(group.prepared(id,1,llama_kv_stream_group_phase::prefill,10));
+        llama_kv_stream_group_plan plan;plan.epoch=99;plan.revision=77;
+        t.assert_true(group.plan(plan)==selection_status::interrupted);
+        t.assert_equal(uint64_t(99),plan.epoch);t.assert_equal(uint64_t(77),plan.revision);
+        t.assert_true(group.busy(3,1) && group.needs_reselection());
+        stop=false;
+        t.assert_true(group.plan(plan)==selection_status::success && group.activate(std::move(plan)));
+        for (auto id : {0u,1u,3u}) t.assert_true(group.selected(id,1));
+    });
+    t.test("logical_capacity_is_independent_of_native_execution_capacity", [](testing & t) {
+        llama_kv_stream_request_group group({4096,8,3});
+        std::vector<llama_kv_stream_group_request> requests;
+        std::vector<llama_kv_stream_prefill_slot> pending;
+        for (uint32_t id=0;id<8;++id) {requests.push_back({id,1,0,0,false});pending.push_back({id,0,512});}
+        if (!t.assert_true("all logical members admitted",group.admit(requests))) return;
+        llama_kv_stream_prefill_plan prefill;
+        if (!t.assert_true(llama_kv_stream_prefill_plan_make({4096,8,3},pending,256,prefill)==selection_status::success)) return;
+        t.assert_equal(size_t(3),prefill.selected.slots.size());
+        t.assert_equal(size_t(85),prefill.tokens_per_slot);
+        for (const auto & request : requests) if (!t.assert_true(group.prepared(request.slot,1,llama_kv_stream_group_phase::prefill,10))) return;
+        llama_kv_stream_group_plan decode;
+        if (!t.assert_true(group.plan(decode)==selection_status::success)) return;
+        t.assert_true(ids(decode.selected)==std::vector<uint32_t>({0,1,2}));
+        t.assert_true("high logical member remains retained",group.busy(7,1));
+    });
+    t.test("state_count_bound_preserves_exact_subset_policy_and_prefill_progress", [](testing & t) {
+        for (bool mixed : {false,true}) {
+            std::vector<llama_kv_stream_prefill_slot> pending;
+            const uint32_t logical_ids[]={1,3,7,15,31,63,127,255};
+            for (size_t index=0;index<8;++index) pending.push_back({logical_ids[index],index*7,513+index*19,mixed ? index%2 : 0});
+            size_t full_quotes=0,bounded_quotes=0,steps=0;
+            const auto measured=[](const selection & selected,void * data) {
+                ++*static_cast<size_t *>(data);
+                return selected.slots.size()<=2 && !(selected.slots.size()==2 && selected.slots[0].id==3 && selected.slots[1].id==7);
+            };
+            while (std::any_of(pending.begin(),pending.end(),[](const auto & slot) {return slot.remaining_tokens!=0;})) {
+                llama_kv_stream_prefill_plan full,bounded;
+                if (!t.assert_true(llama_kv_stream_prefill_plan_make({65536,256},pending,256,full,measured,&full_quotes)==selection_status::success &&
+                        llama_kv_stream_prefill_plan_make({65536,256,2},pending,256,bounded,measured,&bounded_quotes)==selection_status::success)) return;
+                t.assert_true(ids(full.selected)==ids(bounded.selected));
+                t.assert_equal(full.tokens_per_slot,bounded.tokens_per_slot);
+                t.assert_equal(full.selected.history_tokens,bounded.selected.history_tokens);
+                for (size_t i=0;i<full.selected.slots.size();++i) {
+                    t.assert_equal(full.selected.slots[i].growth_tokens,bounded.selected.slots[i].growth_tokens);
+                    t.assert_equal(full.selected.slots[i].offset_tokens,bounded.selected.slots[i].offset_tokens);
+                    for (auto & slot : pending) if (slot.id==full.selected.slots[i].id) {
+                        slot.history_tokens+=full.tokens_per_slot;slot.remaining_tokens-=full.tokens_per_slot;
+                    }
+                }
+                if (!t.assert_true(++steps<100)) return;
+            }
+            t.assert_true("only impossible counts lose their resource quotes",bounded_quotes<full_quotes);
+        }
+        std::vector<selection_slot> large;
+        for (uint32_t slot=0;slot<256;++slot) large.push_back({slot,0});
+        size_t quotes=0;selection selected;
+        const auto fit=[](const selection &,void * data) {++*static_cast<size_t *>(data);return true;};
+        t.assert_true(llama_kv_stream_select({65536,256,24},large,selected,fit,&quotes)==selection_status::success);
+        t.assert_equal(size_t(24),selected.slots.size());t.assert_equal(size_t(1),quotes);
+    });
+    t.test("larger_inventory_prunes_equal_cost_quotes_without_changing_the_winner", [](testing & t) {
+        std::vector<selection_slot> slots;
+        for (uint32_t id=0;id<24;++id) slots.push_back({id,1});
+        size_t quotes=0;
+        const auto measured=[](const selection &,void * data) {++*static_cast<size_t *>(data);return true;};
+        selection result;
+        if (!t.assert_true(llama_kv_stream_select({8,24},slots,result,measured,&quotes)==selection_status::success)) return;
+        t.assert_true(ids(result)==std::vector<uint32_t>({0,1,2,3}));
+        t.assert_equal(size_t(1),quotes);
+        for (size_t id=4;id<slots.size();++id) slots[id].history_tokens=0;
+        if (!t.assert_true(llama_kv_stream_select({8,4},slots,result)==selection_status::success)) return;
+        t.assert_true(ids(result)==std::vector<uint32_t>({4,5,6,7}));
+    });
     t.test("prefill_plan_batches_different_histories_within_one_total_token_budget", [](testing & t) {
         llama_kv_stream_prefill_plan plan;
         if (!t.assert_true(llama_kv_stream_prefill_plan_make({65536, 2},

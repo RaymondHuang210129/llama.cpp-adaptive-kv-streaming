@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline two-slot prefill qualification with progress-gated arrivals."""
+"""Offline selected-group prefill qualification with progress-gated arrivals."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -41,21 +41,42 @@ def instrumented_server_pid(parent, executable):
     return None
 
 
+def request_configuration(args):
+    if not 1 <= args.parallel <= 256:
+        raise ValueError("configured count exceeds the native sequence contract")
+    count = args.requests if args.requests is not None else max(2, args.parallel)
+    if not 1 <= count <= 256 or (args.parallel > 1 and count > args.parallel):
+        raise ValueError("request count exceeds configured slots")
+    ids = [int(value) for value in args.slot_ids.split(',')] if args.slot_ids else (list(range(count)) if args.parallel > 1 else [0] * count)
+    if args.swap_slots:
+        ids.reverse()
+    if len(ids) != count or any(value < 0 or value >= args.parallel for value in ids) or (args.parallel > 1 and len(set(ids)) != count):
+        raise ValueError("request slot IDs must be distinct and within configured capacity")
+    counts = args.prompt_tokens if args.prompt_tokens is not None else [args.prompt_tokens_a] + [args.prompt_tokens_b] * (count - 1)
+    files = args.tokens if args.tokens is not None else [args.tokens_a] + [args.tokens_b] + [None] * max(0, count - 2)
+    files = files[:count]
+    if len(counts) != count or any(value < 1 for value in counts) or len(files) != count:
+        raise ValueError("provide one prompt length and input file per request")
+    return ids, counts, files
+
+
 def qualify(args):
+    slot_ids, prompt_counts, token_files = request_configuration(args)
+    request_count = len(slot_ids)
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "harness-source.py").write_bytes(TEST_SOURCE)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     command = [str(args.server.resolve()), "--model", str(args.model.resolve()), "--parallel", str(args.parallel),
-               "--ctx-size", str(args.context_size), "--batch-size", "256", "--ubatch-size", "256", "--n-gpu-layers", "999",
+               "--ctx-size", str(args.context_size), "--batch-size", str(args.batch_size), "--ubatch-size", str(args.ubatch_size), "--n-gpu-layers", "999",
                "--flash-attn", "on", "--cache-type-k", args.cache_type_k, "--cache-type-v", args.cache_type_v,
                "--shared-device-memory-mib", str(args.arena_mib), "--fit", "off", "--no-mmproj", "--offline",
                "--no-context-shift", "--no-warmup", "--cache-ram", "0", "--no-webui", "--threads", "4",
                "--threads-batch", "4", "--host", "127.0.0.1", "--port", str(port), "-lv", "3"]
     if args.context_checkpoints is not None:
         command += ["--ctx-checkpoints", str(args.context_checkpoints)]
-    if args.parallel == 2:
+    if args.parallel > 1:
         command += ["--kv-unified"]
     if args.mmproj:
         command.remove("--no-mmproj")
@@ -106,29 +127,32 @@ def qualify(args):
                 if args.mode != "target":
                     assert image["timings"]["draft_n"] > 0
                 report["image_prefill_before_text"] = True
-            prompts = [request(port, "/tokenize", {"content": text, "add_special": True})["tokens"]
-                       for text in ("Explain this source code.\n" + "print('hello')\n" * 1800,
-                                    "Explain this different source code.\n" + "console.log('world');\n" * 300)]
-            prompts[0] = prompts[0][:args.prompt_tokens_a]
-            prompts[1] = prompts[1][:args.prompt_tokens_b]
-            for index, source in enumerate((args.tokens_a, args.tokens_b)):
+            source_texts = ("Explain this Python code.\n" + "print('hello')\n" * 1800,
+                            "Explain this JavaScript code.\n" + "console.log('world');\n" * 1800,
+                            "Explain this SQL code.\n" + "SELECT name FROM people WHERE active = 1;\n" * 1800,
+                            "Explain this C code.\n" + "int add(int a, int b) { return a+b; }\n" * 1800)
+            prompts = []
+            for index, (count, source) in enumerate(zip(prompt_counts, token_files)):
                 if source:
                     values = json.loads(source.read_text())
-                    assert isinstance(values, list) and all(isinstance(value, int) and value >= 0 for value in values)
-                    count = args.prompt_tokens_a if index == 0 else args.prompt_tokens_b
-                    prompts[index] = values[-count:]
+                    assert isinstance(values, list) and all(type(value) is int and value >= 0 for value in values)
+                    prompt = values[-count:]
+                else:
+                    text = source_texts[index % len(source_texts)] + f"\nRequest {index}: explain the behavior.\n"
+                    prompt = request(port, "/tokenize", {"content": text, "add_special": True})["tokens"][:count]
+                assert len(prompt) == count, "input is shorter than requested history"
+                prompts.append(prompt)
             late_image = None
             if args.late_vision:
                 assert args.mmproj and not args.cached_prefix and args.arrival_phase == "prefill"
                 from test_adaptive_vision import png
                 late_image = {"prompt_string": "Describe: <__media__> Answer:", "multimodal_data": [png(256, 256)]}
             report["prompt_sha256_each"] = [hashlib.sha256(json.dumps(prompt).encode()).hexdigest()
-                for prompt in (prompts[0], late_image if late_image else prompts[1])]
+                for prompt in ([prompts[0], late_image] if late_image else prompts)]
             ready = threading.Event()
             joined = threading.Event()
-            traces = [{"tokens": [], "progress": []}, {"tokens": [], "progress": []}]
+            traces = [{"tokens": [], "progress": []} for _ in prompts]
             case_started = time.monotonic()
-            slot_ids = ([1, 0] if args.swap_slots else [0, 1]) if args.parallel == 2 else [0, 0]
             if args.cached_prefix:
                 probe = request(port, "/completion", {"prompt": prompts[1][:256], "n_predict": 1, "ignore_eos": True,
                     "id_slot": slot_ids[1], "temperature": 0, "seed": 1234, "cache_prompt": False})
@@ -138,7 +162,7 @@ def qualify(args):
 
             def stream(index):
                 traces[index]["started"] = time.monotonic() - case_started
-                body = {"prompt": late_image if index == 1 and late_image else prompts[index], "n_predict": args.outputs, "temperature": 0, "seed": 1234,
+                body = {"prompt": late_image if index == 1 and late_image else prompts[index], "n_predict": args.outputs, "temperature": args.temperature, "seed": args.seed,
                         "ignore_eos": True, "cache_prompt": args.cached_prefix, "stream": True, "return_tokens": True,
                         "return_progress": True, "id_slot": slot_ids[index]}
                 if args.check_finite_probs:
@@ -163,7 +187,7 @@ def qualify(args):
                             traces[index]["progress"].append([elapsed, progress["processed"]])
                         elif value.get("tokens") and value.get("tokens_predicted", 0) > 0:
                             traces[index]["tokens"].append([elapsed, value["tokens_predicted"], value["tokens"]])
-                        if index == 1 and progress and progress["processed"] > 0:
+                        if index > 0 and progress and progress["processed"] > 0:
                             joined.set()
                         generated = max(generated, value.get("tokens_predicted", 0))
                         if index == 0 and args.arrival_phase == "prefill" and progress and 0 < progress["processed"] < progress["total"]:
@@ -175,14 +199,19 @@ def qualify(args):
                 traces[index]["finished"] = time.monotonic() - case_started
                 return events
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=request_count) as pool:
                 first = pool.submit(stream, 0)
-                assert ready.wait(timeout=120), "no unfinished-prefill progress event"
+                deadline = time.monotonic() + 120
+                while not ready.wait(timeout=0.1):
+                    if first.done():
+                        first.result()
+                        raise AssertionError("first request finished before the requested arrival boundary")
+                    assert time.monotonic() < deadline, "no unfinished-prefill progress event"
                 delay = args.arrival_delay_seconds - (time.monotonic() - case_started)
                 if delay > 0:
                     time.sleep(delay)
-                second = pool.submit(stream, 1)
-                outputs = [first.result(timeout=args.timeout_seconds), second.result(timeout=args.timeout_seconds)]
+                remaining = [pool.submit(stream, index) for index in range(1, request_count)]
+                outputs = [future.result(timeout=args.timeout_seconds) for future in [first] + remaining]
             (args.output / "client-traces.json").write_text(json.dumps(traces, indent=2) + "\n")
             for index, events in enumerate(outputs):
                 (args.output / f"slot{index}.json").write_text(json.dumps(events, indent=2) + "\n")
@@ -205,23 +234,59 @@ def qualify(args):
             text = (args.output / "server.log").read_text()
             prefill = re.findall(r"stream group bind: selected=(\d+) rows=(\d+) phase=prefill", text)
             decode = re.findall(r"stream group bind: selected=(\d+) rows=(\d+) phase=decode", text)
-            report.update(prompt_tokens_each=[len(value) for value in prompts], prefill_bindings=prefill, decode_bindings=decode)
-            expect_pair = args.parallel == 2 and args.arrival_phase != "decode" and not args.closed_group_reference and not args.late_vision
-            assert any(int(selected) == 2 for selected, _ in prefill) == (expect_pair and not args.expect_prefill_fallback), "unexpected shared-prefill scheduling"
+            report.update(request_count=request_count, slot_ids=slot_ids, prompt_tokens_each=[len(value) for value in prompts], prefill_bindings=prefill, decode_bindings=decode)
+            expect_pair = args.parallel > 1 and request_count > 1 and args.arrival_phase != "decode" and not args.closed_group_reference and not args.late_vision
+            actual_max = max([int(selected) for selected, _ in decode], default=1 if args.parallel == 1 else 0)
+            report.update(actual_selected_max=actual_max, genuine_request_count_decode=actual_max == request_count)
+            if args.expect_state_selected_limit is not None:
+                limit = re.search(r"stream state selection bound: configured=(\d+) batch=(\d+) maximum=(\d+)", text)
+                assert limit and int(limit[1]) == args.parallel, "missing mandatory-state selection bound"
+                assert int(limit[3]) == args.expect_state_selected_limit
+                rejections = re.findall(r"stream selection capacity: selected=(\d+)", text)
+                assert all(int(value) <= int(limit[3]) for value in rejections), "quoted a count whose mandatory state cannot fit"
+                report["state_selected_limit"] = int(limit[3])
+            if args.expect_batch_fallback:
+                limit = re.search(r"stream context capacities: configured=(\d+) batch_selected_limit=(\d+) verify_rows=(\d+)", text)
+                assert limit and int(limit[1]) == args.parallel
+                assert actual_max == int(limit[2]) < request_count, "native batch subset was not exercised"
+                report["native_batch_subset_fallback"] = True
+            elif args.expect_logical_fallback:
+                assert sum(len(prompt) for prompt in prompts) >= args.context_size
+                assert 0 < actual_max < request_count, "logical budget did not require a smaller group"
+                report["logical_subset_fallback"] = True
+            elif args.expect_capacity_fallback:
+                assert 0 < actual_max < request_count, "requested subset fallback did not execute"
+                state_limit = re.search(r"stream state selection bound: configured=(\d+) batch=(\d+) maximum=(\d+)", text)
+                state_rejected = state_limit and int(state_limit[1]) == args.parallel and actual_max <= int(state_limit[3]) < request_count
+                assert "stream selection capacity: selected=" in text or state_rejected, "missing native resource rejection"
+                report["resource_subset_fallback"] = True
+            else:
+                assert any(int(selected) == request_count for selected, _ in prefill) == (expect_pair and not args.expect_prefill_fallback), "unexpected shared-prefill scheduling"
             if args.expect_prefill_fallback:
-                assert expect_pair and "stream selection capacity: selected=2" in text
+                assert expect_pair and f"stream selection capacity: selected={request_count}" in text
                 report["prefill_capacity_fallback"] = True
+            if args.arrival_phase == "decode" and request_count > 1:
+                first_decode = text.index("phase=decode") if args.parallel > 1 else 0
+                stops = list(re.finditer(r"id\s+" + str(slot_ids[0]) + r"\s+\|[^\n]*stop processing", text))
+                if args.parallel > 1:
+                    stopped = next(item for item in stops if item.start() > first_decode)
+                    next_prefill = text.index("phase=prefill", first_decode)
+                    assert first_decode < stopped.start() < next_prefill, "arrival joined a committed decode cohort"
+                    report["decode_arrival_queued"] = True
             if args.late_vision:
-                stopped = re.search(r"id\s+" + str(slot_ids[0]) + r"\s+\|[^\n]*stop processing", text)
                 first_decode = text.index("phase=decode")
                 next_prefill = text.index("phase=prefill", first_decode)
-                assert stopped and first_decode < stopped.start() < next_prefill
+                for index, slot_id in enumerate(slot_ids):
+                    if index == 1:
+                        continue
+                    stopped = re.search(r"id\s+" + str(slot_id) + r"\s+\|[^\n]*stop processing", text)
+                    assert stopped and first_decode < stopped.start() < next_prefill, "late image started before the text cohort finished"
                 final = next(value for value in reversed(outputs[1]) if value.get("stop"))
-                report["prompt_tokens_each"] = [len(prompts[0]), final["timings"]["prompt_n"] + final["timings"].get("cache_n", 0)]
+                report["prompt_tokens_each"][1] = final["timings"]["prompt_n"] + final["timings"].get("cache_n", 0)
                 report["late_vision_queued"] = True
-            if args.cancel_request is None:
-                assert any(int(selected) == 2 for selected, _ in decode) == expect_pair, "unexpected joint-decode scheduling"
-            else:
+            if args.cancel_request is None and not args.expect_capacity_fallback and not args.expect_logical_fallback and not args.expect_batch_fallback:
+                assert any(int(selected) == request_count for selected, _ in decode) == expect_pair, "unexpected joint-decode scheduling"
+            elif args.cancel_request is not None:
                 retried = request(port, "/completion", {"prompt": "Write a short greeting.", "id_slot": slot_ids[args.cancel_request],
                                   "n_predict": 16, "ignore_eos": True, "temperature": 0, "return_tokens": True, "cache_prompt": False})
                 assert retried["tokens_predicted"] == 16
@@ -266,12 +331,20 @@ if __name__ == "__main__":
     parser.add_argument("--late-vision", action="store_true")
     parser.add_argument("--mode", choices=["target", "mtp", "dflash7", "dflash7k4v"], default="target")
     parser.add_argument("--arena-mib", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--ubatch-size", type=int, default=256)
     parser.add_argument("--cache-type-k", default="q8_0")
     parser.add_argument("--cache-type-v", default="q4_0")
-    parser.add_argument("--parallel", type=int, choices=[1, 2], default=2)
+    parser.add_argument("--parallel", type=int, choices=range(1, 257), default=2)
+    parser.add_argument("--requests", type=int)
+    parser.add_argument("--slot-ids", help="explicit comma-separated logical request IDs")
+    parser.add_argument("--prompt-tokens", type=int, action="append")
+    parser.add_argument("--tokens", type=Path, action="append")
+    parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--arrival-phase", choices=["prefill", "decode", "simultaneous"], default="prefill")
     parser.add_argument("--swap-slots", action="store_true")
-    parser.add_argument("--cancel-request", type=int, choices=[0, 1])
+    parser.add_argument("--cancel-request", type=int)
     parser.add_argument("--prompt-tokens-a", type=int, default=8192)
     parser.add_argument("--prompt-tokens-b", type=int, default=2048)
     parser.add_argument("--outputs", type=int, default=64)
@@ -280,6 +353,10 @@ if __name__ == "__main__":
     parser.add_argument("--arrival-delay-seconds", type=float, default=0)
     parser.add_argument("--closed-group-reference", action="store_true")
     parser.add_argument("--expect-prefill-fallback", action="store_true")
+    parser.add_argument("--expect-capacity-fallback", action="store_true")
+    parser.add_argument("--expect-logical-fallback", action="store_true")
+    parser.add_argument("--expect-batch-fallback", action="store_true")
+    parser.add_argument("--expect-state-selected-limit", type=int)
     parser.add_argument("--check-finite-probs", action="store_true")
     parser.add_argument("--cached-prefix", action="store_true")
     parser.add_argument("--context-size", type=int, default=32768)

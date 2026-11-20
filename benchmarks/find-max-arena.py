@@ -45,8 +45,10 @@ def arguments(argv=None):
     parser.add_argument("--server", type=Path, default=ROOT /"build-v2/bin" /executable)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--context-size", type=int, default=262144)
-    parser.add_argument("--parallel", type=int, choices=(1, 2), default=1,
+    parser.add_argument("--parallel", type=int, choices=range(1, 257), default=1,
                         help="adaptive slots; each slot and the selected group retain the full context-size limit")
+    parser.add_argument("--probe-selected", type=int,
+                        help="joint probe request count within configured slots; omitted uses the native batch/context limit")
     parser.add_argument("--cache-type-k", choices=SWEEP.KV_TYPES, default="q8_0")
     parser.add_argument("--cache-type-v", choices=SWEEP.KV_TYPES, default="q4_0")
     parser.add_argument("--spec-mode", choices=("none", "mtp", "dflash", "dflash-k4v"), default="none")
@@ -67,6 +69,7 @@ def arguments(argv=None):
     parser.add_argument("--copy-probe", action="store_true",
                         help="also validate a separate 32-output copying path; always enabled for mixed K4V, optional for matched non-mixed sizing")
     parser.add_argument("--no-webui", action="store_true", help="disable the test server's web UI")
+    parser.add_argument("--no-warmup", action="store_true", help="skip startup warmup; retain all real workload probes")
     parser.add_argument("--verbosity", type=int, default=3, help="server log threshold 0-5; route proofs require at least 4")
     parser.add_argument("--decode-tokens", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -112,6 +115,8 @@ def arguments(argv=None):
             or (args.image_min_tokens is not None and args.image_max_tokens is not None and args.image_min_tokens > args.image_max_tokens)
             or (args.image and args.image_max_tokens is not None and args.image_max_tokens > args.context_size) or len(args.image) > 32):
         parser.error("invalid context, output, batch, image, arena, timeout or port bounds")
+    if args.probe_selected is not None and not 1 <= args.probe_selected <= args.parallel:
+        parser.error("--probe-selected must be within configured slot capacity")
     if args.prompt_tokens is not None and not 1 <= args.prompt_tokens <= args.context_size -args.decode_tokens -15:
         parser.error("prefill must leave room for outputs and 15 speculative headroom positions")
     return args
@@ -125,10 +130,12 @@ def server_command(args, arena_mib):
                "--spec-type", {"none":"none", "mtp":"draft-mtp", "dflash":"draft-dflash", "dflash-k4v":"ngram-map-k4v,draft-dflash"}[args.spec_mode],
                "--host", "127.0.0.1", "--port", str(args.port), "--offline", "--no-context-shift", "--cache-ram", "0",
                "-lv", str(max(args.verbosity, 4 if args.spec_mode == "dflash-k4v" or args.copy_probe else 0))]
-    if getattr(args, "parallel", 1) == 2:
+    if getattr(args, "parallel", 1) > 1:
         command.append("--kv-unified")
     if args.no_webui:
         command.append("--no-webui")
+    if getattr(args, "no_warmup", False):
+        command.append("--no-warmup")
     if args.draft_length:
         command += ["--spec-draft-n-max", str(args.draft_length), "--spec-draft-n-min", "0", "--spec-draft-p-min", "0"]
     if args.model_draft:
@@ -143,13 +150,54 @@ def server_command(args, arena_mib):
     return command
 
 
-def environment():
+def environment(server=None):
     env = SWEEP.server_environment(False)
     for name in list(env):
         if name.startswith("LLAMA_ARG_") or name in REMOVED_ENV:
             env.pop(name)
     env["LLAMA_MEDIA_MARKER"] = MARKER
+    if server is not None:
+        runtime = Path(server).resolve().parent
+        variable = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+        paths = []
+        for value in env.get(variable, "").split(os.pathsep):
+            if not value:
+                continue
+            directory = Path(value).resolve()
+            old_build = directory.is_relative_to(ROOT) and any(part.startswith("build") for part in directory.relative_to(ROOT).parts)
+            old_runtime = any(directory.glob("libllama*")) or any(directory.glob("llama.dll")) or any(directory.glob("libggml*"))
+            if directory != runtime and not old_build and not old_runtime:
+                paths.append(value)
+        env[variable] = os.pathsep.join([str(runtime), *paths])
     return env
+
+
+_runtime_library_hashes = {}
+
+
+def loaded_runtime_libraries(pid):
+    if not isinstance(pid, int):
+        return []
+    maps = Path(f"/proc/{pid}/maps")
+    if not maps.is_file():
+        return []
+    paths = {Path(parts[5]) for line in maps.read_text().splitlines()
+             if len(parts := line.split(maxsplit=5)) == 6 and parts[5].startswith("/")
+             and Path(parts[5]).name.startswith(("libllama", "libggml", "libcudart", "libcublas"))}
+    result = []
+    for path in sorted(paths):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        key = (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if key not in _runtime_library_hashes:
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1048576), b""):
+                    digest.update(chunk)
+            _runtime_library_hashes[key] = digest.hexdigest()
+        result.append({"path": str(path), "sha256": _runtime_library_hashes[key]})
+    return result
 
 
 def shell_commands(command):
@@ -185,28 +233,34 @@ def context_semantics(args):
 
 
 def validate_context_semantics(args, props):
-    if getattr(args, "parallel", 1) != 2:
+    if getattr(args, "parallel", 1) <= 1:
         return
     expected = context_semantics(args)
     observed = props.get("stream_context_limits", {})
     if (props.get("total_slots") != expected["slots"]
             or any(observed.get(key) != expected[key] for key in ("per_slot", "selected_group", "all_histories"))
             or type(observed.get("selected_storage")) is not int or observed["selected_storage"] < args.context_size):
-        raise RuntimeError(f"server reported incompatible two-slot context limits: {props}")
+        raise RuntimeError(f"server reported incompatible multi-slot context limits: {props}")
 
 
 def multi_slot_probe_profiles(args):
-    if getattr(args, "parallel", 1) != 2:
+    if getattr(args, "parallel", 1) <= 1:
         return []
+    slots = args.parallel
     count = probe_text_tokens(args)
-    joint = min(count, max(1, (args.context_size -2 *(args.decode_tokens +15)) //2))
-    profiles = [
-        {"label":"single-0", "slots":[0], "prompt_tokens":[count], "selected_max":1},
-        {"label":"single-1", "slots":[1], "prompt_tokens":[count], "selected_max":1},
-        {"label":"joint", "slots":[0,1], "prompt_tokens":[joint,joint], "selected_max":2},
-    ]
-    if args.probe_mode == "full" and count *2 > args.context_size:
-        profiles.append({"label":"serialized", "slots":[0,1], "prompt_tokens":[count,count], "selected_max":1})
+    active = min(slots, getattr(args, "probe_selected", None) or slots, args.context_size // (args.decode_tokens + 16),
+                 args.batch_size // (args.draft_length + 1))
+    if not active:
+        raise ValueError("context cannot fit even one probe request")
+    joint = min(count, (args.context_size - active * (args.decode_tokens + 15)) // active)
+    profiles = [{"label":f"single-{slot}", "slots":[slot], "prompt_tokens":[count], "selected_max":1}
+                for slot in range(slots)]
+    profiles.append({"label":"joint", "slots":list(range(active)), "prompt_tokens":[joint] * active, "selected_max":active})
+    if slots > 2 and active > 1:
+        profiles.append({"label":"asymmetric", "slots":list(range(active)),
+                         "prompt_tokens":[max(1, joint // 2)] + [joint] * (active - 1), "selected_max":active})
+    if args.probe_mode == "full" and count * 2 > args.context_size:
+        profiles.append({"label":"serialized", "slots":list(range(slots)), "prompt_tokens":[count] * slots, "selected_max":1})
     return profiles
 
 
@@ -263,17 +317,17 @@ def observed_completion(args, url, body, label, grouped=False):
 
 def image_slot_requests(args, url, prompt, images):
     body = payload(args, prompt, images)
-    slots = getattr(args, "parallel", 1)
-    if slots == 2:
-        body["prompt"] = [body["prompt"], body["prompt"]]
-    result = observed_completion(args, url, body, "image", grouped=slots == 2)
+    slots = getattr(args, "probe_selected", None) or getattr(args, "parallel", 1)
+    if slots > 1:
+        body["prompt"] = [body["prompt"] for _ in range(slots)]
+    result = observed_completion(args, url, body, "image", grouped=slots > 1)
     rows = [result] if isinstance(result, dict) else result
     if not isinstance(rows, list) or len(rows) != slots:
         raise RuntimeError("incomplete image completion group")
     for row in rows:
         validate_result(args, row, None)
-    if slots == 2 and sorted(row.get("id_slot", -1) for row in rows) != [0, 1]:
-        raise RuntimeError("image group did not use two independent slots")
+    if slots > 1 and sorted(row.get("id_slot", -1) for row in rows) != list(range(slots)):
+        raise RuntimeError("image group did not use independent configured slots")
     return rows
 
 
@@ -282,29 +336,29 @@ def multi_slot_requests(args, url, tokens, candidate, log_path):
     for profile in multi_slot_probe_profiles(args):
         prompts = [tokens[:count] for count in profile["prompt_tokens"]]
         if any(len(prompt) != count for prompt, count in zip(prompts, profile["prompt_tokens"])):
-            raise ValueError("corpus is too short for two-slot probes")
+            raise ValueError("corpus is too short for multi-slot probes")
         body = payload(args, prompts[0] if len(prompts) == 1 else prompts, [])
         if len(prompts) == 1:
             body["id_slot"] = profile["slots"][0]
         offset = log_path.stat().st_size
-        result = observed_completion(args, url, body, profile["label"], grouped=len(prompts) == 2)
+        result = observed_completion(args, url, body, profile["label"], grouped=len(prompts) > 1)
         rows = [result] if isinstance(result, dict) else result
         if not isinstance(rows, list) or len(rows) != len(prompts):
-            raise RuntimeError("incomplete two-slot completion group")
+            raise RuntimeError("incomplete multi-slot completion group")
         for row, count in zip(rows, profile["prompt_tokens"]):
             validate_result(args, row, count)
         ids = [row.get("id_slot") for row in rows]
         if any(type(slot) is not int for slot in ids) or sorted(ids) != profile["slots"]:
-            raise RuntimeError("two-slot response did not identify the requested independent slots")
+            raise RuntimeError("multi-slot response did not identify the requested independent slots")
         with log_path.open("rb") as source:
             source.seek(offset)
             text = source.read().decode("utf-8", errors="replace")
         selected = [int(value) for value in re.findall(r"stream group bind: selected=(\d+) rows=\d+ phase=decode", text)]
         if not selected or max(selected) != profile["selected_max"]:
-            rejected = re.findall(r"stream selection capacity: selected=2 required=(\d+) available=\d+", text)
-            if profile["selected_max"] == 2 and rejected:
+            rejected = re.findall(r"stream selection capacity: selected=" + str(profile["selected_max"]) + r" required=(\d+) available=\d+", text)
+            if profile["selected_max"] > 1 and rejected:
                 raise SWEEP.ArenaTooSmallError((max(map(int, rejected)) +1048575) //1048576)
-            raise RuntimeError(f"two-slot {profile['label']} selection was not exercised: {selected}")
+            raise RuntimeError(f"multi-slot {profile['label']} selection was not exercised: {selected}")
         artifact = args.output /f"arena-{candidate}-{profile['label']}-response.json"
         artifact.write_text(json.dumps({"profile":profile, "request":body, "responses":rows,
                                        "decode_selections":selected}, indent=2) +"\n")
@@ -438,22 +492,24 @@ def _runtime_probe(args, candidate):
     vision_result = None
     multi_profiles = None
     observed_context = None
+    runtime_libraries = []
     image_rows = None
     response_path = None
     prompt_sha256 = None
     completed: list[dict[str, Any]] = []
     mixed_image = bool(args.mmproj and args.spec_mode=="dflash-k4v")
     expected_phases = []
-    if getattr(args, "parallel", 1) == 2 and args.spec_mode == "dflash-k4v":
+    if getattr(args, "parallel", 1) > 1 and args.spec_mode == "dflash-k4v":
         args = argparse.Namespace(**vars(args))
         args._source_log_path, args._source_groups = log_path, []
     with log_path.open("x", encoding="utf-8") as log:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment(), creationflags=flags)
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment(args.server), creationflags=flags)
         try:
             url = f"http://127.0.0.1:{args.port}"
             SWEEP.wait_ready(url, process, log_path)
-            if getattr(args, "parallel", 1) == 2:
+            runtime_libraries = loaded_runtime_libraries(getattr(process, "pid", None))
+            if getattr(args, "parallel", 1) > 1:
                 props = request_json(url +"/props", timeout=args.request_timeout)
                 validate_context_semantics(args, props)
                 observed_context = props["stream_context_limits"]
@@ -480,10 +536,10 @@ def _runtime_probe(args, candidate):
                 if len(tokens) < expected:
                     raise ValueError("corpus is too short; provide more text or set --prompt-tokens")
                 prompt, images = tokens[:expected], []
-            if getattr(args, "parallel", 1) == 2 and not images:
+            if getattr(args, "parallel", 1) > 1 and not images:
                 multi_profiles = multi_slot_requests(args, url, tokens, candidate, log_path)
                 result = multi_profiles[0]["responses"][0]
-            elif getattr(args, "parallel", 1) == 2 and images:
+            elif getattr(args, "parallel", 1) > 1 and images:
                 image_rows = image_slot_requests(args, url, prompt, images)
                 result = image_rows[0]
             else:
@@ -543,7 +599,7 @@ def _runtime_probe(args, candidate):
             SWEEP.validate_execution_log(text)
             if expected_phases:check_vision_phases(text,expected_phases,candidate)
             elif mixed_image:
-                grouped=getattr(args,"parallel",1)==2
+                grouped=getattr(args,"parallel",1)>1
                 phases=[dict(re.findall(r"([a-z][a-z0-9_]*)=([^\s]+)",line)) for line in text.splitlines()
                         if ("vision_group_phase:" if grouped else "vision_phase:") in line]
                 if grouped:
@@ -575,6 +631,7 @@ def _runtime_probe(args, candidate):
         raise RuntimeError(f"probe failed; not a physical OOM: {failure}; see {log_path}") from failure
     return {"arena_mib":candidate, "fits":failure is None, "log":str(log_path), "command":command,
             "log_sha256":hashlib.sha256(log_path.read_bytes()).hexdigest(),
+            "loaded_runtime_libraries":runtime_libraries,
             "response":str(response_path) if response_path else None,
             "response_sha256":hashlib.sha256(response_path.read_bytes()).hexdigest() if response_path else None,
             "prompt_ids_sha256":prompt_sha256, "mixed_proof":mixed_proof, "completed_requests":completed,
@@ -704,7 +761,7 @@ def vision_plan_probe(args, candidate):
     with path.open("xb") as output, log_path.open("x") as log:
         try:
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            process = subprocess.Popen(command,stdout=output,stderr=log,env=environment(),creationflags=flags)
+            process = subprocess.Popen(command,stdout=output,stderr=log,env=environment(args.server),creationflags=flags)
             code = process.wait(timeout=args.request_timeout)
         finally:
             if process is not None:SWEEP.stop_process(process)
@@ -973,7 +1030,11 @@ def fit(args, report_vision=False):
               "command":server_command(command_args,maximum), "uvm":False, "reserve_mib":0,
               "context_size":args.context_size, "context_semantics":context_semantics(args),
               "selection_profiles":(selected or {}).get("selection_profiles"),
-              "observed_context_limits":(selected or {}).get("observed_context_limits"), "cache_type_k":args.cache_type_k, "cache_type_v":args.cache_type_v,
+              "requested_probe_selected_slots":args.probe_selected,
+              "max_observed_text_decode_selection":max((count for row in (selected or {}).get("selection_profiles") or []
+                                                       for count in row.get("decode_selections", [])), default=None),
+              "observed_context_limits":(selected or {}).get("observed_context_limits"),
+              "loaded_runtime_libraries":(selected or {}).get("loaded_runtime_libraries"), "cache_type_k":args.cache_type_k, "cache_type_v":args.cache_type_v,
               "spec_mode":args.spec_mode, "draft_length":args.draft_length, "images":[str(path) for path in args.image],
               "ngram":ngram_settings(args), "mixed_routes_validated":args.spec_mode == "dflash-k4v" and bool(selected and selected.get("mixed_proof")),
               "copy_path_validated":bool(selected and selected.get("mixed_proof")), "headless":args.no_webui,
@@ -982,14 +1043,18 @@ def fit(args, report_vision=False):
               "projector_configured":bool(args.mmproj), "vision_capacity":capacity,
               "vision_execution_validated":runtime_validated and (bool(args.image) or bool((selected or {}).get("vision_bootstrap"))),
               "probe_mode":args.probe_mode, "runtime_probe_validated":runtime_validated,
+              "startup_warmup":not args.no_warmup,
               "full_workload_validated":full_validated, "selected_validation":selected_validation,
               "prompt_tokens":None if args.image else probe_text_tokens(args),
               "requested_prompt_tokens":None if args.image else requested_text_tokens(args),
               "decode_tokens":args.decode_tokens,
-              "scope":"Preflight executes bounded text history plus the requested decode, or the complete supplied image request. Full text history is validated only in full mode or by --validate-selected. Different image shapes, prompts, other processes or driver allocations can change fit."}
+              "scope":"Preflight executes bounded text history plus the requested decode, or the complete supplied image request. Full text history is validated only in full mode or by --validate-selected. Different image shapes, prompts, other processes or driver allocations can change fit. Configured slots are distinct from tested selections; --probe-selected does not certify larger selections."}
     removed = sorted(set(REMOVED_ENV) | {name for name in os.environ if name.startswith("LLAMA_ARG_")})
     report["environment"] = {name:None for name in removed}
     report["environment"]["LLAMA_MEDIA_MARKER"] = MARKER
+    library_variable = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+    report["environment"][library_variable] = environment(args.server)[library_variable]
+    report["runtime_library_environment"] = {library_variable: report["environment"][library_variable]}
     commands = shell_commands(report["command"])
     report["shell"] = "powershell" if os.name == "nt" else "posix"
     report["shell_command"] = commands[report["shell"]]

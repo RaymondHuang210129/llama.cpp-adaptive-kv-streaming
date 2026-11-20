@@ -2387,10 +2387,10 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
     const bool selected_mtp=params.defer_full_cache && params.ctx_type==LLAMA_CONTEXT_TYPE_MTP && arch==LLM_ARCH_QWEN35 &&
-        hparams.n_layer_nextn==1 && cparams.n_seq_max==2 && params.shared_device_memory_bytes &&
+        hparams.n_layer_nextn==1 && cparams.n_seq_max>1 && cparams.n_seq_max<=LLAMA_MAX_SEQ && params.shared_device_memory_bytes &&
         !cparams.shared_device_memory_bytes && !cparams.n_rs_seq;
     const bool selected_dflash=params.defer_full_cache && params.defer_bounded_cache && arch==LLM_ARCH_DFLASH &&
-        params.ctx_type==LLAMA_CONTEXT_TYPE_DEFAULT && cparams.n_seq_max==2 && params.shared_device_memory_bytes &&
+        params.ctx_type==LLAMA_CONTEXT_TYPE_DEFAULT && cparams.n_seq_max>1 && cparams.n_seq_max<=LLAMA_MAX_SEQ && params.shared_device_memory_bytes &&
         !cparams.shared_device_memory_bytes && !cparams.n_rs_seq && hparams.n_swa && hparams.dflash_selector_rank;
     if (!params.kv_stream_selected_sequences.empty() &&
             ((!params.measure_only && !params.defer_full_cache) || !cparams.kv_unified ||

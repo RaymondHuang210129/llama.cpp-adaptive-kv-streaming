@@ -3002,9 +3002,11 @@ bool llama_kv_stream_group_reader::attention_impl(uint32_t layer,const std::vect
         ggml_kv_stream_resume_plan plan;
         size_t needed=0;
         const ggml_kv_stream_attention_request request{shape,heads,queries,tokens};
+        const auto kind=decode ? ggml_kv_stream_workspace_kind::decode : ggml_kv_stream_workspace_kind::prefill;
         if (!ggml_kv_stream_resume_plan_query(partial,s.backend,request,plan) ||
-                !ggml_kv_stream_workspace_query(partial,s.backend,request,decode ?
-                    ggml_kv_stream_workspace_kind::decode : ggml_kv_stream_workspace_kind::prefill,needed) ||
+                (!ggml_kv_stream_workspace_query(partial,s.backend,request,kind,needed) &&
+                    (kind!=ggml_kv_stream_workspace_kind::decode || !ggml_kv_stream_workspace_query(
+                        partial,s.backend,request,ggml_kv_stream_workspace_kind::prefill,needed))) ||
                 needed>ggml_backend_buffer_get_size(scratch) || plan.bytes>ggml_backend_buffer_get_size(scratch)) return false;
         std::vector<ggml_kv_stream_span> spans;
         std::vector<size_t> held;
@@ -3023,7 +3025,7 @@ bool llama_kv_stream_group_reader::attention_impl(uint32_t layer,const std::vect
             ggml_kv_stream_span resident;
             size_t held_count=0;
             implementation::source * streamed=nullptr;
-            const bool direct=decode && queries<=16;
+            const bool direct=decode;
             const bool resident_ready=direct && s.resident_span(first,resident);
             if (resident_ready) {
                 if (!s.prepare_prefix(s.sources[columns[first].source])) {finish();return false;}

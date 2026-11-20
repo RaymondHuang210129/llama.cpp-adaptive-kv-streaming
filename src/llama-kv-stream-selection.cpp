@@ -62,9 +62,15 @@ struct selection_search {
     size_t count = 0;
     std::vector<size_t> chosen;
     llama_kv_stream_selection best;
+    bool interrupted = false;
 
     void visit(size_t first, size_t history) {
-        if (!best.slots.empty() && history > best.history_tokens) return;
+        if (interrupted) return;
+        if (config.continue_search && !config.continue_search(config.control_data)) {
+            interrupted=true;return;
+        }
+        if (!best.slots.empty() && (history > best.history_tokens ||
+                (slots.size()>2 && history==best.history_tokens))) return;
         if (chosen.size() == count) {
             llama_kv_stream_selection candidate;
             candidate.context_tokens = config.context_tokens;
@@ -87,7 +93,23 @@ struct selection_search {
         }
         const size_t needed = count - chosen.size();
         if (slots.size() - first < needed) return;
+        if (slots.size()>2) {
+            std::vector<size_t> histories;
+            for (size_t i=first;i<slots.size();++i)
+                if (chosen.empty() || slots[i].compatibility==slots[chosen.front()].compatibility)
+                    histories.push_back(slots[i].history_tokens);
+            if (histories.size()<needed || count>config.context_tokens-history) return;
+            std::partial_sort(histories.begin(),histories.begin()+needed,histories.end());
+            size_t lower=history;
+            for (size_t i=0;i<needed;++i) {
+                if (histories[i]>config.context_tokens-count-lower) return;
+                lower+=histories[i];
+            }
+            // Later equal-history candidates have larger IDs in this traversal.
+            if (!best.slots.empty() && lower>=best.history_tokens) return;
+        }
         for (size_t i = first; i <= slots.size() - needed; ++i) {
+            if (interrupted) return;
             const auto & slot = slots[i];
             if (!chosen.empty() && slot.compatibility != slots[chosen.front()].compatibility) continue;
             if (slot.history_tokens > config.context_tokens - history) continue;
@@ -125,9 +147,12 @@ llama_kv_stream_selection_status llama_kv_stream_select(
             return !slot.eligible || slot.minimum_growth > config.context_tokens - slot.history_tokens;
         }), sorted.end());
         selection_search search{config, sorted, admit, user_data, 0, {}, {}};
-        for (size_t count = std::min(config.maximum_slots, sorted.size()); count > 0; --count) {
+        const auto maximum=config.maximum_selected_slots ? std::min(config.maximum_slots,config.maximum_selected_slots) : config.maximum_slots;
+        for (size_t count = std::min(maximum, sorted.size()); count > 0; --count) {
             search.count = count;
             search.visit(0, 0);
+            if (search.interrupted) return status::interrupted;
+            if (config.continue_search && !config.continue_search(config.control_data)) return status::interrupted;
             if (!search.best.slots.empty()) {
                 output = std::move(search.best);
                 return status::success;

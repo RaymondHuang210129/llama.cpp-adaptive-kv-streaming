@@ -275,6 +275,17 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     }
 }
 
+bool server_queue::has_pending_mutation() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (!running) return true;
+    const auto mutates=[](const server_task & task) {
+        return task.type!=SERVER_TASK_TYPE_METRICS && task.type!=SERVER_TASK_TYPE_SLOT_GET &&
+            task.type!=SERVER_TASK_TYPE_NEXT_RESPONSE;
+    };
+    return std::any_of(queue_tasks.begin(),queue_tasks.end(),mutates) ||
+        std::any_of(queue_tasks_unhandled.begin(),queue_tasks_unhandled.end(),mutates);
+}
+
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
     time_last_task = ggml_time_ms();
