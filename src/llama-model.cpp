@@ -2394,7 +2394,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         !cparams.shared_device_memory_bytes && !cparams.n_rs_seq && hparams.n_swa && hparams.dflash_selector_rank;
     if (!params.kv_stream_selected_sequences.empty() &&
             ((!params.measure_only && !params.defer_full_cache) || !cparams.kv_unified ||
-             (cparams.n_rs_seq && !(params.defer_full_cache && arch==LLM_ARCH_QWEN35 && cparams.n_rs_seq<=7 && params.kv_stream_rs_rollback)) || params.mem_other ||
+             (cparams.n_rs_seq && !(params.defer_full_cache && arch==LLM_ARCH_QWEN35 && cparams.n_rs_seq<=7)) || params.mem_other ||
              (params.ctx_type!=LLAMA_CONTEXT_TYPE_DEFAULT && !selected_mtp) ||
              (arch!=LLM_ARCH_QWEN35 && arch!=LLM_ARCH_GEMMA4 && !selected_dflash) ||
              !llama_memory_selected_sequences_valid(params,cparams.n_seq_max)))

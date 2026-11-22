@@ -21,6 +21,34 @@ class ArenaFinderTests(unittest.TestCase):
     def args(self, *extra):
         return FINDER.arguments(["--model", "model.gguf", "--context-size", "8192", *extra])
 
+    def test_rollback_location_is_preserved_by_search_validation_and_launch_report(self):
+        for ram in (False, True):
+            with self.subTest(ram=ram), tempfile.TemporaryDirectory() as temporary:
+                args = self.args("--probe-mode", "preflight", "--validate-selected",
+                                 *(["--recurrent-rollback-ram"] if ram else []))
+                args.output = Path(temporary)
+                observed = []
+
+                def probe(config, candidate):
+                    command = FINDER.server_command(config, candidate)
+                    observed.append((config.probe_mode, "--recurrent-rollback-ram" in command))
+                    return {"arena_mib": candidate, "fits": True,
+                            "timings": {"prompt_n": FINDER.probe_text_tokens(config), "predicted_n": 256}}
+
+                def search(initial, checked):
+                    self.assertTrue(checked(2096))
+                    return 2096
+
+                with patch.object(FINDER, "probe", side_effect=probe), \
+                        patch.object(FINDER.SWEEP, "find_max_arena_mib", side_effect=search):
+                    report = FINDER.fit(args)
+                self.assertEqual(observed, [("preflight", ram), ("full", ram)])
+                self.assertEqual(report["recurrent_rollback_ram"], ram)
+                self.assertEqual("--recurrent-rollback-ram" in report["command"], ram)
+                persisted = json.loads((args.output / "result.json").read_text())
+                self.assertEqual(persisted["recurrent_rollback_ram"], ram)
+                self.assertEqual("--recurrent-rollback-ram" in (args.output / "command.ps1").read_text(encoding="utf-8-sig"), ram)
+
     def test_preflight_caps_history_but_keeps_native_capacity_and_requested_decode(self):
         args = self.args("--context-size", "262144", "--probe-mode", "preflight",
                          "--spec-mode", "mtp", "--model-draft", "assistant.gguf", "--mmproj", "vision.gguf")

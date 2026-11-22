@@ -435,6 +435,8 @@ extern "C" {
         // Explicit target verification query bound, independent of recurrent snapshots; zero keeps the inferred profile.
         // Initially supported for serial streamed Gemma4 targets with 1-4 queries that fit n_ubatch.
         uint32_t kv_stream_verify_max;
+        // Store recurrent rollback snapshots in host RAM; current state stays on its native device.
+        bool recurrent_rollback_ram;
     };
 
     struct llama_model_tensor_override {

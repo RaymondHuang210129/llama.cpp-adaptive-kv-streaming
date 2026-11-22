@@ -69,6 +69,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--uvm", action="store_true")
     parser.add_argument("--no-kv-stream-rs-rollback", action="store_true",
                         help="use the old full-checkpoint path instead of default MTP recurrent rollback")
+    parser.add_argument("--recurrent-rollback-ram", action="store_true",
+                        help="store recurrent rollback snapshots in RAM; default keeps them in VRAM")
     parser.add_argument(
         "--mtp-lengths", type=parse_mtp_lengths, default=(0,), metavar="N[,N...]",
         help="maximum MTP draft lengths to sweep (0=target-only baseline; supported: 1-4; default: 0)",
@@ -107,6 +109,8 @@ def server_command(args: argparse.Namespace, context: int, mtp_length: int, aren
         "--threads-batch", "8",
         "-lv", "3",
     ]
+    if getattr(args, "recurrent_rollback_ram", False):
+        command.append("--recurrent-rollback-ram")
     if mtp_length:
         command += [
             "--spec-type", "draft-mtp",
@@ -122,6 +126,8 @@ def server_command(args: argparse.Namespace, context: int, mtp_length: int, aren
 
 def server_environment(uvm: bool) -> dict[str, str]:
     env = {key:value for key,value in os.environ.items() if not key.startswith("LLAMA_ARG_")}
+    for key in ("LLAMA_RS_HOST_SPILL", "LLAMA_RS_STAGED_PUBLICATION"):
+        env.pop(key, None)
     if uvm:
         env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
     else:
@@ -686,6 +692,7 @@ def main() -> int:
                 "status": "ok",
                 "uvm": args.uvm,
                 "budget_policy": "maximum-fit" if args.auto_max_arena else "fixed",
+                "recurrent_rollback_ram": args.recurrent_rollback_ram,
                 "windows_sysmem_fallback_verified": False if os.name == "nt" else None,
                 "command": server_command(args,context,mtp_length,arena_mib),
                 "model": str(args.model),

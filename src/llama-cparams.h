@@ -19,6 +19,7 @@ struct llama_cparams {
     size_t shared_device_memory_bytes = 0;
     uint32_t kv_stream_auxiliary_layers = 0;
     uint32_t kv_stream_verify_max = 0;
+    bool recurrent_rollback_ram = false;
     llama_kv_stream_context_limits stream_limits;
     bool set_stream_limits(uint32_t logical_tokens) noexcept;
     bool kv_streaming() const noexcept {

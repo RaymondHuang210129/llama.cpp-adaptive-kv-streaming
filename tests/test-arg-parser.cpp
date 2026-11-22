@@ -484,6 +484,17 @@ static void test(void) {
             "--spec-draft-n-max","3"};
         assert(common_params_parse(argv.size(),list_str_to_char(argv).data(),rollback,LLAMA_EXAMPLE_SERVER));
         assert(common_context_params_to_llama(rollback).n_rs_seq == 3);
+        assert(!llama_context_default_params().recurrent_rollback_ram);
+        assert(!common_context_params_to_llama(rollback).recurrent_rollback_ram);
+        {
+            auto ram_argv=argv;
+            ram_argv.push_back("--recurrent-rollback-ram");
+            common_params ram;
+            assert(common_params_parse(ram_argv.size(),list_str_to_char(ram_argv).data(),ram,LLAMA_EXAMPLE_SERVER));
+            assert(common_context_params_to_llama(ram).n_rs_seq == 3);
+            assert(common_context_params_to_llama(ram).recurrent_rollback_ram);
+            assert(!common_base_params_to_speculative(ram).recurrent_rollback_ram);
+        }
         argv.push_back("--no-kv-stream-rs-rollback");
         common_params full_checkpoint;
         assert(common_params_parse(argv.size(),list_str_to_char(argv).data(),full_checkpoint,LLAMA_EXAMPLE_SERVER));

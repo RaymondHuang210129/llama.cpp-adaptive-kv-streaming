@@ -72,6 +72,14 @@ Adaptive MTP and DFlash, including DFlash+K4V, inherit the target's K/V formats.
 
 F32 describes storage, not fully FP32 attention: the CUDA reader follows stock attention's FP16 input rounding. Cache-format speed measurements are not model-quality measurements.
 
+### Recurrent rollback placement
+
+Recurrent rollback snapshots use their native backend by default: VRAM when recurrent state is offloaded to CUDA. Add `--recurrent-rollback-ram` to keep those snapshots in system RAM for smaller GPUs. Current recurrent state and attention KV placement are unchanged. Models without recurrent rollback state do not acquire a recurrent-state allocation from this flag.
+
+Pass the same flag to `benchmarks/find-max-arena.py` and `benchmarks/run-fixed-span-sweep.py` when fitting or measuring RAM rollback. Both scripts forward the choice to their servers and record it in results; the finder also preserves it in full validation and generated launch commands. Refit the arena whenever rollback placement changes: native snapshots use more device memory and RAM snapshots require publication staging. Weights and other allocations outside the arena still contribute to the complete GPU footprint.
+
+Earlier published recurrent-rollback measurements used the previous RAM default. Add `--recurrent-rollback-ram` when reproducing those configurations with this version. The legacy `--no-kv-stream-rs-rollback` option selects full checkpoints for attached MTP; it does not select snapshot placement.
+
 ### Platforms and operational limits
 
 | Platform / backend | Implemented or tested here | What this does not establish |
