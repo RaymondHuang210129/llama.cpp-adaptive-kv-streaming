@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import importlib.util
 import json
@@ -55,6 +56,13 @@ class Policy(unittest.TestCase):
         ci.validate_results({"cpu": {"result": "success"}, "ui": {"result": "skipped"}}, {"cpu"})
         with self.assertRaises(ValueError):
             ci.validate_results({"cpu": {"result": "success"}, "ui": {"result": "failure"}}, {"cpu"})
+
+    def test_vendor_sync_uses_fixed_upstream_revisions(self):
+        source = SCRIPT.parents[2] / "scripts/sync_vendor.py"
+        literals = [node.value for node in ast.walk(ast.parse(source.read_text()))
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        self.assertFalse(any("/releases/latest/" in value or "/refs/heads/" in value for value in literals),
+                         "vendor consistency checks must not follow moving upstream branches or releases")
 
     def test_publication_requires_a_successful_v3_push(self):
         self.assertTrue(ci.can_publish("push", "refs/heads/feature/adaptive-kv-stream-v3", "success"))

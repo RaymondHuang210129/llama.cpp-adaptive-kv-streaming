@@ -445,11 +445,15 @@ def validate_completed_image_sources(text, completed, groups=None):
             for source_key, timing_key in (("generated_tokens", "draft_n"), ("accepted_tokens", "draft_n_accepted")):
                 if sum(row[source_key] for row in delta.values()) != group["timings"].get(timing_key, 0):
                     raise RuntimeError("mixed source group totals differ from completed responses")
-            if group["label"] == "image-copy" and not (delta["ngram-map-k4v"]["generated_tokens"] > 0
-                    and delta["ngram-map-k4v"]["accept_calls"] > 0 and delta["draft-dflash"]["prediction_forwards"] == 0):
+            if group["label"] == "image-copy" and not (
+                    delta["ngram-map-k4v"]["generated_tokens"] > 0
+                    and delta["ngram-map-k4v"]["accept_calls"] > 0
+                    and delta["draft-dflash"]["prediction_forwards"] == 0):
                 raise RuntimeError("image copy group did not use K4V without a neural forward")
-            if group["label"] == "image-miss" and not (delta["draft-dflash"]["generated_tokens"] > 0
-                    and delta["draft-dflash"]["prediction_forwards"] > 0 and delta["ngram-map-k4v"]["generated_tokens"] == 0):
+            if group["label"] == "image-miss" and not (
+                    delta["draft-dflash"]["generated_tokens"] > 0
+                    and delta["draft-dflash"]["prediction_forwards"] > 0
+                    and delta["ngram-map-k4v"]["generated_tokens"] == 0):
                 raise RuntimeError("image miss group did not exercise genuine neural fallback")
         return result
     snapshots = {}
@@ -611,9 +615,11 @@ def _runtime_probe(args, candidate):
             if args.spec_mode == "dflash-k4v":
                 if mixed_proof is None:
                     raise RuntimeError("missing completed mixed route probe")
-                mixed_proof["source_stats"] = validate_completed_image_sources(text,completed,groups=getattr(args,"_source_groups",None)) if mixed_image else validate_mixed_sources(text,
-                                                                                                                                          generated_tokens=sum(row["timings"].get("draft_n",0) for row in completed),
-                                                                                                                                          accepted_tokens=sum(row["timings"].get("draft_n_accepted",0) for row in completed))
+                mixed_proof["source_stats"] = (
+                    validate_completed_image_sources(text, completed, groups=getattr(args, "_source_groups", None))
+                    if mixed_image else validate_mixed_sources(
+                        text, generated_tokens=sum(row["timings"].get("draft_n", 0) for row in completed),
+                        accepted_tokens=sum(row["timings"].get("draft_n_accepted", 0) for row in completed)))
             elif mixed_proof is not None:
                 mixed_proof["source_stats"] = speculative_source_stats(text)
                 for source_key, timing_key in (("generated_tokens", "draft_n"), ("accepted_tokens", "draft_n_accepted")):
