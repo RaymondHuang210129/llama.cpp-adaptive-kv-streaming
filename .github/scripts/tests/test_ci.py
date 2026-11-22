@@ -571,6 +571,11 @@ class Workflows(unittest.TestCase):
                     target = self.workflows[Path(uses).name]
                     self.assertIn("workflow_call", target["on"])
 
+    def test_cuda_builds_wait_for_cpu_and_source_gates(self):
+        data = self.workflows["ci.yml"]
+        for name in ("cuda-linux", "cuda-windows"):
+            self.assertTrue({"changes", "ui-build", "cpu", "python", "source"} <= set(data["jobs"][name]["needs"]))
+
     def test_required_result_is_unconditional_and_covers_four_builds(self):
         data = self.workflows["ci.yml"]
         self.assertEqual(data["on"]["push"]["branches"], ["feature/adaptive-kv-stream-v3"])

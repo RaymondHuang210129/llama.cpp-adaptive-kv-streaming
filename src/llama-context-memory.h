@@ -134,7 +134,7 @@ struct llama_context_memory_create_result {
     llama_memory_resource_id resource = 0;
 };
 
-const char * llama_context_memory_create_status_name(llama_context_memory_create_status status) noexcept;
+LLAMA_API const char * llama_context_memory_create_status_name(llama_context_memory_create_status status) noexcept;
 
 // One serial scheduler lifetime; native caches and arena leases retire before scheduler destruction.
 // The caller owns the scheduler/backends and must not submit or mutate their graph caches concurrently.

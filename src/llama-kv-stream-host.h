@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama.h"
+
 #include "../ggml/src/ggml-kv-stream.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -48,14 +50,14 @@ public:
     static std::shared_ptr<llama_kv_stream_host> from_reservation(
             std::shared_ptr<llama_kv_stream_host_reservation> reservation);
 
-    uint64_t cache_id() const noexcept;
+    LLAMA_API uint64_t cache_id() const noexcept;
     const llama_kv_stream_host_config & config() const noexcept;
     const ggml_kv_stream_layout & layout() const noexcept;
     size_t stride() const noexcept;
-    size_t bytes() const noexcept;
-    size_t committed_bytes() const noexcept;
+    LLAMA_API size_t bytes() const noexcept;
+    LLAMA_API size_t committed_bytes() const noexcept;
     // Explicit demand-backed registrations; eager buffers are owned by their backend allocator.
-    size_t registered_bytes() const noexcept;
+    LLAMA_API size_t registered_bytes() const noexcept;
     ggml_backend_buffer_type_t buffer_type() const noexcept;
     ggml_backend_buffer_t buffer() const noexcept;
     bool clear(uint8_t value = 0);

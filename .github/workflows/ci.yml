@@ -39,11 +39,11 @@ jobs:
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cpu.yml
   cuda-linux:
-    needs: [changes, ui-build]
+    needs: [changes, ui-build, cpu, python, source]
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cuda-ubuntu.yml
   cuda-windows:
-    needs: [changes, ui-build]
+    needs: [changes, ui-build, cpu, python, source]
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cuda-windows.yml
   cmake-package:

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -63,7 +65,7 @@ using llama_kv_stream_selection_admit = bool (*)(const llama_kv_stream_selection
 // Plan only the admitted group, not the pending request queue. Prefer cardinality, then
 // smallest history, then slot order. Offsets and growth are logical, not device placement.
 // All non-success results leave output unchanged. No request/output counters are modified.
-llama_kv_stream_selection_status llama_kv_stream_select(
+LLAMA_API llama_kv_stream_selection_status llama_kv_stream_select(
         const llama_kv_stream_selection_config & config,
         const std::vector<llama_kv_stream_selection_slot> & admitted,
         llama_kv_stream_selection & output,
@@ -80,7 +82,7 @@ struct llama_kv_stream_prefill_plan {
     size_t tokens_per_slot = 0;
 };
 
-llama_kv_stream_selection_status llama_kv_stream_prefill_plan_make(
+LLAMA_API llama_kv_stream_selection_status llama_kv_stream_prefill_plan_make(
         const llama_kv_stream_selection_config & config,
         const std::vector<llama_kv_stream_prefill_slot> & slots, size_t maximum_tokens,
         llama_kv_stream_prefill_plan & output,
@@ -144,24 +146,24 @@ struct llama_kv_stream_group_progress {
 class llama_kv_stream_request_group {
 public:
     explicit llama_kv_stream_request_group(llama_kv_stream_selection_config config) : config(config) {}
-    bool admit(const std::vector<llama_kv_stream_group_request> & requests);
-    llama_kv_stream_group_phase phase() const noexcept;
-    bool next_preparation(llama_kv_stream_group_request & request) const noexcept;
-    bool preparing(uint32_t slot, uint64_t request) const noexcept;
-    bool prepared(uint32_t slot, uint64_t request, llama_kv_stream_group_phase phase, size_t history_tokens) noexcept;
-    bool busy(uint32_t slot, uint64_t request) const noexcept;
-    bool selected(uint32_t slot, uint64_t request) const noexcept;
-    llama_kv_stream_selection_status plan(llama_kv_stream_group_plan & output,
+    LLAMA_API bool admit(const std::vector<llama_kv_stream_group_request> & requests);
+    LLAMA_API llama_kv_stream_group_phase phase() const noexcept;
+    LLAMA_API bool next_preparation(llama_kv_stream_group_request & request) const noexcept;
+    LLAMA_API bool preparing(uint32_t slot, uint64_t request) const noexcept;
+    LLAMA_API bool prepared(uint32_t slot, uint64_t request, llama_kv_stream_group_phase phase, size_t history_tokens) noexcept;
+    LLAMA_API bool busy(uint32_t slot, uint64_t request) const noexcept;
+    LLAMA_API bool selected(uint32_t slot, uint64_t request) const noexcept;
+    LLAMA_API llama_kv_stream_selection_status plan(llama_kv_stream_group_plan & output,
         llama_kv_stream_selection_admit admit = nullptr, void * user_data = nullptr) const;
     // Move a validated proposal after the common resource transition succeeds; no allocation here.
-    bool activate(llama_kv_stream_group_plan && plan) noexcept;
-    bool needs_reselection() const noexcept;
-    bool submission(uint32_t slot, uint64_t request, uint32_t maximum_proposals, size_t remaining_outputs,
+    LLAMA_API bool activate(llama_kv_stream_group_plan && plan) noexcept;
+    LLAMA_API bool needs_reselection() const noexcept;
+    LLAMA_API bool submission(uint32_t slot, uint64_t request, uint32_t maximum_proposals, size_t remaining_outputs,
         llama_kv_stream_generation_budget & output) const noexcept;
-    bool advance(const std::vector<llama_kv_stream_group_progress> & progress) noexcept;
-    bool finish(uint32_t slot, uint64_t request) noexcept;
+    LLAMA_API bool advance(const std::vector<llama_kv_stream_group_progress> & progress) noexcept;
+    LLAMA_API bool finish(uint32_t slot, uint64_t request) noexcept;
     // Release the group only after its last GPU users are retired.
-    bool release() noexcept;
+    LLAMA_API bool release() noexcept;
 private:
     struct member {
         llama_kv_stream_group_request request;

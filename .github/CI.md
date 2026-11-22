@@ -11,7 +11,7 @@
 | Linux CUDA, RTX 50 only | Compile and link CUDA/server/tools; check packaged startup and dependencies | `.tar.gz` |
 | Windows CUDA, RTX 50 only | Compile and link CUDA/server/tools; check packaged startup and dependencies | `.zip` |
 
-The required CUDA builds select `120a` on both operating systems, using CUDA 13.0.1 and CCCL v3.4.3. They do not compile older architectures. Python typing, lint, host tests and source consistency checks remain enabled. Server API, ASan/UBSan and UI tests run for relevant paths; CI or CMake changes request all suites. A manual main-CI run requests the full set. Draft PRs run lightweight checks; marking a PR ready triggers compilation and the applicable suites.
+The required CUDA builds select `120a` on both operating systems, using CUDA 13.0.1 and CCCL v3.4.3. CUDA builds start after the CPU build/test/package and Python/source gates succeed, so already-failing commits do not consume the expensive compiler slots. They do not compile older architectures. Python typing, lint, host tests and source consistency checks remain enabled. Server API, ASan/UBSan and UI tests run for relevant paths; CI or CMake changes request all suites. A manual main-CI run requests the full set. Draft PRs run lightweight checks; marking a PR ready triggers compilation and the applicable suites.
 
 The aggregate rejects failed, cancelled, missing or unexpectedly skipped required jobs. Superseded PR runs are cancelled; different branch commits retain separate runs. Internal `cpu-test-*` archives transfer binaries to server tests and expire after one day. They are excluded from releases.
 

@@ -91,8 +91,8 @@ struct llama_context {
     llama_context(const llama_model & model, llama_context_params params, llama_context_mode mode);
     bool is_measurement_only() const { return measurement_only; }
     // Selected-state metadata stays non-executable until all group grants are bound.
-    llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected);
-    llama_context(const llama_model & model,llama_context_params params,
+    LLAMA_API llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected);
+    LLAMA_API llama_context(const llama_model & model,llama_context_params params,
         const std::vector<llama_seq_id> & selected,uint32_t prediction_rows);
     bool group_storage_pending() const noexcept { return group_initializing; }
     const llama_context * group_target_context() const noexcept { return group_target; }
@@ -107,7 +107,7 @@ struct llama_context {
     bool group_restore_recurrent_after_attention();
     // Borrow already initialized chains from the same model's non-executing metadata context.
     // The frontend retains their RNG/grammar ownership through group retirement.
-    bool bind_group_samplers_from(const llama_context & prepared);
+    LLAMA_API bool bind_group_samplers_from(const llama_context & prepared);
     // Compose the measured group on one caller-retained parent, or allocate its first parent.
     bool initialize_group_execution(std::shared_ptr<llama_kv_stream_slot_table> table,
         std::shared_ptr<llama_kv_stream_slot_projection> projection,const llama_batch & representative,
@@ -134,14 +134,14 @@ struct llama_context {
     bool measure_target_workload(const llama_batch & batch,
         const std::vector<llama_memory_phase_cache_identity> & selected_sources,
         llama_memory_work_phase phase, uint64_t id, llama_context_group_workload_quote & output);
-    llama_context_memory_create_result quote_target_group(const llama_batch & batch,
+    LLAMA_API llama_context_memory_create_result quote_target_group(const llama_batch & batch,
         const std::vector<llama_memory_phase_cache_identity> & selected_sources,
         llama_memory_phase_cache_identity bounded_identity, llama_memory_work_phase phase,
         uint64_t id, size_t capacity, llama_context_group_plan & output,
         llama_context * auxiliary = nullptr,
         const std::vector<llama_memory_phase_cache_identity> & auxiliary_sources = {});
 
-    ~llama_context();
+    LLAMA_API ~llama_context();
 
     // reserve a new backend scheduler (if needed)
     // for example, when:
@@ -153,7 +153,7 @@ struct llama_context {
 
     void synchronize();
 
-    const llama_model   & get_model()   const;
+    LLAMA_API const llama_model   & get_model()   const;
     LLAMA_API const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
@@ -224,8 +224,8 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
-    void set_embeddings_nextn(bool value, bool masked);
-    void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    LLAMA_API void set_embeddings_nextn(bool value, bool masked);
+    LLAMA_API void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_kv_stream_decode(bool value) { cparams.kv_stream_decode = value; }
