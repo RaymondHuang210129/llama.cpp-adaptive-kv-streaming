@@ -113,6 +113,28 @@ class NativeHandoff(unittest.TestCase):
             for name, data in payload.items():
                 archive.writestr(name, data)
 
+    def test_runner_image_labels_can_differ_when_actual_build_inputs_match(self):
+        with patch.dict(os.environ, {"ImageVersion": "another-hosted-image"}):
+            (self.archives / "0/objects.zip").unlink()
+            shards.build_shard(self.plan, 0, self.root, self.build, self.archives / "0/objects.zip")
+            with zipfile.ZipFile(self.archives / "0/objects.zip") as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(manifest["profile"]["image"], "another-hosted-image")
+            shards.assemble(self.plan, self.root, self.build, self.archives, self.destination)
+            shards.finish(self.plan, self.root, self.build)
+            metadata = json.loads((self.build / "cuda-shards.json").read_text())
+            self.assertEqual(metadata["profile"]["image"], "another-hosted-image")
+            self.assertEqual(metadata["shards"][0]["image"], "another-hosted-image")
+
+    def test_compiler_bytes_remain_part_of_the_build_identity(self):
+        configuration = self.plan["profile"]["configuration"]
+        compiler = Path(configuration["CMAKE_CXX_COMPILER"])
+        self.assertEqual(self.plan["profile"]["compiler_files"]["CMAKE_CXX_COMPILER"], shards.digest(compiler))
+        plan = copy.deepcopy(self.plan)
+        plan["profile"]["compiler_files"]["CMAKE_CXX_COMPILER"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "compiler_files"):
+            shards.validate_plan(plan, self.root, self.build)
+
     def test_imported_objects_link_without_recompiling_shader_sources(self):
         shards.assemble(self.plan, self.root, self.build, self.archives, self.destination)
         commands = json.loads(subprocess.check_output(["ninja", "-t", "compdb", "-x"], cwd=self.build, text=True))

@@ -108,7 +108,7 @@ def digest(path):
 
 def read_configuration(build):
     keys = {"BUILD_SHARED_LIBS", "CMAKE_BUILD_TYPE", "CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER",
-            "CMAKE_CUDA_COMPILER", "CMAKE_CUDA_ARCHITECTURES", "GGML_CUDA", "GGML_BACKEND_DL",
+            "CMAKE_CUDA_COMPILER", "CMAKE_LINKER", "CMAKE_CUDA_ARCHITECTURES", "GGML_CUDA", "GGML_BACKEND_DL",
             "GGML_NATIVE", "GGML_CUDA_FA_QUANTS", "GGML_CUDA_CCCL_VERSION", "LLAMA_FATAL_WARNINGS", "GGML_FATAL_WARNINGS"}
     result = {}
     for line in (build / "CMakeCache.txt").read_text().splitlines():
