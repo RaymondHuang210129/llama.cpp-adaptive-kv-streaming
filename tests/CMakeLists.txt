@@ -155,6 +155,9 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+llama_build_and_test(test-context-group-exports.cpp)
+target_include_directories(test-context-group-exports PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
