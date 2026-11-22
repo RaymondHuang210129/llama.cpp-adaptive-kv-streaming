@@ -85,13 +85,21 @@ class NativeHandoff(unittest.TestCase):
         self.run_command(["git", "add", "CMakeLists.txt", "main.cpp", "normal.cu", "kv-stream-instance-test.cu", "value.h"])
         self.run_command(["git", "-c", "user.name=CI fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"])
         sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
-        environment = patch.dict(os.environ, {"GITHUB_SHA": sha, "GITHUB_OUTPUT": str(self.root / "test-outputs")})
+        environment = patch.dict(os.environ, {"GITHUB_SHA": sha, "OCEANUS_SOURCE_SHA": sha, "GITHUB_OUTPUT": str(self.root / "test-outputs")})
         environment.start()
         self.addCleanup(environment.stop)
         self.run_command(["cmake", "-S", str(self.root), "-B", str(self.build), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"])
         self.plan = shards.make_plan(self.root, self.build, "fixture", 8, self.root / "plan.json")
         for index in range(len(self.plan["shards"])):
             shards.build_shard(self.plan, index, self.root, self.build, self.archives / str(index) / "objects.zip")
+
+    def test_selected_source_is_independent_of_scheduler_sha_and_mismatches_fail(self):
+        sha = self.plan["profile"]["source"]["sha"]
+        with patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "OCEANUS_SOURCE_SHA": sha}):
+            self.assertEqual(shards.source_identity(self.root)["sha"], sha)
+        with patch.dict(os.environ, {"GITHUB_SHA": sha, "OCEANUS_SOURCE_SHA": "b" * 40}):
+            with self.assertRaises(ValueError):
+                shards.source_identity(self.root)
 
     def run_command(self, args):
         subprocess.run(args, cwd=self.root, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)

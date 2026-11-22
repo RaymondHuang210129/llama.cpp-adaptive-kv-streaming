@@ -23,7 +23,7 @@ def json_write(path, value):
 
 def source_identity(root):
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-    if os.environ.get("GITHUB_SHA", sha) != sha:
+    if (os.environ.get("OCEANUS_SOURCE_SHA") or os.environ.get("GITHUB_SHA", sha)) != sha:
         raise ValueError("checkout does not match the workflow SHA")
     checksum = hashlib.sha256()
     names = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).decode().split("\0")

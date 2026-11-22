@@ -74,6 +74,8 @@ Oceanus runs on one CUDA GPU. Model weights and KV-cache quantization are separa
 
 Q8V8 and Q8V4 have full-model reference profiles. Q4V4 is available through the common KV reader, with narrower full-model qualification; availability is not evidence that every model/drafter/image combination has been qualified. GPU execution evidence covers selected one- to four-slot profiles. Larger configured counts and other GPUs need their own qualification; see the [qualification ledger](MULTI_SLOT_PHASE_ARENA_ROADMAP.md).
 
+[CI build profiles and architecture-specific binary releases](.github/CI.md).
+
 ## Quick Starts
 
 Build the command as you make each choice. Keep `CMD`, the server command, and `FIT`, the arena-finder command, side by side so the fitting workload matches the intended launch. Each step appends arguments to both where needed; the last step adds the measured memory limits and runs `CMD`.
