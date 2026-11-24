@@ -44,7 +44,7 @@ struct llama_context_group_checkpoint {
     std::vector<std::shared_ptr<llama_kv_cells>> cells;
     llama_context_group_sequence_state target, auxiliary;
     // Payload accounting, separate from process RSS and container/node overhead.
-    size_t payload_size() const noexcept;
+    LLAMA_API size_t payload_size() const noexcept;
 };
 class llama_batch_allocr;
 class llama_moe_cache;
@@ -91,8 +91,8 @@ struct llama_context {
     llama_context(const llama_model & model, llama_context_params params, llama_context_mode mode);
     bool is_measurement_only() const { return measurement_only; }
     // Selected-state metadata stays non-executable until all group grants are bound.
-    llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected);
-    llama_context(const llama_model & model,llama_context_params params,
+    LLAMA_API llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected);
+    LLAMA_API llama_context(const llama_model & model,llama_context_params params,
         const std::vector<llama_seq_id> & selected,uint32_t prediction_rows);
     bool group_storage_pending() const noexcept { return group_initializing; }
     const llama_context * group_target_context() const noexcept { return group_target; }
@@ -107,7 +107,7 @@ struct llama_context {
     bool group_restore_recurrent_after_attention();
     // Borrow already initialized chains from the same model's non-executing metadata context.
     // The frontend retains their RNG/grammar ownership through group retirement.
-    bool bind_group_samplers_from(const llama_context & prepared);
+    LLAMA_API bool bind_group_samplers_from(const llama_context & prepared);
     // Compose the measured group on one caller-retained parent, or allocate its first parent.
     bool initialize_group_execution(std::shared_ptr<llama_kv_stream_slot_table> table,
         std::shared_ptr<llama_kv_stream_slot_projection> projection,const llama_batch & representative,
@@ -116,7 +116,7 @@ struct llama_context {
         llama_context_memory_create_result * result = nullptr,llama_context * auxiliary = nullptr,
         std::shared_ptr<llama_kv_stream_slot_projection> auxiliary_projection = {},
         const std::vector<llama_context_group_sequence_state> & auxiliary_states = {});
-    ggml_backend_buffer_t group_parent() const noexcept;
+    LLAMA_API ggml_backend_buffer_t group_parent() const noexcept;
     // Export only selected current/SWA roles after all group work has completed.
     bool save_group_sequences(std::vector<llama_context_group_sequence_state> & output);
     // Save any desired current/SWA snapshots first. Failed retirement stays non-executable.
@@ -134,14 +134,14 @@ struct llama_context {
     bool measure_target_workload(const llama_batch & batch,
         const std::vector<llama_memory_phase_cache_identity> & selected_sources,
         llama_memory_work_phase phase, uint64_t id, llama_context_group_workload_quote & output);
-    llama_context_memory_create_result quote_target_group(const llama_batch & batch,
+    LLAMA_API llama_context_memory_create_result quote_target_group(const llama_batch & batch,
         const std::vector<llama_memory_phase_cache_identity> & selected_sources,
         llama_memory_phase_cache_identity bounded_identity, llama_memory_work_phase phase,
         uint64_t id, size_t capacity, llama_context_group_plan & output,
         llama_context * auxiliary = nullptr,
         const std::vector<llama_memory_phase_cache_identity> & auxiliary_sources = {});
 
-    ~llama_context();
+    LLAMA_API ~llama_context();
 
     // reserve a new backend scheduler (if needed)
     // for example, when:
@@ -153,8 +153,8 @@ struct llama_context {
 
     void synchronize();
 
-    const llama_model   & get_model()   const;
-    const llama_cparams & get_cparams() const;
+    LLAMA_API const llama_model   & get_model()   const;
+    LLAMA_API const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
 
@@ -224,8 +224,8 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
-    void set_embeddings_nextn(bool value, bool masked);
-    void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    LLAMA_API void set_embeddings_nextn(bool value, bool masked);
+    LLAMA_API void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_kv_stream_decode(bool value) { cparams.kv_stream_decode = value; }
@@ -635,13 +635,13 @@ private:
 class llama_context_group {
 public:
     // Reserve canonical host addresses before accepting requests; commit/register rows on demand.
-    static std::unique_ptr<llama_context_group> create(const llama_model & model,llama_context_params params);
-    static std::unique_ptr<llama_context_group> create(const llama_model & model,llama_context_params params,
+    LLAMA_API static std::unique_ptr<llama_context_group> create(const llama_model & model,llama_context_params params);
+    LLAMA_API static std::unique_ptr<llama_context_group> create(const llama_model & model,llama_context_params params,
         std::shared_ptr<llama_kv_stream_slot_table> table);
-    ~llama_context_group();
+    LLAMA_API ~llama_context_group();
     // The caller retains model weights. Declare the shared child before allocating the parent.
-    bool prepare_shared_mtp(const llama_model & model,llama_context_params params);
-    bool prepare_dflash(const llama_model & model,llama_context_params params,uint32_t prediction_rows);
+    LLAMA_API bool prepare_shared_mtp(const llama_model & model,llama_context_params params);
+    LLAMA_API bool prepare_dflash(const llama_model & model,llama_context_params params,uint32_t prediction_rows);
     // Necessary native state-bank bound only; complete workload admission remains required.
     LLAMA_API bool selected_state_limit(uint32_t maximum,uint32_t & output) const;
     // Borrow the retained parent only while all selected states are parked.
@@ -650,31 +650,31 @@ public:
     LLAMA_API bool lend_vision(const std::vector<size_t> & bytes,std::vector<ggml_backend_memory_lease_t> & output);
     // Retained encoder leases reject retirement and keep text admission closed.
     LLAMA_API bool release_vision();
-    bool activate(const llama_kv_stream_selection & selection,const std::vector<llama_kv_stream_slot_handle> & handles,
+    LLAMA_API bool activate(const llama_kv_stream_selection & selection,const std::vector<llama_kv_stream_slot_handle> & handles,
         const llama_batch & representative,llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,
         llama_context_memory_create_result * result = nullptr);
     // Save selected roles before retiring their GPU grants; failed retirement keeps the owner closed.
-    bool park();
+    LLAMA_API bool park();
     // Discard selected native state after failure; reset those request namespaces before reuse.
-    bool discard() noexcept;
+    LLAMA_API bool discard() noexcept;
     LLAMA_API llama_context * context() const noexcept;
     LLAMA_API llama_context * auxiliary_context() const noexcept;
-    llama_context * metadata_context() const noexcept;
-    llama_context * auxiliary_metadata_context() const noexcept;
-    std::shared_ptr<llama_kv_stream_slot_table> source_table() const noexcept;
-    const std::vector<llama_kv_stream_slot_handle> & source_handles() const noexcept;
+    LLAMA_API llama_context * metadata_context() const noexcept;
+    LLAMA_API llama_context * auxiliary_metadata_context() const noexcept;
+    LLAMA_API std::shared_ptr<llama_kv_stream_slot_table> source_table() const noexcept;
+    LLAMA_API const std::vector<llama_kv_stream_slot_handle> & source_handles() const noexcept;
     // Export only parked sources. Loading starts a new namespace at the destination's reserved addresses.
-    bool save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes=true) const;
+    LLAMA_API bool save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes=true) const;
     // Versioned native-endian checkpoint. Caller supplies the actual remaining input bytes.
-    bool write_request(uint32_t slot,llama_io_write_i & output) const;
-    bool read_request(uint32_t slot,llama_io_read_i & input,size_t available);
-    bool write_checkpoint(const llama_context_group_checkpoint & saved,llama_io_write_i & output,bool copy_bytes) const;
-    bool read_checkpoint(uint32_t slot,llama_io_read_i & input,size_t available,llama_context_group_checkpoint & output,bool allow_prefix=false);
-    bool load_request(uint32_t slot,const llama_context_group_checkpoint & saved);
+    LLAMA_API bool write_request(uint32_t slot,llama_io_write_i & output) const;
+    LLAMA_API bool read_request(uint32_t slot,llama_io_read_i & input,size_t available);
+    LLAMA_API bool write_checkpoint(const llama_context_group_checkpoint & saved,llama_io_write_i & output,bool copy_bytes) const;
+    LLAMA_API bool read_checkpoint(uint32_t slot,llama_io_read_i & input,size_t available,llama_context_group_checkpoint & output,bool allow_prefix=false);
+    LLAMA_API bool load_request(uint32_t slot,const llama_context_group_checkpoint & saved);
     // A new request retires the old namespace, not its stable canonical address range.
-    bool reset_request(uint32_t slot);
-    bool advance_request(uint32_t slot);
-    size_t parked_payload_bytes() const noexcept;
+    LLAMA_API bool reset_request(uint32_t slot);
+    LLAMA_API bool advance_request(uint32_t slot);
+    LLAMA_API size_t parked_payload_bytes() const noexcept;
 private:
     llama_context_group();
     struct implementation;

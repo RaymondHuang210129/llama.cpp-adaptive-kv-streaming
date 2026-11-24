@@ -1,11 +1,17 @@
 from pathlib import Path
-import importlib.util, unittest, tempfile, json, urllib.request, os
+import importlib.util
+import os
+import unittest
+import tempfile
+import json
+import urllib.request
 from unittest.mock import patch
 root = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('ms12_finder', root / 'benchmarks/find-max-arena.py')
 assert spec and spec.loader
 finder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(finder)
+
 
 class MultiSlotFinder(unittest.TestCase):
 
@@ -77,11 +83,11 @@ class MultiSlotFinder(unittest.TestCase):
 
     def test_explicit_server_loads_its_own_runtime_instead_of_an_older_build(self):
         server=Path('/tmp/ms16-runtime/bin/llama-server').resolve()
-        old=str(root/'build-upstream-attention-port/bin')
+        old=str(root / 'build-upstream-attention-port/bin')
         variable='PATH' if os.name=='nt' else 'LD_LIBRARY_PATH'
         cuda=str(Path('/usr/local/cuda/lib64').resolve())
         with patch.object(finder.SWEEP,'server_environment',return_value={variable:os.pathsep.join([old,cuda]),
-                         'GGML_CUDA_ENABLE_UNIFIED_MEMORY':'1'}):
+                                                                          'GGML_CUDA_ENABLE_UNIFIED_MEMORY':'1'}):
             env=finder.environment(server)
         paths=env[variable].split(os.pathsep)
         self.assertEqual(paths[0],str(server.parent))
@@ -93,10 +99,11 @@ class MultiSlotFinder(unittest.TestCase):
     def test_runtime_library_hashing_handles_spaces_without_python_311(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory=Path(temporary)
-            library=directory/'libllama runtime.so'
+            library=directory / 'libllama runtime.so'
             library.write_bytes(b'pinned native runtime')
-            maps=directory/'maps'
-            maps.write_text('0-1 r-xp 0 00:00 0 '+str(library)+'\n')
+            maps=directory / 'maps'
+            maps.write_text('0-1 r-xp 0 00:00 0 ' + str(library) + '\n')
+
             def path(value):
                 return maps if value=='/proc/12345/maps' else Path(value)
             with patch.object(finder,'Path',side_effect=path), patch.object(finder.hashlib,'file_digest',None,create=True):
@@ -191,5 +198,7 @@ class MultiSlotFinder(unittest.TestCase):
             groups[1]['source_stats']['draft-dflash']['prediction_forwards'] = 1
             with self.assertRaises(RuntimeError):
                 finder.validate_completed_image_sources('', completed, groups=groups)
+
+
 if __name__ == '__main__':
     unittest.main()

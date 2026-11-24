@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import importlib.util
 import json
@@ -56,13 +57,20 @@ class Policy(unittest.TestCase):
         with self.assertRaises(ValueError):
             ci.validate_results({"cpu": {"result": "success"}, "ui": {"result": "failure"}}, {"cpu"})
 
-    def test_publication_requires_a_successful_v2_push(self):
-        self.assertTrue(ci.can_publish("push", "refs/heads/feature/adaptive-kv-stream-v2", "success"))
+    def test_vendor_sync_uses_fixed_upstream_revisions(self):
+        source = SCRIPT.parents[2] / "scripts/sync_vendor.py"
+        literals = [node.value for node in ast.walk(ast.parse(source.read_text()))
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        self.assertFalse(any("/releases/latest/" in value or "/refs/heads/" in value for value in literals),
+                         "vendor consistency checks must not follow moving upstream branches or releases")
+
+    def test_publication_requires_a_successful_v3_push(self):
+        self.assertTrue(ci.can_publish("push", "refs/heads/feature/adaptive-kv-stream-v3", "success"))
         for event, ref, result in [
             ("pull_request", "refs/pull/1/merge", "success"),
-            ("workflow_dispatch", "refs/heads/feature/adaptive-kv-stream-v2", "success"),
+            ("workflow_dispatch", "refs/heads/feature/adaptive-kv-stream-v3", "success"),
             ("push", "refs/heads/feature/other", "success"),
-            ("push", "refs/heads/feature/adaptive-kv-stream-v2", "failure"),
+            ("push", "refs/heads/feature/adaptive-kv-stream-v3", "failure"),
         ]:
             self.assertFalse(ci.can_publish(event, ref, result))
 
@@ -96,6 +104,18 @@ class Packages(unittest.TestCase):
     def all_packages(self):
         for variant in ci.VARIANTS:
             ci.package(self.fixture(variant), self.output, SHA, variant)
+
+    def test_cpu_package_cli_keeps_internal_packages_outside_cuda_profile_validation(self):
+        build = self.fixture("linux-x64-cpu")
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SCRIPT.parents[2], text=True).strip()
+        with patch.dict(ci.os.environ, {"GITHUB_SHA": sha, "OCEANUS_SOURCE_SHA": sha}):
+            result = subprocess.run([sys.executable, str(SCRIPT), "package", "--build", str(build),
+                                     "--output", str(self.output), "--variant", "linux-x64-cpu"],
+                                    cwd=SCRIPT.parents[2], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads((self.output / "linux-x64-cpu.json").read_text())
+        self.assertEqual(row["file"], ci.archive_name(sha, "linux-x64-cpu"))
+        self.assertNotIn("profile", row)
 
     def test_missing_executables_never_produce_a_package(self):
         build = self.fixture("linux-x64-cpu")
@@ -247,6 +267,145 @@ class Packages(unittest.TestCase):
         self.assertFalse(any("-cpu" in path.name for path in ci.release_assets(self.output, SHA)))
 
 
+class V3Policy(unittest.TestCase):
+    def test_architecture_profiles_have_one_target_and_a_compatible_toolkit(self):
+        expected = {"rtx50": ("120a", "13.0.1", None), "rtx40": ("89-real", "13.0.1", 1),
+                    "rtx30": ("86-real", "13.0.1", 2), "rtx20": ("75-real", "13.0.1", 3),
+                    "v100": ("70-real", "12.9.1", 4), "p100": ("60-real", "12.9.1", 5),
+                    "pascal": ("61-real", "12.9.1", 6)}
+        self.assertEqual(set(ci.CUDA_PROFILES), set(expected))
+        for name, (architecture, toolkit, day) in expected.items():
+            with self.subTest(profile=name):
+                profile = ci.cuda_profile(name)
+                self.assertEqual((profile["architectures"], profile["toolkit"], profile["day"]),
+                                 (architecture, toolkit, day))
+                if day is not None:
+                    self.assertEqual(ci.scheduled_profile(f"17 3 * * {day}"), name)
+        for value in ("unknown", "../p100", "120a;70-real"):
+            with self.assertRaises(ValueError):
+                ci.cuda_profile(value)
+        with self.assertRaises(ValueError):
+            ci.scheduled_profile("17 3 * * 0")
+
+    def test_publication_profiles_cannot_cross_event_or_branch_boundaries(self):
+        ref = "refs/heads/feature/adaptive-kv-stream-v3"
+        self.assertTrue(ci.can_publish("push", ref, "success", "rtx50"))
+        self.assertTrue(ci.can_publish("schedule", ref, "success", "p100"))
+        self.assertTrue(ci.can_publish("workflow_dispatch", ref, "success", "v100"))
+        for event, branch, result, profile in [
+                ("push", ref, "success", "p100"), ("schedule", ref, "success", "rtx50"),
+                ("pull_request", ref, "success", "rtx50"), ("schedule", ref, "failure", "p100"),
+                ("schedule", "refs/heads/feature/adaptive-kv-stream-v2", "success", "p100")]:
+            with self.subTest(event=event, profile=profile):
+                self.assertFalse(ci.can_publish(event, branch, result, profile))
+
+    def test_profile_releases_do_not_reuse_v2_tags_or_other_architecture_names(self):
+        self.assertEqual(ci.release_tag(SHA, "p100"), "v3-p100-" + SHA)
+        self.assertEqual(ci.release_tag(SHA), "sha-" + SHA)
+        names = {ci.archive_name(SHA, "linux-x64-cuda", name) for name in ci.CUDA_PROFILES}
+        self.assertEqual(len(names), len(ci.CUDA_PROFILES))
+        self.assertNotIn(ci.archive_name(SHA, "linux-x64-cuda"), names)
+
+
+class V3Packages(unittest.TestCase):
+    root: Path
+    output: Path
+    setUp = Packages.setUp
+    fixture = Packages.fixture
+
+    def profile_packages(self, profile):
+        configuration = ci.cuda_profile(profile)
+        for variant in ci.VARIANTS:
+            build = self.fixture(variant)
+            with (build / "CMakeCache.txt").open("a") as output:
+                output.write("CMAKE_CUDA_ARCHITECTURES:STRING=" + configuration["architectures"] + "\n")
+                output.write("GGML_CUDA_CCCL_VERSION:STRING=" + configuration["cccl"] + "\n")
+            sdk = self.root / (variant + "-sdk")
+            sdk.mkdir()
+            receipt = {"toolkit": configuration["toolkit"], "platform": "windows-x86_64" if variant.startswith("windows") else "linux-x86_64"}
+            (sdk / "redistributables.json").write_text(json.dumps(receipt))
+            (build / "cuda-shards.json").write_text(json.dumps({"profile": {
+                "source": {"sha": SHA}, "variant": variant, "sdk": receipt,
+                "configuration": ci.read_configuration(build)}}))
+            with patch.dict(ci.os.environ, {"GITHUB_RUN_ID": "42"}):
+                ci.package(build, self.output, SHA, variant, sdk, profile=profile)
+
+    def test_profile_metadata_requires_both_matching_operating_systems(self):
+        self.profile_packages("p100")
+        manifest = ci.verify_packages(self.output, SHA, profile="p100")
+        self.assertEqual(manifest["profile"], "p100")
+        row_path = self.output / "windows-x64-cuda.json"
+        original = row_path.read_text()
+        row_path.unlink()
+        with self.assertRaises(ValueError):
+            ci.verify_packages(self.output, SHA, profile="p100")
+        row_path.write_text(original)
+        for field, value in [("profile", "v100"), ("sha", "a" * 40)]:
+            changed = json.loads(original)
+            changed[field] = value
+            row_path.write_text(json.dumps(changed))
+            with self.assertRaises(ValueError):
+                ci.verify_packages(self.output, SHA, profile="p100")
+        row_path.write_text(original)
+        for field, value in [("CMAKE_CUDA_ARCHITECTURES", "70-real"), ("GGML_CUDA_CCCL_VERSION", "v3.4.3")]:
+            changed = json.loads(original)
+            changed["build"]["configuration"][field] = value
+            row_path.write_text(json.dumps(changed))
+            with self.assertRaises(ValueError):
+                ci.verify_packages(self.output, SHA, profile="p100")
+
+    def test_compatibility_source_requires_a_published_profile_and_successful_v3_push(self):
+        self.profile_packages("rtx50")
+        github = FakeGitHub()
+        ci.publish(self.output, SHA, github, "42", profile="rtx50")
+        real_request = github.request
+        run = {"id": 42, "head_sha": SHA, "head_branch": ci.RELEASE_BRANCH, "event": "push",
+               "status": "completed", "conclusion": "success", "path": ".github/workflows/ci.yml"}
+
+        def request(method, path, **kwargs):
+            if path.startswith("/actions/workflows/ci.yml/runs?"):
+                return {"workflow_runs": [run]}
+            if path == "/actions/runs/42":
+                return run
+            return real_request(method, path, **kwargs)
+
+        with patch.object(github, "request", side_effect=request):
+            self.assertEqual(ci.resolve_compat_source(github), SHA)
+            self.assertEqual(ci.resolve_compat_source(github, SHA), SHA)
+            for key, invalid in [("head_branch", "feature/adaptive-kv-stream-v2"),
+                                 ("event", "pull_request"), ("conclusion", "failure"),
+                                 ("path", ".github/workflows/unrelated.yml"), ("head_sha", "b" * 40)]:
+                original = run[key]
+                run[key] = invalid
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    ci.resolve_compat_source(github, SHA)
+                run[key] = original
+            assert github.release is not None
+            github.release["draft"] = True
+            with self.assertRaises(ValueError):
+                ci.resolve_compat_source(github, SHA)
+            with self.assertRaises(ValueError):
+                ci.resolve_compat_source(github, "main; untrusted")
+
+    def test_profile_releases_are_immutable_and_retries_do_not_upload_again(self):
+        self.profile_packages("v100")
+        github = FakeGitHub(fail_upload=3)
+        with self.assertRaises(RuntimeError):
+            ci.publish(self.output, SHA, github, "42", profile="v100")
+        assert github.release is not None
+        self.assertTrue(github.release["draft"])
+        ci.publish(self.output, SHA, github, "42", profile="v100")
+        self.assertEqual(github.release["tag_name"], ci.release_tag(SHA, "v100"))
+        uploads = github.uploads
+        ci.publish(self.output, SHA, github, "43", profile="v100")
+        self.assertEqual(github.uploads, uploads)
+        self.assertEqual(github.published, 1)
+        changed = json.loads(github.data[next(a["id"] for a in github.release["assets"] if a["name"] == "build-info.json")])
+        changed["profile"] = "rtx50"
+        with self.assertRaises(ValueError):
+            ci.validate_published_release(github.release, json.dumps(changed).encode(), SHA, profile="v100")
+
+
 class FakeGitHub:
     def __init__(self, fail_upload=0):
         self.release: dict[str, Any] | None = None
@@ -283,7 +442,7 @@ class FakeGitHub:
             return self.release
         raise AssertionError((method, path))
 
-    def tag_commit(self, sha):
+    def tag_commit(self, sha, profile=None):
         return self.tag
 
     def download_manifest(self, asset_id):
@@ -327,11 +486,12 @@ class Workflows(unittest.TestCase):
         self.workflows = {path.name: yaml.load(path.read_text(), Loader=yaml.BaseLoader)
                           for path in self.root.glob("*.yml")}
 
-    def build_commands(self, platform, backend, fatal=None, configure_only=False, architectures=None):
+    def build_commands(self, platform, backend, fatal=None, configure_only=False, architectures=None, profile=None):
         spec = importlib.util.spec_from_file_location("ci_build", SCRIPT.parent / "build.py")
         assert spec is not None and spec.loader is not None
         build = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(build)
+        with patch.dict(sys.modules, {"fork_ci": ci}):
+            spec.loader.exec_module(build)
         args = ["build.py", "--backend", backend]
         if fatal is not None:
             args += ["--fatal-warnings", fatal]
@@ -339,6 +499,8 @@ class Workflows(unittest.TestCase):
             args += ["--configure-only"]
         if architectures is not None:
             args += ["--cuda-architectures", architectures]
+        if profile is not None:
+            args += ["--cuda-profile", profile]
         with patch.object(sys, "argv", args), patch.object(sys, "platform", platform), \
                 patch.dict(build.os.environ, {"CUDA_PATH": "/sdk"}), patch.object(build.subprocess, "run") as run:
             build.main()
@@ -351,12 +513,21 @@ class Workflows(unittest.TestCase):
             self.build_commands(platform, "cuda", configure_only=True)
 
     def test_cuda_platform_defaults_and_explicit_legacy_overrides(self):
-        for platform, expected in (("linux", "75-virtual;86-real;89-real;120"), ("win32", "120a")):
+        for platform, expected in (("linux", "120a"), ("win32", "120a")):
             with self.subTest(platform=platform):
                 command = self.build_commands(platform, "cuda", configure_only=True)
                 self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=" + expected, command)
                 override = self.build_commands(platform, "cuda", configure_only=True, architectures="61-real;70-real")
                 self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=61-real;70-real", override)
+
+    def test_each_profile_reaches_both_native_build_configurations(self):
+        for platform in ("linux", "win32"):
+            for name in ci.CUDA_PROFILES:
+                with self.subTest(platform=platform, profile=name):
+                    expected = ci.cuda_profile(name)
+                    command = self.build_commands(platform, "cuda", configure_only=True, profile=name)
+                    self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=" + expected["architectures"], command)
+                    self.assertIn("-DGGML_CUDA_CCCL_VERSION=" + expected["cccl"], command)
 
     def test_build_helper_defaults_to_fatal_warnings_on_both_platforms(self):
         for platform in ("linux", "win32"):
@@ -400,9 +571,14 @@ class Workflows(unittest.TestCase):
                     target = self.workflows[Path(uses).name]
                     self.assertIn("workflow_call", target["on"])
 
+    def test_cuda_builds_wait_for_cpu_and_source_gates(self):
+        data = self.workflows["ci.yml"]
+        for name in ("cuda-linux", "cuda-windows"):
+            self.assertTrue({"changes", "ui-build", "cpu", "python", "source"} <= set(data["jobs"][name]["needs"]))
+
     def test_required_result_is_unconditional_and_covers_four_builds(self):
         data = self.workflows["ci.yml"]
-        self.assertEqual(data["on"]["push"]["branches"], ["feature/adaptive-kv-stream-v2"])
+        self.assertEqual(data["on"]["push"]["branches"], ["feature/adaptive-kv-stream-v3"])
         self.assertNotIn("paths", data["on"]["pull_request"])
         self.assertIn("ready_for_review", data["on"]["pull_request"]["types"])
         required = data["jobs"]["required"]
@@ -422,11 +598,44 @@ class Workflows(unittest.TestCase):
         release = self.workflows["release.yml"]["jobs"]["publish"]
         downloads = [step["with"] for step in release["steps"]
                      if step.get("uses", "").startswith("actions/download-artifact@")]
-        self.assertEqual([step["pattern"] for step in downloads], ["package-*-cuda"])
+        self.assertEqual([step["pattern"] for step in downloads], ["package-${{ inputs.profile }}-${{ inputs.source_sha || github.sha }}-*-cuda"])
         cpu = self.workflows["build-cpu.yml"]["jobs"]["build"]
         uploads = [step["with"] for step in cpu["steps"]
                    if step.get("uses", "").startswith("actions/upload-artifact@")]
         self.assertEqual([step["name"] for step in uploads], ["cpu-test-${{ matrix.variant }}"])
+
+    def test_weekly_profiles_have_timezone_aware_schedules_and_shared_builds(self):
+        data = self.workflows["build-cuda-compat.yml"]
+        self.assertEqual(len(data["on"]["schedule"]), 6)
+        for schedule in data["on"]["schedule"]:
+            self.assertEqual(schedule["timezone"], "America/Chicago")
+            self.assertNotEqual(ci.scheduled_profile(schedule["cron"]), "rtx50")
+        self.assertIn("profile", data["on"]["workflow_dispatch"]["inputs"])
+        self.assertIn("source_sha", data["on"]["workflow_dispatch"]["inputs"])
+        for name in ("cuda-linux", "cuda-windows"):
+            job = data["jobs"][name]
+            self.assertEqual(job["uses"], "./.github/workflows/build-cuda-sharded.yml")
+            self.assertEqual(job["with"]["source_sha"], "${{ needs.resolve.outputs.sha }}")
+            self.assertEqual(job["with"]["profile"], "${{ needs.resolve.outputs.profile }}")
+            self.assertEqual(job["with"]["workers"], "2")
+        self.assertIn("needs.cuda-linux.result == 'success'", data["jobs"]["publish"]["if"])
+        self.assertIn("needs.cuda-windows.result == 'success'", data["jobs"]["publish"]["if"])
+
+    def test_selected_source_and_profile_are_carried_through_all_cuda_stages(self):
+        data = self.workflows["build-cuda-sharded.yml"]
+        self.assertIn("source_sha", data["on"]["workflow_call"]["inputs"])
+        self.assertIn("profile", data["on"]["workflow_call"]["inputs"])
+        for name in ("plan", "compile", "build"):
+            job = data["jobs"][name]
+            self.assertEqual(job["env"]["OCEANUS_SOURCE_SHA"], "${{ inputs.source_sha || github.sha }}")
+            checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+            self.assertEqual(checkout["with"]["ref"], "${{ inputs.source_sha || github.sha }}")
+            setup = next(s for s in job["steps"] if s.get("uses") == "./.github/actions/setup-cuda-build")
+            self.assertEqual(setup["with"]["profile"], "${{ inputs.profile }}")
+        ui = self.workflows["ui-build.yml"]
+        self.assertIn("source_sha", ui["on"]["workflow_call"]["inputs"])
+        build = next(s for s in ui["jobs"]["build"]["steps"] if s.get("name") == "Build UI from this commit")
+        self.assertEqual(build["env"]["LLAMA_BUILD_NUMBER"], "${{ inputs.source_sha || github.sha }}")
 
     def run_typing_install(self, failures):
         steps = self.workflows["python-type-check.yml"]["jobs"]["typing"]["steps"]

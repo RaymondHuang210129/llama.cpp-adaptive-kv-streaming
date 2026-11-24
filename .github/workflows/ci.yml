@@ -1,10 +1,10 @@
 name: CI
 on:
   pull_request:
-    branches: [feature/adaptive-kv-stream-v2]
+    branches: [feature/adaptive-kv-stream-v3]
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
-    branches: [feature/adaptive-kv-stream-v2]
+    branches: [feature/adaptive-kv-stream-v3]
   workflow_dispatch:
 permissions:
   contents: read
@@ -39,11 +39,11 @@ jobs:
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cpu.yml
   cuda-linux:
-    needs: [changes, ui-build]
+    needs: [changes, ui-build, cpu, python, source]
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cuda-ubuntu.yml
   cuda-windows:
-    needs: [changes, ui-build]
+    needs: [changes, ui-build, cpu, python, source]
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cuda-windows.yml
   cmake-package:
@@ -87,7 +87,7 @@ jobs:
           CI_RESULTS: ${{ toJSON(needs) }}
   publish:
     needs: required
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feature/adaptive-kv-stream-v2' && needs.required.result == 'success'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feature/adaptive-kv-stream-v3' && needs.required.result == 'success'
     permissions:
       contents: write
       actions: read

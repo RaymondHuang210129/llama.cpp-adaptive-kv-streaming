@@ -46,14 +46,14 @@ public:
     static std::unique_ptr<llama_kv_stream_logical_cache> create(std::shared_ptr<llama_kv_stream_host> host);
     ~llama_kv_stream_logical_cache();
 
-    std::shared_ptr<llama_kv_stream_host> host() const noexcept;
-    std::shared_ptr<llama_kv_stream_content> content() const noexcept;
-    llama_kv_stream_logical_identity identity() const noexcept;
+    LLAMA_API std::shared_ptr<llama_kv_stream_host> host() const noexcept;
+    LLAMA_API std::shared_ptr<llama_kv_stream_content> content() const noexcept;
+    LLAMA_API llama_kv_stream_logical_identity identity() const noexcept;
     llama_kv_stream_logical_checkpoint checkpoint() const noexcept;
     llama_kv_stream_publication_frontiers frontiers() const noexcept;
-    size_t tokens() const noexcept;
+    LLAMA_API size_t tokens() const noexcept;
     // No pending publication or unacknowledged host replacement.
-    bool ready() const noexcept;
+    LLAMA_API bool ready() const noexcept;
 
     // Caller retires all device users first. Failure preserves the output snapshot.
     bool save(llama_kv_stream_logical_snapshot & output,bool copy_bytes=true) const;
@@ -125,7 +125,7 @@ public:
     // Bind once at startup. A request change never replaces these stable host addresses.
     bool bind(uint32_t slot, std::vector<std::shared_ptr<llama_kv_stream_logical_cache>> caches,
             llama_kv_stream_slot_handle & output);
-    bool get(const llama_kv_stream_slot_handle & handle, uint32_t role,
+    LLAMA_API bool get(const llama_kv_stream_slot_handle & handle, uint32_t role,
             std::shared_ptr<llama_kv_stream_logical_cache> & output) const noexcept;
     // Owner-thread native cells keep their original positions/sequence IDs; revalidate handles before execution.
     bool get_cells(const llama_kv_stream_slot_handle & handle, uint32_t role,
@@ -138,7 +138,7 @@ public:
         uint32_t role, llama_kv_stream_slot_projection & output) const;
     // Semantic snapshot only; the common owner must still retain source/storage completion pins.
     bool projection_current(const llama_kv_stream_slot_projection & projection) const noexcept;
-    const llama_kv_stream_context_limits & limits() const noexcept;
+    LLAMA_API const llama_kv_stream_context_limits & limits() const noexcept;
 
 private:
     struct slot {

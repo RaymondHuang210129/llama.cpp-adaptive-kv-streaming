@@ -23,7 +23,7 @@ def json_write(path, value):
 
 def source_identity(root):
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-    if os.environ.get("GITHUB_SHA", sha) != sha:
+    if (os.environ.get("OCEANUS_SOURCE_SHA") or os.environ.get("GITHUB_SHA", sha)) != sha:
         raise ValueError("checkout does not match the workflow SHA")
     checksum = hashlib.sha256()
     names = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).decode().split("\0")
@@ -34,12 +34,46 @@ def source_identity(root):
     return {"sha": sha, "tree_sha256": checksum.hexdigest()}
 
 
+def compiler_files(configuration):
+    paths = {}
+    for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_CUDA_COMPILER", "CMAKE_LINKER"):
+        if not configuration.get(key):
+            continue
+        path = Path(configuration[key])
+        if not path.is_file():
+            raise ValueError("configured compiler tool is missing: " + key)
+        paths[key] = path.resolve()
+        if configuration.get(key + "_ID") == "GNU":
+            frontend = "cc1plus" if key == "CMAKE_CXX_COMPILER" else "cc1"
+            for name in (frontend, "as", "ld"):
+                value = subprocess.check_output([str(path), "-print-prog-name=" + name], text=True, timeout=15).strip()
+                tool = Path(shutil.which(value) or value)
+                if not tool.is_file():
+                    raise ValueError("compiler subtool is missing: " + name)
+                paths[key + ":" + name] = tool.resolve()
+        elif configuration.get(key + "_ID") == "MSVC":
+            for name in ("c1.dll", "c1xx.dll", "c2.dll"):
+                tool = path.parent / name
+                if tool.is_file():
+                    paths[key + ":" + name] = tool.resolve()
+    checksums = {path: digest(path) for path in set(paths.values())}
+    return {key: checksums[path] for key, path in paths.items()}
+
+
+def profile_changes(expected, actual):
+    # The image label is provenance; compiler bytes and consumed headers define compatibility.
+    return sorted(key for key in set(expected) | set(actual)
+                  if key != "image" and expected.get(key) != actual.get(key))
+
+
 def profile(root, build, variant):
     receipt = Path(os.environ["CUDA_PATH"]) / "redistributables.json" if "CUDA_PATH" in os.environ else None
+    configuration = read_configuration(build)
     return {"source": source_identity(root), "variant": variant,
             "workspace": str(root.resolve()), "build": str(build.resolve()),
             "system": platform.system(), "machine": platform.machine(),
-            "image": os.environ.get("ImageVersion"), "configuration": read_configuration(build),
+            "image": os.environ.get("ImageVersion"), "configuration": configuration,
+            "compiler_files": compiler_files(configuration),
             "sdk": json.loads(receipt.read_text()) if receipt else None,
             "environment": {key: os.environ.get(key) for key in ("INCLUDE", "LIB", "LIBPATH", "CUDA_PATH")},
             "helper_sha256": digest(Path(__file__))}
@@ -110,13 +144,16 @@ def remaining(plan):
 
 def validate_plan(plan, root, build):
     remaining(plan)
-    if plan.get("schema") != 1 or plan["profile"] != profile(root, build, plan["profile"]["variant"]):
-        raise ValueError("shard source, toolchain or build configuration changed")
+    current = profile(root, build, plan["profile"]["variant"])
+    changed = profile_changes(plan["profile"], current)
+    if plan.get("schema") != 1 or changed:
+        raise ValueError("shard source, toolchain or build configuration changed: " + ", ".join(changed))
     if plan["units"] != compilation_units(build):
         raise ValueError("CUDA source coverage or compiler commands changed")
     flattened = [name for shard in plan["shards"] for name in shard]
     if len(flattened) != len(set(flattened)) or set(flattened) != set(plan["units"]):
         raise ValueError("invalid CUDA shard coverage")
+    return current
 
 
 def dependency_hashes(build, outputs, root):
@@ -150,7 +187,7 @@ def member_name(output):
 
 
 def build_shard(plan, index, root, build, output):
-    validate_plan(plan, root, build)
+    current = validate_plan(plan, root, build)
     if index < 0 or index >= len(plan["shards"]):
         raise ValueError("invalid shard index")
     outputs = plan["shards"][index]
@@ -161,7 +198,7 @@ def build_shard(plan, index, root, build, output):
     for name in outputs:
         source = plan["units"][name]["source"]
         dependencies[source] = digest(Path(source))
-    manifest = {"schema": 1, "shard": index, "profile": plan["profile"], "dependencies": dependencies, "objects": {}}
+    manifest = {"schema": 1, "shard": index, "profile": current, "dependencies": dependencies, "objects": {}}
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
         for name in outputs:
@@ -182,7 +219,7 @@ def cmake_quote(value):
 
 
 def assemble(plan, root, build, archives, destination):
-    validate_plan(plan, root, build)
+    current = validate_plan(plan, root, build)
     files = sorted(archives.rglob("objects.zip"))
     if len(files) != len(plan["shards"]):
         raise ValueError("missing CUDA shard archives")
@@ -201,7 +238,7 @@ def assemble(plan, root, build, archives, destination):
                 index = manifest.get("shard")
                 if type(index) is not int or index < 0 or index >= len(plan["shards"]) or index in seen:
                     raise ValueError("duplicate or invalid CUDA shard")
-                if manifest.get("schema") != 1 or manifest.get("profile") != plan["profile"]:
+                if manifest.get("schema") != 1 or profile_changes(plan["profile"], manifest.get("profile", {})):
                     raise ValueError("mixed CUDA build cohorts")
                 seen.add(index)
                 if set(manifest["objects"]) != set(plan["shards"][index]):
@@ -232,7 +269,8 @@ def assemble(plan, root, build, archives, destination):
                     if digest(target) != row.get("sha256"):
                         raise ValueError("CUDA object checksum changed")
                     objects[name] = {"source": row["source"], "file": target.name, "sha256": row["sha256"]}
-                provenance.append({"shard": index, "archive_sha256": digest(path), "objects": len(manifest["objects"])})
+                provenance.append({"shard": index, "archive_sha256": digest(path), "objects": len(manifest["objects"]),
+                                   "image": manifest["profile"].get("image")})
         if set(objects) != set(plan["units"]):
             raise ValueError("incomplete CUDA object coverage")
         stage.rename(destination)
@@ -241,7 +279,7 @@ def assemble(plan, root, build, archives, destination):
     manifest_path = destination / "objects.cmake"
     manifest_path.write_text("set(GGML_CUDA_CI_SOURCES\n" + sources + "\n)\nset(GGML_CUDA_CI_OBJECTS\n" + binaries + "\n)\n")
     compressed_bytes = sum(path.stat().st_size for path in files)
-    json_write(build / "cuda-shards.json", {"profile": plan["profile"], "shards": provenance, "objects": objects,
+    json_write(build / "cuda-shards.json", {"profile": current, "plan_image": plan["profile"].get("image"), "shards": provenance, "objects": objects,
                                             "dependencies": dependencies, "object_root": str(destination.resolve()),
                                             "compressed_object_bytes": compressed_bytes})
     subprocess.run(["cmake", "-S", str(root), "-B", str(build),
@@ -251,8 +289,9 @@ def assemble(plan, root, build, archives, destination):
 
 def finish(plan, root, build):
     remaining(plan)
-    if plan["profile"] != profile(root, build, plan["profile"]["variant"]):
-        raise ValueError("final link configuration changed")
+    changed = profile_changes(plan["profile"], profile(root, build, plan["profile"]["variant"]))
+    if changed:
+        raise ValueError("final link configuration changed: " + ", ".join(changed))
     metadata = json.loads((build / "cuda-shards.json").read_text())
     if set(metadata["objects"]) != set(plan["units"]):
         raise ValueError("incomplete final object coverage")

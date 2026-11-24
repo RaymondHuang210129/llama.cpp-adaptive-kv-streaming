@@ -146,15 +146,15 @@ struct llama_batch_ext {
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:
-    llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed = false);
+    LLAMA_API llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed = false);
 
     // convert a llama_batch_ext to internal llama_batch and sanitize it
-    bool init(
+    LLAMA_API bool init(
             const llama_batch_ext & batch_inp,
             const llama_vocab & vocab,
             bool output_all, const float * embd_h = nullptr);
 
-    const llama_batch & get_batch() const;
+    LLAMA_API const llama_batch & get_batch() const;
 
     uint32_t get_n_tokens()  const;
     uint32_t get_n_outputs() const;
@@ -256,8 +256,8 @@ struct llama_batch_compat {
     llama_batch_ext * batch_ext;
 
     // n_embd_row is the embd row width of batch_inp, 0 = use the decoder width
-    llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row = 0);
-    ~llama_batch_compat();
+    LLAMA_API llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row = 0);
+    LLAMA_API ~llama_batch_compat();
 
     // fill an existing llama_batch_ext from a llama_batch (old API)
     // note: this is called directly by the tests, skipping llama_context creation

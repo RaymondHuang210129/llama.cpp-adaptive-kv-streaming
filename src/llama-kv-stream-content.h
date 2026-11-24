@@ -62,7 +62,7 @@ public:
     llama_kv_stream_content & operator=(const llama_kv_stream_content &) = delete;
 
     std::shared_ptr<llama_kv_stream_host> host() const noexcept;
-    uint64_t generation() const noexcept;
+    LLAMA_API uint64_t generation() const noexcept;
     uint64_t mirror_epoch() const noexcept;
     // Invalid coordinates return false without changing output.
     bool dirty(const llama_kv_stream_rows & rows, bool & output) const noexcept;

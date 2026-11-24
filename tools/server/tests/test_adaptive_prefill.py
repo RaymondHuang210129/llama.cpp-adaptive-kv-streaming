@@ -234,7 +234,8 @@ def qualify(args):
             text = (args.output / "server.log").read_text()
             prefill = re.findall(r"stream group bind: selected=(\d+) rows=(\d+) phase=prefill", text)
             decode = re.findall(r"stream group bind: selected=(\d+) rows=(\d+) phase=decode", text)
-            report.update(request_count=request_count, slot_ids=slot_ids, prompt_tokens_each=[len(value) for value in prompts], prefill_bindings=prefill, decode_bindings=decode)
+            prompt_token_counts = [len(value) for value in prompts]
+            report.update(request_count=request_count, slot_ids=slot_ids, prompt_tokens_each=prompt_token_counts, prefill_bindings=prefill, decode_bindings=decode)
             expect_pair = args.parallel > 1 and request_count > 1 and args.arrival_phase != "decode" and not args.closed_group_reference and not args.late_vision
             actual_max = max([int(selected) for selected, _ in decode], default=1 if args.parallel == 1 else 0)
             report.update(actual_selected_max=actual_max, genuine_request_count_decode=actual_max == request_count)
@@ -282,7 +283,7 @@ def qualify(args):
                     stopped = re.search(r"id\s+" + str(slot_id) + r"\s+\|[^\n]*stop processing", text)
                     assert stopped and first_decode < stopped.start() < next_prefill, "late image started before the text cohort finished"
                 final = next(value for value in reversed(outputs[1]) if value.get("stop"))
-                report["prompt_tokens_each"][1] = final["timings"]["prompt_n"] + final["timings"].get("cache_n", 0)
+                prompt_token_counts[1] = final["timings"]["prompt_n"] + final["timings"].get("cache_n", 0)
                 report["late_vision_queued"] = True
             if args.cancel_request is None and not args.expect_capacity_fallback and not args.expect_logical_fallback and not args.expect_batch_fallback:
                 assert any(int(selected) == request_count for selected, _ in decode) == expect_pair, "unexpected joint-decode scheduling"

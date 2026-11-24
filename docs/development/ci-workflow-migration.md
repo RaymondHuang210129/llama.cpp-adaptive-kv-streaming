@@ -1,6 +1,6 @@
 # GitHub Actions migration plan
 
-Status: implemented locally on `feature/ci-workflow-migration`; hosted Windows/CUDA runs, live publication and branch-protection activation remain pending. See the [operating guide](../../.github/README.md).
+Status: implemented locally on `feature/ci-workflow-migration`; hosted Windows/CUDA runs, live publication and branch-protection activation remain pending. See the [operating guide](../../.github/CI.md).
 
 Baseline: `2f63f96e3b8e0c249e3385fe378233b2ffceb528` on `feature/adaptive-kv-stream-v2`.
 

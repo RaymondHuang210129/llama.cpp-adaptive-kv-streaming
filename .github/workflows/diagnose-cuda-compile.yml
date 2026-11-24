@@ -1,7 +1,7 @@
 name: Diagnose one CUDA compilation
 on:
   pull_request:
-    branches: [feature/adaptive-kv-stream-v2]
+    branches: [feature/adaptive-kv-stream-v3]
     types: [labeled]
   workflow_dispatch:
     inputs:

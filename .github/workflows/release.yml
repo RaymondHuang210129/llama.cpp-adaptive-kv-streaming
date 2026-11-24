@@ -1,27 +1,41 @@
 name: Publish SHA binaries
 on:
   workflow_call:
+    inputs:
+      profile:
+        type: string
+        default: rtx50
+      source_sha:
+        type: string
+        default: ''
 permissions:
   contents: write
   actions: read
 jobs:
   publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feature/adaptive-kv-stream-v2'
+    env:
+      OCEANUS_SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+      OCEANUS_CUDA_PROFILE: ${{ inputs.profile }}
+    if: >-
+      github.ref == 'refs/heads/feature/adaptive-kv-stream-v3' &&
+      ((github.event_name == 'push' && inputs.profile == 'rtx50') ||
+       ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && inputs.profile != 'rtx50'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
-      group: publish-${{ github.sha }}
+      group: publish-${{ inputs.profile }}-${{ inputs.source_sha || github.sha }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.11'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          pattern: package-*-cuda
+          pattern: package-${{ inputs.profile }}-${{ inputs.source_sha || github.sha }}-*-cuda
           path: packages
           merge-multiple: true
       - name: Validate every OS/backend package before publishing

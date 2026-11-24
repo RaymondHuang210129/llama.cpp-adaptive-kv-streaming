@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import unittest
 
 spec = importlib.util.spec_from_file_location('adaptive_prefill', Path(__file__).with_name('test_adaptive_prefill.py'))
+assert spec is not None and spec.loader is not None
 harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
 

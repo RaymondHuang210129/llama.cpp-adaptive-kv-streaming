@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 
-ARCHITECTURES = "75-virtual;86-real;89-real;120"
+from fork_ci import CUDA_PROFILES, cuda_profile
 
 
 def main():
@@ -17,7 +17,8 @@ def main():
     parser.add_argument("--shared", choices=("ON", "OFF"), default="ON")
     parser.add_argument("--fatal-warnings", choices=("ON", "OFF"), default="ON")
     parser.add_argument("--sanitizer", choices=("ADDRESS", "UNDEFINED", "THREAD"))
-    parser.add_argument("--cuda-architectures", default="120a" if sys.platform == "win32" else ARCHITECTURES)
+    parser.add_argument("--cuda-profile", choices=tuple(CUDA_PROFILES), default=os.environ.get("OCEANUS_CUDA_PROFILE", "rtx50"))
+    parser.add_argument("--cuda-architectures")
     parser.add_argument("--configure-only", action="store_true")
     args = parser.parse_args()
     cuda = args.backend == "cuda"
@@ -37,11 +38,12 @@ def main():
     if sys.platform == "win32":
         options.append("-DLLAMA_BUILD_BORINGSSL=ON")
     if cuda:
+        profile = cuda_profile(args.cuda_profile)
         root = Path(os.environ["CUDA_PATH"])
         options += ["-DCUDAToolkit_ROOT=" + str(root),
                     "-DCMAKE_CUDA_COMPILER=" + str(root / "bin" / ("nvcc.exe" if sys.platform == "win32" else "nvcc")),
-                    "-DCMAKE_CUDA_ARCHITECTURES=" + args.cuda_architectures,
-                    "-DGGML_CUDA_FA_QUANTS=all", "-DGGML_CUDA_CCCL_VERSION=v3.4.3"]
+                    "-DCMAKE_CUDA_ARCHITECTURES=" + (args.cuda_architectures or profile["architectures"]),
+                    "-DGGML_CUDA_FA_QUANTS=all", "-DGGML_CUDA_CCCL_VERSION=" + profile["cccl"]]
     if args.sanitizer:
         options += ["-DLLAMA_SANITIZE_" + args.sanitizer + "=ON", "-DGGML_SANITIZE_" + args.sanitizer + "=ON"]
     subprocess.run(options, check=True)
