@@ -343,7 +343,7 @@ $CMD += @('--model-draft', $OceanusDraftModel, '--spec-draft-ngl', '999')
 $FIT += @('--model-draft', $OceanusDraftModel)
 ```
 
-**Optional: keep Qwen rollback snapshots in RAM.** Speculative verification retains recurrent-state snapshots so it can restore a rejected prefix. These stay on the native backend by default (VRAM with CUDA offload). If you need more VRAM for the KV arena, append the following to both commands; transfers may reduce decode speed. This changes rollback snapshots only, not live recurrent state or attention KV. Refit the arena whenever you change this choice. Gemma has no recurrent rollback state.
+**Optional: keep Qwen rollback snapshots in RAM.** Speculative verification retains recurrent-state snapshots so it can restore a rejected prefix. These stay on the native backend by default (VRAM with CUDA offload). Their footprint grows with draft depth and the number of selected slots, which can reduce the number of requests that decode together in a small arena. To reduce that footprint, append the following to both commands; transfers may reduce decode speed. This changes rollback snapshots only, not live recurrent state or attention KV. Refit the arena whenever you change this choice. Gemma has no recurrent rollback state.
 
 Bash:
 
