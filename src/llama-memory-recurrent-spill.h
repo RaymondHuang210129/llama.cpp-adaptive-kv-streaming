@@ -19,7 +19,7 @@ struct llama_recurrent_rollback_plan {
 
 // Plan target rollback independently of draft cache ownership; keep the embedded-MTP depth limit.
 bool llama_recurrent_rollback_plan_make(uint32_t depth, bool embedded_mtp, uint32_t microbatch_rows,
-        llama_recurrent_rollback_plan & output) noexcept;
+        llama_recurrent_rollback_plan & output, bool host_spill = false) noexcept;
 
 struct llama_recurrent_spill_layer {
     ggml_type type_r = GGML_TYPE_F32;

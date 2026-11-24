@@ -69,6 +69,8 @@ def arguments(argv=None):
     parser.add_argument("--copy-probe", action="store_true",
                         help="also validate a separate 32-output copying path; always enabled for mixed K4V, optional for matched non-mixed sizing")
     parser.add_argument("--no-webui", action="store_true", help="disable the test server's web UI")
+    parser.add_argument("--recurrent-rollback-ram", action="store_true",
+                        help="store recurrent rollback snapshots in RAM; default keeps them in VRAM")
     parser.add_argument("--no-warmup", action="store_true", help="skip startup warmup; retain all real workload probes")
     parser.add_argument("--verbosity", type=int, default=3, help="server log threshold 0-5; route proofs require at least 4")
     parser.add_argument("--decode-tokens", type=int, default=256)
@@ -134,6 +136,8 @@ def server_command(args, arena_mib):
         command.append("--kv-unified")
     if args.no_webui:
         command.append("--no-webui")
+    if args.recurrent_rollback_ram:
+        command.append("--recurrent-rollback-ram")
     if getattr(args, "no_warmup", False):
         command.append("--no-warmup")
     if args.draft_length:
@@ -1034,6 +1038,7 @@ def fit(args, report_vision=False):
     report = {"arena_mib":maximum, "initial_arena_mib":args.initial_arena_mib,
               "next_mib_rejected":maximum +1 if next_rejected else None,
               "command":server_command(command_args,maximum), "uvm":False, "reserve_mib":0,
+              "recurrent_rollback_ram":args.recurrent_rollback_ram,
               "context_size":args.context_size, "context_semantics":context_semantics(args),
               "selection_profiles":(selected or {}).get("selection_profiles"),
               "requested_probe_selected_slots":args.probe_selected,

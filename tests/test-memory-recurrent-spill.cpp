@@ -719,8 +719,15 @@ int main(int argc, char ** argv) {
             t.assert_equal(depth,plan.depth);
             t.assert_equal(depth+1,plan.verification_rows);
             t.assert_equal(std::max(4u,depth+1),plan.workspace_rows);
-            t.assert_equal(depth != 0,plan.host_spill);
-            t.assert_equal(depth ? 2u : 0u,plan.stage_slots);
+            t.assert_equal(false,plan.host_spill);
+            t.assert_equal(0u,plan.stage_slots);
+            llama_recurrent_rollback_plan ram;
+            if (!t.assert_true(llama_recurrent_rollback_plan_make(depth,false,256,ram,true))) return;
+            t.assert_equal(plan.depth,ram.depth);
+            t.assert_equal(plan.verification_rows,ram.verification_rows);
+            t.assert_equal(plan.workspace_rows,ram.workspace_rows);
+            t.assert_equal(depth!=0,ram.host_spill);
+            t.assert_equal(depth ? 2u : 0u,ram.stage_slots);
             for (bool mtp : {false,true}) {
                 auto saved=plan;
                 const bool valid=llama_recurrent_rollback_plan_make(depth,mtp,depth+1,plan);
@@ -738,6 +745,68 @@ int main(int argc, char ** argv) {
             t.assert_equal(123u,sentinel.depth);
             t.assert_equal(456u,sentinel.verification_rows);
             t.assert_equal(789u,sentinel.workspace_rows);
+        }
+    });
+    t.test("selected_resident_rollback_accounts_for_history_and_restores_each_prefix", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        for (auto selected : std::vector<std::vector<llama_seq_id>>{{2},{3,1},{3,1,0},{3,1,0,2}})
+        for (uint32_t depth=1;depth<=7;++depth) for (uint32_t rollback=0;rollback<=depth;++rollback) {
+            const auto count=uint32_t(selected.size());
+            llama_memory_recurrent memory(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,count,4,depth,nullptr,false,true,true);
+            if (!t.assert_true("native rollback admits a compact selected bank",memory.configure_selected_sequences(selected))) return;
+            t.assert_true(!memory.spill_enabled());
+            t.assert_equal(int64_t(count*(depth+1)),memory.s_l[0]->ne[1]);
+            ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+            if (!t.assert_true(memory.current_storage_requirements(type,bytes))) return;
+            llama_memory_recurrent native(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,count,count,depth,nullptr);
+            ggml_backend_buffer_type_t native_type=nullptr;size_t native_bytes=0;
+            if (!t.assert_true(native.current_storage_requirements(native_type,native_bytes))) return;
+            t.assert_equal(native_bytes,bytes);
+            std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+                ggml_backend_memory_arena_new(type,bytes),ggml_backend_memory_arena_free);
+            const auto alignment=ggml_backend_buft_get_alignment(type);
+            if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                    ggml_backend_memory_arena_reserve_at(arena.get(),91,0,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                    ggml_backend_memory_arena_commit(arena.get()))) return;
+            std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> lease(
+                ggml_backend_memory_arena_acquire(arena.get(),91),ggml_backend_memory_lease_free);
+            if (!t.assert_true(lease && memory.bind_current_storage(lease.get()))) return;
+            llama_batch_allocr allocator(1);auto batch=allocator.ubatch_reserve(depth+1,count);
+            std::fill(batch.data->seq_idx.begin(),batch.data->seq_idx.end(),-1);
+            for (uint32_t seq=0;seq<count;++seq) {
+                batch.seq_id_unq[seq]=selected[seq];batch.seq_idx[selected[seq]]=int32_t(seq);
+            }
+            for (uint32_t seq=0;seq<count;++seq) for (uint32_t i=0;i<=depth;++i) {
+                const auto row=seq*(depth+1)+i;
+                batch.n_seq_id[row]=1;batch.seq_id[row]=&selected[seq];batch.pos[row]=llama_pos(10+i);
+            }
+            if (!t.assert_true(memory.prepare({batch}) && memory.find_slot(batch))) return;
+            for (auto * tensor : {memory.r_l[0],memory.s_l[0]}) {
+                std::vector<float> values(ggml_nelements(tensor));
+                const auto width=size_t(tensor->ne[0]);
+                for (uint32_t slot=0;slot<=depth;++slot) for (uint32_t cell=0;cell<count;++cell) {
+                    const auto sequence=*memory.cells[cell].seq_id.begin();
+                    std::fill_n(values.data()+(slot*count+cell)*width,width,float(slot*10+sequence+1));
+                }
+                ggml_backend_tensor_set(tensor,values.data(),0,ggml_nbytes(tensor));
+            }
+            for (uint32_t seq=0;seq<count;++seq) {
+                const auto sequence=selected[seq];
+                const auto rejected=(rollback+seq)%(depth+1);
+                if (rejected && !t.assert_true(memory.seq_rm(sequence,11+depth-rejected,-1))) return;
+                recurrent_bytes_writer saved;memory.state_write(saved,sequence,0);
+                llama_memory_recurrent restored(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,1,1,0,nullptr);
+                recurrent_bytes_reader reader(saved.bytes);restored.state_read(reader,0,0);
+                t.assert_equal(saved.bytes.size(),reader.cursor);
+                for (auto * tensor : {restored.r_l[0],restored.s_l[0]}) {
+                    std::vector<float> values(ggml_nelements(tensor));
+                    ggml_backend_tensor_get(tensor,values.data(),0,ggml_nbytes(tensor));
+                    t.assert_true(std::all_of(values.begin(),values.end(),[&](float value) {return value==float(rejected*10+sequence+1);}));
+                }
+                t.assert_equal(llama_pos(10+depth-rejected),restored.seq_pos_max(0));
+            }
         }
     });
     t.test("selected_current_bank_accepts_logical_id_without_allocating_unchosen_rows", [](testing & t) {

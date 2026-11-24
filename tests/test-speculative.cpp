@@ -64,6 +64,7 @@ static common_params streamed_dflash_params(int predictions, uint16_t ngram) {
 }
 
 int main(int argc, char ** argv) {
+    ggml_time_init();
     testing t;
     if (argc == 2) t.set_filter(argv[1]);
 

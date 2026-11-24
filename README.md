@@ -343,6 +343,22 @@ $CMD += @('--model-draft', $OceanusDraftModel, '--spec-draft-ngl', '999')
 $FIT += @('--model-draft', $OceanusDraftModel)
 ```
 
+**Optional: keep Qwen rollback snapshots in RAM.** Speculative verification retains recurrent-state snapshots so it can restore a rejected prefix. These stay on the native backend by default (VRAM with CUDA offload). Their footprint grows with draft depth and the number of selected slots, which can reduce the number of requests that decode together in a small arena. To reduce that footprint, append the following to both commands; transfers may reduce decode speed. This changes rollback snapshots only, not live recurrent state or attention KV. Refit the arena whenever you change this choice. Gemma has no recurrent rollback state.
+
+Bash:
+
+```bash
+CMD+=(--recurrent-rollback-ram)
+FIT+=(--recurrent-rollback-ram)
+```
+
+PowerShell:
+
+```powershell
+$CMD += '--recurrent-rollback-ram'
+$FIT += '--recurrent-rollback-ram'
+```
+
 ### 5. Choose slots and the context budget
 
 Use one slot for one request, or start with two to four for concurrent clients. The build accepts 1-256 logical slots; actual joint execution depends on batching, model state, context, and arena capacity.
@@ -652,7 +668,7 @@ Shared ring  [ target suffixes, refilled as layers advance   ]
 Workspace    [ target verification of anchor and candidates ]
 ```
 
-The accepted prefix is committed. A rejection also restores the matching recurrent state and truncates or replays the provisional suffix; changing KV length alone would be insufficient. Host-backed rollback candidates and bounded device staging avoid retaining a full device snapshot for every candidate. Workspace, draft weights, active state, and transfers still cost memory and time. See [MTP design and qualification](MTP_ADAPTIVE_KV_ROADMAP.md).
+The accepted prefix is committed. A rejection also restores the matching recurrent state and truncates or replays the provisional suffix; changing KV length alone would be insufficient. Rollback snapshots stay on the native backend by default. With `--recurrent-rollback-ram`, host-backed candidates and bounded device staging reduce their VRAM footprint at the cost of transfers. Workspace, draft weights, active state, and transfers still cost memory and time. See [MTP design and qualification](MTP_ADAPTIVE_KV_ROADMAP.md).
 
 #### Gemma MTP: borrow the target's KV
 

@@ -1,5 +1,6 @@
 from pathlib import Path
 import importlib.util
+import os
 import unittest
 import tempfile
 import json
@@ -81,17 +82,20 @@ class MultiSlotFinder(unittest.TestCase):
         self.assertEqual(next(row for row in finder.multi_slot_probe_profiles(args) if row['label']=='joint')['selected_max'],2)
 
     def test_explicit_server_loads_its_own_runtime_instead_of_an_older_build(self):
-        server=Path('/tmp/ms16-runtime/bin/llama-server')
+        server=Path('/tmp/ms16-runtime/bin/llama-server').resolve()
         old=str(root / 'build-upstream-attention-port/bin')
-        with patch.object(finder.SWEEP,'server_environment',return_value={'LD_LIBRARY_PATH':old + ':/usr/local/cuda/lib64',
+        variable='PATH' if os.name=='nt' else 'LD_LIBRARY_PATH'
+        cuda=str(Path('/usr/local/cuda/lib64').resolve())
+        with patch.object(finder.SWEEP,'server_environment',return_value={variable:os.pathsep.join([old,cuda]),
                                                                           'GGML_CUDA_ENABLE_UNIFIED_MEMORY':'1'}):
             env=finder.environment(server)
-        paths=env['LD_LIBRARY_PATH'].split(':')
+        paths=env[variable].split(os.pathsep)
         self.assertEqual(paths[0],str(server.parent))
         self.assertNotIn(old,paths)
-        self.assertIn('/usr/local/cuda/lib64',paths)
+        self.assertIn(cuda,paths)
         self.assertNotIn('GGML_CUDA_ENABLE_UNIFIED_MEMORY',env)
 
+    @unittest.skipIf(os.name=='nt', 'runtime library hashing uses Linux /proc maps')
     def test_runtime_library_hashing_handles_spaces_without_python_311(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory=Path(temporary)

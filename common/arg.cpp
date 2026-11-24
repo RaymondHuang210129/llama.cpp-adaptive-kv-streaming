@@ -2464,9 +2464,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--no-kv-stream-rs-rollback"},
-        "use full target checkpoints instead of default host-spilled recurrent rollback for serial MTP KV streaming",
+        "use full target checkpoints instead of recurrent rollback for serial MTP KV streaming",
         [](common_params & params) { params.no_kv_stream_rs_rollback = true; }
     ).set_env("LLAMA_ARG_NO_KV_STREAM_RS_ROLLBACK"));
+    add_opt(common_arg(
+        {"--recurrent-rollback-ram"},
+        "store recurrent rollback snapshots in RAM instead of VRAM; current state and KV placement are unchanged",
+        [](common_params & params) { params.recurrent_rollback_ram = true; }
+    ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_RAM"));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},

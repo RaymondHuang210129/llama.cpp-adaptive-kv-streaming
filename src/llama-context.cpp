@@ -963,6 +963,7 @@ llama_context::llama_context(
     cparams.shared_device_memory_bytes = params.shared_device_memory_bytes;
     cparams.kv_stream_auxiliary_layers = params.kv_stream_auxiliary_layers;
     cparams.kv_stream_verify_max = params.kv_stream_verify_max;
+    cparams.recurrent_rollback_ram = params.recurrent_rollback_ram;
     if (cparams.kv_stream_verify_max && (!cparams.kv_streaming() || model.arch != LLM_ARCH_GEMMA4 ||
             params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other || (!group_initializing && cparams.n_seq_max != 1) ||
             cparams.kv_stream_verify_max > 4 || cparams.kv_stream_verify_max > cparams.n_ubatch)) {
@@ -977,7 +978,7 @@ llama_context::llama_context(
     }
     llama_recurrent_rollback_plan rollback_plan;
     if (cparams.kv_streaming() && !llama_recurrent_rollback_plan_make(
-            cparams.n_rs_seq,cparams.kv_stream_auxiliary_layers != 0,cparams.n_ubatch,rollback_plan)) {
+            cparams.n_rs_seq,cparams.kv_stream_auxiliary_layers != 0,cparams.n_ubatch,rollback_plan,cparams.recurrent_rollback_ram)) {
         throw std::runtime_error("KV-stream target rollback requires depth 0-7 (embedded MTP: 0-3) and ubatch >= depth+1");
     }
     const bool streamed_rs_rollback=cparams.kv_streaming() && rollback_plan.host_spill;
@@ -987,7 +988,7 @@ llama_context::llama_context(
     if (params.kv_stream_pool_bytes || params.shared_device_memory_bytes) {
         if ((model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_GEMMA4) || params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other ||
                 hparams.no_alloc || hparams.vocab_only || model.devices.size() != 1 || (!group_initializing && cparams.n_seq_max != 1) ||
-                (cparams.n_rs_seq && !streamed_rs_rollback) || !cparams.offload_kqv || params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED ||
+                !cparams.offload_kqv || params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED ||
                 !cparams.causal_attn || params.embeddings || model.devices.front().is_meta || !llama_kv_stream_device_buffer_type(model.devices.front().dev)) {
             throw std::runtime_error("KV streaming requires one CUDA device, serial Qwen35 or Gemma4 target context, -fa on, supported rollback mode, no embedding mode and allocated weights (--fit off)");
         }
@@ -1281,7 +1282,7 @@ llama_context::llama_context(
             params_mem.defer_full_cache=false;
             params_mem.kv_stream_selected_sequences.clear();
         }
-        params_mem.kv_stream_rs_rollback=(measurement_only || group_initializing) && cparams.n_rs_seq!=0;
+        params_mem.kv_stream_rs_rollback=cparams.recurrent_rollback_ram && cparams.n_rs_seq!=0;
         if (model.arch == LLM_ARCH_GEMMA4 && cparams.shared_device_memory_bytes) {
             if (params.swa_full) throw std::runtime_error("Gemma arena streaming requires bounded SWA storage (swa_full=false)");
             params_mem.defer_bounded_cache=true;
@@ -5029,7 +5030,7 @@ bool llama_context::measure_target_workload(const llama_batch & input,
         }
         for (uint32_t slot=0;slot<cparams.n_seq_max;++slot) if (consumed[slot]!=rows[slot]) return false;
         if (group.native_batches.empty()) return false;
-        if (cparams.n_rs_seq && kv_resources.recurrent) {
+        if (cparams.n_rs_seq && cparams.recurrent_rollback_ram && kv_resources.recurrent) {
             ggml_backend_buffer_type_t type=nullptr;
             if (!kv_resources.recurrent->prepare_measurement_publication(selected_count) ||
                     !kv_resources.recurrent->spill_stage_requirements(type,next.publication_bytes) || type!=next.buffer_type) return false;
@@ -5094,7 +5095,7 @@ bool llama_context::measure_workspace_impl(const llama_ubatch * native_batch, ui
         uint32_t outputs, bool managed_full_attention, std::vector<size_t> & sizes) {
     try {
         std::vector<size_t> measured(backend_ptrs.size());
-        if (cparams.n_rs_seq && kv_resources.recurrent) {
+        if (cparams.n_rs_seq && cparams.recurrent_rollback_ram && kv_resources.recurrent) {
             ggml_backend_sched_reset(sched.get());
             for (auto & previous : gf_res_prev) if (previous) previous->reset();
             gf_res_reserve->reset();
@@ -6710,6 +6711,7 @@ llama_context_params llama_context_default_params() {
         /*.shared_device_memory_bytes   =*/ 0,
         /*.kv_stream_auxiliary_layers   =*/ 0,
         /*.kv_stream_verify_max         =*/ 0,
+        /*.recurrent_rollback_ram        =*/ false,
     };
 
     return result;
@@ -8311,6 +8313,8 @@ bool llama_context::group_restore_recurrent_after_attention() {
             group_execution->phase!=llama_memory_work_phase::mtp_draft) return true;
     auto * restore=group_target->kv_resources.recurrent;
     if (!restore || std::none_of(restore->rs_idx.begin(),restore->rs_idx.end(),[](uint32_t index) {return index!=0;})) return true;
+    // Resident history is selected by the next target's state-copy inputs.
+    if (!restore->spill_enabled()) return true;
     return restore->staged_publication_enabled() && group_recurrent_restore_isolated() && restore->restore_spill_async(nullptr,false);
 }
 

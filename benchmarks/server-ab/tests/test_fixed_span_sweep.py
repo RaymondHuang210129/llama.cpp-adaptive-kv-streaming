@@ -18,6 +18,26 @@ SPEC.loader.exec_module(SWEEP)
 
 
 class MtpSweepTests(unittest.TestCase):
+    def test_rollback_environment_cannot_override_the_recorded_command(self):
+        with patch.dict(os.environ, {"LLAMA_RS_HOST_SPILL": "1", "LLAMA_RS_STAGED_PUBLICATION": "1",
+                                     "LLAMA_ARG_RECURRENT_ROLLBACK_RAM": "1"}):
+            for uvm in (False, True):
+                env = SWEEP.server_environment(uvm)
+                for name in ("LLAMA_RS_HOST_SPILL", "LLAMA_RS_STAGED_PUBLICATION", "LLAMA_ARG_RECURRENT_ROLLBACK_RAM"):
+                    self.assertFalse(name in env, name)
+
+    def test_rollback_location_reaches_target_and_speculative_commands(self):
+        for ram in (False, True):
+            argv = [str(SCRIPT), "--model", "target.gguf"]
+            if ram:
+                argv.append("--recurrent-rollback-ram")
+            with self.subTest(ram=ram), patch("sys.argv", argv):
+                args = SWEEP.arguments()
+            self.assertEqual(args.recurrent_rollback_ram, ram)
+            for depth in (0, 3):
+                command = SWEEP.server_command(args, 32768, depth, 2096)
+                self.assertEqual("--recurrent-rollback-ram" in command, ram)
+
     def test_external_assistant_cli_and_commands_do_not_load_it_for_target_only(self):
         with patch("sys.argv",[str(SCRIPT),"--model","target.gguf","--model-draft","assistant.gguf","--mtp-lengths","0,1,2,3"]):
             args=SWEEP.arguments()

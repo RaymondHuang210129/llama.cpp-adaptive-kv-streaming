@@ -84,7 +84,7 @@ int32_t llama_memory_recurrent::sequence_tail(llama_seq_id id) const {
 bool llama_memory_recurrent::configure_selected_sequences(const std::vector<llama_seq_id> & sequences) {
     const bool rollback=selected_storage && selected_storage->measurement && n_rs_seq && spill;
     if (!selected_storage || !selected_storage->pending || current_storage_parked() || used ||
-            ((n_rs_seq || spill) && !rollback) || !selected_storage->sequence_publications.empty() ||
+            (spill && !rollback) || (n_rs_seq && !selected_storage->measurement) || !selected_storage->sequence_publications.empty() ||
             sequences.size()!=size || !size || size>n_seq_max) return false;
     try {
         std::vector<int32_t> tails(n_seq_max,-1);
@@ -162,7 +162,7 @@ llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_ty
     uint32_t publication_slots=2;
     if (stream_host_spill) {
         llama_recurrent_rollback_plan plan;
-        if (!llama_recurrent_rollback_plan_make(n_rs_seq,false,n_rs_seq < 8 ? n_rs_seq+1 : 0,plan))
+        if (!llama_recurrent_rollback_plan_make(n_rs_seq,false,n_rs_seq < 8 ? n_rs_seq+1 : 0,plan,true))
             throw std::runtime_error("invalid streamed recurrent rollback plan");
         publication_slots=plan.stage_slots;
     }

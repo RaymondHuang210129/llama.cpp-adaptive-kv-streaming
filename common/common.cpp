@@ -1882,6 +1882,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
+    cparams.recurrent_rollback_ram = params.recurrent_rollback_ram;
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
