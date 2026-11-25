@@ -159,3 +159,31 @@ A matched, single-pass SWE A/B comparison used 8,192 history tokens and 512 outp
 These are single observations without startup warmup, retries, repeated timing trials or statistical confidence intervals. The optimized compact result is 2.26% above the prototype in this short-context case; it is not a general throughput promise. All four sampled whole-device peaks were 15,537,405,952 bytes. The fixed arena reuses the reduced bank's capacity internally; it does not reduce the arena's physical allocation.
 
 Raw records live under `/home/raymond/LLM/compact-rollback-20261125/P7-swe-qwen-mtp-n2-h8192-a2096-*`, with commands, runtime-library hashes, pinned SWE A-D token-bank hashes, actual prompt hashes, token timelines and NVML samples. The mathematical and memory improvements in this checkpoint do not close P5-P7: placement qualification, broader product profiles and long-context/refitted measurements remain open.
+
+## P5 budget-aware placement
+
+P5 adds `--recurrent-rollback-auto` for selected-group activation. The common selector accepts complete owner quotes for native device, dense host and qualified FP32 GDN storage. It has no model-name rules. Device peaks include current/bounded state, graph workspace, publication staging and the minimum KV pool. Advisory latency includes capture, acceptance-dependent restoration, KV streaming and the maximum of concurrent H2D/D2H payload times. The bandwidth/compute seeds are estimates, not measured PCIe utilization. Independently restorable partial regions are not advertised; the qualified choices are whole-bank plans.
+
+Placement changes occur only after the old group has drained and exported its current native roles. Candidate descriptions allocate no device state; a fresh normal admission check precedes each actual arena binding. Cached descriptions advise cost only. A cached choice that fails fresh admission triggers one bounded refresh. The cache retains one selected-identity profile, no GPU leases or executable tensor addresses. It is invalidated on an explicit provider change. All publication metadata is prepared before acquiring GPU grants.
+
+The policy keeps eight real-work correction samples per representation and a workload key, with 5% hysteresis and a four-boundary cooldown for an unchanged workload. It shares a common correction until competing feasible representations have comparable samples, avoiding a penalty on the only measured provider. Explicit native/default, RAM and compact launch choices remain reproducible. The internal parked-owner setter supports qualified explicit provider changes and rejects an active group or a lent vision arena.
+
+Serial recurrent banks remain outside the shared arena. Their placement is fixed at launch. `benchmarks/select-recurrent-placement.py` fits native/RAM/compact separately, subtracts an explicit reserve, checks one full workload per feasible choice, compares exact output tokens and ranks measured common decode intervals. It emits a fixed command and retains the previous choice within the 5% margin. It does not start a production server or migrate a live serial bank. Use a free GPU, a fresh output directory, and `--no-warmup` when startup warmup is unwanted. For example:
+
+```bash
+./.venv/bin/python benchmarks/select-recurrent-placement.py \
+  --server ./build/bin/llama-server --model /path/to/Qwen-with-MTP.gguf \
+  --spec-mode mtp --draft-length 3 --parallel 1 --context-size 8192 \
+  --cache-type-k q8_0 --cache-type-v q4_0 --prompt-tokens 2048 \
+  --decode-tokens 512 --no-webui --no-warmup --output arena-placement
+```
+
+The result prints the selected provider and `arena_mib`; `selection.json` retains every fit and measurement, and `command.txt` contains the complete selected command. Default reserve is 16 MiB. Windows users must configure the executable's NVIDIA profile to Prefer No Sysmem Fallback before fitting; the tool cannot certify that driver setting. A full workload that fails validation is not a timed valid candidate.
+
+TDD evidence includes missing-API/CLI regressions, tight budgets, transfer overlap, malformed costs, hysteresis across workload changes, bounded feedback and an attempted active-owner switch. The deterministic provider suite passes 85 assertions. Real GPU migration exercises native -> RAM -> compact and compact -> RAM -> native on one retained parent, with 176 profile assertions. The final cached-policy three-/four-slot MTP and all 64 two-slot depth-seven acceptance pairs pass, including 6,844 prefix assertions; the failed-owner gate passes as well. The four targeted host suites pass with both ASan and UBSan, including leak detection.
+
+The first runtime policy trial chose the correct compact bank but repeatedly quoted losing plans between the first output token and the decode group. It measured 130.863 tokens/s versus 141.715 for explicit compact. Cached advisory quotes reduced that transition cost: the repaired trial measured 139.891 tokens/s, passed the declared 98%-of-explicit-compact gate and matched all 1,024 output tokens. The failed trial, gate and repaired result are preserved in `P5-auto-planning-{red,green}.json`; the failed trial is not discarded or averaged into the retained result.
+
+At two SWE histories of 16,384 tokens, a 2,096 MiB arena, a 262,144-position combined budget and 512 outputs per request, the measured common-window rates were native 128.250, RAM 118.747, prototype compact 129.262, optimized compact 132.299 and automatic 131.713 tokens/s. Outputs match across all five runs. These are single observations. At short context, the serial launch selector fitted native/RAM/compact maxima of 2,980/3,394/3,260 MiB; after its 16 MiB reserve, measured rates were 113.181/108.997/113.987 tokens/s. It retained native because the compact difference was below its switching threshold. No timing repetitions, reverse-order pass or discarded startup requests were used.
+
+The kernel checkpoint commit `c2b4ea696` also builds independently in `kernel-check-source/`; its four CPU component suites pass without the in-progress placement changes. Raw P5 records, commands, library/model identities, capacity boundaries, output timelines and sampled GPU peaks are retained under `/home/raymond/LLM/compact-rollback-20261125/`. Larger-context performance and the complete P6 matrix remain separate gates below.

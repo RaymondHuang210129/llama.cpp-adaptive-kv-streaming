@@ -48,6 +48,7 @@ static bool target_drift_control = false, target_drift_rs_control = false;
 static bool rollback_probe = false;
 static bool wide_rollback_control = false;
 static bool compact_rollback_control = false;
+static bool auto_rollback_control = false;
 static bool vision_mtp_handoff = false;
 static bool dflash_vision_readiness = false;
 static uint32_t dflash_vision_microbatch = 256;
@@ -4604,6 +4605,7 @@ static void test_group_n_mtp_exact(testing & t,llama_model * model,uint32_t coun
     }
     oracle.compare();cp.shared_device_memory_bytes=size_t(2048)*1024*1024;
     cp.recurrent_rollback_compact=compact_rollback_control;
+    cp.recurrent_rollback_auto=auto_rollback_control;
     cp.kv_stream_auxiliary_layers=gemma ? 0 : 1;cp.kv_stream_verify_max=gemma ? depth+1 : 0;
     auto group=llama_context_group::create(*model,cp);
     if (!t.assert_true(group!=nullptr)) return;
@@ -6745,7 +6747,7 @@ static void test_group_dflash_metadata(testing & t,llama_model * model,const cha
 }
 
 static void test_group_rollback(testing & t,llama_model * model,bool recurrent=false,bool owner_failure=false,
-        uint32_t maximum=3,bool endpoints=false,bool interleave=false) {
+        uint32_t maximum=3,bool endpoints=false,bool interleave=false,bool migrate=false) {
     if (!t.assert_equal(recurrent ? LLM_ARCH_QWEN35 : LLM_ARCH_GEMMA4,model->arch)) return;
     auto cp=llama_context_default_params();
     cp.n_ctx=recurrent ? 512 : 4096;cp.n_batch=cp.n_ubatch=256;cp.n_rs_seq=recurrent ? maximum : 0;cp.n_seq_max=2;cp.kv_unified=true;cp.swa_full=false;
@@ -6790,8 +6792,9 @@ static void test_group_rollback(testing & t,llama_model * model,bool recurrent=f
     const auto native_params=cp;
     const auto check=[&](const control & item) {
         auto cp=native_params;
-        cp.shared_device_memory_bytes=size_t(1024)*1024*1024;cp.kv_stream_verify_max=recurrent ? 0 : maximum+1;
-        cp.recurrent_rollback_compact=compact_rollback_control;
+        cp.shared_device_memory_bytes=size_t(migrate ? 3072 : 1024)*1024*1024;cp.kv_stream_verify_max=recurrent ? 0 : maximum+1;
+        cp.recurrent_rollback_compact=migrate ? item.accepted[0]!=0 : compact_rollback_control;
+        cp.recurrent_rollback_auto=!migrate && auto_rollback_control;
         t.out<<"rollback depth="<<item.depth<<" accepted="<<item.accepted[0]<<','<<item.accepted[1]<<std::endl;
         auto group=llama_context_group::create(*model,cp);if (!t.assert_true(group!=nullptr)) return false;
         llama_set_embeddings_nextn(group->metadata_context(),true,false);
@@ -6800,10 +6803,15 @@ static void test_group_rollback(testing & t,llama_model * model,bool recurrent=f
         input({5,5},{0,0},false);
         if (!t.assert_true(group->activate(selection,group->source_handles(),batch,llama_memory_work_phase::target_prefill,1,1))) return false;
         if (!t.assert_equal(0,group->context()->decode(batch)) || !t.assert_true(group->park())) return false;
+        if (migrate && !t.assert_true(group->set_recurrent_placement(llama_recurrent_representation::dense_host))) return false;
         if (!t.assert_true(llama_kv_stream_select({cp.n_ctx,2},{{0,5},{1,5}},selection)==llama_kv_stream_selection_status::success)) return false;
         input({item.depth+1,item.depth+1},{5,5});
         if (!t.assert_true(group->activate(selection,group->source_handles(),batch,llama_memory_work_phase::target_verify,1,2))) return false;
         auto * context=group->context();
+        if (migrate) {
+            t.assert_true(context->get_kv_resources().recurrent->spill_enabled());
+            t.assert_true(!group->set_recurrent_placement(llama_recurrent_representation::dense_device));
+        }
         t.out<<"rollback phase=verify"<<std::endl;
         if (!t.assert_equal(0,context->decode(batch)) || !compare(*context,item.verify)) return false;
         if (owner_failure) {
@@ -6873,6 +6881,8 @@ static void test_group_rollback(testing & t,llama_model * model,bool recurrent=f
         }
         auto * parent=context->group_parent();
         if (!t.assert_true(group->park())) return false;
+        if (migrate && !t.assert_true(group->set_recurrent_placement(item.accepted[0] ?
+                llama_recurrent_representation::dense_device : llama_recurrent_representation::gdn_fp32))) return false;
         if (!t.assert_true(llama_kv_stream_select({cp.n_ctx,2},{{0,7+item.accepted[0]},{1,7+item.accepted[1]}},selection)==llama_kv_stream_selection_status::success)) return false;
         input({1,1},{7+item.accepted[0],7+item.accepted[1]});
         if (!t.assert_true(group->activate(selection,group->source_handles(),batch,llama_memory_work_phase::target_verify,1,3))) return false;
@@ -9577,6 +9587,7 @@ int main(int argc,char ** argv) {
         rollback_probe = rollback_probe || !std::strcmp(argv[i],"--mtp-rs-rollback-probe");
         wide_rollback_control = wide_rollback_control || !std::strcmp(argv[i],"--target-rs-rollback");
         compact_rollback_control = compact_rollback_control || !std::strcmp(argv[i],"--compact-rollback");
+        auto_rollback_control = auto_rollback_control || !std::strcmp(argv[i],"--auto-rollback");
         vision_mtp_handoff = vision_mtp_handoff || !std::strcmp(argv[i],"--vision-mtp-handoff");
         serial_workspace_growth = serial_workspace_growth || !std::strcmp(argv[i],"--serial-workspace-growth");
     }
@@ -9876,6 +9887,11 @@ int main(int argc,char ** argv) {
             test_group_rollback(t,model.get(),true,false,7,false,true);
         });
         return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-placement-switch-only");})) {
+        t.test("Drained_provider_switches_preserve_native_prefixes_and_parent",[&](testing & t) {
+            test_group_rollback(t,model.get(),true,false,7,true,false,true);
+        });return t.summary();
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-rollback-owner-failure-only");})) {
         t.test("Failed_hybrid_rollback_closes_admission_before_reconstruction",[&](testing & t) {test_group_rollback(t,model.get(),true,true);});

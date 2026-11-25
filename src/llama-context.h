@@ -9,6 +9,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent-provider.h"
 #include "llama-moe-cache.h"
 #include "llama-kv-stream-logical-cache.h"
 
@@ -109,13 +110,15 @@ struct llama_context {
     // The frontend retains their RNG/grammar ownership through group retirement.
     LLAMA_API bool bind_group_samplers_from(const llama_context & prepared);
     // Compose the measured group on one caller-retained parent, or allocate its first parent.
+    // quote_only describes an unbounded candidate without allocating. Normal admission is still required.
     bool initialize_group_execution(std::shared_ptr<llama_kv_stream_slot_table> table,
         std::shared_ptr<llama_kv_stream_slot_projection> projection,const llama_batch & representative,
         llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,
         ggml_backend_buffer_t parent = nullptr,const std::vector<llama_context_group_sequence_state> & states = {},
         llama_context_memory_create_result * result = nullptr,llama_context * auxiliary = nullptr,
         std::shared_ptr<llama_kv_stream_slot_projection> auxiliary_projection = {},
-        const std::vector<llama_context_group_sequence_state> & auxiliary_states = {});
+        const std::vector<llama_context_group_sequence_state> & auxiliary_states = {},
+        llama_context_group_plan * quote_only = nullptr);
     LLAMA_API ggml_backend_buffer_t group_parent() const noexcept;
     // Export only selected current/SWA roles after all group work has completed.
     bool save_group_sequences(std::vector<llama_context_group_sequence_state> & output);
@@ -624,6 +627,8 @@ private:
     const llama_context * group_target = nullptr;
     bool group_restore_failed = false;
     std::vector<llama_seq_id> group_selected;
+    double placement_elapsed_ms = 0, placement_expected_ms = 0;
+    uint64_t placement_steps = 0;
     struct group_execution_binding;
     std::unique_ptr<group_execution_binding> group_execution;
     std::weak_ptr<llama_kv_stream_slot_table> group_source_table;
@@ -655,6 +660,8 @@ public:
         llama_context_memory_create_result * result = nullptr);
     // Save selected roles before retiring their GPU grants; failed retirement keeps the owner closed.
     LLAMA_API bool park();
+    // A parked native checkpoint can enter any supported provider at the next activation.
+    LLAMA_API bool set_recurrent_placement(llama_recurrent_representation representation);
     // Discard selected native state after failure; reset those request namespaces before reuse.
     LLAMA_API bool discard() noexcept;
     LLAMA_API llama_context * context() const noexcept;

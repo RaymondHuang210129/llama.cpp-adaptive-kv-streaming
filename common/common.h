@@ -590,6 +590,7 @@ struct common_params {
     bool no_kv_stream_rs_rollback = false; // retain full checkpoints for attached MTP
     bool recurrent_rollback_ram = false; // store recurrent rollback snapshots in host RAM
     bool recurrent_rollback_compact = false;
+    bool recurrent_rollback_auto = false;
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

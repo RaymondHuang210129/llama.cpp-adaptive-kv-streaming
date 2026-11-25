@@ -2478,6 +2478,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) { params.recurrent_rollback_compact = true; }
     ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT"));
     add_opt(common_arg(
+        {"--recurrent-rollback-auto"},
+        "compare complete native/RAM/compact quotes at drained selected-group boundaries; serial keeps its explicit launch placement",
+        [](common_params & params) { params.recurrent_rollback_auto = true; }
+    ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_AUTO"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

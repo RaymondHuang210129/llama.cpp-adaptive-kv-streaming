@@ -965,8 +965,16 @@ llama_context::llama_context(
     cparams.kv_stream_verify_max = params.kv_stream_verify_max;
     cparams.recurrent_rollback_ram = params.recurrent_rollback_ram;
     cparams.recurrent_rollback_compact = params.recurrent_rollback_compact;
+    cparams.recurrent_rollback_auto = params.recurrent_rollback_auto;
     if (params.recurrent_rollback_ram && params.recurrent_rollback_compact)
         throw std::runtime_error("recurrent RAM and compact rollback policies are mutually exclusive");
+    if (params.recurrent_rollback_auto && (params.recurrent_rollback_ram || params.recurrent_rollback_compact))
+        throw std::runtime_error("automatic recurrent placement conflicts with explicit placement");
+    if (params.recurrent_rollback_auto && std::getenv("LLAMA_RS_HOST_SPILL") &&
+            std::strcmp(std::getenv("LLAMA_RS_HOST_SPILL"),"1")==0)
+        throw std::runtime_error("automatic recurrent placement conflicts with LLAMA_RS_HOST_SPILL; use the explicit RAM option");
+    if (params.recurrent_rollback_auto && !group_initializing && !measurement_only && cparams.n_rs_seq)
+        LLAMA_LOG_WARN("rollback placement: serial storage is fixed at launch; use the arena fitter to compare explicit native/RAM/compact plans\n");
     if (cparams.kv_stream_verify_max && (!cparams.kv_streaming() || model.arch != LLM_ARCH_GEMMA4 ||
             params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other || (!group_initializing && cparams.n_seq_max != 1) ||
             cparams.kv_stream_verify_max > 4 || cparams.kv_stream_verify_max > cparams.n_ubatch)) {
@@ -1461,6 +1469,14 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     if (cparams.kv_shared_read) finish_shared_kv_read();
+    if (!group_initializing && !measurement_only && cparams.n_seq_max==1 && kv_resources.recurrent &&
+            std::getenv("LLAMA_ROLLBACK_PROFILE") && std::strcmp(std::getenv("LLAMA_ROLLBACK_PROFILE"),"1")==0) {
+        const auto & recurrent=*kv_resources.recurrent;
+        const auto * bank=recurrent.spill_bank();
+        const auto transfers=bank ? bank->transfer_stats() : llama_recurrent_transfer_stats{};
+        LLAMA_LOG_INFO("rollback serial state profile: host_d2h_bytes=%zu host_h2d_bytes=%zu replay_calls=%" PRIu64 " replay_prefix_rows=%" PRIu64 " replay_ms=%.3f\n",
+            transfers.d2h_bytes,transfers.h2d_bytes,recurrent.compact_replay_calls,recurrent.compact_replay_rows,recurrent.compact_replay_ms);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!no_alloc() && !opt_ctx) {
@@ -2841,6 +2857,9 @@ bool llama_context::publish_mtp_kv(const llama_ubatch & ubatch, const llm_graph_
 llm_graph_result * llama_context::process_ubatch(
         const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx,
         llama_memory_text_phase phase, ggml_status & ret) {
+    const bool placement_measure=placement_expected_ms>0 && phase==llama_memory_text_phase::decode &&
+        gtype==LLM_GRAPH_TYPE_DEFAULT && ubatch.n_seq_tokens>1;
+    const int64_t placement_start=placement_measure ? ggml_time_us() : 0;
     llama_memory_recurrent * rs_spill = nullptr;
     if (model.arch == LLM_ARCH_QWEN35 && cparams.n_rs_seq && gtype == LLM_GRAPH_TYPE_DEFAULT && memory) {
         rs_spill = kv_resources.recurrent;
@@ -3143,6 +3162,17 @@ llm_graph_result * llama_context::process_ubatch(
     spill_capture.active=false;
     streaming.completed = true;
     ret = GGML_STATUS_SUCCESS;
+
+    if (stream && std::getenv("LLAMA_ROLLBACK_PROFILE") && std::strcmp(std::getenv("LLAMA_ROLLBACK_PROFILE"),"1")==0) {
+        const auto stats=stream->sequence_stats(llama_kv_stream_access_role::append);
+        LLAMA_LOG_INFO("rollback serial KV profile: decode=%d rows=%u h2d_bytes=%zu h2d_calls=%zu reused_bytes=%zu\n",
+            phase==llama_memory_text_phase::decode,ubatch.n_tokens,stats.copy_bytes,stats.copy_calls,stats.reused_bytes);
+    }
+
+    if (placement_measure) {
+        placement_elapsed_ms+=double(ggml_time_us()-placement_start)/1000;
+        ++placement_steps;
+    }
 
     return res;
 }
@@ -6742,6 +6772,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_stream_verify_max         =*/ 0,
         /*.recurrent_rollback_ram        =*/ false,
         /*.recurrent_rollback_compact    =*/ false,
+        /*.recurrent_rollback_auto       =*/ false,
     };
 
     return result;
@@ -7703,6 +7734,9 @@ struct group_execution_resources {
     std::unique_ptr<llama_context_memory> workspace;
     std::unique_ptr<llama_memory_phase_owner> owner;
     bool decode=false,shared_roles=false;
+    bool profile=std::getenv("LLAMA_ROLLBACK_PROFILE") && std::strcmp(std::getenv("LLAMA_ROLLBACK_PROFILE"),"1")==0;
+    size_t profile_resident_bytes=0;
+    uint32_t profile_rows=0;
     std::function<bool()> reader_admission={};
 
     explicit group_execution_resources(llama_context & context) : context(context) {}
@@ -7770,6 +7804,7 @@ struct group_execution_resources {
         return reader->complete_publication(layer,rows,committed);
     }
     bool ensure_reader(ggml_backend_memory_lease_t reader_staging,bool prepare,uint32_t rows=1) {
+        profile_rows=rows;
         std::vector<llama_kv_stream_group_frontier> frontiers;
         frontiers.reserve(sources.size());
         std::vector<llama_kv_stream_group_reader_source> visible;
@@ -7823,6 +7858,7 @@ struct group_execution_resources {
         const bool decode_mode=reader_admission || decode_transport(size_t(op->src[0]->ne[1]));
         const auto okay=decode_mode && !reader_admission ? reader->enqueue_attention(layer,columns,op,workspace,true) :
             reader->attention(layer,columns,op,workspace,decode_mode);
+        if (okay && profile) profile_resident_bytes+=reader->resident_upload_bytes();
         if (okay && layer+1==sources[reader_sources.front()].host->config().layers && !context.group_restore_recurrent_after_attention()) {
             LLAMA_LOG_ERROR("%s: grouped recurrent restore after attention failed\n",__func__);return false;
         }
@@ -7837,7 +7873,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
         llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision,ggml_backend_buffer_t existing_parent,
         const std::vector<llama_context_group_sequence_state> & states,llama_context_memory_create_result * result,
         llama_context * auxiliary,std::shared_ptr<llama_kv_stream_slot_projection> auxiliary_projection,
-        const std::vector<llama_context_group_sequence_state> & auxiliary_states) {
+        const std::vector<llama_context_group_sequence_state> & auxiliary_states,llama_context_group_plan * quote_only) {
     if (result) *result={};
     const bool readonly=auxiliary && model.arch==LLM_ARCH_GEMMA4 && auxiliary->model.arch==LLM_ARCH_GEMMA4_ASSISTANT &&
         auxiliary->group_target==this && auxiliary->cparams.ctx_other==this && !cparams.kv_stream_auxiliary_layers;
@@ -7885,9 +7921,10 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
         llama_context_group_plan quote;llama_memory_phase_cache_identity bounded_identity;
         if (!llama_context_group_bounded_identity(identities,child_identities,bounded_identity)) return false;
         const auto admission=quote_target_group(representative,identities,bounded_identity,phase,
-            profile,cparams.shared_device_memory_bytes,quote,auxiliary,child_identities);
+            profile,quote_only ? SIZE_MAX : cparams.shared_device_memory_bytes,quote,auxiliary,child_identities);
         if (result) *result=admission;
         if (admission.status!=llama_context_memory_create_status::success) return false;
+        if (quote_only) {*quote_only=std::move(quote);return true;}
         if (result) result->status=llama_context_memory_create_status::invalid_configuration;
         if (existing_parent && (ggml_backend_buffer_get_type(existing_parent)!=quote.target.buffer_type ||
                 ggml_backend_buffer_get_size(existing_parent)!=cparams.shared_device_memory_bytes)) return false;
@@ -7941,6 +7978,11 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
         for (const auto & region : regions) if (!ggml_backend_memory_arena_reserve_at(resources->parent.get(),region.id,
                 region.offset,region.size,region.alignment,region.flags,nullptr)) return false;
         if (!ggml_backend_memory_arena_commit(resources->parent.get())) return false;
+        if (resources->profile)
+            LLAMA_LOG_INFO("rollback arena profile: selected=%zu phase=%u recurrent=%zu bounded=%zu graph=%zu writer=%zu attention=%zu publication=%zu kv_pool=%zu parent=%zu unused=%zu\n",
+                count,unsigned(phase),quote.current_state_bytes,quote.bounded.allocation.bytes,graph_bytes,
+                quote.target.writer_bytes,quote.target.attention_bytes,quote.target.publication_bytes,
+                pages*page.bytes+conversion,cparams.shared_device_memory_bytes,cparams.shared_device_memory_bytes-cursor);
         if (child) child->parent.reset(ggml_backend_memory_arena_retain(resources->parent.get()));
         if (kv_resources.recurrent) {
             resources->recurrent_state=resources->acquire(101);
@@ -8261,7 +8303,17 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
                 auto retained=weak.lock();return retained && retained->ensure_reader(staging,true,rows);
             };
             context.group_execution->reader_finish=[weak] {
-                auto retained=weak.lock();return retained && (!retained->reader || retained->reader->finish());
+                auto retained=weak.lock();
+                if (!retained || (retained->reader && !retained->reader->finish())) return false;
+                if (retained->profile && retained->reader) {
+                    const auto stats=retained->reader->sequence_stats();
+                    LLAMA_LOG_INFO("rollback KV profile: role=%u decode=%d selected=%zu rows=%u ring_h2d_bytes=%zu ring_h2d_calls=%zu resident_h2d_bytes=%zu reused_bytes=%zu\n",
+                        retained->projection->role,retained->context.get_cparams().kv_stream_decode,
+                        retained->projection->handles.size(),retained->profile_rows,stats.copy_bytes,stats.copy_calls,
+                        retained->profile_resident_bytes,stats.reused_bytes);
+                    retained->profile_resident_bytes=0;
+                }
+                return true;
             };
         };
         bind_readers(*this,resources,staging);
@@ -8367,6 +8419,18 @@ struct llama_context_group::implementation {
     std::unique_ptr<llama_context> active;
     std::unique_ptr<llama_context> active_auxiliary;
     std::vector<llama_seq_id> selected;
+    llama_recurrent_placement_state placement;
+    llama_recurrent_placement_choice active_placement;
+    uint64_t active_placement_workload=0;
+    double partial_fraction=.5,partial_rows=2;
+    struct placement_quote {
+        llama_recurrent_representation representation;
+        llama_context_params params;
+        llama_context_group_plan quote;
+    };
+    std::vector<placement_quote> placement_quotes;
+    std::vector<llama_seq_id> quoted_selection;
+    llama_memory_work_phase quoted_phase=llama_memory_work_phase::target_prefill;
 };
 
 llama_context_group::llama_context_group() = default;
@@ -8395,9 +8459,17 @@ bool llama_context_group::selected_state_limit(uint32_t maximum,uint32_t & outpu
             const auto * recurrent=impl->metadata->get_kv_resources().recurrent;
             if (recurrent) {
                 auto params=impl->params;params.samplers=nullptr;params.n_samplers=0;
-                llama_context pending(*impl->model,params,selected);
-                ggml_backend_buffer_type_t current_type=nullptr;
-                if (!pending.get_kv_resources().recurrent->current_storage_requirements(current_type,total) || current_type!=type) return false;
+                const bool automatic=params.recurrent_rollback_auto;params.recurrent_rollback_auto=false;
+                size_t smallest=SIZE_MAX;
+                for (int alternative=0;alternative<(automatic ? 3 : 1);++alternative) {
+                    if (automatic) {params.recurrent_rollback_ram=alternative==1;params.recurrent_rollback_compact=alternative==2;}
+                    llama_context pending(*impl->model,params,selected);
+                    ggml_backend_buffer_type_t current_type=nullptr;size_t bytes=0;
+                    const auto * current=pending.get_kv_resources().recurrent;
+                    if (!current || !current->current_storage_requirements(current_type,bytes) || current_type!=type) return false;
+                    smallest=std::min(smallest,bytes);
+                }
+                total=smallest;
             }
             if (!bounded(*impl->metadata) || (impl->block_model && (!impl->auxiliary_metadata || !bounded(*impl->auxiliary_metadata)))) return false;
             // Shared MTP aliases the target bank; its storage must not be charged twice.
@@ -8627,6 +8699,49 @@ bool restore_parked_group_projection(const llama_model & model,const std::shared
     }
     output=std::move(states);return true;
 }
+
+bool group_placement_plan(const llama_context & context,const llama_context_group_plan & quote,
+        const llama_kv_stream_slot_projection & projection,llama_recurrent_representation representation,
+        double partial_fraction,double partial_rows,llama_recurrent_placement_plan & output) {
+    const auto * recurrent=context.get_kv_resources().recurrent;
+    const auto & params=context.get_cparams();
+    if (!recurrent || !params.n_rs_seq || quote.target.pool_minimum_bytes>quote.budget.parent_minimum_bytes) return false;
+    const size_t count=projection.handles.size();
+    if (!count || projection.sources.size()!=count) return false;
+    double current=0,matrix=0;
+    for (auto * tensor : recurrent->r_l) if (tensor) current+=double(tensor->ne[0])*ggml_type_size(tensor->type)*count;
+    for (auto * tensor : recurrent->s_l) if (tensor) matrix+=double(tensor->ne[0])*ggml_type_size(tensor->type)*count;
+    current+=matrix;
+    const size_t mandatory=quote.budget.parent_minimum_bytes-quote.target.pool_minimum_bytes;
+    const size_t pool=mandatory<params.shared_device_memory_bytes ? params.shared_device_memory_bytes-mandatory : 0;
+    long double required=0;
+    if (quote.caches.size()!=quote.cache_allocations.size()) return false;
+    size_t source=0;
+    for (size_t i=0;i<quote.caches.size();++i) if (!quote.cache_allocations[i].bytes) {
+        const auto & cache=quote.caches[i];
+        const auto tokens=projection.sources[source++%count].tokens+params.n_rs_seq+1;
+        required+=static_cast<long double>((tokens+255)/256*256)*cache.row_bytes*cache.layers;
+    }
+    if (required>SIZE_MAX) return false;
+    // Conservative seeds; only drained real-work samples update the bounded correction.
+    constexpr double device_bytes_per_ms=512.0*1024*1024;
+    const double rows=params.n_rs_seq+1;
+    llama_recurrent_placement_plan next;
+    next.representation=representation;next.peak_bytes=quote.budget.parent_minimum_bytes;
+    next.kv_stream_bytes=required>pool ? size_t(required)-pool : 0;
+    next.compute_ms=context.get_model().size()/device_bytes_per_ms;
+    if (representation==llama_recurrent_representation::dense_host) {
+        const double writes=current*params.n_rs_seq;
+        if (writes>SIZE_MAX) return false;
+        next.d2h_bytes=size_t(writes);next.h2d_bytes=size_t(current*partial_fraction);
+        next.compute_ms+=current*rows/device_bytes_per_ms;
+    } else if (representation==llama_recurrent_representation::gdn_fp32) {
+        const double factors=std::max(0.0,double(quote.current_state_bytes)-2*current);
+        next.compute_ms+=(2*current+factors)/device_bytes_per_ms;
+        next.restore_ms=partial_fraction*(2*matrix+factors*partial_rows/rows)/device_bytes_per_ms;
+    } else next.compute_ms+=current*(rows+1)/device_bytes_per_ms;
+    output=next;return true;
+}
 }
 
 bool llama_context_group::activate(const llama_kv_stream_selection & selection,
@@ -8646,57 +8761,151 @@ bool llama_context_group::activate(const llama_kv_stream_selection & selection,
             selected.push_back(llama_seq_id(handle.slot));
         }
         if (!restore_parked_group_projection(*impl->model,impl->table,projection,impl->parked,states)) return false;
-        auto candidate=std::make_unique<llama_context>(*impl->model,impl->params,selected);
-        if (impl->metadata) {
-            const auto & prepared=impl->metadata->get_cparams();
-            candidate->set_causal_attn(prepared.causal_attn);
-            candidate->set_embeddings_nextn(prepared.embeddings_nextn,prepared.embeddings_nextn_masked);
-            if (!candidate->bind_group_samplers_from(*impl->metadata)) return false;
-        }
-        if (impl->block_model) {
-            candidate->serial_feature_layers=impl->block_model->target_layer_ids;candidate->serial_feature_producer=true;
-            candidate->serial_feature_images=impl->metadata->serial_feature_images;
-            for (auto layer : candidate->serial_feature_layers) candidate->set_embeddings_layer_inp(uint32_t(layer),true);
-        }
-        std::unique_ptr<llama_context> child;
+        std::unique_ptr<llama_context> candidate,child;
         std::shared_ptr<llama_kv_stream_slot_projection> child_projection;
         std::vector<llama_context_group_sequence_state> child_states;
-        if (impl->params.kv_stream_auxiliary_layers || impl->shared_model || impl->block_model) {
-            if (impl->shared_model || impl->block_model) child_projection=projection;
-            else {
-                child_projection=std::make_shared<llama_kv_stream_slot_projection>();
-                if (!impl->table->project(selection,handles,1,*child_projection)) return false;
-                if (!restore_parked_group_projection(*impl->model,impl->table,child_projection,impl->parked_auxiliary,child_states)) return false;
+        const auto prepare=[&](llama_context_params params) {
+            child.reset();candidate.reset();child_projection.reset();child_states.clear();
+            candidate=std::make_unique<llama_context>(*impl->model,params,selected);
+            if (impl->metadata) {
+                const auto & prepared=impl->metadata->get_cparams();
+                candidate->set_causal_attn(prepared.causal_attn);
+                candidate->set_embeddings_nextn(prepared.embeddings_nextn,prepared.embeddings_nextn_masked);
+                if (!candidate->bind_group_samplers_from(*impl->metadata)) return false;
             }
-            auto child_params=impl->shared_model || impl->block_model ? impl->shared_params : impl->params;
-            child_params.ctx_type=impl->block_model ? LLAMA_CONTEXT_TYPE_DEFAULT : LLAMA_CONTEXT_TYPE_MTP;child_params.ctx_other=candidate.get();
-            child_params.shared_device_memory_bytes=0;child_params.n_rs_seq=0;child_params.kv_stream_auxiliary_layers=0;
-            child_params.samplers=nullptr;child_params.n_samplers=0;
             if (impl->block_model) {
-                if (std::any_of(projection->sources.begin(),projection->sources.end(),[](const auto & source) {return source.tokens!=0;})) {
-                    for (size_t i=0;i<handles.size();++i) {
-                        const auto handle=handles[i];const auto & source=projection->sources[i];
-                        auto saved=impl->parked_auxiliary[handle.slot];
-                        if (!source.tokens && !saved.model && saved.sequence==-1 && !saved.request_epoch && !saved.cache_id &&
-                                !saved.cache_generation && !saved.tokens && saved.recurrent.empty() && saved.bounded.empty() && saved.full_columns.empty()) {
-                            saved=states[i];saved.model=impl->block_model;
+                candidate->serial_feature_layers=impl->block_model->target_layer_ids;candidate->serial_feature_producer=true;
+                candidate->serial_feature_images=impl->metadata->serial_feature_images;
+                for (auto layer : candidate->serial_feature_layers) candidate->set_embeddings_layer_inp(uint32_t(layer),true);
+            }
+            if (impl->params.kv_stream_auxiliary_layers || impl->shared_model || impl->block_model) {
+                if (impl->shared_model || impl->block_model) child_projection=projection;
+                else {
+                    child_projection=std::make_shared<llama_kv_stream_slot_projection>();
+                    if (!impl->table->project(selection,handles,1,*child_projection)) return false;
+                    if (!restore_parked_group_projection(*impl->model,impl->table,child_projection,impl->parked_auxiliary,child_states)) return false;
+                }
+                auto child_params=impl->shared_model || impl->block_model ? impl->shared_params : params;
+                child_params.recurrent_rollback_auto=false;
+                child_params.ctx_type=impl->block_model ? LLAMA_CONTEXT_TYPE_DEFAULT : LLAMA_CONTEXT_TYPE_MTP;child_params.ctx_other=candidate.get();
+                child_params.shared_device_memory_bytes=0;child_params.n_rs_seq=0;child_params.kv_stream_auxiliary_layers=0;
+                child_params.samplers=nullptr;child_params.n_samplers=0;
+                if (impl->block_model) {
+                    if (std::any_of(projection->sources.begin(),projection->sources.end(),[](const auto & source) {return source.tokens!=0;})) {
+                        for (size_t i=0;i<handles.size();++i) {
+                            const auto handle=handles[i];const auto & source=projection->sources[i];
+                            auto saved=impl->parked_auxiliary[handle.slot];
+                            if (!source.tokens && !saved.model && saved.sequence==-1 && !saved.request_epoch && !saved.cache_id &&
+                                    !saved.cache_generation && !saved.tokens && saved.recurrent.empty() && saved.bounded.empty() && saved.full_columns.empty()) {
+                                saved=states[i];saved.model=impl->block_model;
+                            }
+                            if (saved.model!=impl->block_model || saved.sequence!=llama_seq_id(handle.slot) ||
+                                    saved.request_epoch!=handle.generation || saved.cache_id!=source.id ||
+                                    saved.cache_generation!=source.generation || saved.tokens!=source.tokens ||
+                                    saved.full_columns!=states[i].full_columns) return false;
+                            child_states.push_back(std::move(saved));
                         }
-                        if (saved.model!=impl->block_model || saved.sequence!=llama_seq_id(handle.slot) ||
-                                saved.request_epoch!=handle.generation || saved.cache_id!=source.id ||
-                                saved.cache_generation!=source.generation || saved.tokens!=source.tokens ||
-                                saved.full_columns!=states[i].full_columns) return false;
-                        child_states.push_back(std::move(saved));
+                    }
+                    child=std::make_unique<llama_context>(*impl->block_model,child_params,selected,impl->prediction_rows);
+                } else child=std::make_unique<llama_context>(impl->shared_model ? *impl->shared_model : *impl->model,child_params,selected);
+                child->set_embeddings_nextn(true,!impl->block_model);
+                if (impl->auxiliary_metadata && !child->bind_group_samplers_from(*impl->auxiliary_metadata)) return false;
+            }
+            return true;
+        };
+        const bool automatic=impl->params.recurrent_rollback_auto && impl->params.n_rs_seq &&
+            impl->metadata && impl->metadata->get_kv_resources().recurrent;
+        for (unsigned attempt=0;attempt<2;++attempt) {
+            auto policy=impl->placement;
+            llama_recurrent_placement_choice choice;
+            uint64_t workload=0;
+            auto chosen_params=impl->params;chosen_params.recurrent_rollback_auto=false;
+            std::vector<implementation::placement_quote> fresh;
+            bool cached=false;
+            if (automatic) {
+                llama_recurrent_placement_request request;
+                request.budget=impl->params.shared_device_memory_bytes;
+                request.generation=selection_revision;request.safe_boundary=true;
+                workload=(uint64_t(selected.size())<<48) | (uint64_t(impl->params.n_rs_seq)<<40) |
+                    (uint64_t(impl->params.type_k)<<32) | (uint64_t(impl->params.type_v)<<24) |
+                    (uint64_t(phase)<<20) | (projection->selected.history_tokens/16384);
+                request.workload=workload;
+                cached=!attempt && !impl->placement_quotes.empty() && impl->quoted_selection==selected;
+                if (cached && impl->quoted_phase!=phase) for (const auto & item : impl->placement_quotes) {
+                    const auto & q=item.quote;
+                    // A narrower graph can admit a representation that failed in prefill.
+                    if (q.budget.parent_minimum_bytes>request.budget && q.bounded.allocation.bytes<=request.budget &&
+                            q.current_state_bytes<=request.budget-q.bounded.allocation.bytes) cached=false;
+                }
+                const auto describe=[&](const std::vector<implementation::placement_quote> & quotes) {
+                    request.plans.clear();
+                    for (const auto & item : quotes) {
+                        llama_recurrent_placement_plan plan;
+                        if (!group_placement_plan(*impl->metadata,item.quote,*projection,item.representation,
+                                impl->partial_fraction,impl->partial_rows,plan)) return false;
+                        request.plans.push_back(plan);
+                    }
+                    return true;
+                };
+                if (cached) {
+                    if (!describe(impl->placement_quotes) || !llama_recurrent_placement_choose(request,policy,choice)) cached=false;
+                    else if (!impl->placement.chosen || choice.representation!=impl->placement.current) cached=false;
+                }
+                if (!cached) {
+                    policy=impl->placement;
+                    for (auto representation : {llama_recurrent_representation::dense_device,
+                            llama_recurrent_representation::dense_host,llama_recurrent_representation::gdn_fp32}) {
+                        auto params=chosen_params;
+                        params.recurrent_rollback_ram=representation==llama_recurrent_representation::dense_host;
+                        params.recurrent_rollback_compact=representation==llama_recurrent_representation::gdn_fp32;
+                        if (!prepare(params)) return false;
+                        const auto * recurrent=candidate->get_kv_resources().recurrent;
+                        if (!recurrent || (params.recurrent_rollback_compact && !recurrent->compact_enabled())) continue;
+                        llama_context_group_plan quote;llama_context_memory_create_result described;
+                        if (!candidate->initialize_group_execution(impl->table,projection,representative,phase,profile,
+                                selection_revision,impl->parent.get(),states,&described,child.get(),child_projection,child_states,&quote)) return false;
+                        fresh.push_back({representation,params,std::move(quote)});
+                    }
+                    if (!describe(fresh) || !llama_recurrent_placement_choose(request,policy,choice)) {
+                        if (result) {
+                            result->status=llama_context_memory_create_status::insufficient_budget;
+                            result->available_bytes=request.budget;result->required_bytes=SIZE_MAX;
+                            for (const auto & plan : request.plans) result->required_bytes=std::min(result->required_bytes,plan.peak_bytes);
+                            result->additional_bytes=result->required_bytes>request.budget ? result->required_bytes-request.budget : 0;
+                        }
+                        return false;
                     }
                 }
-                child=std::make_unique<llama_context>(*impl->block_model,child_params,selected,impl->prediction_rows);
-            } else child=std::make_unique<llama_context>(impl->shared_model ? *impl->shared_model : *impl->model,child_params,selected);
-            child->set_embeddings_nextn(true,!impl->block_model);
-            if (impl->auxiliary_metadata && !child->bind_group_samplers_from(*impl->auxiliary_metadata)) return false;
+                const auto & quotes=cached ? impl->placement_quotes : fresh;
+                const auto found=std::find_if(quotes.begin(),quotes.end(),[&](const auto & item) {
+                    return item.representation==choice.representation;
+                });
+                chosen_params=found->params;
+                LLAMA_LOG_INFO("rollback placement: provider=%s selected=%zu history=%zu advisory_peak=%zu budget=%zu predicted_ms=%.3f adjusted_ms=%.3f samples=%u quote_reused=%d safe_boundary=1\n",
+                    choice.representation==llama_recurrent_representation::gdn_fp32 ? "gdn-fp32" :
+                    choice.representation==llama_recurrent_representation::dense_host ? "dense-host" : "dense-device",
+                    selected.size(),projection->selected.history_tokens,choice.peak_bytes,request.budget,
+                    choice.predicted_ms,choice.adjusted_ms,policy.samples[size_t(choice.representation)],cached);
+            }
+            if (!prepare(chosen_params)) return false;
+            auto quoted_selection=automatic && !cached ? selected : std::vector<llama_seq_id>{};
+            llama_context_memory_create_result local;
+            auto * admission=result ? result : &local;
+            // Cached quotes advise cost only. This fresh quote still gates every GPU allocation.
+            if (!candidate->initialize_group_execution(impl->table,projection,representative,phase,profile,selection_revision,
+                    impl->parent.get(),states,admission,child.get(),child_projection,child_states)) {
+                if (cached && admission->status==llama_context_memory_create_status::insufficient_budget) continue;
+                return false;
+            }
+            if (!impl->parent) impl->parent.reset(ggml_backend_buffer_retain(candidate->group_parent()));
+            if (automatic) {
+                impl->placement=policy;impl->active_placement=choice;impl->active_placement_workload=workload;
+                if (!cached) {impl->placement_quotes=std::move(fresh);impl->quoted_selection=std::move(quoted_selection);impl->quoted_phase=phase;}
+                if (phase==llama_memory_work_phase::target_verify) candidate->placement_expected_ms=choice.predicted_ms;
+            }
+            impl->active=std::move(candidate);impl->active_auxiliary=std::move(child);impl->selected=std::move(selected);return true;
         }
-        if (!candidate->initialize_group_execution(impl->table,projection,representative,phase,profile,selection_revision,
-                impl->parent.get(),states,result,child.get(),child_projection,child_states)) return false;
-        if (!impl->parent) impl->parent.reset(ggml_backend_buffer_retain(candidate->group_parent()));
-        impl->active=std::move(candidate);impl->active_auxiliary=std::move(child);impl->selected=std::move(selected);return true;
+        return false;
     } catch (const std::bad_alloc &) {
         if (result) result->status=llama_context_memory_create_status::allocation_failed;
         return false;
@@ -8714,13 +8923,55 @@ bool llama_context_group::park() {
             if (state.sequence<0 || size_t(state.sequence)>=impl->parked.size()) return false;
         for (const auto & state : auxiliary_states)
             if (state.sequence<0 || size_t(state.sequence)>=impl->parked_auxiliary.size()) return false;
+        if (std::getenv("LLAMA_ROLLBACK_PROFILE") && std::strcmp(std::getenv("LLAMA_ROLLBACK_PROFILE"),"1")==0) {
+            if (const auto * recurrent=impl->active->get_kv_resources().recurrent) {
+                llama_recurrent_transfer_stats total;
+                for (auto sequence : impl->selected) if (const auto * bank=recurrent->spill_bank(sequence)) {
+                    const auto stats=bank->transfer_stats();total.d2h_bytes+=stats.d2h_bytes;total.h2d_bytes+=stats.h2d_bytes;
+                    total.d2h_calls+=stats.d2h_calls;total.h2d_calls+=stats.h2d_calls;
+                }
+                LLAMA_LOG_INFO("rollback state profile: selected=%zu host_d2h_bytes=%zu host_h2d_bytes=%zu host_d2h_calls=%zu host_h2d_calls=%zu replay_calls=%" PRIu64 " replay_prefix_rows=%" PRIu64 " replay_ms=%.3f\n",
+                    impl->selected.size(),total.d2h_bytes,total.h2d_bytes,total.d2h_calls,total.h2d_calls,
+                    recurrent->compact_replay_calls,recurrent->compact_replay_rows,recurrent->compact_replay_ms);
+            }
+        }
         if (impl->active_auxiliary && !impl->active_auxiliary->detach_group_execution()) return false;
         if (!impl->active->detach_group_execution()) return false;
+        if (impl->params.recurrent_rollback_auto && impl->active->placement_steps) {
+            const auto steps=impl->active->placement_steps;
+            llama_recurrent_placement_observe(impl->placement,impl->active_placement.representation,
+                impl->active_placement_workload,impl->active_placement.predicted_ms,impl->active->placement_elapsed_ms/steps);
+            if (const auto * recurrent=impl->active->get_kv_resources().recurrent) {
+                impl->partial_fraction=std::min(1.0,double(recurrent->rollback_events)/(steps*impl->selected.size()));
+                impl->partial_rows=recurrent->rollback_events ? double(recurrent->rollback_prefix_rows)/recurrent->rollback_events : 1;
+            }
+        }
         // Publish only exported members after retirement succeeds; keep parked peers in place.
         static_assert(std::is_nothrow_move_assignable<llama_context_group_sequence_state>::value,"state publication must not allocate");
         for (auto & state : states) impl->parked[size_t(state.sequence)]=std::move(state);
         for (auto & state : auxiliary_states) impl->parked_auxiliary[size_t(state.sequence)]=std::move(state);
         impl->active_auxiliary.reset();impl->active.reset();impl->selected.clear();return true;
+    } catch (...) {return false;}
+}
+
+bool llama_context_group::set_recurrent_placement(llama_recurrent_representation representation) {
+    if (!impl || impl->active || impl->active_auxiliary || impl->vision_lent || !impl->metadata ||
+            size_t(representation)>size_t(llama_recurrent_representation::gdn_fp32)) return false;
+    try {
+        auto params=impl->params;
+        params.recurrent_rollback_auto=false;
+        params.recurrent_rollback_ram=representation==llama_recurrent_representation::dense_host;
+        params.recurrent_rollback_compact=representation==llama_recurrent_representation::gdn_fp32;
+        if (!params.n_rs_seq || !impl->metadata->get_kv_resources().recurrent) {
+            if (representation!=llama_recurrent_representation::dense_device) return false;
+        } else {
+            auto probe=params;probe.samplers=nullptr;probe.n_samplers=0;
+            llama_context pending(*impl->model,probe,std::vector<llama_seq_id>{0});
+            const auto * recurrent=pending.get_kv_resources().recurrent;
+            if (!recurrent || (params.recurrent_rollback_ram && !recurrent->spill_enabled()) ||
+                    (params.recurrent_rollback_compact && !recurrent->compact_enabled())) return false;
+        }
+        impl->params=params;impl->placement={};impl->placement_quotes.clear();impl->quoted_selection.clear();return true;
     } catch (...) {return false;}
 }
 

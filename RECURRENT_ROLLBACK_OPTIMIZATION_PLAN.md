@@ -1,6 +1,6 @@
 # Compact recurrent rollback and budget-aware placement
 
-Status: P0-P4 complete; P5-P7 remain in progress. Implementation branch `feature/compact-recurrent-rollback`. Exact operator and integrated transaction gates passed on the qualified backend; placement policy, broader product qualification and performance closeout remain open.
+Status: P0-P5 complete; P6-P7 remain in progress. Implementation branch `feature/compact-recurrent-rollback`. Exact operator and integrated transaction gates passed on the qualified backend; budget-aware placement is qualified; broader product qualification and performance closeout remain open.
 
 Evidence: [P0 reference and allocation ledger](docs/development/compact-recurrent-rollback.md).
 
@@ -184,12 +184,12 @@ Exit: compact execution passes correctness and lifecycle gates, and actual alloc
 
 ### P5. Add budget-aware placement and bounded adaptation
 
-- [ ] Compare the supported dense and compact plans using total predicted decode cost within the hard device budget and reserve.
-- [ ] Account for extra KV streaming caused by state residency, reconstruction cost, transfers and acceptance-dependent behavior.
-- [ ] Support partial residency only for independently restorable regions with explicit dependencies.
-- [ ] Change plans only at qualified safe request/phase boundaries after draining affected work.
-- [ ] Add hysteresis and bounded measurements so the policy does not oscillate or profile indefinitely.
-- [ ] Retain reproducible user overrides and clear unsupported/admission errors.
+- [x] Compare the supported dense and compact plans using total predicted decode cost within the hard device budget and reserve.
+- [x] Account for extra KV streaming caused by state residency, reconstruction cost, transfers and acceptance-dependent behavior.
+- [x] Support partial residency only for independently restorable regions with explicit dependencies.
+- [x] Change plans only at qualified safe request/phase boundaries after draining affected work.
+- [x] Add hysteresis and bounded measurements so the policy does not oscillate or profile indefinitely.
+- [x] Retain reproducible user overrides and clear unsupported/admission errors.
 
 Exit: deterministic budget tests pass and measured plan choices improve total execution cost over the applicable references.
 

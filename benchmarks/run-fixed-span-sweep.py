@@ -73,13 +73,15 @@ def arguments() -> argparse.Namespace:
                         help="store recurrent rollback snapshots in RAM; default keeps them in VRAM")
     parser.add_argument("--recurrent-rollback-compact", action="store_true",
                         help="use qualified FP32 GDN logs; unsupported operators retain native storage")
+    parser.add_argument("--recurrent-rollback-auto", action="store_true",
+                        help="compare complete recurrent plans at drained selected-group boundaries")
     parser.add_argument(
         "--mtp-lengths", type=parse_mtp_lengths, default=(0,), metavar="N[,N...]",
         help="maximum MTP draft lengths to sweep (0=target-only baseline; supported: 1-4; default: 0)",
     )
     args=parser.parse_args()
-    if args.recurrent_rollback_ram and args.recurrent_rollback_compact:
-        parser.error("RAM and compact rollback policies are mutually exclusive")
+    if sum((args.recurrent_rollback_ram,args.recurrent_rollback_compact,args.recurrent_rollback_auto))>1:
+        parser.error("RAM, compact and automatic rollback policies are mutually exclusive")
     if not math.isfinite(args.request_timeout) or not 1<=args.request_timeout<=43200:
         parser.error("--request-timeout must be finite and within 1..43200 seconds")
     if args.h2d_reference_gbps is not None and (not math.isfinite(args.h2d_reference_gbps) or args.h2d_reference_gbps <= 0):
@@ -117,6 +119,8 @@ def server_command(args: argparse.Namespace, context: int, mtp_length: int, aren
         command.append("--recurrent-rollback-ram")
     if getattr(args, "recurrent_rollback_compact", False):
         command.append("--recurrent-rollback-compact")
+    if getattr(args, "recurrent_rollback_auto", False):
+        command.append("--recurrent-rollback-auto")
     if mtp_length:
         command += [
             "--spec-type", "draft-mtp",
@@ -700,6 +704,7 @@ def main() -> int:
                 "budget_policy": "maximum-fit" if args.auto_max_arena else "fixed",
                 "recurrent_rollback_ram": args.recurrent_rollback_ram,
                 "recurrent_rollback_compact": args.recurrent_rollback_compact,
+                "recurrent_rollback_auto": args.recurrent_rollback_auto,
                 "windows_sysmem_fallback_verified": False if os.name == "nt" else None,
                 "command": server_command(args,context,mtp_length,arena_mib),
                 "model": str(args.model),

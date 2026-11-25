@@ -439,6 +439,7 @@ extern "C" {
         bool recurrent_rollback_ram;
         // Use qualified FP32 GDN update logs; unsupported operators retain native storage.
         bool recurrent_rollback_compact;
+        bool recurrent_rollback_auto; // Choose a provider only at drained selected-group boundaries.
     };
 
     struct llama_model_tensor_override {

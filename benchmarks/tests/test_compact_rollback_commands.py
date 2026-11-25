@@ -39,6 +39,32 @@ class CompactCommandTests(unittest.TestCase):
             self.assertNotIn("LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT", SWEEP.server_environment(False))
             self.assertNotIn("LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT", FINDER.environment())
 
+    def test_independent_serial_and_joint_histories_match_for_each_slot(self):
+        args=FINDER.arguments(["--model","target.gguf","--parallel","2","--context-size","8192",
+                               "--prompt-tokens","16","--probe-mode","full","--distinct-probe-histories"])
+        profiles=FINDER.multi_slot_probe_profiles(args)
+        tokens=list(range(100))
+        singles=[FINDER.multi_slot_probe_prompts(args,tokens,p)[0] for p in profiles if p["label"].startswith("single-")]
+        joint=FINDER.multi_slot_probe_prompts(args,tokens,next(p for p in profiles if p["label"]=="joint"))
+        self.assertEqual(singles,joint)
+        self.assertNotEqual(joint[0],joint[1])
+        self.assertEqual(joint[0][0],joint[1][0])
+        with self.assertRaises(ValueError):
+            FINDER.multi_slot_probe_prompts(args,tokens[:20],next(p for p in profiles if p["label"]=="joint"))
+
+    def test_auto_policy_roundtrips_and_conflicts_with_explicit_placements(self):
+        args=FINDER.arguments(["--model","target.gguf","--parallel","4","--recurrent-rollback-auto"])
+        self.assertIn("--recurrent-rollback-auto",FINDER.server_command(args,2096))
+        for explicit in ("--recurrent-rollback-ram","--recurrent-rollback-compact"):
+            with self.assertRaises(SystemExit):
+                FINDER.arguments(["--model","target.gguf","--recurrent-rollback-auto",explicit])
+
+    def test_mixed_mode_joint_capacity_uses_the_larger_verification_width(self):
+        args=FINDER.arguments(["--model","target.gguf","--model-draft","draft.gguf","--parallel","64",
+                               "--spec-mode","dflash-k4v","--draft-length","1","--ngram-m","7"])
+        joint=next(p for p in FINDER.multi_slot_probe_profiles(args) if p["label"]=="joint")
+        self.assertEqual(32,joint["selected_max"])
+
 
 if __name__ == "__main__":
     unittest.main()

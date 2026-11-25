@@ -70,6 +70,7 @@ Oceanus runs on one CUDA GPU. Model weights and KV-cache quantization are separa
 | KV cache | Q8V8 (`q8_0` / `q8_0`), Q8V4 (`q8_0` / `q4_0`), and Q4V4 (`q4_0` / `q4_0`), subject to compiled kernels and memory fit. |
 | Image input | Optional matching `mmproj` for still images and interleaved image/text prompts. Text-only execution explicitly disables the projector. |
 | Drafting | Target-only; MTP with 1-3 proposals on both models; DFlash2 with 1-7 proposals on Qwen; Qwen DFlash2 + CPU K4V with independently selected neural/copy lengths of 1-7. |
+| Qwen recurrent rollback | Native snapshots by default; optional RAM snapshots, qualified FP32 checkpoint/log storage, or automatic placement for selected groups. Refit the arena after changing placement. |
 | Parallel requests | Configurable logical slots, one shared GPU arena, independent histories, and jointly executed selections that fit the context and memory budgets. |
 
 Q8V8 and Q8V4 have full-model reference profiles. Q4V4 is available through the common KV reader, with narrower full-model qualification; availability is not evidence that every model/drafter/image combination has been qualified. GPU execution evidence covers selected one- to four-slot profiles. Larger configured counts and other GPUs need their own qualification; see the [qualification ledger](MULTI_SLOT_PHASE_ARENA_ROADMAP.md).
@@ -358,6 +359,26 @@ PowerShell:
 $CMD += '--recurrent-rollback-ram'
 $FIT += '--recurrent-rollback-ram'
 ```
+
+**Optional: compact Qwen rollback in VRAM.** Choose this instead of the RAM option above. `--recurrent-rollback-compact` retains a checkpoint, a working state and the evaluated FP32 updates needed to reconstruct an accepted prefix. For the reference Qwen geometry, persistent rollback storage falls from 598.50 to 318.41 MiB per selected request with MTP3, and from 1,197.00 to 331.95 MiB with DFlash7. Prefix restoration adds computation; the fastest choice depends on context and available KV capacity.
+
+Bash:
+
+```bash
+CMD+=(--recurrent-rollback-compact)
+FIT+=(--recurrent-rollback-compact)
+```
+
+PowerShell:
+
+```powershell
+$CMD += '--recurrent-rollback-compact'
+$FIT += '--recurrent-rollback-compact'
+```
+
+Compact CUDA execution is currently gated to the qualified Linux Release build using NVCC 13.0.88 and `sm120a`; other builds retain native storage. Target-only and Gemma retain their normal storage. Check the observed representation in the finder log, then refit the arena. The [rollback qualification ledger](docs/development/compact-recurrent-rollback.md) records the arithmetic contract and hardware limits.
+
+**Optional: automatic group placement.** Use `--recurrent-rollback-auto` in both commands to compare native, RAM and compact plans when a selected group is activated. It accounts for state storage, graph workspace, KV residency and estimated transfer/replay cost, with bounded feedback and hysteresis. Plans can change after a group drains and parks its state. The RAM, compact and automatic flags are mutually exclusive. Serial storage stays fixed at launch; the [measured placement selector](benchmarks/select-recurrent-placement.py) can fit and compare explicit launch settings before starting a server.
 
 ### 5. Choose slots and the context budget
 

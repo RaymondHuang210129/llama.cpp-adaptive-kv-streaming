@@ -73,6 +73,14 @@ def arguments(argv=None):
                         help="store recurrent rollback snapshots in RAM; default keeps them in VRAM")
     parser.add_argument("--recurrent-rollback-compact", action="store_true",
                         help="use qualified FP32 GDN logs; unsupported operators retain native storage")
+    parser.add_argument("--recurrent-rollback-auto", action="store_true",
+                        help="compare complete native/RAM/compact plans at drained selected-group boundaries")
+    parser.add_argument("--measure-decode", action="store_true",
+                        help="record token arrival timelines and a common decode window for each probe cohort")
+    parser.add_argument("--distinct-probe-histories", action="store_true",
+                        help="give slots different corpus ranges; the corpus must cover slots times prompt tokens")
+    parser.add_argument("--probe-token-offset", type=int, default=0,
+                        help="start text histories at this corpus token offset, retaining the initial special token")
     parser.add_argument("--no-warmup", action="store_true", help="skip startup warmup; retain all real workload probes")
     parser.add_argument("--verbosity", type=int, default=3, help="server log threshold 0-5; route proofs require at least 4")
     parser.add_argument("--decode-tokens", type=int, default=256)
@@ -85,8 +93,12 @@ def arguments(argv=None):
     parser.add_argument("--request-timeout", type=float, default=3600)
     parser.add_argument("--output", type=Path, default=ROOT /"benchmarks/results/arena-fit")
     args = parser.parse_args(argv)
-    if args.recurrent_rollback_ram and args.recurrent_rollback_compact:
-        parser.error("RAM and compact rollback policies are mutually exclusive")
+    if args.probe_token_offset<0 or args.image and args.probe_token_offset:
+        parser.error("probe token offset must be nonnegative and applies to text histories only")
+    if args.measure_decode and args.decode_tokens<2:
+        parser.error("decode-window measurement needs at least two output tokens")
+    if sum((args.recurrent_rollback_ram,args.recurrent_rollback_compact,args.recurrent_rollback_auto))>1:
+        parser.error("RAM, compact and automatic rollback policies are mutually exclusive")
     if args.image:
         if args.image_min_tokens is None:args.image_min_tokens=64
         if args.image_max_tokens is None:args.image_max_tokens=4096
@@ -144,6 +156,8 @@ def server_command(args, arena_mib):
         command.append("--recurrent-rollback-ram")
     if getattr(args, "recurrent_rollback_compact", False):
         command.append("--recurrent-rollback-compact")
+    if getattr(args, "recurrent_rollback_auto", False):
+        command.append("--recurrent-rollback-auto")
     if getattr(args, "no_warmup", False):
         command.append("--no-warmup")
     if args.draft_length:
@@ -210,6 +224,21 @@ def loaded_runtime_libraries(pid):
     return result
 
 
+def process_memory(pid):
+    if type(pid) is not int or pid<=0:
+        return None
+    try:
+        text=Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return None
+    fields=dict(re.findall(r"^(VmHWM|VmRSS):\s+(\d+) kB$",text,re.MULTILINE))
+    if "VmHWM" not in fields:
+        return None
+    return {"peak_rss_bytes":int(fields["VmHWM"])*1024,
+            "current_rss_bytes":int(fields.get("VmRSS",0))*1024,
+            "scope":"process RSS through completed requests, including startup and mapped pages"}
+
+
 def shell_commands(command):
     def quote(value):
         return "'" +value.replace("'", "''") +"'"
@@ -259,7 +288,7 @@ def multi_slot_probe_profiles(args):
     slots = args.parallel
     count = probe_text_tokens(args)
     active = min(slots, getattr(args, "probe_selected", None) or slots, args.context_size // (args.decode_tokens + 16),
-                 args.batch_size // (args.draft_length + 1))
+                 args.batch_size // (max(args.draft_length,(ngram_settings(args) or {}).get("ngram_m",0)) + 1))
     if not active:
         raise ValueError("context cannot fit even one probe request")
     joint = min(count, (args.context_size - active * (args.decode_tokens + 15)) // active)
@@ -314,7 +343,13 @@ def request_completion_group(url, body, timeout):
 def observed_completion(args, url, body, label, grouped=False):
     log_path = getattr(args, "_source_log_path", None)
     before = speculative_source_stats(log_path.read_text(errors="replace")) if log_path else {}
-    result = request_completion_group(url +"/completion", body, timeout=args.request_timeout) if grouped else request_json(url +"/completion", body, timeout=args.request_timeout)
+    if getattr(args, "measure_decode", False):
+        from recurrent_measurement import stream_completions
+        body["stream"] = True
+        rows = stream_completions(url +"/completion", body, len(body["prompt"]) if grouped else 1, args.request_timeout)
+        result = rows if grouped else rows[0]
+    else:
+        result = request_completion_group(url +"/completion", body, timeout=args.request_timeout) if grouped else request_json(url +"/completion", body, timeout=args.request_timeout)
     if log_path:
         after = speculative_source_stats(log_path.read_text(errors="replace"))
         fields = ("generated_tokens", "accepted_tokens", "accept_calls", "prediction_forwards")
@@ -341,10 +376,24 @@ def image_slot_requests(args, url, prompt, images):
     return rows
 
 
+def multi_slot_probe_prompts(args, tokens, profile):
+    stride=probe_text_tokens(args) if getattr(args,"distinct_probe_histories",False) else 0
+    prompts=[]
+    for slot,count in zip(profile["slots"],profile["prompt_tokens"]):
+        first=getattr(args,"probe_token_offset",0)+slot*stride
+        prompt=tokens[first:first+count]
+        if len(prompt)!=count:
+            raise ValueError("corpus is too short for the selected independent probe histories")
+        if first and prompt:
+            prompt=[tokens[0],*prompt[1:]]
+        prompts.append(prompt)
+    return prompts
+
+
 def multi_slot_requests(args, url, tokens, candidate, log_path):
     observations = []
     for profile in multi_slot_probe_profiles(args):
-        prompts = [tokens[:count] for count in profile["prompt_tokens"]]
+        prompts = multi_slot_probe_prompts(args,tokens,profile)
         if any(len(prompt) != count for prompt, count in zip(prompts, profile["prompt_tokens"])):
             raise ValueError("corpus is too short for multi-slot probes")
         body = payload(args, prompts[0] if len(prompts) == 1 else prompts, [])
@@ -507,6 +556,7 @@ def _runtime_probe(args, candidate):
     multi_profiles = None
     observed_context = None
     runtime_libraries = []
+    host_memory = None
     image_rows = None
     response_path = None
     prompt_sha256 = None
@@ -549,7 +599,7 @@ def _runtime_probe(args, candidate):
                 tokens = request_json(url +"/tokenize", {"content":corpus, "add_special":True}, timeout=args.request_timeout)["tokens"]
                 if len(tokens) < expected:
                     raise ValueError("corpus is too short; provide more text or set --prompt-tokens")
-                prompt, images = tokens[:expected], []
+                prompt, images = multi_slot_probe_prompts(args,tokens,{"slots":[0],"prompt_tokens":[expected]})[0], []
             if getattr(args, "parallel", 1) > 1 and not images:
                 multi_profiles = multi_slot_requests(args, url, tokens, candidate, log_path)
                 result = multi_profiles[0]["responses"][0]
@@ -557,7 +607,11 @@ def _runtime_probe(args, candidate):
                 image_rows = image_slot_requests(args, url, prompt, images)
                 result = image_rows[0]
             else:
-                result = request_json(url +"/completion", payload(args,prompt,images), timeout=args.request_timeout)
+                if getattr(args,"measure_decode",False):
+                    from recurrent_measurement import stream_completions
+                    result=stream_completions(url +"/completion",payload(args,prompt,images),1,args.request_timeout)[0]
+                else:
+                    result = request_json(url +"/completion", payload(args,prompt,images), timeout=args.request_timeout)
             response_path = args.output /f"arena-{candidate}-response.json"
             response_path.write_text(json.dumps(result, indent=2) +"\n")
             if not args.image:
@@ -602,6 +656,7 @@ def _runtime_probe(args, candidate):
         except Exception as error:
             failure = error
         finally:
+            host_memory=process_memory(getattr(process,"pid",None))
             SWEEP.stop_process(process)
     text = log_path.read_text(encoding="utf-8", errors="replace")
     if re.search(r"illegal memory access|misaligned address|device-side assert|unspecified launch failure", text, re.IGNORECASE):
@@ -649,6 +704,7 @@ def _runtime_probe(args, candidate):
             "observed_compact_recurrent":bool(re.search(r"representation=gdn-fp32",text)),
             "log_sha256":hashlib.sha256(log_path.read_bytes()).hexdigest(),
             "loaded_runtime_libraries":runtime_libraries,
+            "process_memory":host_memory,
             "response":str(response_path) if response_path else None,
             "response_sha256":hashlib.sha256(response_path.read_bytes()).hexdigest() if response_path else None,
             "prompt_ids_sha256":prompt_sha256, "mixed_proof":mixed_proof, "completed_requests":completed,
@@ -1047,6 +1103,10 @@ def fit(args, report_vision=False):
               "command":server_command(command_args,maximum), "uvm":False, "reserve_mib":0,
               "recurrent_rollback_ram":args.recurrent_rollback_ram,
               "recurrent_rollback_compact":args.recurrent_rollback_compact,
+              "recurrent_rollback_auto":args.recurrent_rollback_auto,
+              "measured_decode_windows":args.measure_decode,
+              "distinct_probe_histories":args.distinct_probe_histories,
+              "probe_token_offset":args.probe_token_offset,
               "context_size":args.context_size, "context_semantics":context_semantics(args),
               "selection_profiles":(selected or {}).get("selection_profiles"),
               "requested_probe_selected_slots":args.probe_selected,
