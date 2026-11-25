@@ -108,6 +108,10 @@ struct llama_recurrent_spill_identity {
     uint64_t generation = 0;
 };
 
+struct llama_recurrent_transfer_stats {
+    size_t d2h_bytes=0,h2d_bytes=0,d2h_calls=0,h2d_calls=0;
+};
+
 class llama_recurrent_spill_bank {
 public:
     static std::unique_ptr<llama_recurrent_spill_bank> create(
@@ -152,6 +156,7 @@ public:
     void reset(bool pristine) noexcept;
     size_t host_bytes() const noexcept;
     size_t allocated_host_bytes() const noexcept;
+    llama_recurrent_transfer_stats transfer_stats() const noexcept;
     uint64_t snapshot_generation(size_t layer, bool value, uint32_t slot) const noexcept;
     bool snapshot_pristine(size_t layer, bool value, uint32_t slot) const noexcept;
     const void * snapshot_data(size_t layer, bool value, uint32_t slot, uint64_t generation) const noexcept;

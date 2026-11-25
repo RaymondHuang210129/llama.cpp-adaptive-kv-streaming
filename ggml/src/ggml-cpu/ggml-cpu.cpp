@@ -453,6 +453,8 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
+    if (op->op==GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT) for (int i : {6,7})
+        if (!op->src[i] || (op->src[i]->buffer && !ggml_backend_buffer_is_host(op->src[i]->buffer))) return false;
     ggml_backend_buffer_t owner=nullptr;
     if (!ggml_backend_execution_owner(op,owner)) return false;
     if (owner) return ggml_backend_execution_supports(owner,dev,op);

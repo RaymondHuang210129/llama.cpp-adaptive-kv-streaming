@@ -427,6 +427,11 @@ int main(int argc, char ** argv) {
         t.assert_true(original_r==actual_r && original_s==actual_s);
         t.assert_equal(uint64_t(1),bank->snapshot_generation(0,false,2));
         t.assert_equal(size_t(2),probe.uploads);
+        const auto transfers=bank->transfer_stats();
+        t.assert_equal(size_t(384),transfers.d2h_bytes);
+        t.assert_equal(size_t(384),transfers.h2d_bytes);
+        t.assert_equal(size_t(2),transfers.d2h_calls);
+        t.assert_equal(size_t(2),transfers.h2d_calls);
     });
     t.test("grouped_publication_failure_drains_and_invalidates_the_whole_submitted_plane", [](testing & t) {
         for (size_t failure : {1u,2u}) {

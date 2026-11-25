@@ -140,3 +140,22 @@ One no-startup-warmup pass, Qwen Q3 target, embedded MTP3, q8_0/q4_0 KV, 8,192 c
 | Compact prototype | 100.38 | 100.12 | 68.86 | 73.10 |
 
 The memory reduction alone does not establish an end-to-end speedup. P7 must reduce capture/integration and replay costs, then remeasure matched workloads. An immutable pre-optimization runtime and hashes are retained in `P4-runtime/` and `P4-runtime-manifest.json` under the evidence directory. GPU pauses were bounded to the tests; the original production container/image was restored afterward. No candidate has been deployed or pushed.
+
+## Qualified capture/replay optimization checkpoint
+
+P7 kernel work was qualified while the P5 policy and P6 matrix remained in progress. Direct capture writes the working matrix and update records into the owner's existing persistent banks. Its graph output contains attention and, only for a long prefill, the retained tail checkpoint. This removes the intermediate final-matrix and record copies. Replay handles multiple state elements per thread and preserves the frozen native multiplication/FMA order with explicit rounding intrinsics. A first vector trial failed 80 bitwise checks and was rejected before the corrected implementation passed.
+
+The expanded operator fixture passes 2,008,756 assertions on CPU, current CUDA, and the unchanged frozen native CUDA bridge. It checks captured factors, every prefix, reversed physical mappings, untouched log padding, signed zero, subnormals and decay underflow. The retained CUDA contract is restricted to the qualified Linux Release/NVCC 13.0.88/sm120a build and normal graph/PDL settings. The integrated CPU transaction suite still passes 330,205 assertions. CUDA model checks pass the 6,844-assertion two-slot prefix suite and the three-/four-slot MTP profiles. Final CUDA memcheck and synccheck report zero errors; racecheck reports zero hazards, errors or warnings. ASan/UBSan host suites pass with leak detection enabled.
+
+A matched, single-pass SWE A/B comparison used 8,192 history tokens and 512 outputs per request, two genuinely selected requests, q8_0/q4_0 KV, a 262,144 combined context budget and a fixed 2,096 MiB arena. Every output token matches across placements. The common decode interval, rather than a sum of per-request rates, measured:
+
+| Placement | Aggregate tokens/s |
+| --- | ---: |
+| Native device snapshots | 140.350 |
+| Dense RAM snapshots | 126.441 |
+| Frozen compact prototype | 138.588 |
+| Optimized compact | 141.715 |
+
+These are single observations without startup warmup, retries, repeated timing trials or statistical confidence intervals. The optimized compact result is 2.26% above the prototype in this short-context case; it is not a general throughput promise. All four sampled whole-device peaks were 15,537,405,952 bytes. The fixed arena reuses the reduced bank's capacity internally; it does not reduce the arena's physical allocation.
+
+Raw records live under `/home/raymond/LLM/compact-rollback-20261125/P7-swe-qwen-mtp-n2-h8192-a2096-*`, with commands, runtime-library hashes, pinned SWE A-D token-bank hashes, actual prompt hashes, token timelines and NVML samples. The mathematical and memory improvements in this checkpoint do not close P5-P7: placement qualification, broader product profiles and long-context/refitted measurements remain open.

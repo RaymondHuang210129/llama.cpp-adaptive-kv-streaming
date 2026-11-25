@@ -1,10 +1,12 @@
 #include "llama-memory-recurrent-compact.h"
+#include "llama-impl.h"
 #include "llama-model.h"
 #include "ggml-cpp.h"
 #include "llama-memory-recurrent-history.h"
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 
 namespace {
@@ -51,25 +53,15 @@ void llama_recurrent_compact_capture_history(ggml_context * ctx,ggml_cgraph * gr
 std::pair<ggml_tensor *,ggml_tensor *> llama_recurrent_compact_capture_matrix(ggml_context * ctx,ggml_cgraph * graph,
         ggml_tensor * q,ggml_tensor * k,ggml_tensor * v,ggml_tensor * g,ggml_tensor * beta,ggml_tensor * state,
         uint32_t depth,const llama_recurrent_compact_graph_storage & storage) {
-    const int64_t rows=depth+1, sequences=v->ne[3], elements=state->ne[0]*state->ne[1]*state->ne[2];
-    auto * capture=ggml_gated_delta_net_capture(ctx,q,k,v,g,beta,state,rows);
-    auto part=[&](ggml_gdn_capture_part p) {return ggml_gated_delta_net_capture_view(ctx,capture,p);};
-    auto * final=ggml_reshape_2d(ctx,part(GGML_GDN_CAPTURE_FINAL),elements,sequences);
-    ggml_build_forward_expand(graph,ggml_set_rows(ctx,storage.matrix,final,storage.destinations));
-    ggml_tensor * records=nullptr;
-    for (auto p : {GGML_GDN_CAPTURE_DECAY,GGML_GDN_CAPTURE_KEY,GGML_GDN_CAPTURE_CORRECTION}) {
-        auto * field=part(p);
-        if (field->ne[2]<rows) field=ggml_pad(ctx,field,0,0,rows-field->ne[2],0);
-        field=ggml_reshape_2d(ctx,field,field->ne[0]*field->ne[1]*field->ne[2],sequences);
-        records=records ? ggml_concat(ctx,records,field,0) : field;
-    }
-    ggml_build_forward_expand(graph,ggml_set_rows(ctx,storage.log,records,storage.slots));
+    auto * capture=ggml_gated_delta_net_capture_direct(ctx,q,k,v,g,beta,state,storage.matrix,storage.log,
+            storage.destinations,storage.slots,depth+1);
+    ggml_build_forward_expand(graph,capture);
     ggml_tensor * checkpoint=nullptr;
-    if (v->ne[2]>rows) {
-        checkpoint=ggml_cont(ctx,part(GGML_GDN_CAPTURE_CHECKPOINT));
+    if (v->ne[2]>depth+1) {
+        checkpoint=ggml_cont(ctx,ggml_gated_delta_net_capture_view(ctx,capture,GGML_GDN_CAPTURE_CHECKPOINT));
         ggml_set_output(checkpoint);ggml_build_forward_expand(graph,checkpoint);
     }
-    return {part(GGML_GDN_CAPTURE_ATTENTION),checkpoint};
+    return {ggml_gated_delta_net_capture_view(ctx,capture,GGML_GDN_CAPTURE_ATTENTION),checkpoint};
 }
 
 bool llama_memory_recurrent::init_compact(const llama_model & model,ggml_type r,ggml_type s,bool offload,
@@ -91,10 +83,15 @@ bool llama_memory_recurrent::init_compact(const llama_model & model,ggml_type r,
     auto part=[&](ggml_gdn_capture_part p) {return ggml_gated_delta_net_capture_view(ctx.get(),capture,p);};
     auto * replay=ggml_gated_delta_net_replay_prefix(ctx.get(),part(GGML_GDN_CAPTURE_CHECKPOINT),part(GGML_GDN_CAPTURE_DECAY),
             part(GGML_GDN_CAPTURE_KEY),part(GGML_GDN_CAPTURE_CORRECTION),0);
+    auto * cache=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,w*w*heads,2);
+    auto * log=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,(heads+w*keys+w*heads)*(n_rs_seq+1),1);
+    auto * indices=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_I32,1);
+    auto * direct=ggml_gated_delta_net_capture_direct(ctx.get(),q,q,v,g,g,state,cache,log,indices,indices,n_rs_seq+1);
     bool any=false;
     for (uint32_t layer=0;layer<hparams.n_layer();++layer) if (!filter || filter(layer)) {
         auto * device=offload ? model.dev_layer(layer) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (!device || !ggml_backend_dev_supports_op(device,capture) || !ggml_backend_dev_supports_op(device,replay)) return false;
+        if (!device || !ggml_backend_dev_supports_op(device,capture) || !ggml_backend_dev_supports_op(device,replay) ||
+                !ggml_backend_dev_supports_op(device,direct)) return false;
         if (ggml_backend_dev_type(device)!=GGML_BACKEND_DEVICE_TYPE_CPU) {
             auto * registry=ggml_backend_dev_backend_reg(device);
             using contract_fn=bool (*)(ggml_backend_dev_t);
@@ -105,6 +102,7 @@ bool llama_memory_recurrent::init_compact(const llama_model & model,ggml_type r,
     }
     if (!any) return false;
     auto next=std::make_unique<compact_storage_state>();
+    next->profile=std::getenv("LLAMA_ROLLBACK_PROFILE") && std::strcmp(std::getenv("LLAMA_ROLLBACK_PROFILE"),"1")==0;
     next->slots.assign(n_seq_max,-1);next->sequences.resize(size);
     next->logs.resize(hparams.n_layer());next->timelines.resize(hparams.n_layer());
     for (uint32_t i=0;i<size;++i) {next->slots[i]=int32_t(i);next->sequences[i].logical=llama_seq_id(i);}
@@ -186,6 +184,21 @@ bool llama_memory_recurrent::compact_rollback_valid(llama_seq_id id,uint32_t rol
 bool llama_memory_recurrent::materialize_compact() {
     if (!compact) return true;
     if (compact->capturing || compact->poisoned) return false;
+    const auto publish=[&]() {
+        for (auto & sequence : compact->sequences) if (sequence.logical>=0) {
+            if (compact->profile && sequence.pending && !sequence.prefill)
+                LLAMA_LOG_INFO("rollback prefix profile: slot=%d rows=%u prefix=%u\n",sequence.logical,sequence.rows,
+                    sequence.rows-rs_idx[sequence.logical]);
+            if (sequence.pending || rs_idx[sequence.logical]) sequence.role=sequence.working;
+            if (rs_idx[sequence.logical]) sequence.rolled=true;
+            sequence.pending=false;rs_idx[sequence.logical]=0;
+        }
+        compact->failed=false;
+        return materialize_compact_aliases();
+    };
+    if (std::none_of(compact->sequences.begin(),compact->sequences.end(),[&](const auto & sequence) {
+            return sequence.logical>=0 && rs_idx[sequence.logical]!=0;
+        })) return publish();
     const int64_t w=hparams.ssm_d_state, heads=hparams.ssm_dt_rank, keys=hparams.ssm_n_group;
     const int64_t rows=n_rs_seq+1, history=hparams.ssm_d_conv-1, channels=hparams.n_embd_r()/history;
     const size_t nodes=std::max<size_t>(2048,32*r_l.size()*compact->sequences.size());
@@ -193,6 +206,7 @@ bool llama_memory_recurrent::materialize_compact() {
     if (!ctx) return false;
     auto * graph=ggml_new_graph_custom(ctx.get(),nodes,false);
     bool replaying=false;
+    uint64_t prefix_rows=0;
     for (size_t slot=0;slot<compact->sequences.size();++slot) {
         const auto & sequence=compact->sequences[slot];
         if (sequence.logical<0) continue;
@@ -201,6 +215,7 @@ bool llama_memory_recurrent::materialize_compact() {
         if (!sequence.valid || rollback>=sequence.rows || !compact->backend) return false;
         replaying=true;
         const int32_t prefix=int32_t(sequence.rows-rollback);
+        prefix_rows+=prefix;
         for (size_t layer=0;layer<r_l.size();++layer) if (s_l[layer]) {
             auto * s=s_l[layer];auto * r=r_l[layer];auto * log=compact->logs[layer];
             auto * checkpoint=span(ctx.get(),s,w,w,heads,((1-sequence.working)*size+slot)*s->nb[1]);
@@ -217,14 +232,13 @@ bool llama_memory_recurrent::materialize_compact() {
             ggml_build_forward_expand(graph,ggml_cpy(ctx.get(),window,destination));
         }
     }
-    if (replaying && !compute(compact->backend,graph)) {compact->failed=true;return false;}
-    for (auto & sequence : compact->sequences) if (sequence.logical>=0) {
-        if (sequence.pending || rs_idx[sequence.logical]) sequence.role=sequence.working;
-        if (rs_idx[sequence.logical]) sequence.rolled=true;
-        sequence.pending=false;rs_idx[sequence.logical]=0;
+    if (replaying) {
+        const auto start=ggml_time_us();
+        if (!compute(compact->backend,graph)) {compact->failed=true;return false;}
+        compact_replay_ms+=double(ggml_time_us()-start)/1000;
+        ++compact_replay_calls;compact_replay_rows+=prefix_rows;
     }
-    compact->failed=false;
-    return materialize_compact_aliases();
+    return publish();
 }
 
 uint64_t llama_memory_recurrent::begin_compact_capture(ggml_backend_t backend,const llama_ubatch & batch,bool prefill) {
@@ -296,6 +310,7 @@ bool llama_memory_recurrent::finish_compact_capture(const llama_ubatch & batch,
     for (auto slot : compact->active) {
         auto & sequence=compact->sequences[slot];
         sequence.rows=std::min(batch.n_seq_tokens,n_rs_seq+1);sequence.valid=true;
+        sequence.prefill=compact->prefill;
         sequence.pending=batch.n_seq_tokens<=n_rs_seq+1;
         if (!sequence.pending) sequence.role=sequence.working;
     }

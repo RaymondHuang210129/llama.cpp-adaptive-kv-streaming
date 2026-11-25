@@ -728,6 +728,7 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     GGML_ASSERT((uint32_t) seq_id < n_seq_max);
     GGML_ASSERT(idx <= n_rs_seq);
 
+    if (idx && rs_idx[seq_id]!=idx) {++rollback_events;rollback_prefix_rows+=n_rs_seq+1-idx;}
     rs_idx[seq_id] = idx;
 }
 

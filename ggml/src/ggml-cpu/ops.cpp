@@ -11162,8 +11162,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
-    const bool capture = dst->op == GGML_OP_GATED_DELTA_NET_CAPTURE;
+    const bool direct = dst->op == GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT;
+    const bool capture = direct || dst->op == GGML_OP_GATED_DELTA_NET_CAPTURE;
     const int64_t retained = capture ? ggml_get_op_params_i32(dst, 1) : n_tokens;
+    const int64_t capacity = direct ? ggml_get_op_params_i32(dst,2) : retained;
     GGML_ASSERT(K >= 1);
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
@@ -11181,10 +11183,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
-    float * checkpoint = capture ? state_out_base + state_size_per_snap : nullptr;
-    float * decay = capture ? checkpoint + state_size_per_snap : nullptr;
-    float * keys = capture ? decay + H * retained * n_seqs : nullptr;
-    float * corrections = capture ? keys + S_v * nek1 * retained * n_seqs : nullptr;
+    float * checkpoint = !capture ? nullptr : direct ? (n_tokens>capacity ? state_out_base : nullptr) : state_out_base + state_size_per_snap;
+    float * decay = capture && !direct ? checkpoint + state_size_per_snap : nullptr;
+    float * keys = capture && !direct ? decay + H * retained * n_seqs : nullptr;
+    float * corrections = capture && !direct ? keys + S_v * nek1 * retained * n_seqs : nullptr;
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -11212,7 +11214,17 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // For K>1, work in scratch and copy out per-token when the slot is in range.
         float * s_out = (K > 1)
             ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+            : direct ? nullptr : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        float * local_decay=decay,* local_keys=keys,* local_corrections=corrections;
+        if (direct) {
+            const int32_t destination=((const int32_t *)dst->src[8]->data)[iv3];
+            const int32_t slot=((const int32_t *)dst->src[9]->data)[iv3];
+            GGML_ASSERT(destination>=0 && destination<dst->src[6]->ne[1] && slot>=0 && slot<dst->src[7]->ne[1]);
+            s_out=(float *)dst->src[6]->data+int64_t(destination)*dst->src[6]->ne[0]+iv1*S_v*S_v;
+            local_decay=(float *)dst->src[7]->data+int64_t(slot)*dst->src[7]->ne[0];
+            local_keys=local_decay+H*capacity;
+            local_corrections=local_keys+S_v*nek1*capacity;
+        }
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
@@ -11223,7 +11235,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
         for (int64_t t = 0; t < n_tokens; t++) {
-            if (capture && t == n_tokens - retained)
+            if (checkpoint && t == n_tokens - retained)
                 memcpy(checkpoint + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
@@ -11256,10 +11268,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             if (capture && t >= n_tokens - retained) {
-                const int64_t row = iv3 * retained + t - (n_tokens - retained);
-                decay[row * H + iv1] = expf(g_d[0]);
-                memcpy(corrections + (row * H + iv1) * S_v, delta, S_v * sizeof(float));
-                if (iv1 < nek1) memcpy(keys + (row * nek1 + iv1) * S_v, k_d, S_v * sizeof(float));
+                const int64_t row = (direct ? 0 : iv3 * retained) + t - (n_tokens - retained);
+                local_decay[row * H + iv1] = expf(g_d[0]);
+                memcpy(local_corrections + (row * H + iv1) * S_v, delta, S_v * sizeof(float));
+                if (iv1 < nek1) memcpy(local_keys + (row * nek1 + iv1) * S_v, k_d, S_v * sizeof(float));
             }
 
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]

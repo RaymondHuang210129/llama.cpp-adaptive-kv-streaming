@@ -2877,6 +2877,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GATED_DELTA_NET_CAPTURE:
+        case GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
         case GGML_OP_GATED_DELTA_NET_REPLAY:
@@ -5869,6 +5870,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (op->op==GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT) for (int i : {6,7})
+        if (!op->src[i] || (op->src[i]->buffer &&
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(op->src[i]->buffer))!=dev)) return false;
     ggml_backend_buffer_t owner;
     if (!ggml_backend_execution_owner(op,owner)) return false;
     if (owner) return ggml_backend_execution_supports(owner,dev,op);
@@ -6319,6 +6323,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET_CAPTURE:
         case GGML_OP_GATED_DELTA_NET_REPLAY:
+            return true;
+        case GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT:
             return true;
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&

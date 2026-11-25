@@ -1101,9 +1101,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
     "GATED_DELTA_NET_CAPTURE",
     "GATED_DELTA_NET_REPLAY",
+    "GATED_DELTA_NET_CAPTURE_DIRECT",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,9 +1219,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "gdn_capture(q,k,v,g,b,s)",
     "gdn_replay(s,g,k,u,p)",
+    "gdn_capture_direct(q,k,v,g,b,s,cache,log,dst,slot)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6434,8 +6436,8 @@ struct ggml_tensor * ggml_gated_delta_net(
 
 // ggml_lightning_indexer
 
-struct ggml_tensor * ggml_gated_delta_net_capture(
-        struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+static int64_t ggml_gdn_capture_validate(
+        struct ggml_tensor * q, struct ggml_tensor * k,
         struct ggml_tensor * v, struct ggml_tensor * g, struct ggml_tensor * beta, struct ggml_tensor * state,
         int64_t keep_rows) {
     const int64_t w = v->ne[0], h = v->ne[1], kh = k->ne[1], t = v->ne[2], n = v->ne[3];
@@ -6458,6 +6460,17 @@ struct ggml_tensor * ggml_gated_delta_net_capture(
     const int64_t a = ggml_nelements(v), s = ggml_nelements(state);
     const int64_t records = retained * n * (h + w*kh + w*h);
     GGML_ASSERT(s <= (INT64_MAX / (int64_t)sizeof(float) - a - records) / 2);
+    return retained;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_capture(
+        struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+        struct ggml_tensor * v, struct ggml_tensor * g, struct ggml_tensor * beta, struct ggml_tensor * state,
+        int64_t keep_rows) {
+    const int64_t retained=ggml_gdn_capture_validate(q,k,v,g,beta,state,keep_rows);
+    const int64_t a=ggml_nelements(v),s=ggml_nelements(state);
+    const int64_t records=retained*v->ne[3]*(v->ne[1]+v->ne[0]*k->ne[1]+v->ne[0]*v->ne[1]);
+    struct ggml_tensor * inputs[]={q,k,v,g,beta,state};
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a + 2*s + records);
     result->op = GGML_OP_GATED_DELTA_NET_CAPTURE;
     for (size_t i = 0; i < sizeof(inputs)/sizeof(inputs[0]); ++i) result->src[i] = inputs[i];
@@ -6467,16 +6480,47 @@ struct ggml_tensor * ggml_gated_delta_net_capture(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_capture_direct(
+        struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+        struct ggml_tensor * v, struct ggml_tensor * g, struct ggml_tensor * beta, struct ggml_tensor * state,
+        struct ggml_tensor * cache, struct ggml_tensor * log, struct ggml_tensor * destinations,
+        struct ggml_tensor * slots, int64_t keep_rows) {
+    const int64_t retained=ggml_gdn_capture_validate(q,k,v,g,beta,state,keep_rows);
+    const int64_t w=v->ne[0],h=v->ne[1],n=v->ne[3],a=ggml_nelements(v),image=ggml_nelements(state);
+    GGML_ASSERT(cache->type==GGML_TYPE_F32 && log->type==GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(cache) && ggml_is_matrix(cache) && cache->ne[0]==w*w*h);
+    GGML_ASSERT(cache->ne[1]%2==0 && cache->ne[1]>=2*n);
+    GGML_ASSERT(ggml_is_contiguous(log) && ggml_is_matrix(log) && log->ne[1]==cache->ne[1]/2);
+    GGML_ASSERT(log->ne[0]==(h+w*k->ne[1]+w*h)*keep_rows);
+    struct ggml_tensor * indices[]={destinations,slots};
+    for (size_t i=0;i<2;++i) GGML_ASSERT(indices[i]->type==GGML_TYPE_I32 && ggml_is_contiguous(indices[i]) &&
+            ggml_is_vector(indices[i]) && ggml_nelements(indices[i])==n);
+    struct ggml_tensor * result=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,a+(v->ne[2]>keep_rows ? image : 0));
+    result->op=GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT;
+    struct ggml_tensor * inputs[]={q,k,v,g,beta,state,cache,log,destinations,slots};
+    for (size_t i=0;i<sizeof(inputs)/sizeof(inputs[0]);++i) result->src[i]=inputs[i];
+    ggml_set_op_params_i32(result,0,1);
+    ggml_set_op_params_i32(result,1,(int32_t)retained);
+    ggml_set_op_params_i32(result,2,(int32_t)keep_rows);
+    return result;
+}
+
 struct ggml_tensor * ggml_gated_delta_net_capture_view(
         struct ggml_context * ctx, struct ggml_tensor * capture, enum ggml_gdn_capture_part part) {
-    GGML_ASSERT(capture->op == GGML_OP_GATED_DELTA_NET_CAPTURE);
+    const bool direct=capture->op==GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT;
+    GGML_ASSERT(direct || capture->op == GGML_OP_GATED_DELTA_NET_CAPTURE);
     struct ggml_tensor * v = capture->src[2], * state = capture->src[5];
     const int64_t a = ggml_nelements(v), s = ggml_nelements(state);
     const int64_t rows = ggml_get_op_params_i32(capture, 1);
     const int64_t decay = rows * v->ne[1] * v->ne[3], keys = rows * capture->src[1]->ne[0] * capture->src[1]->ne[1] * v->ne[3];
     const struct ggml_tensor * shape = NULL;
     int64_t offset = 0;
-    switch (part) {
+    if (direct) {
+        GGML_ASSERT(part==GGML_GDN_CAPTURE_ATTENTION || (part==GGML_GDN_CAPTURE_CHECKPOINT &&
+                    v->ne[2]>ggml_get_op_params_i32(capture,2)));
+        shape=part==GGML_GDN_CAPTURE_ATTENTION ? v : state;
+        offset=part==GGML_GDN_CAPTURE_ATTENTION ? 0 : a;
+    } else switch (part) {
         case GGML_GDN_CAPTURE_ATTENTION: shape = v; break;
         case GGML_GDN_CAPTURE_FINAL: shape = state; offset = a; break;
         case GGML_GDN_CAPTURE_CHECKPOINT: shape = state; offset = a + s; break;

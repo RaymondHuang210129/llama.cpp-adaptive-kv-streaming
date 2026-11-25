@@ -30,6 +30,7 @@ struct llama_memory_recurrent::compact_storage_state {
         bool valid = false;
         bool pending = false;
         bool rolled = false;
+        bool prefill = false;
     };
     std::vector<sequence> sequences;
     std::vector<int32_t> slots;
@@ -42,4 +43,5 @@ struct llama_memory_recurrent::compact_storage_state {
     bool prefill = false;
     bool failed = false;
     bool poisoned = false;
+    bool profile = false;
 };

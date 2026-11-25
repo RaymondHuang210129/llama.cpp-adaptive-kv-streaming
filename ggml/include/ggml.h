@@ -603,6 +603,7 @@ extern "C" {
 
         GGML_OP_GATED_DELTA_NET_CAPTURE,
         GGML_OP_GATED_DELTA_NET_REPLAY,
+        GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT,
 
         GGML_OP_COUNT,
     };
@@ -2679,6 +2680,16 @@ extern "C" {
             int64_t keep_rows);
     GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_view(
             struct ggml_context * ctx, struct ggml_tensor * capture, enum ggml_gdn_capture_part part);
+    // Write the working image and records directly into owner-bound FP32 storage.
+    // Cache: [width*width*heads, 2*capacity]; log: [(heads+width*key_heads+width*heads)*keep_rows, capacity].
+    // I32 destination/slot vectors select unique working rows and log rows for each input sequence.
+    // Input state must remain independent of those working rows. Output is attention plus
+    // a tail checkpoint only when input rows exceed keep_rows. The owner retains all mutated storage.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_direct(
+            struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+            struct ggml_tensor * v, struct ggml_tensor * g, struct ggml_tensor * beta, struct ggml_tensor * state,
+            struct ggml_tensor * cache, struct ggml_tensor * log, struct ggml_tensor * destinations,
+            struct ggml_tensor * slots, int64_t keep_rows);
     // Prefixes: I32 [sequences], each in [0, rows]. Zero restores the checkpoint;
     // an accepted verification anchor is prefix one. Records are backend-specific:
     // capture and replay must use the same qualified arithmetic/backend contract.

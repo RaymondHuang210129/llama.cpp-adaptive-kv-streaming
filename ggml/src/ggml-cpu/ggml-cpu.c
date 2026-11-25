@@ -2087,6 +2087,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GATED_DELTA_NET_CAPTURE:
+        case GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT:
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
@@ -2291,6 +2292,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GATED_DELTA_NET_CAPTURE:
+        case GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT:
         case GGML_OP_GATED_DELTA_NET_REPLAY:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
@@ -3031,6 +3033,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                 case GGML_OP_GATED_DELTA_NET_CAPTURE:
+        case GGML_OP_GATED_DELTA_NET_CAPTURE_DIRECT:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);

@@ -320,6 +320,7 @@ struct spill_publication_state {
 };
 
 struct llama_recurrent_spill_bank::implementation {
+    llama_recurrent_transfer_stats transfers;
     std::unique_ptr<spill_publication_state> publication;
     llama_recurrent_spill_layout layout;
     ggml_backend_buffer_t host = nullptr;
@@ -469,6 +470,7 @@ bool llama_recurrent_spill_bank::implementation::publish_snapshot(
         auto * host_base=static_cast<uint8_t *>(ggml_backend_buffer_get_base(host));
         try { ggml_backend_tensor_get_async(p.copy_backend,source,host_base+host_offset,0,bytes); }
         catch (...) { submission_failed=true; return false; }
+        transfers.d2h_bytes+=bytes;++transfers.d2h_calls;
     }
     if (--p.remaining == 0) {
         auto * consumed=p.slot_events[p.current_slot];
@@ -860,6 +862,7 @@ bool llama_recurrent_spill_bank::capture(ggml_backend_t backend, size_t layer, b
     ++s.submitted;
     try { ggml_backend_tensor_get_async(backend,source,host+offset,source_offset,bytes); }
     catch (...) { s.submission_failed=true; return false; }
+    s.transfers.d2h_bytes+=bytes;++s.transfers.d2h_calls;
     return true;
 }
 
@@ -938,6 +941,7 @@ bool llama_recurrent_spill_bank::restore(ggml_backend_t backend, size_t layer, b
     // A queued partial restore poisons current state even when the backend reports failure afterwards.
     try { ggml_backend_tensor_set_async(copy,destination,host+offset,destination_offset,bytes); }
     catch (...) { s.submission_failed=true; return false; }
+    s.transfers.h2d_bytes+=bytes;++s.transfers.h2d_calls;
     return true;
 }
 
@@ -1004,6 +1008,8 @@ void llama_recurrent_spill_bank::reset(bool pristine) noexcept {
     }
 }
 
+
+llama_recurrent_transfer_stats llama_recurrent_spill_bank::transfer_stats() const noexcept {return impl->transfers;}
 
 size_t llama_recurrent_spill_bank::host_bytes() const noexcept { return impl->layout.host_snapshot_bytes; }
 size_t llama_recurrent_spill_bank::allocated_host_bytes() const noexcept {

@@ -4948,6 +4948,14 @@ struct test_gated_delta_net : public test_case {
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
+        if (compact==3) {
+            auto * cache=ggml_new_tensor_2d(ctx,type,head_size*head_size*head_count*v_repeat,2*n_seqs);
+            auto * log=ggml_new_tensor_2d(ctx,type,(head_count*v_repeat+head_size*head_count+head_size*head_count*v_repeat)*8,n_seqs);
+            auto * destinations=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,n_seqs);
+            auto * slots=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,n_seqs);
+            ggml_set_name(destinations,"gdn_destinations");ggml_set_name(slots,"gdn_slots");
+            return ggml_gated_delta_net_capture_direct(ctx,q,k,v,g,beta,state,cache,log,destinations,slots,8);
+        }
         ggml_tensor * out = compact ? ggml_gated_delta_net_capture(ctx, q, k, v, g, beta, state, 8) :
             ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         if (compact == 2) {
@@ -4961,6 +4969,11 @@ struct test_gated_delta_net : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
+            if (!std::strcmp(t->name,"gdn_destinations") || !std::strcmp(t->name,"gdn_slots")) {
+                std::vector<int32_t> indices(size_t(n_seqs),0);
+                for (size_t i=0;i<indices.size();++i) indices[i]=int32_t(i+(!std::strcmp(t->name,"gdn_destinations") ? n_seqs : 0));
+                ggml_backend_tensor_set(t,indices.data(),0,ggml_nbytes(t));continue;
+            }
             if (strcmp(t->name, "g") == 0) {
                 init_tensor_uniform(t, -20.0f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
@@ -11856,7 +11869,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
-    for (int mode : {1, 2}) for (int64_t rows : {1, 8, 16}) for (int64_t width : {64, 128}) {
+    for (int mode : {1, 2, 3}) for (int64_t rows : {1, 8, 16}) for (int64_t width : {64, 128}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, width, rows, 2, 3, false, false, 1, mode));
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
@@ -12416,7 +12429,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
-    for (int mode : {0, 1, 2}) for (int64_t rows : {4, 8}) for (int64_t slots : {1, 2, 3, 4}) {
+    for (int mode : {0, 1, 2, 3}) for (int64_t rows : {4, 8}) for (int64_t slots : {1, 2, 3, 4}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, rows, slots, 3, false, false, rows, mode));
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024

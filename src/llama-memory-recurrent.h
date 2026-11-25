@@ -126,6 +126,9 @@ public:
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+    uint64_t rollback_events = 0, rollback_prefix_rows = 0;
+    uint64_t compact_replay_calls = 0, compact_replay_rows = 0;
+    double compact_replay_ms = 0;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
