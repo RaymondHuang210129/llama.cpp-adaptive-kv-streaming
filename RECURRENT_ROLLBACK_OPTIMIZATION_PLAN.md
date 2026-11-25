@@ -1,6 +1,6 @@
 # Compact recurrent rollback and budget-aware placement
 
-Status: P0-P1 complete; P2 in progress. Implementation branch `feature/compact-recurrent-rollback`. Dense reference GPU checks passed; compact runtime qualification has not started.
+Status: P0-P3 complete; P4 integration qualification in progress. Implementation branch `feature/compact-recurrent-rollback`. Dense reference GPU checks passed; compact runtime qualification has not started.
 
 Evidence: [P0 reference and allocation ledger](docs/development/compact-recurrent-rollback.md).
 
@@ -153,21 +153,21 @@ Exit: existing paths pass unchanged, and common admission can compare complete c
 
 ### P2. Qualify shared convolution history
 
-- [ ] Reconstruct every supported history window from a retained timeline.
-- [ ] Test short blocks, repeated windows, timeline wrap/rebase, zero/full acceptance and transaction abort.
-- [ ] Cover slot parking/reselection/reuse and any operator-specific auxiliary history.
-- [ ] Measure retained timeline and temporary concatenation bytes; retain bitwise reference comparisons.
+- [x] Reconstruct every supported history window from a retained timeline.
+- [x] Test short blocks, repeated windows, timeline wrap/rebase, zero/full acceptance and transaction abort.
+- [x] Cover slot parking/reselection/reuse and any operator-specific auxiliary history.
+- [x] Measure retained timeline and temporary concatenation bytes; retain bitwise reference comparisons.
 
 Exit: an exact, independently selectable history provider with measured requirements. Its modest standalone savings must not be reported as matrix-state savings.
 
 ### P3. Capture and replay GDN updates in shadow mode
 
-- [ ] Keep dense snapshots as the reference while capturing evaluated decay, grouped keys and corrections.
-- [ ] Build bounded CPU and CUDA replay fixtures before integrating replay into production commits.
-- [ ] Compare every prefix, including transaction abort, zero accepted proposals, full acceptance and short verification blocks.
-- [ ] Check state tensors, convolution state, logits and sampling/acceptance contracts.
-- [ ] Cover one through four selected sequences, configured capacity greater than selection, sparse IDs and nonuniform acceptance.
-- [ ] Verify writer ownership, event ordering, stale-generation rejection and failure cleanup.
+- [x] Keep dense snapshots as the reference while capturing evaluated decay, grouped keys and corrections.
+- [x] Build bounded CPU and CUDA replay fixtures before integrating replay into production commits.
+- [x] Compare every prefix, including transaction abort, zero accepted proposals, full acceptance and short verification blocks.
+- [x] Check state tensors, convolution state, logits and sampling/acceptance contracts.
+- [x] Cover one through four selected sequences, configured capacity greater than selection, sparse IDs and nonuniform acceptance.
+- [x] Verify writer ownership, event ordering, stale-generation rejection and failure cleanup.
 
 Exit: replay is qualified under a stated arithmetic contract; capture overhead and log layouts are measured. Shadow capture is not a production performance result.
 

@@ -601,6 +601,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_GATED_DELTA_NET_CAPTURE,
+        GGML_OP_GATED_DELTA_NET_REPLAY,
+
         GGML_OP_COUNT,
     };
 
@@ -2658,6 +2661,34 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // FP32 scalar-decay GDN capture, retaining a tail of 1-8 rows; width 64 or 128.
+    // Capture uses the native backend's arithmetic and retains two dense images plus
+    // evaluated decay, grouped keys and corrections, without intermediate matrices.
+    enum ggml_gdn_capture_part {
+        GGML_GDN_CAPTURE_ATTENTION,
+        GGML_GDN_CAPTURE_FINAL,
+        GGML_GDN_CAPTURE_CHECKPOINT,
+        GGML_GDN_CAPTURE_DECAY,
+        GGML_GDN_CAPTURE_KEY,
+        GGML_GDN_CAPTURE_CORRECTION,
+    };
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture(
+            struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+            struct ggml_tensor * v, struct ggml_tensor * g, struct ggml_tensor * beta, struct ggml_tensor * state,
+            int64_t keep_rows);
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_view(
+            struct ggml_context * ctx, struct ggml_tensor * capture, enum ggml_gdn_capture_part part);
+    // Prefixes: I32 [sequences], each in [0, rows]. Zero restores the checkpoint;
+    // an accepted verification anchor is prefix one. Records are backend-specific:
+    // capture and replay must use the same qualified arithmetic/backend contract.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx, struct ggml_tensor * checkpoint, struct ggml_tensor * decay,
+            struct ggml_tensor * key, struct ggml_tensor * correction, struct ggml_tensor * prefixes);
+    // Same prefix for all sequences, encoded in the op; requires no device descriptor allocation.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay_prefix(
+            struct ggml_context * ctx, struct ggml_tensor * checkpoint, struct ggml_tensor * decay,
+            struct ggml_tensor * key, struct ggml_tensor * correction, int32_t prefix);
 
     // DSA lightning indexer
     //

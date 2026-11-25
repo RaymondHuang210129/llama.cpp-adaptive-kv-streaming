@@ -177,6 +177,13 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()
 
+    # Exact replay is enabled only for the tested compiler/ISA pair. Other builds
+    # retain native rollback until their arithmetic and lifecycle fixtures qualify.
+    if (UNIX AND CMAKE_CUDA_COMPILER_VERSION VERSION_EQUAL "13.0.88" AND
+            "${CMAKE_CUDA_ARCHITECTURES}" MATCHES "^120a(-real)?$")
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_GDN_EXACT_SM120)
+    endif()
+
     if (GGML_CUDA_FORCE_MMQ)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()

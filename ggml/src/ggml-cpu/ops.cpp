@@ -11162,6 +11162,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
+    const bool capture = dst->op == GGML_OP_GATED_DELTA_NET_CAPTURE;
+    const int64_t retained = capture ? ggml_get_op_params_i32(dst, 1) : n_tokens;
     GGML_ASSERT(K >= 1);
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
@@ -11179,6 +11181,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
+    float * checkpoint = capture ? state_out_base + state_size_per_snap : nullptr;
+    float * decay = capture ? checkpoint + state_size_per_snap : nullptr;
+    float * keys = capture ? decay + H * retained * n_seqs : nullptr;
+    float * corrections = capture ? keys + S_v * nek1 * retained * n_seqs : nullptr;
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -11217,6 +11223,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
         for (int64_t t = 0; t < n_tokens; t++) {
+            if (capture && t == n_tokens - retained)
+                memcpy(checkpoint + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
@@ -11245,6 +11253,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
                 delta[j] = (v_d[j] - sum) * beta_val;
+            }
+
+            if (capture && t >= n_tokens - retained) {
+                const int64_t row = iv3 * retained + t - (n_tokens - retained);
+                decay[row * H + iv1] = expf(g_d[0]);
+                memcpy(corrections + (row * H + iv1) * S_v, delta, S_v * sizeof(float));
+                if (iv1 < nek1) memcpy(keys + (row * nek1 + iv1) * S_v, k_d, S_v * sizeof(float));
             }
 
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
@@ -11312,6 +11327,26 @@ static void ggml_compute_forward_gated_delta_net_f32(
 
         ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_replay(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * checkpoint = dst->src[0];
+    const int64_t w = dst->ne[0], h = dst->ne[2], n = dst->ne[3], rows = dst->src[1]->ne[2], kh = dst->src[2]->ne[1];
+    const auto * lengths = dst->src[4] ? (const int32_t *) dst->src[4]->data : nullptr;
+    for (int64_t sh = params->ith; sh < h * n; sh += params->nth) {
+        const int64_t sequence = sh / h, head = sh % h;
+        const int32_t prefix = lengths ? lengths[sequence] : ggml_get_op_params_i32(dst, 0);
+        GGML_ASSERT(prefix >= 0 && prefix <= rows);
+        auto * out = (float *) dst->data + sh * w * w;
+        memcpy(out, (const float *)checkpoint->data + sh * w * w, w * w * sizeof(float));
+        for (int32_t t = 0; t < prefix; ++t) {
+            const auto decay = ((const float *) dst->src[1]->data)[(sequence * rows + t) * h + head];
+            const auto * key = (const float *) dst->src[2]->data + ((sequence * rows + t) * kh + head % kh) * w;
+            const auto * correction = (const float *) dst->src[3]->data + ((sequence * rows + t) * h + head) * w;
+            ggml_vec_scale_f32(w * w, out, decay);
+            for (int64_t col = 0; col < w; ++col) ggml_vec_mad_f32(w, out + col * w, key, correction[col]);
+        }
     }
 }
 

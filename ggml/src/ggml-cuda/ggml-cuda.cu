@@ -2876,7 +2876,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_gated_linear_attn(ctx, dst);
             break;
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_CAPTURE:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            ggml_cuda_op_gated_delta_net_replay(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -6313,6 +6317,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_GATED_DELTA_NET_CAPTURE:
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            return true;
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -6827,7 +6834,13 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
     return status::success;
 }
 
+static bool ggml_backend_cuda_gdn_replay_exact(ggml_backend_dev_t device) {
+    auto * context=static_cast<ggml_backend_cuda_device_context *>(device->context);
+    return ggml_cuda_gdn_fp32_replay_exact(context->device);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (!strcmp(name,"ggml_backend_gdn_fp32_replay_exact")) return (void *)ggml_backend_cuda_gdn_replay_exact;
     if (!strcmp(name,"ggml_backend_operator_workspace_prepare")) return (void *)ggml_backend_cuda_operator_workspace_prepare;
     if (!strcmp(name,"ggml_backend_operator_workspace_query")) return (void *)ggml_backend_cuda_operator_workspace_query;
     if (!strcmp(name,"ggml_backend_operator_workspace_graph_query")) return (void *)ggml_backend_cuda_operator_workspace_graph_query;

@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "GATED_DELTA_NET_CAPTURE",
+    "GATED_DELTA_NET_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "gdn_capture(q,k,v,g,b,s)",
+    "gdn_replay(s,g,k,u,p)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6429,6 +6433,91 @@ struct ggml_tensor * ggml_gated_delta_net(
 }
 
 // ggml_lightning_indexer
+
+struct ggml_tensor * ggml_gated_delta_net_capture(
+        struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+        struct ggml_tensor * v, struct ggml_tensor * g, struct ggml_tensor * beta, struct ggml_tensor * state,
+        int64_t keep_rows) {
+    const int64_t w = v->ne[0], h = v->ne[1], kh = k->ne[1], t = v->ne[2], n = v->ne[3];
+    GGML_ASSERT(w == 64 || w == 128);
+    GGML_ASSERT(t >= 1 && t <= INT32_MAX && keep_rows >= 1 && keep_rows <= 8 && h > 0 && h <= INT32_MAX &&
+            kh > 0 && kh <= h && h % kh == 0 && n > 0 && n <= INT32_MAX);
+    const int64_t retained = MIN(t, keep_rows);
+    const int64_t fixed = 2*w*w*h + retained*(h + w*kh + w*h);
+    GGML_ASSERT(t <= (INT64_MAX / (int64_t)sizeof(float) - fixed) / (w*h));
+    const int64_t per_sequence = fixed + t*w*h;
+    GGML_ASSERT(per_sequence > 0 && n <= INT64_MAX / (int64_t)sizeof(float) / per_sequence);
+    struct ggml_tensor * inputs[] = {q, k, v, g, beta, state};
+    for (size_t i = 0; i < sizeof(inputs)/sizeof(inputs[0]); ++i) GGML_ASSERT(inputs[i]->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_are_same_shape(q, k) && ggml_are_same_stride(q, k));
+    GGML_ASSERT(q->ne[0] == w && q->ne[2] == t && q->ne[3] == n);
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == h && g->ne[2] == t && g->ne[3] == n);
+    GGML_ASSERT(ggml_are_same_shape(g, beta) && ggml_is_contiguous(g) && ggml_is_contiguous(beta));
+    GGML_ASSERT(state->ne[0] == w && state->ne[1] == w && state->ne[2] == h && state->ne[3] == n && ggml_is_contiguous(state));
+    const int64_t a = ggml_nelements(v), s = ggml_nelements(state);
+    const int64_t records = retained * n * (h + w*kh + w*h);
+    GGML_ASSERT(s <= (INT64_MAX / (int64_t)sizeof(float) - a - records) / 2);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a + 2*s + records);
+    result->op = GGML_OP_GATED_DELTA_NET_CAPTURE;
+    for (size_t i = 0; i < sizeof(inputs)/sizeof(inputs[0]); ++i) result->src[i] = inputs[i];
+    // The shared CPU forward path uses K=1 (only final state), plus compact records.
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, (int32_t) retained);
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_capture_view(
+        struct ggml_context * ctx, struct ggml_tensor * capture, enum ggml_gdn_capture_part part) {
+    GGML_ASSERT(capture->op == GGML_OP_GATED_DELTA_NET_CAPTURE);
+    struct ggml_tensor * v = capture->src[2], * state = capture->src[5];
+    const int64_t a = ggml_nelements(v), s = ggml_nelements(state);
+    const int64_t rows = ggml_get_op_params_i32(capture, 1);
+    const int64_t decay = rows * v->ne[1] * v->ne[3], keys = rows * capture->src[1]->ne[0] * capture->src[1]->ne[1] * v->ne[3];
+    const struct ggml_tensor * shape = NULL;
+    int64_t offset = 0;
+    switch (part) {
+        case GGML_GDN_CAPTURE_ATTENTION: shape = v; break;
+        case GGML_GDN_CAPTURE_FINAL: shape = state; offset = a; break;
+        case GGML_GDN_CAPTURE_CHECKPOINT: shape = state; offset = a + s; break;
+        case GGML_GDN_CAPTURE_DECAY: shape = capture->src[3]; offset = a + 2*s; break;
+        case GGML_GDN_CAPTURE_KEY: shape = capture->src[1]; offset = a + 2*s + decay; break;
+        case GGML_GDN_CAPTURE_CORRECTION: shape = v; offset = a + 2*s + decay + keys; break;
+        default: GGML_ABORT("invalid GDN capture part");
+    }
+    const int64_t view_rows = part >= GGML_GDN_CAPTURE_DECAY ? rows : shape->ne[2];
+    return ggml_view_4d(ctx, capture, shape->ne[0], shape->ne[1], view_rows, shape->ne[3],
+            shape->ne[0]*sizeof(float), shape->ne[0]*shape->ne[1]*sizeof(float),
+            shape->ne[0]*shape->ne[1]*view_rows*sizeof(float), offset*sizeof(float));
+}
+
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx, struct ggml_tensor * checkpoint, struct ggml_tensor * decay,
+        struct ggml_tensor * key, struct ggml_tensor * correction, struct ggml_tensor * prefixes) {
+    const int64_t w = checkpoint->ne[0], h = checkpoint->ne[2], n = checkpoint->ne[3], t = decay->ne[2];
+    GGML_ASSERT((w == 64 || w == 128) && checkpoint->ne[1] == w && h > 0 && n > 0 && t >= 1 && t <= 8);
+    GGML_ASSERT(decay->ne[0] == 1 && decay->ne[1] == h && decay->ne[3] == n);
+    GGML_ASSERT(key->ne[0] == w && key->ne[1] > 0 && h % key->ne[1] == 0 && key->ne[2] == t && key->ne[3] == n);
+    GGML_ASSERT(correction->ne[0] == w && correction->ne[1] == h && correction->ne[2] == t && correction->ne[3] == n);
+    GGML_ASSERT(prefixes->type == GGML_TYPE_I32 && ggml_is_vector(prefixes) && ggml_nelements(prefixes) == n && ggml_is_contiguous(prefixes));
+    struct ggml_tensor * inputs[] = {checkpoint, decay, key, correction, prefixes};
+    for (size_t i = 0; i < 4; ++i) GGML_ASSERT(inputs[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(inputs[i]));
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, checkpoint);
+    result->op = GGML_OP_GATED_DELTA_NET_REPLAY;
+    for (size_t i = 0; i < sizeof(inputs)/sizeof(inputs[0]); ++i) result->src[i] = inputs[i];
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_replay_prefix(
+        struct ggml_context * ctx, struct ggml_tensor * checkpoint, struct ggml_tensor * decay,
+        struct ggml_tensor * key, struct ggml_tensor * correction, int32_t prefix) {
+    GGML_ASSERT(prefix >= 0 && prefix <= decay->ne[2]);
+    struct ggml_tensor * metadata = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, checkpoint->ne[3]);
+    struct ggml_tensor * result = ggml_gated_delta_net_replay(ctx, checkpoint, decay, key, correction, metadata);
+    result->src[4] = NULL;
+    ggml_set_op_params_i32(result, 0, prefix);
+    return result;
+}
 
 struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_context * ctx,

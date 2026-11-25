@@ -72,3 +72,34 @@ The regression first failed on the missing provider contract. Five tests then pa
 The missing history API first produced a compilation failure. CPU and the frozen sm120a CUDA backend then each passed 98,777 assertions, with zero failures, exceptions or skips. Cases cover one to four selected sequences, one to eight input rows, unequal per-sequence prefixes, abort/anchor/full acceptance, tail rebasing, repeated materialization and arbitrary FP32 bit patterns. The retained tensor has exactly `(history + retained rows) * channels * selected * sizeof(float)` bytes. Gather/transpose temporaries remain part of the graph quote and can be reused after their consumers complete.
 
 This qualifies the bounded history operations. P2 remains open for transaction, parking/reselection and production-provider integration; those tests must run against the integrated storage before this stage is declared complete. Production was restored after the isolated CUDA fixture.
+
+## P3 exact FP32 GDN capture and replay
+
+The missing capture/replay API first produced a compilation failure. CPU and CUDA fixtures subsequently each pass 4,128 assertions, with raw attention and matrix bytes compared against the native operator for every prefix. Cases cover widths 64/128, grouped keys, one to four sequences, unequal acceptance, abort, anchor-only acceptance, short blocks and retained tails of larger prefill blocks. CPU retains its scale-then-update vector routines. CUDA replay preserves the native CUDA update expression; CPU and CUDA records are not interchangeable under this exact contract.
+
+A separate bounded fixture calls the unchanged GDN implementation from the frozen V3 CUDA library through its exported entry point and calls the newly compiled capture/replay kernels on the same inputs. All 4,128 assertions pass against that frozen implementation as well. Its bridge source, compile/link commands and logs are retained in the P0 evidence directory. This qualifies the operator; it is not a claim of full stock-server equivalence.
+
+Capture stores final state, a checkpoint and FP32 evaluated decay, grouped keys and corrections. Its output has two matrix images, independently of the native rollback depth. It retains at most eight update rows, taking its checkpoint at the start of that tail for longer prefill blocks. Replay fuses the ordered prefix into one materialization pass. The scalar-prefix form needs no GPU descriptor allocation.
+
+The initial native-exact CUDA contract is enabled only on the qualified Linux CUDA 13.0.88 / sm120a build and a compute-12.0 device. Other builds retain native state in the model adapter. An executable-retirement capability is also required; a graph mode that cannot retire temporary executables cannot acquire this provider. Registered inference operators remain separately testable on other backends.
+
+The qualification build uses the repository's existing CI object-manifest mechanism to retain 221 unchanged CUDA objects from the full build. Modified GDN/dispatcher objects and host sources were rebuilt. Existing GGML declarations/layouts and op identifiers were checked unchanged; new identifiers were appended. The object manifest records source/object hashes and compiler commands. All FlashAttention quant pairs remain compiled.
+
+CUDA memory checking reports zero errors, race checking zero hazards/errors/warnings, and synchronization checking zero errors. Graphs and PDL retain their normal settings. The combined host ASan/UBSan suites pass without errors or skips.
+
+### Isolated operator timings
+
+Measured with `test-backend-ops perf`, using Qwen geometry (128-wide states, 48 value heads, 16 grouped keys), in microseconds per layer operation. Replay restores half the captured inputs. The harness amortizes graph submission and reuses its data; these cached microbenchmarks are not end-to-end decode rates or physical PCIe/DRAM bandwidth measurements.
+
+| Rows | Sequences | Native K images | Capture | Prefix replay |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 1 | 10.59 | 7.61 | 13.94 |
+| 4 | 2 | 18.35 | 12.53 | 26.82 |
+| 4 | 3 | 35.70 | 17.60 | 39.63 |
+| 4 | 4 | 88.92 | 22.88 | 52.85 |
+| 8 | 1 | 18.46 | 11.75 | 18.53 |
+| 8 | 2 | 76.80 | 19.17 | 36.01 |
+| 8 | 3 | 119.50 | 28.25 | 53.43 |
+| 8 | 4 | 160.31 | 37.13 | 71.02 |
+
+Replay cost is material even after reducing snapshot writes. P7 must measure its full inference cost, including integration copies, before retaining an optimization.
