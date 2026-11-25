@@ -300,7 +300,11 @@ class V3Policy(unittest.TestCase):
                 self.assertFalse(ci.can_publish(event, branch, result, profile))
 
     def test_profile_releases_do_not_reuse_v2_tags_or_other_architecture_names(self):
-        self.assertEqual(ci.release_tag(SHA, "p100"), "v3-p100-" + SHA)
+        for profile, architecture in (("rtx50", "120a"), ("rtx40", "89"), ("rtx30", "86"),
+                                      ("rtx20", "75"), ("v100", "70"), ("p100", "60"), ("pascal", "61")):
+            self.assertEqual(ci.release_tag(SHA, profile), "sm" + architecture + "-" + SHA)
+            self.assertEqual(ci.archive_name(SHA, "windows-x64-cuda", profile),
+                             "sm" + architecture + "-" + SHA + "-windows-x64-cuda.zip")
         self.assertEqual(ci.release_tag(SHA), "sha-" + SHA)
         names = {ci.archive_name(SHA, "linux-x64-cuda", name) for name in ci.CUDA_PROFILES}
         self.assertEqual(len(names), len(ci.CUDA_PROFILES))
@@ -329,6 +333,25 @@ class V3Packages(unittest.TestCase):
                 "configuration": ci.read_configuration(build)}}))
             with patch.dict(ci.os.environ, {"GITHUB_RUN_ID": "42"}):
                 ci.package(build, self.output, SHA, variant, sdk, profile=profile)
+
+    def test_existing_published_target_skips_but_absent_or_draft_target_builds(self):
+        self.profile_packages("p100")
+        github = FakeGitHub()
+        with patch.object(ci, "resolve_compat_source", return_value=SHA):
+            self.assertEqual(ci.compatibility_plan(github, "p100")["skip"], "false")
+            ci.publish(self.output, SHA, github, "42", profile="p100")
+            self.assertEqual(ci.compatibility_plan(github, "p100"), {"sha": SHA, "profile": "p100", "skip": "true"})
+            assert github.release is not None
+            github.release["draft"] = True
+            self.assertEqual(ci.compatibility_plan(github, "p100")["skip"], "false")
+            github.release["draft"] = False
+            removed = github.release["assets"].pop()
+            with self.assertRaises(ValueError):
+                ci.compatibility_plan(github, "p100")
+            github.release["assets"].append(removed)
+            github.tag = "a" * 40
+            with self.assertRaises(ValueError):
+                ci.compatibility_plan(github, "p100")
 
     def test_profile_metadata_requires_both_matching_operating_systems(self):
         self.profile_packages("p100")
@@ -416,6 +439,8 @@ class FakeGitHub:
 
     def request(self, method, path, payload=None, upload=None):
         if method == "GET":
+            if path.startswith("/releases/tags/") and (self.release is None or self.release["tag_name"] != path.removeprefix("/releases/tags/")):
+                return None
             return self.release
         if method == "POST" and path == "/git/refs":
             assert payload is not None
@@ -639,6 +664,15 @@ class Workflows(unittest.TestCase):
             self.assertEqual(job["with"]["workers"], "2")
         self.assertIn("needs.cuda-linux.result == 'success'", data["jobs"]["publish"]["if"])
         self.assertIn("needs.cuda-windows.result == 'success'", data["jobs"]["publish"]["if"])
+
+    def test_existing_target_short_circuits_every_compatibility_build_stage(self):
+        jobs = self.workflows["build-cuda-compat.yml"]["jobs"]
+        self.assertEqual(jobs["resolve"]["outputs"]["skip"], "${{ steps.source.outputs.skip }}")
+        for name in ("ui-build", "cuda-dependencies", "cuda-linux", "cuda-windows", "publish"):
+            self.assertIn("needs.resolve.outputs.skip != 'true'", jobs[name]["if"])
+        publish = self.workflows["release.yml"]["jobs"]["publish"]
+        checkout = next(s for s in publish["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["ref"], "${{ inputs.source_sha || github.sha }}")
 
     def test_selected_source_and_profile_are_carried_through_all_cuda_stages(self):
         data = self.workflows["build-cuda-sharded.yml"]

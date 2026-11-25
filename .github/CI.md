@@ -39,6 +39,8 @@ CUDA 12.9.1 supplies the Volta/Pascal compiler and runtime dependencies. P100 ex
 
 `build-cuda-compat.yml` also accepts manual `profile` and optional full `source_sha` inputs. Leaving the SHA blank selects the latest successful V3 push CI with a published `rtx50` profile release. An explicit SHA must have that same release and successful CI provenance. The resolver rejects draft/incomplete releases, missing or redirected tags, mixed OS provenance, wrong toolchains and unrelated/failed CI runs. Complete one V3 push build before bootstrapping compatibility builds.
 
+Before starting UI, dependency preparation, or either CUDA build, the resolver checks the selected architecture/source pair. A complete published release with the correct tag target, both OS packages, and matching manifest checksums produces `skip=true`; all build and publication jobs are skipped. Drafts and bare tags do not count as completed builds. A malformed published release fails validation rather than being silently reused.
+
 The selected SHA is resolved once, then used for UI checkout/build identity, every CUDA checkout, shard validation, artifact names and package provenance. It can differ from the scheduled workflow's `GITHUB_SHA`; the source SHA is carried separately as `OCEANUS_SOURCE_SHA`. The schedule must exist on the repository's default branch, currently V3. [GitHub schedule behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 
 These jobs compile CUDA and check packaged executable startup without a GPU. They do not establish numerical correctness or throughput on the corresponding physical cards. Hardware qualification remains separate from package availability.
@@ -57,10 +59,10 @@ Linux uses GCC 13 on Ubuntu 24.04 and an ephemeral swap file for heavy compiler 
 
 ## Commit-SHA releases
 
-A successful V3 push publishes an `rtx50` prerelease. Scheduled/manual compatibility runs publish their own profile only after both OS builds and packaged-startup checks succeed. Release tags are **`v3-<profile>-<full-40-character-sha>`**, containing:
+A successful V3 push publishes an `rtx50` prerelease. Scheduled/manual compatibility runs publish their own profile only after both OS builds and packaged-startup checks succeed. Release names and tags are **`sm<architecture>-<full-40-character-V3-source-sha>`**, such as `sm120a-<sha>`, `sm89-<sha>`, or `sm60-<sha>`. The `a` suffix is retained for architecture-specific CUDA targets. Each release contains:
 
-- `oceanus-v3-<sha>-<profile>-linux-x64-cuda.tar.gz`
-- `oceanus-v3-<sha>-<profile>-windows-x64-cuda.zip`
+- `sm<architecture>-<sha>-linux-x64-cuda.tar.gz`
+- `sm<architecture>-<sha>-windows-x64-cuda.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
@@ -68,7 +70,8 @@ The archives contain `llama-server`, `llama-cli`, `llama-bench`, backend/shared 
 
 The manifest identifies source SHA, architecture profile, run/attempt, compiler/configuration, SDK receipt, shard provenance and checksums. Validation requires both OS packages to match the profile's architecture, CCCL and toolkit. Weekly binaries can lag the latest RTX 50 release: choose the profile and SHA shown in the release name and manifest.
 
-Pull requests and manual main-CI runs cannot publish. The publication gate explicitly checks cancellation and successful required builds so it can be reevaluated after recovery of a failed dependency. The publisher stages assets in an owned draft and publishes only after validation. Reruns verify an existing complete release and preserve its original bytes. An interrupted draft may be resumed by the same Actions run ID; another run's draft is retained for review. Compatibility publication revalidates the source's successful RTX 50 release before writing its own release. Existing `sha-<sha>` V2 releases and assets are not modified.
+
+Pull requests and manual main-CI runs cannot publish. The publication gate explicitly checks cancellation and successful required builds so it can be reevaluated after recovery of a failed dependency. The publisher stages assets in an owned draft and publishes only after validation. Reruns verify an existing complete release and preserve its original bytes. An interrupted draft may be resumed by the same Actions run ID; another run's draft is retained for review. Compatibility publication revalidates the source's successful RTX 50 release before writing its own release.
 
 ## Local checks and remaining rollout
 

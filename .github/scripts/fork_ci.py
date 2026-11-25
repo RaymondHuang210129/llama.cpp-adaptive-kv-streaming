@@ -81,11 +81,19 @@ def validate_sha(sha):
         raise ValueError("a full lowercase commit SHA is required")
 
 
+def architecture_name(profile):
+    target = cuda_profile(profile)["architectures"]
+    match = re.fullmatch(r"([0-9]+[a-z]?)(?:-real|-virtual)?", target)
+    if not match:
+        raise ValueError("release profiles require one CUDA architecture")
+    return "sm" + match[1]
+
+
 def release_tag(sha, profile=None):
     validate_sha(sha)
     if profile is not None:
         cuda_profile(profile)
-    return "sha-" + sha if profile is None else "v3-" + profile + "-" + sha
+    return "sha-" + sha if profile is None else architecture_name(profile) + "-" + sha
 
 
 def archive_name(sha, variant, profile=None):
@@ -94,7 +102,7 @@ def archive_name(sha, variant, profile=None):
         raise ValueError("unsupported package variant")
     if profile is not None:
         cuda_profile(profile)
-    prefix = f"llama-kv-stream-{sha}" if profile is None else f"oceanus-v3-{sha}-{profile}"
+    prefix = f"llama-kv-stream-{sha}" if profile is None else release_tag(sha, profile)
     return f"{prefix}-{variant}" + (".zip" if variant.startswith("windows") else ".tar.gz")
 
 
@@ -285,7 +293,8 @@ def validate_published_release(release, manifest_bytes, sha, profile=None):
         raise ValueError("published release has a different architecture profile")
     expected = {}
     for variant, row in packages.items():
-        if row.get("sha") != sha or row.get("variant") != variant or row.get("file") != archive_name(sha, variant, profile):
+        if (row.get("sha") != sha or row.get("variant") != variant
+                or row.get("file") != archive_name(sha, variant, profile)):
             raise ValueError("published package identity is invalid")
         if profile is not None:
             if row.get("profile") != profile:
@@ -360,7 +369,28 @@ class GitHub:
         return data
 
 
+def published_profile_release(github, sha, profile):
+    tag = release_tag(sha, profile)
+    release = github.request("GET", "/releases/tags/" + tag)
+    if release is None or release.get("draft"):
+        return None
+    if release.get("tag_name") != tag:
+        raise ValueError("release lookup returned another tag")
+    if github.tag_commit(sha, profile) != sha:
+        raise ValueError("published release tag points at another commit")
+    asset = next((a for a in release.get("assets", []) if a["name"] == "build-info.json"), None)
+    if asset is None:
+        raise ValueError("published release has no provenance manifest")
+    raw = github.download_manifest(asset["id"])
+    validate_published_release(release, raw, sha, profile)
+    return release, raw
+
+
 def publish(directory, sha, github, run_id, profile=None):
+    if profile is not None:
+        existing = published_profile_release(github, sha, profile)
+        if existing is not None:
+            return existing[0]
     write_release_metadata(directory, sha, profile)
     tag = release_tag(sha, profile)
     release = github.request("GET", "/releases/tags/" + tag)
@@ -383,7 +413,7 @@ def publish(directory, sha, github, run_id, profile=None):
         github.request("POST", "/git/refs", {"ref": "refs/tags/" + tag, "sha": sha})
     if not release:
         release = github.request("POST", "/releases", {"tag_name": tag, "target_commitish": sha,
-                                 "name": "Oceanus V3 " + (profile or "legacy") + " " + sha[:12], "draft": True, "prerelease": True,
+                                 "name": tag, "draft": True, "prerelease": True,
                                                        "body": f"Continuous Oceanus V3 build of `{sha}` ({profile or 'legacy'}). See build-info.json and SHA256SUMS.\n\n{owner}"})
     release_id = release["id"]
     current = {row["name"]: row for row in release.get("assets", [])}
@@ -417,16 +447,12 @@ def resolve_compat_source(github, requested=None):
                       if successful_source_run(row, row.get("head_sha"))]
     for sha, run in candidates:
         validate_sha(sha)
-        release = github.request("GET", "/releases/tags/" + release_tag(sha, "rtx50"))
-        if release is None and not requested:
+        published = published_profile_release(github, sha, "rtx50")
+        if published is None and not requested:
             continue
-        if not release or release.get("draft") or github.tag_commit(sha, "rtx50") != sha:
+        if published is None:
             raise ValueError("compatibility source needs a published RTX 50 release")
-        asset = next((a for a in release.get("assets", []) if a["name"] == "build-info.json"), None)
-        if not asset:
-            raise ValueError("source release has no provenance manifest")
-        raw = github.download_manifest(asset["id"])
-        validate_published_release(release, raw, sha, "rtx50")
+        _, raw = published
         manifest = json.loads(raw)
         run_ids = {str(row["build"].get("run_id", "")) for row in manifest["packages"].values()}
         if len(run_ids) != 1 or not next(iter(run_ids)).isdigit():
@@ -438,6 +464,16 @@ def resolve_compat_source(github, requested=None):
             raise ValueError("source release does not come from successful V3 push CI")
         return sha
     raise ValueError("no successful V3 push with a published RTX 50 release was found")
+
+
+def compatibility_plan(github, profile, requested=None):
+    cuda_profile(profile)
+    sha = resolve_compat_source(github, requested)
+    published = published_profile_release(github, sha, profile)
+    exists = published is not None
+    if published is not None:
+        sys.stdout.write("Already published " + published[0]["tag_name"] + "; skipping compatibility builds.\n")
+    return {"sha": sha, "profile": profile, "skip": "true" if exists else "false"}
 
 
 def write_outputs(values):
@@ -471,8 +507,7 @@ def main():
         if not can_publish(event, os.environ.get("GITHUB_REF"), "success", profile) or profile == "rtx50":
             parser.error("compatibility builds require a scheduled/manual V3 architecture profile")
         github = GitHub(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_TOKEN"])
-        sha = resolve_compat_source(github, args.source_sha)
-        write_outputs({"sha": sha, "profile": profile})
+        write_outputs(compatibility_plan(github, profile, args.source_sha))
     elif args.action == "changes":
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         base = event.get("pull_request", {}).get("base", {}).get("sha") or event.get("before")
