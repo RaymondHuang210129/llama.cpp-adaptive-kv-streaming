@@ -77,6 +77,7 @@ bool llama_recurrent_placement_choose(const llama_recurrent_placement_request & 
     if (!r.safe_boundary || !r.generation || r.generation<state.last_generation || r.plans.empty() ||
             r.reserve>r.budget || !std::isfinite(r.h2d_bytes_per_ms) || r.h2d_bytes_per_ms<=0 ||
             !std::isfinite(r.d2h_bytes_per_ms) || r.d2h_bytes_per_ms<=0 ||
+            !std::isfinite(r.transfer_overlap_fraction) || r.transfer_overlap_fraction<0 || r.transfer_overlap_fraction>1 ||
             !std::isfinite(r.hysteresis) || r.hysteresis<0 || r.hysteresis>=1) return false;
     std::array<bool,3> seen{};
     bool comparable=true;
@@ -101,8 +102,9 @@ bool llama_recurrent_placement_choose(const llama_recurrent_placement_request & 
                 !std::isfinite(plan.restore_ms) || plan.restore_ms<0) return false;
         seen[index]=true;
         if (plan.peak_bytes>r.budget-r.reserve) continue;
-        const double copies=std::max((double(plan.h2d_bytes)+double(plan.kv_stream_bytes))/r.h2d_bytes_per_ms,
-                                     double(plan.d2h_bytes)/r.d2h_bytes_per_ms);
+        const double h2d=(double(plan.h2d_bytes)+double(plan.kv_stream_bytes))/r.h2d_bytes_per_ms;
+        const double d2h=double(plan.d2h_bytes)/r.d2h_bytes_per_ms;
+        const double copies=std::max(h2d,d2h)+(1-r.transfer_overlap_fraction)*std::min(h2d,d2h);
         const double predicted=plan.compute_ms+plan.restore_ms+copies;
         if (!std::isfinite(predicted)) return false;
         double factor=common_factor;

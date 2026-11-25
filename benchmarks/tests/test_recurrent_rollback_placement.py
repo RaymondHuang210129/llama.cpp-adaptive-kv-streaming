@@ -2,6 +2,7 @@
 
 The target GGUF must contain embedded Qwen MTP weights. No models are downloaded.
 """
+import contextlib
 import importlib.util
 import json
 import os
@@ -21,6 +22,27 @@ SPEC.loader.exec_module(FINDER)
 @unittest.skipUnless(os.environ.get("LLAMA_ROLLBACK_TEST_SERVER") and os.environ.get("LLAMA_ROLLBACK_TEST_MODEL"),
                      "set rollback test server and embedded-MTP model paths for CUDA integration")
 class RecurrentRollbackPlacementTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("LLAMA_ROLLBACK_TEST_DRAFT"), "set the matching DFlash2 draft path")
+    def test_automatic_admission_considers_four_slot_compact_plan(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1",0));port=listener.getsockname()[1]
+        destination=os.environ.get("LLAMA_ROLLBACK_TEST_OUTPUT")
+        manager=contextlib.nullcontext(destination) if destination else tempfile.TemporaryDirectory()
+        with manager as temporary:
+            args=FINDER.arguments([
+                "--server",str(Path(os.environ["LLAMA_ROLLBACK_TEST_SERVER"]).resolve()),
+                "--model",str(Path(os.environ["LLAMA_ROLLBACK_TEST_MODEL"]).resolve()),
+                "--model-draft",str(Path(os.environ["LLAMA_ROLLBACK_TEST_DRAFT"]).resolve()),
+                "--context-size","262144","--parallel","4","--cache-type-k","q8_0","--cache-type-v","q4_0",
+                "--spec-mode","dflash","--draft-length","7","--prompt-tokens","64","--decode-tokens","16",
+                "--probe-mode","preflight","--recurrent-rollback-auto","--no-warmup","--no-webui","--verbosity","4","--port",str(port)])
+            args.output=Path(temporary);args.output.mkdir(exist_ok=True)
+            record=FINDER.probe(args,3072)
+            (args.output/"record.json").write_text(json.dumps(record,indent=2)+"\n")
+            self.assertTrue(record["fits"],record.get("error"))
+            joint=next(row for row in record["selection_profiles"] if row["profile"]["label"]=="joint")
+            self.assertEqual(4,max(joint["decode_selections"],default=0))
+
     def test_selected_mtp_restores_prefixes_in_vram_and_ram(self):
         self.check_placement("mtp", 3, 2096)
 

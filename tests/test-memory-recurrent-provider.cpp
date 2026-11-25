@@ -72,8 +72,26 @@ int main() {
         t.assert_true(llama_recurrent_provider_describe(r, representation::dense_device, {}, out));
         t.assert_equal(size_t(0), out.device_peak);
     });
+    t.test("unqualified_copy_overlap_cannot_hide_host_rollback_cost", [](testing & t) {
+        llama_recurrent_placement_request r;
+        r.budget=1000;r.safe_boundary=true;r.generation=1;
+        r.h2d_bytes_per_ms=r.d2h_bytes_per_ms=100;
+        r.plans={{representation::dense_host,600,25,200,100,1,0},
+                 {representation::gdn_fp32,800,0,260,0,1,.1}};
+        llama_recurrent_placement_state state;llama_recurrent_placement_choice out;
+        if (!t.assert_true(llama_recurrent_placement_choose(r,state,out))) return;
+        t.assert_true("unqualified overlap must retain both transfer directions",out.representation==representation::gdn_fp32);
+        r.transfer_overlap_fraction=1;state={};
+        t.assert_true(llama_recurrent_placement_choose(r,state,out) && out.representation==representation::dense_host);
+        for (double invalid : {-1.0,1.01,std::numeric_limits<double>::quiet_NaN()}) {
+            r.transfer_overlap_fraction=invalid;
+            const auto previous=out.representation;
+            t.assert_true(!llama_recurrent_placement_choose(r,state,out) && out.representation==previous);
+        }
+    });
     t.test("placement_uses_complete_budget_and_overlapped_transfers", [](testing & t) {
         llama_recurrent_placement_request r;
+        r.transfer_overlap_fraction=1;
         r.budget=1000;r.reserve=100;r.safe_boundary=true;r.generation=1;
         r.h2d_bytes_per_ms=r.d2h_bytes_per_ms=100;
         r.plans={{representation::dense_device,950,0,0,0,1,0},
@@ -132,6 +150,7 @@ int main() {
     });
     t.test("placement_can_trade_device_state_for_less_KV_streaming", [](testing & t) {
         llama_recurrent_placement_request r;r.safe_boundary=true;r.budget=1000;r.generation=1;
+        r.transfer_overlap_fraction=1;
         r.h2d_bytes_per_ms=r.d2h_bytes_per_ms=100;
         r.plans={{representation::dense_device,950,0,0,0,1,0},
                  {representation::gdn_fp32,800,0,0,0,1.1,0},

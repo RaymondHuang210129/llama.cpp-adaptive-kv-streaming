@@ -3795,9 +3795,15 @@ private:
         std::unique_ptr<llama_context> auxiliary;
     };
 
-    pending_stream_contexts make_pending_stream_contexts(const std::vector<llama_seq_id> & selected) {
+    pending_stream_contexts make_pending_stream_contexts(const std::vector<llama_seq_id> & selected,
+            const llama_recurrent_representation * placement=nullptr) {
         auto params=common_context_params_to_llama(params_base,model_tgt);
         params.n_ctx=stream_contexts->source_table()->limits().slot_limit;
+        if (placement) {
+            params.recurrent_rollback_auto=false;
+            params.recurrent_rollback_ram=*placement==llama_recurrent_representation::dense_host;
+            params.recurrent_rollback_compact=*placement==llama_recurrent_representation::gdn_fp32;
+        }
         pending_stream_contexts result;result.target=std::make_unique<llama_context>(*model_tgt,params,selected);
         auto & pending=*result.target;
         if (!pending.bind_group_samplers_from(*stream_contexts->metadata_context()))
@@ -3849,20 +3855,30 @@ private:
                 auxiliary_identities.push_back({cache->host()->cache_id(),cache->content()->generation()});
             }
         }
-        auto contexts=make_pending_stream_contexts(selected);auto & pending=*contexts.target;
-        llama_context_group_plan quote;
         llama_memory_phase_cache_identity bounded_identity;
         if (!llama_context_group_bounded_identity(identities,auxiliary_identities,bounded_identity))
             throw std::runtime_error("selected cache identities are invalid");
-        const auto result=pending.quote_target_group(batch,identities,bounded_identity,
-            phase,1,params.shared_device_memory_bytes,quote,contexts.auxiliary.get(),auxiliary_identities);
-        if (result.status==llama_context_memory_create_status::insufficient_budget) {
-            SRV_INF("stream selection capacity: selected=%zu required=%zu available=%zu\n",selected.size(),result.required_bytes,result.available_bytes);
-            return false;
+        const bool automatic=params.recurrent_rollback_auto && params.n_rs_seq &&
+            stream_contexts->metadata_context()->get_kv_resources().recurrent;
+        // Admission needs one feasible plan; avoid measuring larger banks before a compact plan that fits.
+        const std::array<llama_recurrent_representation,3> alternatives={
+            llama_recurrent_representation::gdn_fp32,llama_recurrent_representation::dense_host,
+            llama_recurrent_representation::dense_device};
+        size_t minimum=SIZE_MAX;
+        for (size_t i=0;i<(automatic ? alternatives.size() : 1);++i) {
+            auto contexts=make_pending_stream_contexts(selected,automatic ? &alternatives[i] : nullptr);
+            auto & pending=*contexts.target;
+            llama_context_group_plan quote;
+            const auto result=pending.quote_target_group(batch,identities,bounded_identity,
+                phase,1,params.shared_device_memory_bytes,quote,contexts.auxiliary.get(),auxiliary_identities);
+            if (result.status==llama_context_memory_create_status::success) return true;
+            if (result.status!=llama_context_memory_create_status::insufficient_budget)
+                throw std::runtime_error("joint workload is unavailable during group selection");
+            minimum=std::min(minimum,result.required_bytes);
         }
-        if (result.status!=llama_context_memory_create_status::success)
-            throw std::runtime_error("native joint workload is unavailable during group selection");
-        return true;
+        SRV_INF("stream selection capacity: selected=%zu required=%zu available=%zu\n",selected.size(),minimum,
+            params.shared_device_memory_bytes);
+        return false;
     }
 
     static bool admit_stream_selection(const llama_kv_stream_selection & selection, void * data) {

@@ -1,6 +1,6 @@
 # Compact recurrent rollback and budget-aware placement
 
-Status: P0-P6 complete, including serial arena ownership and the full supported-configuration gate. P7 closeout is in progress. Implementation branch `feature/compact-recurrent-rollback`. Exact operator and integrated transaction gates passed on the qualified backend; bounded group and serial placement are qualified; broader product qualification and performance closeout remain open.
+Status: P0-P7 complete. Serial recurrent state is arena-owned; exact compact capture/replay, live placement, product qualification and measured performance/resource closeout are retained on `feature/compact-recurrent-rollback`.
 
 Evidence: [P0 reference and allocation ledger](docs/development/compact-recurrent-rollback.md).
 
@@ -207,14 +207,14 @@ Use the compositional numerical contracts in [MS17](MULTI_SLOT_PHASE_ARENA_ROADM
 
 ### P7. Optimize performance and close out
 
-- [ ] Profile the qualified P6 implementation to separate capture, replay, commit, transfer, graph/launch, and KV-streaming costs.
-- [ ] Reuse owner-issued workspace for bounded restoration scratch; compare safe borrowed-image plans with the persistent-image reference.
-- [ ] Fuse prefix steps within a replay pass so intermediate dense matrices are not written between steps.
-- [ ] Optimize full-acceptance and abort paths, grouped-key reuse, descriptor preparation and launch count without weakening transaction semantics.
-- [ ] Evaluate cross-layer or selected-sequence batching and safe overlap only where profiling identifies a material cost.
-- [ ] Calibrate placement using measured costs, preserve bounded adaptation and hysteresis, and retain explicit reproducible overrides.
-- [ ] Rerun applicable P6 correctness, failure/lifetime and non-regression gates after every retained optimization.
-- [ ] Publish matched before/after timings, real memory peaks, accepted-prefix distributions, KV-transfer changes, and the final qualification ledger.
+- [x] Profile the qualified P6 implementation to separate capture, replay, commit, transfer, graph/launch, and KV-streaming costs.
+- [x] Reuse owner-issued workspace for bounded restoration scratch; compare safe borrowed-image plans with the persistent-image reference.
+- [x] Fuse prefix steps within a replay pass so intermediate dense matrices are not written between steps.
+- [x] Optimize full-acceptance and abort paths, grouped-key reuse, descriptor preparation and launch count without weakening transaction semantics.
+- [x] Evaluate cross-layer or selected-sequence batching and safe overlap only where profiling identifies a material cost.
+- [x] Calibrate placement using measured costs, preserve bounded adaptation and hysteresis, and retain explicit reproducible overrides.
+- [x] Rerun applicable P6 correctness, failure/lifetime and non-regression gates after every retained optimization.
+- [x] Publish matched before/after timings, real memory peaks, accepted-prefix distributions, KV-transfer changes, and the final qualification ledger.
 
 Exit: retain only measured end-to-end improvements with unchanged numerical and lifecycle contracts. Target-only and unaffected models remain non-regression controls. Record rejected optimization trials and remaining hardware limits; an isolated replay-kernel speedup cannot close P7 if total decode regresses.
 

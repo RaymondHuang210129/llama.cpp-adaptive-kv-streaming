@@ -162,7 +162,7 @@ Raw records live under `/home/raymond/LLM/compact-rollback-20261125/P7-swe-qwen-
 
 ## P5 budget-aware placement
 
-P5 adds `--recurrent-rollback-auto` for selected-group activation. The common selector accepts complete owner quotes for native device, dense host and qualified FP32 GDN storage. It has no model-name rules. Device peaks include current/bounded state, graph workspace, publication staging and the minimum KV pool. Advisory latency includes capture, acceptance-dependent restoration, KV streaming and the maximum of concurrent H2D/D2H payload times. The bandwidth/compute seeds are estimates, not measured PCIe utilization. Independently restorable partial regions are not advertised; the qualified choices are whole-bank plans.
+P5 adds `--recurrent-rollback-auto` for selected-group activation. The common selector accepts complete owner quotes for native device, dense host and qualified FP32 GDN storage. It has no model-name rules. Device peaks include current/bounded state, graph workspace, publication staging and the minimum KV pool. Advisory latency includes capture, acceptance-dependent restoration, KV streaming and the maximum of concurrent H2D/D2H payload times. The bandwidth/compute seeds are estimates, not measured PCIe utilization. The initial full-overlap assumption is superseded by the P7 calibration below. Independently restorable partial regions are not advertised; the qualified choices are whole-bank plans.
 
 Placement changes occur only after the old group has drained and exported its current native roles. Candidate descriptions allocate no device state; a fresh normal admission check precedes each actual arena binding. Cached descriptions advise cost only. A cached choice that fails fresh admission triggers one bounded refresh. The cache retains one selected-identity profile, no GPU leases or executable tensor addresses. It is invalidated on an explicit provider change. All publication metadata is prepared before acquiring GPU grants.
 
@@ -246,3 +246,60 @@ Single-slot non-regression controls use 8,192 history tokens, 512 outputs per me
 | Gemma MTP3, 2,048 MiB arena | 89.490 | 89.483 | 16,648,896,512 / 16,648,896,512 bytes |
 
 The observed rate differences are -0.44%, -0.11% and -0.01%, respectively, without statistical confidence from repeated timings. The Qwen target-only device peak drops by exactly 150 MiB when its normal current recurrent image moves into the fixed parent; Gemma allocates no new recurrent resources. Long-context and instrumented resource comparisons are recorded in the P7 closeout separately.
+
+## P7 final optimization and placement results
+
+P7 retains direct capture into the owner-issued working bank/logs, vectorized exact prefix replay, a full-acceptance path without replay graph allocation, and host-only advisory graph-template reuse. These changes preserve the qualified FP32 arithmetic and the committed/working ownership protocol. Replay already batches affected layers/sequences into one backend graph and writes directly to the prebound working image. There is no extra device result allocator. Long-prefill tail checkpoints reuse measured graph workspace until computation and KV publication complete.
+
+Returning the working image as scratch at the draft boundary would discard accepted current state; copying it over the checkpoint would destroy the original state required by late prefix rollback. Retaining a borrowed lease through that lifetime has the same two-image lower bound. A sealed-commit/deferred-merge or offloaded-checkpoint provider would need a different qualified contract. Those candidates were not substituted for the proven two-image provider. The measured replay share below does not justify adding a new cross-layer fusion or asynchronous state-publication mechanism in this delivery.
+
+### Corrections found by the final performance gates
+
+The first 2x64K automatic run selected RAM and measured 64.923 aggregate tokens/s, while explicit compact measured 77.792. Its cost seed had assumed perfect overlap of all H2D/KV and D2H work without qualification. Transfer cost now starts conservatively with both directions retained. An internal, finite `[0,1]` overlap fraction permits explicitly qualified overlap; it defaults to zero. The previous full-duplex unit cases now request that assumption explicitly. A new regression first selected RAM incorrectly, then passes with the conservative default and still proves a qualified full-duplex case can choose RAM. The provider suite passes 91 assertions, including invalid-overlap rejection and unchanged output on failure. Existing bounded real-work feedback, workload keys, hysteresis and cooldown remain intact.
+
+A second gate found that preliminary server admission quoted only its default native bank. Four-slot DFlash7 therefore reported a 5,214 MiB minimum and repeatedly selected pairs even though compact could admit all four slots in 3,072 MiB. Admission now checks complete available representation plans before pruning the cohort. It tries compact first to avoid redundant larger-bank measurement; actual activation still makes its own cost choice and fresh hard-budget admission. No state bank is allocated by this preliminary quote. The real-server regression first failed, then proved four selected decode slots within the same arena.
+
+After the capacity fix alone, automatic four-slot throughput was 136.130 tokens/s. Logs isolated the remaining gap to admission setup before decode: steady four-slot execution took approximately 7.24 seconds versus explicit compact's 7.27 seconds. Avoiding redundant native/RAM preliminary quotes brought the final automatic observation to 157.529 tokens/s. Both failed trials and their raw logs are retained; they are not treated as retained performance results. Serial migration, the three-/four-slot MTP oracle and all 64 two-slot seven-token acceptance combinations pass again after the costing/admission corrections.
+
+### Matched throughput
+
+All normal runs use greedy sampling, no discarded startup requests, no startup warmup, and 512 outputs per request. Serial rows average independent SWE A/B requests; parallel rows measure emitted tokens in the actual common decode interval. Every retained comparison checks prompt identities and all output tokens. These are single observations without repetitions, reverse-order passes or statistical confidence. Instrumented rates are excluded.
+
+| Qwen workload | Arena policy | Native | RAM | Compact prototype | Optimized compact | Final automatic |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Serial MTP3, 8K A/B | Common 2,304 MiB | 115.255 | 111.901 | - | 116.330 | - |
+| Two-slot MTP3, 8K each | Fixed 2,096 MiB | 140.350 | 126.441 | 138.588 | 141.715 | - |
+| Two-slot MTP3, 16K each | Fixed 2,096 MiB | 128.250 | 118.747 | 129.262 | 132.299 | - |
+| Two-slot MTP3, 64K each | Fixed 2,096 MiB | 68.534 | 64.776 | 75.051 | 77.792 | 77.858 |
+| Four-slot DFlash7, 8K each | Fixed 3,072 MiB | Not admitted by state size | 92.493 | - | 157.300 | 157.529 |
+| Serial DFlash7, 96K A/B | Each fitted maximum minus 16 MiB | 108.182 | 105.576 | - | 110.386 | - |
+
+The 2x64K optimized observation is 13.5% above native and 3.7% above the compact prototype. Final automatic placement matches the explicit compact path closely. Four-slot optimized compact is 70.1% above the applicable RAM reference. The refitted 96K serial observation is 2.0% above native. The 96K fitted/used arenas are native 3,330/3,314 MiB, RAM 3,316/3,300 MiB and compact 3,332/3,316 MiB. The full 96K requests validated those selected sizes once; all six request outputs match. The 2,096 MiB serial native MTP3 capacity limit remains a separately recorded non-admission, not a speed sample.
+
+[Normal performance CSV](compact-recurrent-rollback-performance.csv) records rates, acceptance, real arena sizes, sampled whole-device peaks, process RSS, runtime fingerprints and relative raw-evidence locations. Prototype and historical serial allocation records are kept distinct from the corrected serial arena measurements. Larger logical histories do not require relocating authoritative host KV.
+
+### Arena and transfer accounting
+
+The fixed parent's total allocation remains unchanged; compact storage increases the usable KV region. Payloads follow the actual selected sequence count. For MTP3, native/compact persistent recurrent storage is 598.500/318.410 MiB per selected sequence; for DFlash7 it is 1,197.000/331.945 MiB. The conservative convolution component alone is not smaller for MTP3, and a depth-one compact bank is not advertised as a universal memory reduction.
+
+The instrumented 8K workloads report the following actual verify-phase grants:
+
+| Workload/provider | Parent MiB | Recurrent MiB | Publication MiB | Graph MiB | KV pool MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MTP3 selected 2, native | 2,096 | 1,197.000 | 0 | 162.273 | 704.031 |
+| MTP3 selected 2, RAM | 2,096 | 299.250 | 37.406 | 162.273 | 1,564.469 |
+| MTP3 selected 2, compact | 2,096 | 636.820 | 0 | 162.273 | 1,264.250 |
+| DFlash7 selected 4, RAM | 3,072 | 598.500 | 174.562 | 132.830 | 2,083.250 |
+| DFlash7 selected 4, compact | 3,072 | 1,327.781 | 0 | 50.330 | 1,611.188 |
+
+Bounded draft KV, writer/attention scratch and alignment are also charged in these parents; the table does not omit them from admission. Compact prefill graph envelopes are larger because they retain tail checkpoints until publication: MTP3 selected 2 uses 487.276 MiB, versus 208.510 native/RAM; DFlash7 selected 4 uses 795.276 MiB, versus 298.213 RAM. Decode releases that phase workspace to KV. The four-slot native DFlash7 bank alone needs 4,788 MiB and cannot be a 3,072 MiB control.
+
+Across the complete instrumented MTP3 requests, RAM records 172.587 GiB of rollback D2H and 3.215 GiB of rollback H2D; compact records zero of either and 14.925 ms in 20 replay graph executions. DFlash7 selected 4 records 1,009.339/53.625 GiB of RAM rollback D2H/H2D; compact records zero and 255.452 ms in 141 replay graph executions. These counters include prefill, decode and applicable retirement, not just the timed common interval. Replay timers include backend graph execution and synchronization rather than only device kernel time. Prefix logs record actual materialized rows/prefixes; maximum-width rollback counters are not substituted for that distribution. [Instrumented resource CSV](compact-recurrent-rollback-resources.csv) provides the complete phase grants and request totals.
+
+A separate Nsight capture uses a client NVTX range beginning after every cohort's first token and ending at the first completed stream. Its 1,024 output tokens match the normal compact reference. Within the 7,436.375 ms common interval, GPU kernel work sums to 6,031.062 ms; its union is 5,710.439 ms, and the union of kernels/memory operations is 5,826.782 ms. Quantized matrix multiplication accounts for 4,470.325 ms (74.1% of cumulative kernel work), attention 592.080 ms, GDN capture 72.790 ms and replay 7.791 ms. Capture plus replay is approximately 1.1% of client-observed decode wall time. Work sums are not exclusive critical-path time because operations can overlap. Other D2H traffic remains for logits/features even when rollback D2H is zero. [Decode-window kernel CSV](compact-recurrent-rollback-nsys-kernels.csv) and `P7-nsys-decode-summary.json` retain the detailed classification. Profile rates are not included in the throughput table.
+
+### Qualification scope and completion
+
+The retained exact CUDA contract remains the qualified Linux Release/NVCC 13.0.88/sm120a build with normal graphs/PDL and the existing compiler guards. CPU and CUDA each match their retained native arithmetic; this is not a cross-backend bitwise claim. Other builds/operators retain their applicable native fallback. This delivery does not add new model pairings, speculation depths or KV formats. Higher configured capacities/sparse IDs retain the existing generic bound; actual GPU product qualification on this card covers one through four selected requests. Admission may select a smaller cohort when its complete histories/resources do not fit, and such a run is not scored as full parallelism.
+
+All P0-P7 delivery stages are complete. Final CPU/provider/owner/transaction/history checks, ASan/UBSan suites, kernel CUDA order/memory checks, full-model prefix/state/logit gates, product configuration pairs and matched non-regression controls pass under their stated scope. No numerical tolerance was relaxed for a speed result. The original production container/image is restored and healthy with three slots; the feature has not been pushed or deployed. Source commits and immutable runtime/library/model/workload identities are retained with the evidence.

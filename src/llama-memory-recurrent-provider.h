@@ -68,6 +68,8 @@ struct llama_recurrent_placement_request {
     uint64_t generation = 0, workload = 0;
     uint64_t cooldown = 4;
     bool safe_boundary = false;
+    // Only qualified overlap may hide transfer time. Zero is the conservative seed.
+    double transfer_overlap_fraction = 0;
 };
 
 struct llama_recurrent_placement_state {

@@ -1,0 +1,6 @@
+mode,slots,variant,parent_bytes,recurrent_bytes,bounded_bytes,publication_bytes,prefill_graph_bytes,decode_graph_bytes,prefill_kv_pool_bytes,decode_kv_pool_bytes,host_d2h_bytes,host_h2d_bytes,replay_calls,replay_prefix_rows,replay_ms,evidence
+mtp,2,native,2197815296,1255145472,0,0,218638464,170156032,689668096,738230272,0.0,0.0,0.0,0.0,0.0,P7-swe-qwen-mtp-n2-h8192-a2096-profile-native-resource-final/server.log
+mtp,2,ram,2197815296,313786368,0,39223296,218638464,170156032,1591902208,1640464384,185314443264.0,3451650048.0,0.0,0.0,0.0,P7-swe-qwen-mtp-n2-h8192-a2096-profile-ram-resource-final/server.log
+mtp,2,after,2197815296,667754496,0,0,510945664,170156032,984875008,1325662208,0.0,0.0,20.0,54.0,14.925,P7-swe-qwen-mtp-n2-h8192-a2096-profile-after-resource-final/server.log
+dflash,4,ram,3221225472,627572736,70287360,183042048,312699008,139281920,1993605120,2184445952,1083769749504.0,57579798528.0,0.0,0.0,0.0,P7-swe-qwen-dflash-n4-h8192-a3072-profile-ram-resource-final/server.log
+dflash,4,after,3221225472,1392279552,70287360,0,833907072,52774656,890732544,1689452544,0.0,0.0,141.0,1187.0,255.45199999999997,P7-swe-qwen-dflash-n4-h8192-a3072-profile-after-resource-final/server.log
