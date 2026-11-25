@@ -44,9 +44,9 @@ static void llama_log_memory_phase(const llama_context_memory * memory) {
     llama_context_memory_diagnostics d;
     if (!memory || !memory->diagnostics(d)) return;
     const char * phase = d.kv_device_suspended ? "suspended" : d.phase == llama_memory_text_phase::decode ? "decode" : "prefill";
-    LLAMA_LOG_WARN("memory_phase: phase=%s parent=%zu compute=%zu kv_pool=%zu writer=%zu attention=%zu persistent_kv=%zu publication_stage=%zu unused=%zu reclaimed_compute=%zu capture=external transition_us=%" PRIu64 " arena_gen=%" PRIu64 " kv_revision=%" PRIu64 " resident_pages=%u ring_slots=%u active_pages=%u streaming=%d last_h2d_bytes=%zu last_h2d_calls=%zu copy_ms=%.3f elapsed_ms=%.3f\n",
+    LLAMA_LOG_WARN("memory_phase: phase=%s parent=%zu compute=%zu kv_pool=%zu writer=%zu attention=%zu persistent_kv=%zu publication_stage=%zu recurrent_state=%zu unused=%zu reclaimed_compute=%zu capture=external transition_us=%" PRIu64 " arena_gen=%" PRIu64 " kv_revision=%" PRIu64 " resident_pages=%u ring_slots=%u active_pages=%u streaming=%d last_h2d_bytes=%zu last_h2d_calls=%zu copy_ms=%.3f elapsed_ms=%.3f\n",
         phase,d.parent_bytes,d.workspace_bytes,d.kv_pool_bytes,d.kv_writer_bytes,
-        d.kv_attention_bytes,d.persistent_cache_bytes,d.publication_stage_bytes,d.unused_bytes,d.reclaimed_workspace_bytes,
+        d.kv_attention_bytes,d.persistent_cache_bytes,d.publication_stage_bytes,d.recurrent_state_bytes,d.unused_bytes,d.reclaimed_workspace_bytes,
         d.last_transition_us,d.arena_generation,d.layout_revision,
         d.resident_pages_per_layer,d.ring_slots,d.active_pages,
         int(d.streaming_active),d.last_copy_bytes,d.last_copy_calls,
@@ -973,8 +973,10 @@ llama_context::llama_context(
     if (params.recurrent_rollback_auto && std::getenv("LLAMA_RS_HOST_SPILL") &&
             std::strcmp(std::getenv("LLAMA_RS_HOST_SPILL"),"1")==0)
         throw std::runtime_error("automatic recurrent placement conflicts with LLAMA_RS_HOST_SPILL; use the explicit RAM option");
-    if (params.recurrent_rollback_auto && !group_initializing && !measurement_only && cparams.n_rs_seq)
-        LLAMA_LOG_WARN("rollback placement: serial storage is fixed at launch; use the arena fitter to compare explicit native/RAM/compact plans\n");
+    // Start with the smallest device bank. The first safe text boundary selects a complete plan.
+    if (params.recurrent_rollback_auto && !group_initializing && cparams.n_rs_seq &&
+            cparams.shared_device_memory_bytes && cparams.n_seq_max==1 && params.ctx_type==LLAMA_CONTEXT_TYPE_DEFAULT)
+        cparams.recurrent_rollback_ram=true;
     if (cparams.kv_stream_verify_max && (!cparams.kv_streaming() || model.arch != LLM_ARCH_GEMMA4 ||
             params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other || (!group_initializing && cparams.n_seq_max != 1) ||
             cparams.kv_stream_verify_max > 4 || cparams.kv_stream_verify_max > cparams.n_ubatch)) {
@@ -1509,7 +1511,9 @@ llama_context::~llama_context() {
     if (kv_resources.full && kv_resources.full->get_group_model()) kv_resources.full->get_group_model()->unbind();
     group_execution.reset();
     compute_memory.reset();
-    if (serial_cache || publication_stage) { memory.reset(); serial_cache.reset(); publication_stage.reset(); }
+    if (serial_cache || publication_stage || recurrent_storage) {
+        memory.reset();serial_cache.reset();publication_stage.reset();recurrent_storage.reset();
+    }
     sched.reset();
     compute_arenas.clear();
 }
@@ -1629,12 +1633,14 @@ bool llama_context::prepare_compute_arenas(
     if (!llama_compute_workspace_plan_make(backend_buft, measurements, n_phases, plan)) {
         return false;
     }
+    if (!group_execution && cparams.shared_device_memory_bytes && cparams.n_seq_max==1)
+        serial_recurrent_workspace_plan=plan;
     // A sampler can change the child's graph footprint after construction. Its graphs are retired before measurement.
     if (compute_memory && cparams.kv_shared_read && compute_memory->borrows_serial_parent() &&
             !compute_memory->covers_workspace(plan)) {
         compute_memory.reset();
     }
-    if (compute_memory && (serial_cache || publication_stage || compute_memory->has_bounded_cache() ||
+    if (compute_memory && (serial_cache || publication_stage || recurrent_storage || compute_memory->has_bounded_cache() ||
             (cparams.kv_shared_read && compute_memory->borrows_serial_parent()))) {
         if (!compute_memory->covers_workspace(plan) && !compute_memory->grow_workspace(plan)) return false;
         compute_memory_graph_revision=compute_memory->graph_binding_revision();
@@ -1654,7 +1660,7 @@ bool llama_context::prepare_compute_arenas(
         llama_context_memory_create_result admission;
         compute_memory = llama_context_memory::create(
             sched.get(),backend_ptrs,plan,stream,serial_parent,false,{},0,&admission);
-        if (!compute_memory && serial_parent && !cparams.serial_block_rows && !cparams.kv_shared_read &&
+        if (!compute_memory && serial_parent && !source->recurrent_storage && !cparams.serial_block_rows && !cparams.kv_shared_read &&
                 admission.status == llama_context_memory_create_status::insufficient_budget) {
             // Keep separate scratch if the shared budget cannot hold the draft graph and live KV scratch.
             LLAMA_LOG_WARN("%s: MTP graph exceeds shared arena quota: available=%zu required=%zu additional=%zu bytes; trying a separate workspace\n",
@@ -1673,6 +1679,32 @@ bool llama_context::prepare_compute_arenas(
                 llama_context_memory_create_status_name(admission.status) + "; required=" +
                 std::to_string(admission.required_bytes) + ", available=" + std::to_string(admission.available_bytes) +
                 ", additional=" + std::to_string(admission.additional_bytes) + " bytes");
+        }
+        if (compute_memory && kv_resources.recurrent && kv_resources.recurrent->current_storage_pending() &&
+                cparams.shared_device_memory_bytes && !recurrent_storage) {
+            auto * recurrent=kv_resources.recurrent;
+            ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+            if (!recurrent->current_storage_requirements(type,bytes) || type!=ggml_backend_buffer_get_type(compute_memory->shared_parent()))
+                throw std::runtime_error("invalid serial recurrent allocation quote");
+            llama_context_memory_create_result state_admission;
+            auto loan=compute_memory->reserve_recurrent_state(bytes,&state_admission);
+            if (!loan) throw std::runtime_error(std::string("serial recurrent state does not fit the declared arena: ")+
+                llama_context_memory_create_status_name(state_admission.status)+"; required="+std::to_string(state_admission.required_bytes)+
+                ", available="+std::to_string(state_admission.available_bytes)+", additional="+std::to_string(state_admission.additional_bytes)+" bytes");
+            if (!compute_memory->retire_graph()) throw std::runtime_error("failed to retire serial recurrent reservation graphs");
+            ggml_backend_sched_reset(sched.get());
+            if (gf_res_reserve) gf_res_reserve->reset();
+            if (!recurrent->bind_current_storage(loan->lease())) throw std::runtime_error("failed to bind serial recurrent state");
+            recurrent_storage=std::move(loan);
+            size_t staging=0;ggml_backend_buffer_type_t stage_type=nullptr;
+            if (recurrent->spill_enabled() && recurrent->spill_stage_requirements(stage_type,staging)) {
+                auto publication=compute_memory->reserve_staging(staging);
+                if (!publication || !recurrent->bind_spill_stage(publication->lease()))
+                    throw std::runtime_error("serial recurrent publication staging does not fit the arena");
+                publication_stage=std::move(publication);
+            }
+            recurrent->clear(true);
+            if (!compute_memory->prepare_serial_target()) throw std::runtime_error("failed to recapture arena-owned recurrent state");
         }
         if (compute_memory && kv_resources.bounded && kv_resources.bounded->bounded_storage_pending()) {
             auto * local=kv_resources.bounded;
@@ -1736,7 +1768,7 @@ void llama_context::sched_reserve() {
 
     synchronize();
     release_kv_workspaces(false);
-    const bool keep_parent=compute_memory && (serial_cache || publication_stage || compute_memory->has_bounded_cache() ||
+    const bool keep_parent=compute_memory && (serial_cache || publication_stage || recurrent_storage || compute_memory->has_bounded_cache() ||
         (cparams.kv_shared_read && compute_memory->borrows_serial_parent()));
     if (keep_parent) {
         if (!compute_memory->retire_graph()) throw std::runtime_error("failed to retire serial arena graph");
@@ -2961,11 +2993,14 @@ llm_graph_result * llama_context::process_ubatch(
             }
             return true;
         };
-        bool isolated=group_restore || (compute_memory && restore_target->compute_memory &&
-            disjoint(restore_target->compute_memory->shared_parent()));
-        if (!group_restore && compute_memory) for (auto * lease : compute_memory->workspace_leases())
-            isolated=isolated && lease && disjoint(ggml_backend_memory_lease_buffer(lease));
-        // Group state has its own persistent lease; serial state is outside the draft arena.
+        bool isolated=group_restore || (compute_memory && restore_target->compute_memory);
+        if (!group_restore && compute_memory) {
+            isolated=isolated && !compute_memory->workspace_leases().empty();
+            for (auto * lease : compute_memory->workspace_leases())
+                isolated=isolated && lease && disjoint(ggml_backend_memory_lease_buffer(lease));
+            if (serial_cache) isolated=isolated && disjoint(ggml_backend_memory_lease_buffer(serial_cache->lease()));
+        }
+        // Both paths retain recurrent destinations outside every active draft view.
         if (isolated) restore_target->synchronize();
         if (!isolated) {
             LLAMA_LOG_ERROR("%s: target recurrent restore overlaps draft storage\n",__func__);
@@ -3623,6 +3658,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             !compute_memory->borrows_serial_parent() &&
             !compute_memory->prepare_serial_target()) {
         LLAMA_LOG_ERROR("%s: failed to hand off shared graph scratch to target\n", __func__);
+        return -2;
+    }
+    if (!group_execution && cparams.recurrent_rollback_auto && recurrent_storage &&
+            (serial_placement_phase!=text_phase || !kv_resources.full->get_kv_stream()->tokens()) &&
+            !choose_serial_recurrent_placement(text_phase)) {
+        LLAMA_LOG_ERROR("%s: no admitted serial recurrent placement\n",__func__);
         return -2;
     }
     if (compute_memory && (cparams.mtp_publish_host || cparams.serial_block_rows || cparams.kv_shared_read) && compute_memory->borrows_serial_parent() &&
@@ -7577,6 +7618,197 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_context::set_serial_recurrent_placement(llama_recurrent_representation representation,
+        llama_recurrent_placement_plan * quote) {
+    auto * hybrid=dynamic_cast<llama_memory_hybrid *>(memory.get());
+    auto * stream=kv_resources.full ? kv_resources.full->get_kv_stream() : nullptr;
+    if (!hybrid || group_execution || cparams.n_seq_max!=1 || !cparams.shared_device_memory_bytes ||
+            !compute_memory || !recurrent_storage || !stream || !stream->complete() ||
+            size_t(representation)>size_t(llama_recurrent_representation::gdn_fp32)) return false;
+    auto * previous=hybrid->get_mem_recr();
+    const auto old_ram=cparams.recurrent_rollback_ram,old_compact=cparams.recurrent_rollback_compact;
+    const auto old_decode=cparams.kv_stream_decode;
+    const auto current=old_compact ? llama_recurrent_representation::gdn_fp32 : old_ram ?
+        llama_recurrent_representation::dense_host : llama_recurrent_representation::dense_device;
+    if (!quote && current==representation) return true;
+    const auto phase=old_decode ?
+        llama_memory_text_phase::decode : llama_memory_text_phase::prefill;
+    llama_compute_workspace_plan old_plan;
+    std::vector<uint8_t> checkpoint;
+    std::unique_ptr<llama_memory_recurrent> old;
+    bool released=false,begun=false;
+    const auto reset_graphs=[&] {
+        ggml_backend_sched_reset(sched.get());
+        for (auto & graph : gf_res_prev) if (graph) graph->reset();
+        if (gf_res_reserve) gf_res_reserve->reset();
+        gf_res_prev_active=nullptr;
+    };
+    const auto bind=[&](llama_memory_recurrent & state) {
+        ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+        if (!state.current_storage_requirements(type,bytes)) return false;
+        llama_context_memory_create_result admitted;
+        auto loan=compute_memory->reserve_recurrent_state(bytes,&admitted);
+        if (!loan || !state.bind_current_storage(loan->lease())) return false;
+        recurrent_storage=std::move(loan);
+        size_t stage=0;ggml_backend_buffer_type_t stage_type=nullptr;
+        if (state.spill_enabled() && state.spill_stage_requirements(stage_type,stage)) {
+            if (!publication_stage) publication_stage=compute_memory->reserve_staging(stage);
+            if (!publication_stage || !state.bind_spill_stage(publication_stage->lease())) return false;
+        }
+        state.clear(true);
+        llama_io_read_host restore(checkpoint.data(),checkpoint.size());state.state_read(restore,0,0);
+        return restore.n_bytes()==checkpoint.size();
+    };
+    try {
+        if (!quote) old_plan=serial_recurrent_workspace_plan;
+        synchronize();
+        if (!quote) {
+            llama_io_write_dummy size(false);previous->state_write(size,0,0);checkpoint.resize(size.n_bytes());
+            llama_io_write_host save(checkpoint.data(),checkpoint.size());previous->state_write(save,0,0);
+        }
+        if (!compute_memory->prepare_serial_target() || !compute_memory->retire_graph()) return false;
+        reset_graphs();
+        auto layer=std::find_if(previous->r_l.begin(),previous->r_l.end(),[](auto * value){return value!=nullptr;});
+        if (layer==previous->r_l.end()) return false;
+        const auto index=size_t(layer-previous->r_l.begin());
+        auto candidate=std::make_unique<llama_memory_recurrent>(model,previous->r_l[index]->type,previous->s_l[index]->type,
+            true,previous->size,1,previous->n_rs_seq,[&](int32_t i){return model.hparams.is_recr(i);},
+            representation==llama_recurrent_representation::dense_host,true,true,
+            representation==llama_recurrent_representation::gdn_fp32);
+        if (!candidate->configure_selected_sequences({0}) ||
+                (representation==llama_recurrent_representation::gdn_fp32 && !candidate->compact_enabled()))
+            {LLAMA_LOG_ERROR("serial recurrent migration: provider unavailable\n");compute_memory->prepare_serial_target();return false;}
+        old=std::move(hybrid->mem_recr);hybrid->mem_recr=std::move(candidate);
+        kv_resources=llama_memory_kv_resources_get(memory.get());
+        cparams.recurrent_rollback_ram=representation==llama_recurrent_representation::dense_host;
+        cparams.recurrent_rollback_compact=representation==llama_recurrent_representation::gdn_fp32;
+        std::vector<size_t> measurements(2*backend_ptrs.size());
+        for (int p=0;p<2;++p) {
+            cparams.kv_stream_decode=p!=0;
+            const auto rows=p ? std::min(cparams.n_ubatch,cparams.kv_stream_decode_rows()) : std::min(cparams.n_ubatch,cparams.n_ctx);
+            std::vector<size_t> sizes(backend_ptrs.size());
+            auto full=memory->init_full();
+            if (!full || !graph_reserve(rows,1,std::min(rows,cparams.n_outputs_max),full.get(),true,sizes.data()))
+                throw std::runtime_error("serial recurrent graph quote failed");
+            std::copy(sizes.begin(),sizes.end(),measurements.begin()+p*backend_ptrs.size());
+        }
+        llama_compute_workspace_plan plan;
+        if (!llama_compute_workspace_plan_make(backend_buft,measurements,2,plan)) throw std::runtime_error("invalid recurrent workspace quote");
+        reset_graphs();
+        ggml_backend_buffer_type_t type=nullptr,stage_type=nullptr;
+        size_t state_bytes=0,stage_bytes=0,pool_bytes=0;
+        auto & state=*hybrid->mem_recr;
+        if (!state.current_storage_requirements(type,state_bytes) ||
+                (state.spill_enabled() && !state.spill_stage_requirements(stage_type,stage_bytes)))
+            throw std::runtime_error("invalid serial recurrent storage quote");
+        llama_context_memory_create_result admission;
+        const auto admitted=compute_memory->quote_recurrent_state(state_bytes,stage_bytes,plan,phase,admission,pool_bytes);
+        if (quote) {
+            llama_recurrent_placement_plan cost;cost.representation=representation;cost.peak_bytes=admission.required_bytes;
+            if (!admitted && admission.status!=llama_context_memory_create_status::insufficient_budget)
+                throw std::runtime_error("serial recurrent complete quote failed");
+            double current_bytes=0,matrix=0;
+            for (auto * tensor : state.r_l) if (tensor) current_bytes+=ggml_row_size(tensor->type,tensor->ne[0]);
+            for (auto * tensor : state.s_l) if (tensor) matrix+=ggml_row_size(tensor->type,tensor->ne[0]);
+            current_bytes+=matrix;
+            llama_kv_stream_memory_requirements resources;
+            const auto host=stream->host();
+            if (!host || !stream->memory_requirements(resources))
+                throw std::runtime_error("serial KV placement quote unavailable");
+            const auto tokens=stream->tokens()+cparams.n_rs_seq+1;
+            const auto & layout=host->layout();
+            const long double required=static_cast<long double>((tokens+255)/256*256)*
+                (layout.k_token_bytes+layout.v_token_bytes)*host->config().layers;
+            if (required>SIZE_MAX) throw std::runtime_error("serial KV placement quote overflow");
+            const auto available=pool_bytes>resources.pool_decode_min_bytes ? pool_bytes-resources.pool_decode_min_bytes : 0;
+            cost.kv_stream_bytes=required>available ? size_t(required)-available : 0;
+            constexpr double device_bytes_per_ms=512.0*1024*1024;
+            const double rows=cparams.n_rs_seq+1;
+            const auto events=previous->rollback_events>=serial_placement_rollbacks ?
+                previous->rollback_events-serial_placement_rollbacks : previous->rollback_events;
+            const auto prefix_rows=previous->rollback_prefix_rows>=serial_placement_prefix_rows ?
+                previous->rollback_prefix_rows-serial_placement_prefix_rows : previous->rollback_prefix_rows;
+            const double fraction=placement_steps ? std::min(1.0,double(events)/placement_steps) : .5;
+            const double prefix=events ? double(prefix_rows)/events : rows/2;
+            cost.compute_ms=model.size()/device_bytes_per_ms;
+            if (representation==llama_recurrent_representation::dense_host) {
+                cost.d2h_bytes=size_t(current_bytes*cparams.n_rs_seq);cost.h2d_bytes=size_t(current_bytes*fraction);
+                cost.compute_ms+=current_bytes*rows/device_bytes_per_ms;
+            } else if (representation==llama_recurrent_representation::gdn_fp32) {
+                const double factors=std::max(0.0,double(state_bytes)-2*current_bytes);
+                cost.compute_ms+=(2*current_bytes+factors)/device_bytes_per_ms;
+                cost.restore_ms=fraction*(2*matrix+factors*prefix/rows)/device_bytes_per_ms;
+            } else cost.compute_ms+=current_bytes*(rows+1)/device_bytes_per_ms;
+            hybrid->mem_recr=std::move(old);kv_resources=llama_memory_kv_resources_get(memory.get());
+            cparams.recurrent_rollback_ram=old_ram;cparams.recurrent_rollback_compact=old_compact;cparams.kv_stream_decode=old_decode;
+            sched_reserve_state.invalidate();
+            if (!compute_memory->prepare_serial_target()) return false;
+            *quote=cost;return true;
+        }
+        if (!admitted) throw std::runtime_error("serial recurrent candidate exceeds arena budget");
+        if (!compute_memory->begin_recurrent_replan()) throw std::runtime_error("recurrent replan gate rejected");
+        begun=true;
+        if (!old->park_spill_stage() || !old->release_current_storage()) throw std::runtime_error("recurrent retirement failed");
+        recurrent_storage.reset();released=true;
+        if (!compute_memory->reconfigure_recurrent_workspace(plan)) throw std::runtime_error("serial recurrent workspace admission failed");
+        if (!bind(*hybrid->mem_recr)) throw std::runtime_error("serial recurrent state binding failed");
+        serial_recurrent_workspace_plan=std::move(plan);
+        cparams.kv_stream_decode=old_decode;
+        if (!compute_memory->finish_recurrent_replan(phase)) throw std::runtime_error("serial recurrent activation failed");
+        sched_reserve_state.invalidate();compute_memory_graph_revision=compute_memory->graph_binding_revision();return true;
+    } catch (...) {
+        try {throw;} catch (const std::exception & error) {LLAMA_LOG_ERROR("serial recurrent migration: %s\n",error.what());}
+        catch (...) {LLAMA_LOG_ERROR("serial recurrent migration: unknown failure\n");}
+        reset_graphs();
+        if (old) {
+            if (released && recurrent_storage) {
+                hybrid->mem_recr->park_spill_stage();hybrid->mem_recr->release_current_storage();recurrent_storage.reset();
+            }
+            hybrid->mem_recr=std::move(old);kv_resources=llama_memory_kv_resources_get(memory.get());
+        }
+        cparams.recurrent_rollback_ram=old_ram;cparams.recurrent_rollback_compact=old_compact;
+        cparams.kv_stream_decode=old_decode;
+        if (released) {
+            if (!compute_memory->reconfigure_recurrent_workspace(old_plan) || !bind(*hybrid->mem_recr)) return false;
+            serial_recurrent_workspace_plan=std::move(old_plan);
+        }
+        if (begun) compute_memory->finish_recurrent_replan(phase);else compute_memory->prepare_serial_target();
+        sched_reserve_state.invalidate();return false;
+    }
+}
+
+bool llama_context::choose_serial_recurrent_placement(llama_memory_text_phase phase) {
+    if (!compute_memory || !recurrent_storage || serial_placement_generation==UINT64_MAX) return false;
+    const auto * stream=kv_resources.full ? kv_resources.full->get_kv_stream() : nullptr;
+    if (!stream || !stream->complete()) return false;
+    if (serial_placement.chosen && placement_steps)
+        llama_recurrent_placement_observe(serial_placement,serial_placement_choice.representation,
+            serial_placement_workload,serial_placement_choice.predicted_ms,placement_elapsed_ms/placement_steps);
+    llama_recurrent_placement_request request;
+    request.budget=cparams.shared_device_memory_bytes;request.generation=serial_placement_generation+1;
+    request.workload=(uint64_t(cparams.n_rs_seq)<<40) | (uint64_t(kv_resources.full->type_k())<<32) |
+        (uint64_t(kv_resources.full->type_v())<<24) | (uint64_t(phase)<<20) | (stream->tokens()/16384);
+    request.safe_boundary=true;
+    for (auto representation : {llama_recurrent_representation::dense_device,
+            llama_recurrent_representation::dense_host,llama_recurrent_representation::gdn_fp32}) {
+        llama_recurrent_placement_plan quote;
+        if (set_serial_recurrent_placement(representation,&quote)) request.plans.push_back(quote);
+    }
+    auto policy=serial_placement;llama_recurrent_placement_choice choice;
+    if (!llama_recurrent_placement_choose(request,policy,choice) || !set_serial_recurrent_placement(choice.representation)) return false;
+    serial_placement=policy;serial_placement_choice=choice;serial_placement_generation=request.generation;
+    serial_placement_workload=request.workload;serial_placement_phase=phase;
+    placement_elapsed_ms=0;placement_steps=0;
+    serial_placement_rollbacks=kv_resources.recurrent->rollback_events;
+    serial_placement_prefix_rows=kv_resources.recurrent->rollback_prefix_rows;
+    placement_expected_ms=phase==llama_memory_text_phase::decode ? choice.predicted_ms : 0;
+    LLAMA_LOG_INFO("rollback placement: provider=%s selected=1 history=%zu advisory_peak=%zu budget=%zu predicted_ms=%.3f safe_boundary=1 serial=1\n",
+        choice.representation==llama_recurrent_representation::gdn_fp32 ? "gdn-fp32" :
+        choice.representation==llama_recurrent_representation::dense_host ? "dense-host" : "dense-device",
+        stream->tokens(),choice.peak_bytes,request.budget,choice.predicted_ms);
+    return true;
 }
 
 bool llama_context::save_group_sequences(std::vector<llama_context_group_sequence_state> & output) {

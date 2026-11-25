@@ -121,6 +121,7 @@ struct llama_context_memory_diagnostics {
     size_t borrowed_phase_bytes = 0;
     size_t persistent_cache_bytes = 0;
     size_t publication_stage_bytes = 0;
+    size_t recurrent_state_bytes = 0;
 };
 
 enum class llama_context_memory_create_status {
@@ -172,6 +173,19 @@ public:
         llama_context_memory_create_result * admission);
     // Stable publication staging stays disjoint from both graph scratch and elastic KV.
     LLAMA_API std::unique_ptr<llama_context_memory_loan> reserve_staging(size_t bytes);
+    // Keep recurrent storage in a fixed prefix, disjoint from graph/KV and fixed suffixes.
+    LLAMA_API std::unique_ptr<llama_context_memory_loan> reserve_recurrent_state(size_t bytes,
+        llama_context_memory_create_result * admission = nullptr);
+    LLAMA_API bool release_recurrent_state() noexcept;
+    // Drain every serial scheduler before changing recurrent storage or its workspace plan.
+    LLAMA_API bool begin_recurrent_replan() noexcept;
+    LLAMA_API bool finish_recurrent_replan(llama_memory_text_phase phase,
+        const std::function<bool()> & rebuild = {}) noexcept;
+    LLAMA_API bool reconfigure_recurrent_workspace(const llama_compute_workspace_plan & plan,
+        llama_context_memory_create_result * admission = nullptr) noexcept;
+    LLAMA_API bool quote_recurrent_state(size_t bytes,size_t publication,
+        const llama_compute_workspace_plan & plan,llama_memory_text_phase phase,
+        llama_context_memory_create_result & admission,size_t & kv_pool_bytes) const noexcept;
     // External leases prevent cleanup; the parent remains usable with the fixed region until they return.
     LLAMA_API bool release_bounded_cache() noexcept;
     LLAMA_API bool has_bounded_cache() const noexcept;
@@ -243,9 +257,9 @@ public:
 private:
     friend class llama_context_memory_loan;
     std::unique_ptr<llama_context_memory_loan> reserve_region(size_t bytes,const llama_memory_bounded_kv_layout * layout,
-        llama_context_memory_create_result * admission = nullptr);
+        llama_context_memory_create_result * admission = nullptr,bool recurrent = false);
     bool release_staging() noexcept;
-    bool release_region(bool cache) noexcept;
+    bool release_region(bool cache,bool recurrent = false) noexcept;
     struct implementation;
     explicit llama_context_memory(std::unique_ptr<implementation> impl);
     std::unique_ptr<implementation> impl;

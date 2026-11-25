@@ -6746,6 +6746,109 @@ static void test_group_dflash_metadata(testing & t,llama_model * model,const cha
     }
 }
 
+static void test_serial_recurrent_switch(testing & t,llama_model * model) {
+    auto cp=llama_context_default_params();cp.n_ctx=8192;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=1;
+    cp.n_rs_seq=3;cp.n_outputs_max=4;cp.n_outputs_max_per_seq=4;cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;
+    cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;cp.n_threads=cp.n_threads_batch=4;
+    std::vector<std::vector<float>> reference;const auto vocabulary=model->vocab.n_tokens();
+    std::vector<std::vector<uint8_t>> states;
+    const auto run=[&](llama_context & context,bool compare,bool automatic=false) {
+        auto batch=llama_batch_init(32,0,1);
+        struct cleanup {llama_batch & b;~cleanup(){llama_batch_free(b);}} cleanup{batch};
+        for (int step=0;step<4;++step) {
+            const uint32_t past=step==0 ? 0 : step==1 ? 32 : step==2 ? 34 : 35;
+            batch.n_tokens=step==0 ? 32 : step==2 ? 1 : 4;
+            if (automatic) llama_set_kv_stream_decode(&context,step>0);
+            if (compare && !automatic && step && !t.assert_true(context.set_serial_recurrent_placement(step==1 ?
+                    llama_recurrent_representation::dense_host : step==2 ? llama_recurrent_representation::gdn_fp32 :
+                    llama_recurrent_representation::dense_device))) return;
+            for (int row=0;row<batch.n_tokens;++row) {
+                batch.token[row]=llama_token(100+past+row);batch.pos[row]=past+row;batch.n_seq_id[row]=1;
+                batch.seq_id[row][0]=0;batch.logits[row]=row+1==batch.n_tokens;
+            }
+            if (!t.assert_equal(0,context.decode(batch))) return;
+            const auto * logits=llama_get_logits_ith(&context,-1);
+            if (!t.assert_true(logits!=nullptr)) return;
+            if (compare) {
+                size_t differences=0,first=0;
+                for (size_t i=0;i<vocabulary;++i) if (std::memcmp(logits+i,reference[step].data()+i,sizeof(float))) {
+                    if (!differences) first=i;
+                    ++differences;
+                }
+                if (differences) fprintf(stderr,"serial switch step=%d mismatches=%zu first=%zu actual=%a expected=%a\n",
+                    step,differences,first,double(logits[first]),double(reference[step][first]));
+                t.assert_true("provider switches preserve native logits",differences==0);
+            }
+            else reference.emplace_back(logits,logits+vocabulary);
+            image_writer state;context.get_kv_resources().recurrent->state_write(state,0,0);
+            if (compare) {
+                if (state.bytes!=states[step]) {
+                    size_t different=0,first=0;
+                    for (size_t i=0;i<std::min(state.bytes.size(),states[step].size());++i) if (state.bytes[i]!=states[step][i]) {
+                        if (!different) first=i;
+                        ++different;
+                    }
+                    fprintf(stderr,"serial state step=%d different=%zu first=%zu sizes=%zu/%zu\n",step,different,first,state.bytes.size(),states[step].size());
+                }
+                t.assert_true("provider switches preserve native recurrent bytes",state.bytes==states[step]);
+            }
+            else states.push_back(std::move(state.bytes));
+            if (step==1 && !t.assert_true(llama_memory_seq_rm(context.get_memory(),0,34,-1))) return;
+        }
+    };
+    {llama_context native(*model,cp);run(native,false);}
+    if (!t.assert_equal(size_t(4),reference.size())) return;
+    cp.shared_device_memory_bytes=size_t(3072)*1048576;
+    {
+        llama_context streamed(*model,cp);auto * parent=llama_context_compute_memory(&streamed)->shared_parent();
+        run(streamed,true);
+        t.assert_true(parent==llama_context_compute_memory(&streamed)->shared_parent());
+    }
+    cp.recurrent_rollback_auto=true;
+    for (size_t arena_mib : {size_t(512),size_t(3072)}) {
+        cp.shared_device_memory_bytes=arena_mib*1048576;
+        llama_context automatic(*model,cp);auto * owner=llama_context_compute_memory(&automatic);
+        auto * parent=owner->shared_parent();
+        if (arena_mib==512) t.assert_true("an over-budget migration is rejected before state retirement",
+            !automatic.set_serial_recurrent_placement(llama_recurrent_representation::dense_device));
+        run(automatic,true,true);
+        t.assert_true("automatic placement preserves the one parent allocation",parent==owner->shared_parent());
+        if (arena_mib==512) t.assert_true("automatic serial placement starts when native rollback cannot fit",
+            automatic.get_cparams().recurrent_rollback_ram);
+    }
+}
+
+static void test_serial_recurrent_arena(testing & t,llama_model * model) {
+    auto cp=llama_context_default_params();cp.n_ctx=8192;cp.n_batch=cp.n_ubatch=256;cp.n_seq_max=1;
+    cp.n_rs_seq=3;cp.n_outputs_max=4;cp.n_outputs_max_per_seq=4;
+    cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.n_threads=cp.n_threads_batch=4;
+    for (int provider=0;provider<3;++provider) {
+        auto params=cp;params.shared_device_memory_bytes=size_t(2096)*1048576;
+        params.recurrent_rollback_ram=provider==1;params.recurrent_rollback_compact=provider==2;
+        llama_context context(*model,params);
+        auto * recurrent=context.get_kv_resources().recurrent;
+        auto * owner=llama_context_compute_memory(&context);
+        if (!t.assert_true(recurrent && owner && owner->shared_parent())) return;
+        auto * parent=owner->shared_parent();
+        const auto first=uintptr_t(ggml_backend_buffer_get_base(parent));const auto bytes=ggml_backend_buffer_get_size(parent);
+        const auto contained=[&](ggml_tensor * tensor) {
+            if (!tensor) return true;
+            if (!tensor->buffer || !tensor->data) return false;
+            const auto pointer=uintptr_t(tensor->data);
+            return pointer>=first && pointer-first<=bytes && ggml_nbytes(tensor)<=bytes-(pointer-first);
+        };
+        for (auto * tensor : recurrent->r_l) t.assert_true("serial recurrent history is arena-owned",contained(tensor));
+        for (auto * tensor : recurrent->s_l) t.assert_true("serial recurrent matrices are arena-owned",contained(tensor));
+        ggml_backend_buffer_type_t type=nullptr;size_t state_bytes=0;
+        if (!t.assert_true(recurrent->current_storage_requirements(type,state_bytes))) return;
+        llama_context_memory_diagnostics diagnostics;
+        t.assert_true(owner->diagnostics(diagnostics));
+        t.assert_equal(state_bytes,diagnostics.recurrent_state_bytes);
+        t.assert_equal(params.shared_device_memory_bytes,diagnostics.parent_bytes);
+    }
+}
+
 static void test_group_rollback(testing & t,llama_model * model,bool recurrent=false,bool owner_failure=false,
         uint32_t maximum=3,bool endpoints=false,bool interleave=false,bool migrate=false) {
     if (!t.assert_equal(recurrent ? LLM_ARCH_QWEN35 : LLM_ARCH_GEMMA4,model->arch)) return;
@@ -9886,6 +9989,14 @@ int main(int argc,char ** argv) {
         t.test("Every_two_slot_seven_token_acceptance_prefix_matches_native_correction_and_restore",[&](testing & t) {
             test_group_rollback(t,model.get(),true,false,7,false,true);
         });
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--serial-recurrent-switch-only");})) {
+        t.test("Serial_provider_switch_preserves_native_logits_and_parent",[&](testing & t){test_serial_recurrent_switch(t,model.get());});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--serial-recurrent-arena-only");})) {
+        t.test("Serial_recurrent_state_has_no_external_device_bank",[&](testing & t) {test_serial_recurrent_arena(t,model.get());});
         return t.summary();
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-placement-switch-only");})) {

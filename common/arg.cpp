@@ -2479,7 +2479,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT"));
     add_opt(common_arg(
         {"--recurrent-rollback-auto"},
-        "compare complete native/RAM/compact quotes at drained selected-group boundaries; serial keeps its explicit launch placement",
+        "compare complete native/RAM/compact quotes at drained request/phase boundaries within the shared arena",
         [](common_params & params) { params.recurrent_rollback_auto = true; }
     ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_AUTO"));
     add_opt(common_arg(

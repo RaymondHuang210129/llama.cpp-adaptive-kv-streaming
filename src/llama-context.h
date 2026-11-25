@@ -109,6 +109,9 @@ struct llama_context {
     // Borrow already initialized chains from the same model's non-executing metadata context.
     // The frontend retains their RNG/grammar ownership through group retirement.
     LLAMA_API bool bind_group_samplers_from(const llama_context & prepared);
+    // Internal phase-boundary operation; no model submission may be in progress.
+    LLAMA_API bool set_serial_recurrent_placement(llama_recurrent_representation representation,
+        llama_recurrent_placement_plan * quote = nullptr);
     // Compose the measured group on one caller-retained parent, or allocate its first parent.
     // quote_only describes an unbounded candidate without allocating. Normal admission is still required.
     bool initialize_group_execution(std::shared_ptr<llama_kv_stream_slot_table> table,
@@ -519,6 +522,7 @@ private:
     std::vector<ggml_backend_ptr> backends;
     std::unique_ptr<llama_context_memory_loan> serial_cache;
     std::unique_ptr<llama_context_memory_loan> publication_stage;
+    std::unique_ptr<llama_context_memory_loan> recurrent_storage;
     // Memory consumers may drain backend work during teardown, including constructor-failure unwinding.
     llama_memory_ptr memory;
     llama_memory_kv_resources kv_resources;
@@ -530,6 +534,13 @@ private:
     std::unique_ptr<llama_context_memory> compute_memory;
     // A serial child can replan the parent's grants between target decode calls.
     uint64_t compute_memory_graph_revision = 0;
+    llama_compute_workspace_plan serial_recurrent_workspace_plan;
+    bool choose_serial_recurrent_placement(llama_memory_text_phase phase);
+    llama_recurrent_placement_state serial_placement;
+    llama_recurrent_placement_choice serial_placement_choice;
+    llama_memory_text_phase serial_placement_phase = llama_memory_text_phase::unspecified;
+    uint64_t serial_placement_generation = 0, serial_placement_workload = 0;
+    uint64_t serial_placement_rollbacks = 0, serial_placement_prefix_rows = 0;
     // Validated source context outlives this MTP context; no cross-context ownership cycle.
     llama_context * mtp_target_ctx = nullptr;
     llama_context * serial_target_ctx = nullptr;

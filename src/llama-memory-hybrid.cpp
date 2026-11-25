@@ -68,13 +68,18 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr,
         stream && stream->kv_stream_rs_rollback,
-        stream && (stream->measure_only || !stream->kv_stream_selected_sequences.empty()),
-        stream && (stream->measure_only || stream->defer_full_cache),
+        stream && (stream->measure_only || !stream->kv_stream_selected_sequences.empty() ||
+            (stream->shared_device_memory_bytes && n_seq_max==1)),
+        stream && (stream->measure_only || stream->defer_full_cache ||
+            (stream->shared_device_memory_bytes && n_seq_max==1)),
         stream && stream->kv_stream_rs_compact
     )) {
-    if (stream && !stream->kv_stream_selected_sequences.empty() &&
-            !mem_recr->configure_selected_sequences(stream->kv_stream_selected_sequences))
-        throw std::runtime_error("failed to configure selected recurrent identities");
+    if (stream) {
+        auto selected=stream->kv_stream_selected_sequences;
+        if (selected.empty() && stream->shared_device_memory_bytes && n_seq_max==1) selected={0};
+        if (!selected.empty() && !mem_recr->configure_selected_sequences(selected))
+            throw std::runtime_error("failed to configure selected recurrent identities");
+    }
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

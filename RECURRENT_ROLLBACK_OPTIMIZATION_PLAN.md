@@ -1,6 +1,6 @@
 # Compact recurrent rollback and budget-aware placement
 
-Status: P0-P5 complete; P6-P7 remain in progress. Implementation branch `feature/compact-recurrent-rollback`. Exact operator and integrated transaction gates passed on the qualified backend; budget-aware placement is qualified; broader product qualification and performance closeout remain open.
+Status: P0-P5 complete, including the serial arena ownership correction. P6-P7 remain in progress. Implementation branch `feature/compact-recurrent-rollback`. Exact operator and integrated transaction gates passed on the qualified backend; bounded group and serial placement are qualified; broader product qualification and performance closeout remain open.
 
 Evidence: [P0 reference and allocation ledger](docs/development/compact-recurrent-rollback.md).
 
@@ -66,7 +66,7 @@ Four selected MTP3 sequences would therefore have approximately 1,228.64 MiB of 
 
 These are design estimates, not measured GPU peaks or promised throughput. The estimates exclude additional graph temporaries and any staging required by the final implementation. A design that retains old full-snapshot operator outputs can keep the old peak even after reducing the persistent bank.
 
-In multi-slot mode, capacity follows the activated selection, including sparse logical IDs; it must not reserve a full bank for every configured slot. Saved states of unselected requests remain in host memory. Reducing an internal bank frees capacity inside the existing arena; the arena's total device allocation remains fixed unless it is explicitly refitted. Account separately for allocations outside the arena, including the current serial execution path.
+In multi-slot mode, capacity follows the activated selection, including sparse logical IDs; it must not reserve a full bank for every configured slot. Saved states of unselected requests remain in host memory. Reducing an internal bank frees capacity inside the existing arena; the arena's total device allocation remains fixed unless it is explicitly refitted. Account separately for allocations outside the arena. In phase-arena execution, serial recurrent banks belong inside the same declared budget as group banks.
 
 ## Representation contract
 
@@ -183,6 +183,8 @@ Exit: replay is qualified under a stated arithmetic contract; capture overhead a
 Exit: compact execution passes correctness and lifecycle gates, and actual allocation peaks demonstrate that the dense snapshot planes were removed.
 
 ### P5. Add budget-aware placement and bounded adaptation
+
+User clarification: serial recurrent state belongs inside the shared phase arena. Automatic placement must remain live at safe request/phase boundaries. A fixed launch command is optional tooling, not a substitute for serial ownership and migration. Move current/rollback storage into owner-issued arena leases, account for its peak with graph/KV/draft resources, and qualify serial migration before closing this stage.
 
 - [x] Compare the supported dense and compact plans using total predicted decode cost within the hard device budget and reserve.
 - [x] Account for extra KV streaming caused by state residency, reconstruction cost, transfers and acceptance-dependent behavior.

@@ -1172,7 +1172,7 @@ bool llama_memory_recurrent::capture_spill(ggml_backend_sched_t sched,
     return true;
 }
 
-const llama_recurrent_spill_bank * llama_memory_recurrent::spill_bank() const noexcept { return spill.get(); }
+const llama_recurrent_spill_bank * llama_memory_recurrent::spill_bank() const noexcept { return n_seq_max==1 ? spill_bank(0) : spill.get(); }
 const llama_recurrent_spill_bank * llama_memory_recurrent::spill_bank(llama_seq_id sequence) const noexcept {
     if (sequence<0 || uint32_t(sequence)>=n_seq_max) return nullptr;
     if (selected_storage && !selected_storage->sequence_publications.empty())
