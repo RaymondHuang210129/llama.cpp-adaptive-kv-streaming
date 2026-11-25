@@ -2473,6 +2473,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) { params.recurrent_rollback_ram = true; }
     ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_RAM"));
     add_opt(common_arg(
+        {"--recurrent-rollback-compact"},
+        "use qualified FP32 GDN rollback logs with KV streaming; unsupported operators retain native storage",
+        [](common_params & params) { params.recurrent_rollback_compact = true; }
+    ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

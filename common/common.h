@@ -589,6 +589,7 @@ struct common_params {
     uint32_t kv_stream_auxiliary_layers = 0; // optional legacy assertion; context count comes from model metadata
     bool no_kv_stream_rs_rollback = false; // retain full checkpoints for attached MTP
     bool recurrent_rollback_ram = false; // store recurrent rollback snapshots in host RAM
+    bool recurrent_rollback_compact = false;
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

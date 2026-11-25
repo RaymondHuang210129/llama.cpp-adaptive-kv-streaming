@@ -47,6 +47,7 @@ static bool mtp_memory_probe = false, mtp_sustained_control = false, mtp_sustain
 static bool target_drift_control = false, target_drift_rs_control = false;
 static bool rollback_probe = false;
 static bool wide_rollback_control = false;
+static bool compact_rollback_control = false;
 static bool vision_mtp_handoff = false;
 static bool dflash_vision_readiness = false;
 static uint32_t dflash_vision_microbatch = 256;
@@ -887,6 +888,8 @@ static void test_wide_target_rollback(testing & t,llama_model * model) {
             params.type_k=GGML_TYPE_Q8_0; params.type_v=GGML_TYPE_Q4_0;
             params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
             // Include a real phase-arena handoff while other streamed cases force a small physical ring.
+            params.recurrent_rollback_ram=streamed && !compact_rollback_control;
+            params.recurrent_rollback_compact=streamed && compact_rollback_control;
             if (streamed && depth == 7 && prefix == 505) params.shared_device_memory_bytes=size_t(2240)*1048576;
             else params.kv_stream_pool_bytes=streamed ? 16*1048576 : 0;
             context_ptr ctx(llama_init_from_model(model,params),llama_free);
@@ -896,11 +899,12 @@ static void test_wide_target_rollback(testing & t,llama_model * model) {
             auto * recurrent=hybrid->get_mem_recr();
             auto * kv=hybrid->get_mem_attn();
             auto * stream=kv->get_kv_stream();
-            t.assert_equal(streamed,recurrent->spill_enabled());
+            t.assert_equal(streamed && !compact_rollback_control,recurrent->spill_enabled());
+            t.assert_equal(streamed && compact_rollback_control,recurrent->compact_enabled());
             if (streamed) {
                 if (!t.assert_true(stream && !stream->auxiliary_cache())) return;
-                t.out << "rollback D=" << depth << " prefix=" << prefix << " stage MiB=" <<
-                    double(recurrent->spill_bank()->staged_device_bytes())/1048576 << '\n';
+                t.out << "rollback D=" << depth << " prefix=" << prefix << " representation=" <<
+                    (compact_rollback_control ? "gdn-fp32" : "dense-host") << '\n';
             }
             const auto drain=[&] {
                 llama_synchronize(ctx.get());
@@ -968,7 +972,7 @@ static void test_wide_target_rollback(testing & t,llama_model * model) {
             state("rejected_context_end");
             if (streamed) oracle.finish();
         }
-        t.out << "D=" << depth << " prefix=" << prefix << " native/spilled rollback bits match (" <<
+        t.out << "D=" << depth << " prefix=" << prefix << " native/candidate rollback bits match (" <<
             oracle.records() << " records, " << oracle.byte_count() << " bytes)\n";
     }
 }
@@ -4599,6 +4603,7 @@ static void test_group_n_mtp_exact(testing & t,llama_model * model,uint32_t coun
         if (!execute(target,child)) return;
     }
     oracle.compare();cp.shared_device_memory_bytes=size_t(2048)*1024*1024;
+    cp.recurrent_rollback_compact=compact_rollback_control;
     cp.kv_stream_auxiliary_layers=gemma ? 0 : 1;cp.kv_stream_verify_max=gemma ? depth+1 : 0;
     auto group=llama_context_group::create(*model,cp);
     if (!t.assert_true(group!=nullptr)) return;
@@ -6786,6 +6791,7 @@ static void test_group_rollback(testing & t,llama_model * model,bool recurrent=f
     const auto check=[&](const control & item) {
         auto cp=native_params;
         cp.shared_device_memory_bytes=size_t(1024)*1024*1024;cp.kv_stream_verify_max=recurrent ? 0 : maximum+1;
+        cp.recurrent_rollback_compact=compact_rollback_control;
         t.out<<"rollback depth="<<item.depth<<" accepted="<<item.accepted[0]<<','<<item.accepted[1]<<std::endl;
         auto group=llama_context_group::create(*model,cp);if (!t.assert_true(group!=nullptr)) return false;
         llama_set_embeddings_nextn(group->metadata_context(),true,false);
@@ -9125,6 +9131,10 @@ static void test_gemma_bounded_cache(testing & t, llama_model * model) {
 }
 
 int main(int argc,char ** argv) {
+    if (std::any_of(argv+1,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--quiet-graphs");}))
+        llama_log_set([](ggml_log_level level,const char * text,void *) {
+            if (level!=GGML_LOG_LEVEL_DEBUG) std::fputs(text,stderr);
+        },nullptr);
     int baseline=0;
     bool exact_options = false, cache_options = false;
     for (int i = 1; i < argc; ++i) {
@@ -9566,6 +9576,7 @@ int main(int argc,char ** argv) {
         target_drift_control = target_drift_control || target_drift_rs_control;
         rollback_probe = rollback_probe || !std::strcmp(argv[i],"--mtp-rs-rollback-probe");
         wide_rollback_control = wide_rollback_control || !std::strcmp(argv[i],"--target-rs-rollback");
+        compact_rollback_control = compact_rollback_control || !std::strcmp(argv[i],"--compact-rollback");
         vision_mtp_handoff = vision_mtp_handoff || !std::strcmp(argv[i],"--vision-mtp-handoff");
         serial_workspace_growth = serial_workspace_growth || !std::strcmp(argv[i],"--serial-workspace-growth");
     }

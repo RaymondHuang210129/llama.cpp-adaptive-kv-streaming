@@ -71,6 +71,8 @@ def arguments(argv=None):
     parser.add_argument("--no-webui", action="store_true", help="disable the test server's web UI")
     parser.add_argument("--recurrent-rollback-ram", action="store_true",
                         help="store recurrent rollback snapshots in RAM; default keeps them in VRAM")
+    parser.add_argument("--recurrent-rollback-compact", action="store_true",
+                        help="use qualified FP32 GDN logs; unsupported operators retain native storage")
     parser.add_argument("--no-warmup", action="store_true", help="skip startup warmup; retain all real workload probes")
     parser.add_argument("--verbosity", type=int, default=3, help="server log threshold 0-5; route proofs require at least 4")
     parser.add_argument("--decode-tokens", type=int, default=256)
@@ -83,6 +85,8 @@ def arguments(argv=None):
     parser.add_argument("--request-timeout", type=float, default=3600)
     parser.add_argument("--output", type=Path, default=ROOT /"benchmarks/results/arena-fit")
     args = parser.parse_args(argv)
+    if args.recurrent_rollback_ram and args.recurrent_rollback_compact:
+        parser.error("RAM and compact rollback policies are mutually exclusive")
     if args.image:
         if args.image_min_tokens is None:args.image_min_tokens=64
         if args.image_max_tokens is None:args.image_max_tokens=4096
@@ -138,6 +142,8 @@ def server_command(args, arena_mib):
         command.append("--no-webui")
     if args.recurrent_rollback_ram:
         command.append("--recurrent-rollback-ram")
+    if getattr(args, "recurrent_rollback_compact", False):
+        command.append("--recurrent-rollback-compact")
     if getattr(args, "no_warmup", False):
         command.append("--no-warmup")
     if args.draft_length:
@@ -640,6 +646,7 @@ def _runtime_probe(args, candidate):
     if failure and not context_limit and not SWEEP.is_arena_capacity_failure(text):
         raise RuntimeError(f"probe failed; not a physical OOM: {failure}; see {log_path}") from failure
     return {"arena_mib":candidate, "fits":failure is None, "log":str(log_path), "command":command,
+            "observed_compact_recurrent":bool(re.search(r"representation=gdn-fp32",text)),
             "log_sha256":hashlib.sha256(log_path.read_bytes()).hexdigest(),
             "loaded_runtime_libraries":runtime_libraries,
             "response":str(response_path) if response_path else None,
@@ -1039,6 +1046,7 @@ def fit(args, report_vision=False):
               "next_mib_rejected":maximum +1 if next_rejected else None,
               "command":server_command(command_args,maximum), "uvm":False, "reserve_mib":0,
               "recurrent_rollback_ram":args.recurrent_rollback_ram,
+              "recurrent_rollback_compact":args.recurrent_rollback_compact,
               "context_size":args.context_size, "context_semantics":context_semantics(args),
               "selection_profiles":(selected or {}).get("selection_profiles"),
               "requested_probe_selected_slots":args.probe_selected,

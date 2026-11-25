@@ -277,6 +277,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    bool can_reuse(const llama_memory_recurrent_context * memory, const llama_ubatch & batch);
 
     ggml_tensor * s_copy;  // I32 [n_rs]
 
@@ -284,6 +285,8 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * compact_destinations = nullptr; // I32 [n_seqs]
+    ggml_tensor * compact_slots = nullptr; // I32 [n_seqs]
 
     const llama_memory_recurrent_context * mctx;
 
@@ -951,6 +954,8 @@ public:
     void add_fused_node(llm_graph_fused_node result);
     void add_recurrent_snapshot(llm_graph_recurrent_snapshot result);
     const std::vector<llm_graph_recurrent_snapshot> & get_recurrent_snapshots() const { return recurrent_snapshots; }
+    void add_recurrent_checkpoint(ggml_tensor * tensor, uint32_t layer) { recurrent_checkpoints.emplace_back(tensor,layer); }
+    const std::vector<std::pair<ggml_tensor *,uint32_t>> & get_recurrent_checkpoints() const { return recurrent_checkpoints; }
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
@@ -977,6 +982,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::vector<llm_graph_recurrent_snapshot> recurrent_snapshots;
+    std::vector<std::pair<ggml_tensor *,uint32_t>> recurrent_checkpoints;
 
     ggml_context_ptr ctx_compute;
 

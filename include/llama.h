@@ -437,6 +437,8 @@ extern "C" {
         uint32_t kv_stream_verify_max;
         // Store recurrent rollback snapshots in host RAM; current state stays on its native device.
         bool recurrent_rollback_ram;
+        // Use qualified FP32 GDN update logs; unsupported operators retain native storage.
+        bool recurrent_rollback_compact;
     };
 
     struct llama_model_tensor_override {

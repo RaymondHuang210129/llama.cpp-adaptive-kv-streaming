@@ -44,7 +44,7 @@ int main() {
         llama_recurrent_provider_requirements out;
         t.assert_true(!llama_recurrent_provider_describe(r, representation::gdn_fp32, {}, out));
         t.assert_true(llama_recurrent_provider_describe(r, representation::gdn_fp32, {true, true, true}, out));
-        t.assert_equal(size_t(320.6953125 * 1024 * 1024), out.device_persistent);
+        t.assert_equal(size_t(331.9453125 * 1024 * 1024), out.device_persistent);
         r.layers[0].key_heads = 17;
         t.assert_true(!llama_recurrent_provider_describe(r, representation::gdn_fp32, {true, true, true}, out));
     });

@@ -50,7 +50,8 @@ bool llama_recurrent_provider_describe(const llama_recurrent_provider_request & 
                     !mul(timeline, frame, timeline) || !mul(matrix, 2, images) ||
                     !aligned(images, r.alignment, images) || !aligned(record, r.alignment, record) ||
                     !aligned(timeline, r.alignment, timeline) || !add(images, record, bytes) ||
-                    !add(bytes, timeline, bytes)) return false;
+                    !add(bytes, timeline, bytes) || !mul(history, 2, history) ||
+                    !aligned(history, r.alignment, history) || !add(bytes, history, bytes)) return false;
         } else {
             if (!aligned(matrix, r.alignment, matrix) || !aligned(history, r.alignment, history) ||
                     !add(matrix, history, bytes)) return false;

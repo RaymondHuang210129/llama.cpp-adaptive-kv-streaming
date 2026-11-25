@@ -69,7 +69,8 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_recr,
         stream && stream->kv_stream_rs_rollback,
         stream && (stream->measure_only || !stream->kv_stream_selected_sequences.empty()),
-        stream && (stream->measure_only || stream->defer_full_cache)
+        stream && (stream->measure_only || stream->defer_full_cache),
+        stream && stream->kv_stream_rs_compact
     )) {
     if (stream && !stream->kv_stream_selected_sequences.empty() &&
             !mem_recr->configure_selected_sequences(stream->kv_stream_selected_sequences))

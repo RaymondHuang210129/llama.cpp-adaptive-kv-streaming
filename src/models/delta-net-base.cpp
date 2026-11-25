@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-recurrent-compact.h"
 
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
@@ -476,6 +477,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
+    if (mctx_cur->compact_enabled()) {
+        llama_recurrent_compact_capture_history(ctx0,gf,conv_input,uint32_t(conv_kernel_size-1),cparams.n_rs_seq,
+                {conv_states_all,mctx_cur->get_s_l(il),mctx_cur->compact_log(il),mctx_cur->compact_timeline(il),
+                 inp->compact_destinations,inp->compact_slots});
+        return conv_input;
+    }
+
     if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
@@ -576,6 +584,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
+
+    if (mctx_cur->compact_enabled()) {
+        auto captured=llama_recurrent_compact_capture_matrix(ctx0,gf,q,k,v,g,b,s,cparams.n_rs_seq,
+                {mctx_cur->get_r_l(il),ssm_states_all,mctx_cur->compact_log(il),mctx_cur->compact_timeline(il),
+                 inp->compact_destinations,inp->compact_slots});
+        if (captured.second) res->add_recurrent_checkpoint(captured.second,uint32_t(il));
+        cb(captured.first,"attn_output",il);
+        return captured.first;
+    }
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);

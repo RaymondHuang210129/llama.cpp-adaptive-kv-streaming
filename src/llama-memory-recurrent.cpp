@@ -1,4 +1,5 @@
 #include "llama-memory-recurrent.h"
+#include "llama-memory-recurrent-compact.h"
 
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
@@ -88,6 +89,8 @@ bool llama_memory_recurrent::configure_selected_sequences(const std::vector<llam
             sequences.size()!=size || !size || size>n_seq_max) return false;
     try {
         std::vector<int32_t> tails(n_seq_max,-1);
+        std::vector<int32_t> compact_slots(compact ? n_seq_max : 0,-1);
+        if (compact) for (size_t i=0;i<sequences.size();++i) compact_slots[sequences[i]]=int32_t(i);
         std::vector<uint8_t> selected(n_seq_max,0);
         for (auto id : sequences) {
             if (id<0 || uint32_t(id)>=n_seq_max || selected[id]) return false;
@@ -123,6 +126,10 @@ bool llama_memory_recurrent::configure_selected_sequences(const std::vector<llam
         selected_storage->sequence_capturing=std::move(capturing);selected_storage->sequence_pending=std::move(pending);
         selected_storage->sequence_restoring=std::move(restoring);selected_storage->sequence_rollback=std::move(rolled);
         if (rollback) spill.reset();
+        if (compact) {
+            compact->slots.swap(compact_slots);
+            for (size_t i=0;i<sequences.size();++i) compact->sequences[i].logical=sequences[i];
+        }
         return true;
     } catch (const std::bad_alloc &) {return false;}
 }
@@ -140,7 +147,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
 llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_type type_r,ggml_type type_s,bool offload,
         uint32_t mem_size,uint32_t n_seq_max,uint32_t n_rs_seq,const layer_filter_cb & filter,
-        bool stream_host_spill,bool defer_current,bool measurement) : hparams(model.hparams), n_seq_max(n_seq_max) {
+        bool stream_host_spill,bool defer_current,bool measurement,bool compact_rollback) : hparams(model.hparams), n_seq_max(n_seq_max) {
     if (measurement && !defer_current) throw std::runtime_error("recurrent graph measurement requires deferred current storage");
     const int32_t n_layer = hparams.n_layer();
     if (defer_current && (!mem_size || !n_seq_max || n_seq_max>LLAMA_MAX_SEQ ||
@@ -158,7 +165,8 @@ llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_ty
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
     const char * spill_flag=std::getenv("LLAMA_RS_HOST_SPILL");
-    const bool want_spill = n_rs_seq && (stream_host_spill || (spill_flag && std::strcmp(spill_flag,"1") == 0));
+    const bool want_spill = n_rs_seq && (stream_host_spill || (!compact_rollback && spill_flag && std::strcmp(spill_flag,"1") == 0));
+    if (compact_rollback && !want_spill && n_rs_seq) init_compact(model,type_r,type_s,offload,filter);
     uint32_t publication_slots=2;
     if (stream_host_spill) {
         llama_recurrent_rollback_plan plan;
@@ -187,7 +195,7 @@ llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_ty
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((compact ? 4u : hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -234,13 +242,22 @@ llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_ty
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (want_spill ? 1 : (1 + n_rs_seq));
+        const uint32_t n_rows = mem_size * (compact ? 2 : want_spill ? 1 : (1 + n_rs_seq));
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+        if (compact) {
+            const int64_t width=hparams.ssm_d_state, heads=hparams.ssm_d_inner/width;
+            const int64_t keys=hparams.ssm_n_group, history=hparams.ssm_d_conv-1;
+            const int64_t channels=hparams.n_embd_r()/history;
+            compact->logs[i]=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,(heads+width*keys+width*heads)*(n_rs_seq+1),mem_size);
+            compact->timelines[i]=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,channels*(history+n_rs_seq+1),mem_size);
+            ggml_format_name(compact->logs[i],"cache_gdn_log_l%d",i);
+            ggml_format_name(compact->timelines[i],"cache_conv_timeline_l%d",i);
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -266,6 +283,7 @@ llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_ty
     }
 
     if (is_empty()) {
+        compact.reset();
         if (n_rs_seq > 0) {
             this->n_rs_seq = 0;
             LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
@@ -323,12 +341,19 @@ llama_memory_recurrent::llama_memory_recurrent(const llama_model & model,ggml_ty
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
         const size_t memory_size_p = size_p_bytes();
+        size_t memory_extra=0;
+        if (compact) for (size_t layer=0;layer<r_l.size();++layer) for (auto * tensor : {compact->logs[layer],compact->timelines[layer]})
+            if (tensor) memory_extra+=ggml_nbytes(tensor);
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                (float)(memory_size_r + memory_size_s + memory_size_p + memory_extra) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+        if (compact) LLAMA_LOG_INFO("%s: representation=gdn-fp32 selected=%u configured=%u history_images=2 matrix_images=2 logs_timeline=%.6f MiB prefill_checkpoint=graph_workspace\n",
+                __func__,mem_size,n_seq_max,double(memory_extra)/(1024.0*1024.0));
+        else if (compact_rollback && n_rs_seq && !is_empty())
+            LLAMA_LOG_INFO("%s: compact provider unavailable; retaining dense recurrent storage\n",__func__);
     }
 }
 
@@ -362,6 +387,8 @@ llama_memory_recurrent::~llama_memory_recurrent() {
 }
 
 void llama_memory_recurrent::clear(bool data) {
+    if (compact && compact->backend) ggml_backend_synchronize(compact->backend);
+    clear_compact();
     if (selected_storage) for (auto & bank : selected_storage->sequence_publications) if (bank) bank->reset(data);
     if (selected_storage) {
         std::fill(selected_storage->sequence_capturing.begin(),selected_storage->sequence_capturing.end(),0);
@@ -420,6 +447,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
+        if (compact && !materialize_compact_aliases()) return false;
+        clear_compact(seq_id);
         if (grouped) for (size_t id=0;id<selected_storage->sequence_publications.size();++id) {
             if ((seq_id>=0 && size_t(seq_id)!=id) || !selected_storage->sequence_publications[id]) continue;
             selected_storage->sequence_publications[id]->reset(false);
@@ -465,7 +494,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0 || spill_restore_pending || spill_rollback_pending ||
-                    (grouped && (selected_storage->sequence_restoring[seq_id] || selected_storage->sequence_rollback[seq_id]));
+                    (grouped && (selected_storage->sequence_restoring[seq_id] || selected_storage->sequence_rollback[seq_id])) ||
+                    (compact && !compact_rollback_valid(seq_id,uint32_t(rollback)));
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     if (spill && !spill_slot_valid(uint32_t(rollback))) return false;
                     if (grouped && !spill_slot_valid(uint32_t(rollback),seq_id)) return false;
@@ -550,6 +580,14 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             }
         }
         if (tail_src >= 0) {
+            if (compact) {
+                if (!materialize_compact()) throw std::runtime_error("failed to materialize recurrent state before copying");
+                const auto source=compact_slot(seq_id_src),destination=compact_slot(seq_id_dst);
+                if (source<0 || destination<0) throw std::runtime_error("unselected compact recurrent copy");
+                clear_compact(seq_id_dst);
+                compact->sequences[destination].alias=source;
+                compact->sequences[destination].fresh=false;
+            }
             auto & cell_src = cells[tail_src];
 
             cell_src.seq_id.insert(seq_id_dst);
@@ -559,6 +597,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
+    if (compact) {
+        if (!materialize_compact()) throw std::runtime_error("failed to materialize compact state before keep");
+        for (auto & sequence : compact->sequences) if (sequence.logical!=seq_id) clear_compact(sequence.logical);
+    }
     uint32_t new_head = size;
 
     for (uint32_t i=0;i<sequence_capacity();++i) if (llama_seq_id(i)!=seq_id) sequence_tail(llama_seq_id(i))=-1;
@@ -743,6 +785,7 @@ bool llama_memory_recurrent::restore_spill_slot(uint32_t slot) {
 
 
 bool llama_memory_recurrent::current_storage_pending() const noexcept {
+    if (compact && compact->poisoned) return true;
     if (!selected_storage) return false;
     if (selected_storage->pending || !selected_storage->parked_rows.empty() || selected_storage->sequence_failed ||
             (spill && spill->publication_stage_parked())) return true;
@@ -795,6 +838,7 @@ bool llama_memory_recurrent::current_storage_requirements(ggml_backend_buffer_ty
 }
 
 bool llama_memory_recurrent::replace_current_storage(ggml_backend_memory_lease_t lease) {
+    if (compact && compact->capturing) return false;
     if (!selected_storage || ctxs_bufs.size()!=1 || spill_pending || spill_restore_pending) return false;
     ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
     if (!current_storage_requirements(type,bytes)) return false;
@@ -807,13 +851,14 @@ bool llama_memory_recurrent::replace_current_storage(ggml_backend_memory_lease_t
                 ggml_backend_buffer_get_size(buffer)!=bytes)) return false;
         ggml_context_ptr context(ggml_init({ggml_get_mem_size(ctxs_bufs.front().first.get()),nullptr,true}));
         if (!context) return false;
-        std::vector<ggml_tensor *> next_r(r_l.size()),next_s(s_l.size()),next_p(p_l.size());
-        for (size_t layer=0;layer<r_l.size();++layer) for (size_t field=0;field<3;++field) {
-            auto * source=field==0 ? r_l[layer] : field==1 ? s_l[layer] : p_l[layer];
+        std::vector<ggml_tensor *> next_r(r_l.size()),next_s(s_l.size()),next_p(p_l.size()),next_log(r_l.size()),next_timeline(r_l.size());
+        for (size_t layer=0;layer<r_l.size();++layer) for (size_t field=0;field<5;++field) {
+            auto * source=field==0 ? r_l[layer] : field==1 ? s_l[layer] : field==2 ? p_l[layer] :
+                !compact ? nullptr : field==3 ? compact->logs[layer] : compact->timelines[layer];
             if (!source) continue;
             auto * tensor=ggml_dup_tensor(context.get(),source);
             ggml_set_name(tensor,ggml_get_name(source));
-            (field==0 ? next_r : field==1 ? next_s : next_p)[layer]=tensor;
+            (field==0 ? next_r : field==1 ? next_s : field==2 ? next_p : field==3 ? next_log : next_timeline)[layer]=tensor;
         }
         ggml_backend_buffer_ptr owned(lease ? ggml_backend_buffer_retain(buffer) : ggml_backend_buft_alloc_buffer(type,0));
         if (!owned) return false;
@@ -835,6 +880,7 @@ bool llama_memory_recurrent::replace_current_storage(ggml_backend_memory_lease_t
             selected_storage->retired.swap(ctxs_bufs);
         } else selected_storage->retired.clear();
         ctxs_bufs.swap(next);r_l.swap(next_r);s_l.swap(next_s);p_l.swap(next_p);
+        if (compact) {compact->logs.swap(next_log);compact->timelines.swap(next_timeline);}
         selected_storage->lease.swap(next_lease);
         selected_storage->pending=!lease;
         return true;
@@ -859,10 +905,11 @@ bool llama_memory_recurrent::current_storage_parked() const noexcept {
 bool llama_memory_recurrent::park_current_storage() {
     if (!selected_storage) return false;
     if (current_storage_parked()) return selected_storage->pending || release_current_storage();
-    if (selected_storage->pending || !complete_spill() || !complete_restore_spill()) return false;
+    if (selected_storage->pending || !materialize_compact() || !complete_spill() || !complete_restore_spill()) return false;
     try {
         std::vector<std::vector<uint8_t>> rows;
-        for (size_t layer=0;layer<r_l.size();++layer) for (auto * tensor : {r_l[layer],s_l[layer],p_l[layer]}) {
+        for (size_t layer=0;layer<r_l.size();++layer) for (auto * tensor : {r_l[layer],s_l[layer],p_l[layer],
+                compact ? compact->logs[layer] : nullptr,compact ? compact->timelines[layer] : nullptr}) {
             if (!tensor) continue;
             rows.emplace_back(ggml_nbytes(tensor));
             ggml_backend_tensor_get(tensor,rows.back().data(),0,rows.back().size());
@@ -888,7 +935,8 @@ bool llama_memory_recurrent::restore_current_storage(ggml_backend_memory_lease_t
     if (!replace_current_storage(lease)) return false;
     try {
         size_t index=0;
-        for (size_t layer=0;layer<r_l.size();++layer) for (auto * tensor : {r_l[layer],s_l[layer],p_l[layer]}) {
+        for (size_t layer=0;layer<r_l.size();++layer) for (auto * tensor : {r_l[layer],s_l[layer],p_l[layer],
+                compact ? compact->logs[layer] : nullptr,compact ? compact->timelines[layer] : nullptr}) {
             if (!tensor) continue;
             const auto & row=selected_storage->parked_rows.at(index++);
             if (row.size()!=ggml_nbytes(tensor)) throw std::runtime_error("parked recurrent row geometry changed");
@@ -1680,6 +1728,8 @@ size_t llama_memory_recurrent::size_p_bytes() const {
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
+    if (!const_cast<llama_memory_recurrent *>(this)->materialize_compact())
+        throw std::runtime_error("failed to materialize compact recurrent state");
     if (current_storage_pending()) throw std::runtime_error("current recurrent storage is unbound");
     if (selected_storage && !selected_storage->sequence_publications.empty() &&
             !const_cast<llama_memory_recurrent *>(this)->materialize_spill_for_device_state())
@@ -1721,7 +1771,8 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 }
             }
 
-            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+            const uint32_t cell_id = compact ? uint32_t(compact_current_row(seq_id>=0 ? seq_id : *cell.seq_id.begin())) :
+                rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
@@ -1767,6 +1818,11 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     GGML_UNUSED(flags);
+    if (compact && compact->capturing) throw std::runtime_error("compact recurrent verification is in flight");
+    if (compact) {
+        if (!materialize_compact_aliases()) throw std::runtime_error("failed to detach copied compact state before restore");
+        clear_compact(seq_id);
+    }
     if (current_storage_pending()) throw std::runtime_error("current recurrent storage is unbound");
     if (!complete_restore_spill()) throw std::runtime_error("failed to complete recurrent restore before loading state");
 
@@ -1779,6 +1835,16 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     // the head is valid only when state_read_meta() succeeded
     const bool meta_read = state_read_meta(io, cell_count, seq_id);
     const uint32_t cell_head = head;
+    if (compact && meta_read) for (uint32_t i=head;i<head+cell_count;++i) {
+        if (cells[i].seq_id.empty()) {res=false;break;}
+        const auto primary=compact_slot(*cells[i].seq_id.begin());
+        if (primary<0) {res=false;break;}
+        for (auto id : cells[i].seq_id) {
+            const auto slot=compact_slot(id);
+            if (slot<0) {res=false;break;}
+            compact->sequences[slot].alias=slot==primary ? -1 : primary;
+        }
+    }
 
     res = res && meta_read;
 
@@ -1802,6 +1868,8 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
     }
+    if (compact) for (uint32_t i=cell_head;i<cell_head+cell_count;++i) for (auto id : cells[i].seq_id)
+        compact->sequences[compact_slot(id)].fresh=false;
 }
 
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
@@ -2038,6 +2106,14 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 }
 
 bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count) {
+    const auto read_rows=[&](ggml_tensor * tensor,size_t row_bytes) {
+        if (!compact) {io.read_tensor(tensor,head*row_bytes,cell_count*row_bytes);return;}
+        for (uint32_t i=head;i<head+cell_count;++i) {
+            const auto row=compact_current_row(*cells[i].seq_id.begin());
+            if (row<0) throw std::runtime_error("unselected compact recurrent restore");
+            io.read_tensor(tensor,size_t(row)*row_bytes,row_bytes);
+        }
+    };
     uint32_t s_trans;
     uint32_t n_layer;
     io.read(&s_trans, sizeof(s_trans));
@@ -2081,7 +2157,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
         if (cell_count) {
             // Read and set the keys for the whole cell range
-            io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+            read_rows(r_l[il],r_size_row);
         }
 
         if (p_l[il] != nullptr) {
@@ -2125,7 +2201,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
             if (cell_count) {
                 // Read and set the values for the whole cell range
-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                read_rows(s_l[il],s_size_row);
             }
         }
     } else {
@@ -2293,6 +2369,10 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
+    if (mem->compact_enabled()) {
+        const auto & ids=mem->cells[cell_idx].seq_id;
+        return ids.empty() ? 0 : mem->compact_current_row(*ids.begin());
+    }
 
     if (mem->n_rs_seq == 0) {
         return src0;

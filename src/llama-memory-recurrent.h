@@ -29,8 +29,20 @@ public:
 
     llama_memory_recurrent(const llama_model & model, ggml_type type_r, ggml_type type_s, bool offload,
             uint32_t mem_size, uint32_t n_seq_max, uint32_t n_rs_seq,
-            const layer_filter_cb & filter, bool stream_host_spill, bool defer_current, bool measurement);
+            const layer_filter_cb & filter, bool stream_host_spill, bool defer_current, bool measurement,
+            bool compact_rollback = false);
     bool prepare_measurement_publication(uint32_t active_cells);
+    bool compact_enabled() const noexcept;
+    int32_t compact_current_row(llama_seq_id sequence) const;
+    int32_t compact_working_row(llama_seq_id sequence) const;
+    int32_t compact_slot(llama_seq_id sequence) const;
+    ggml_tensor * compact_log(int32_t layer) const;
+    ggml_tensor * compact_timeline(int32_t layer) const;
+    uint64_t begin_compact_capture(ggml_backend_t backend, const llama_ubatch & batch, bool prefill);
+    bool finish_compact_capture(const llama_ubatch & batch,
+            const std::vector<std::pair<ggml_tensor *, uint32_t>> & checkpoints, uint64_t generation);
+    void cancel_compact_capture() noexcept;
+    bool materialize_compact();
 
     ~llama_memory_recurrent() override;
 
@@ -155,6 +167,12 @@ public:
 
 private:
     friend class llama_memory_recurrent_context;
+    struct compact_storage_state;
+    std::unique_ptr<compact_storage_state> compact;
+    bool init_compact(const llama_model & model, ggml_type r, ggml_type s, bool offload, const layer_filter_cb & filter);
+    void clear_compact(llama_seq_id sequence = -1);
+    bool compact_rollback_valid(llama_seq_id sequence, uint32_t rollback) const;
+    bool materialize_compact_aliases();
     std::unique_ptr<llama_recurrent_spill_bank> spill;
     bool restore_spill_slot(uint32_t slot);
     bool spill_slot_valid(uint32_t slot);
@@ -237,6 +255,12 @@ public:
     // llama_memory_recurrent_context specific API
     //
     bool spill_enabled() const;
+
+    bool compact_enabled() const;
+    int32_t compact_slot(llama_seq_id sequence) const;
+    int32_t compact_working_row(llama_seq_id sequence) const;
+    ggml_tensor * compact_log(int32_t layer) const;
+    ggml_tensor * compact_timeline(int32_t layer) const;
 
     uint32_t get_n_rs() const;
     uint32_t get_head() const;

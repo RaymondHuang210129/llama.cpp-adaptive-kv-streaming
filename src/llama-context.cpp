@@ -964,6 +964,9 @@ llama_context::llama_context(
     cparams.kv_stream_auxiliary_layers = params.kv_stream_auxiliary_layers;
     cparams.kv_stream_verify_max = params.kv_stream_verify_max;
     cparams.recurrent_rollback_ram = params.recurrent_rollback_ram;
+    cparams.recurrent_rollback_compact = params.recurrent_rollback_compact;
+    if (params.recurrent_rollback_ram && params.recurrent_rollback_compact)
+        throw std::runtime_error("recurrent RAM and compact rollback policies are mutually exclusive");
     if (cparams.kv_stream_verify_max && (!cparams.kv_streaming() || model.arch != LLM_ARCH_GEMMA4 ||
             params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other || (!group_initializing && cparams.n_seq_max != 1) ||
             cparams.kv_stream_verify_max > 4 || cparams.kv_stream_verify_max > cparams.n_ubatch)) {
@@ -1283,6 +1286,7 @@ llama_context::llama_context(
             params_mem.kv_stream_selected_sequences.clear();
         }
         params_mem.kv_stream_rs_rollback=cparams.recurrent_rollback_ram && cparams.n_rs_seq!=0;
+        params_mem.kv_stream_rs_compact=cparams.recurrent_rollback_compact && cparams.kv_streaming() && cparams.n_rs_seq!=0;
         if (model.arch == LLM_ARCH_GEMMA4 && cparams.shared_device_memory_bytes) {
             if (params.swa_full) throw std::runtime_error("Gemma arena streaming requires bounded SWA storage (swa_full=false)");
             params_mem.defer_bounded_cache=true;
@@ -3040,6 +3044,25 @@ llm_graph_result * llama_context::process_ubatch(
         return nullptr;
     }
 
+    struct compact_capture_guard {
+        llama_memory_recurrent * owner;
+        uint64_t generation=0;
+        ~compact_capture_guard() {if (generation) owner->cancel_compact_capture();}
+    } compact_capture{rs_spill};
+    if (rs_spill && rs_spill->compact_enabled()) {
+        ggml_backend_t execution=nullptr;
+        for (auto * tensor : rs_spill->r_l) if (tensor) {
+            auto * device=ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+            for (auto & backend : backends) if (ggml_backend_get_device(backend.get())==device) execution=backend.get();
+            break;
+        }
+        compact_capture.generation=rs_spill->begin_compact_capture(execution,ubatch,phase==llama_memory_text_phase::prefill);
+        if (!compact_capture.generation) {
+            LLAMA_LOG_ERROR("%s: compact recurrent transaction rejected\n",__func__);
+            ret=GGML_STATUS_FAILED;return nullptr;
+        }
+    }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -3111,6 +3134,12 @@ llm_graph_result * llama_context::process_ubatch(
     if (cparams.kv_shared_read && !finish_shared_kv_read()) {
         ret=GGML_STATUS_FAILED; return nullptr;
     }
+    if (compact_capture.generation && !rs_spill->finish_compact_capture(
+            ubatch,res->get_recurrent_checkpoints(),compact_capture.generation)) {
+        LLAMA_LOG_ERROR("%s: compact recurrent publication failed\n",__func__);
+        ret=GGML_STATUS_FAILED;return nullptr;
+    }
+    compact_capture.generation=0;
     spill_capture.active=false;
     streaming.completed = true;
     ret = GGML_STATUS_SUCCESS;
@@ -6712,6 +6741,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_stream_auxiliary_layers   =*/ 0,
         /*.kv_stream_verify_max         =*/ 0,
         /*.recurrent_rollback_ram        =*/ false,
+        /*.recurrent_rollback_compact    =*/ false,
     };
 
     return result;

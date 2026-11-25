@@ -1,6 +1,6 @@
 # Compact recurrent rollback and budget-aware placement
 
-Status: P0-P3 complete; P4 integration qualification in progress. Implementation branch `feature/compact-recurrent-rollback`. Dense reference GPU checks passed; compact runtime qualification has not started.
+Status: P0-P4 complete; P5-P7 remain in progress. Implementation branch `feature/compact-recurrent-rollback`. Exact operator and integrated transaction gates passed on the qualified backend; placement policy, broader product qualification and performance closeout remain open.
 
 Evidence: [P0 reference and allocation ledger](docs/development/compact-recurrent-rollback.md).
 
@@ -173,12 +173,12 @@ Exit: replay is qualified under a stated arithmetic contract; capture overhead a
 
 ### P4. Integrate compact storage and transaction commit
 
-- [ ] Change the operator/fusion output contract so full intermediate matrices are no longer allocated or written for the compact plan.
-- [ ] Implement checkpoint/working-image ownership and coherent commit across every participating component.
-- [ ] Exercise partial-copy failure, failed compute, cancellation, failed admission, phase handoff and slot reuse.
-- [ ] Update workload quotes and test predicted versus observed high-water marks, including graph temporaries.
-- [ ] Preserve dense native/RAM fallback and deterministic explicit policy selection.
-- [ ] Propagate and record the selected representation/placement through arena fitting, all probes, generated commands and sweeps.
+- [x] Change the operator/fusion output contract so full intermediate matrices are no longer allocated or written for the compact plan.
+- [x] Implement checkpoint/working-image ownership and coherent commit across every participating component.
+- [x] Exercise partial-copy failure, failed compute, cancellation, failed admission, phase handoff and slot reuse.
+- [x] Update workload quotes and test predicted versus observed high-water marks, including graph temporaries.
+- [x] Preserve dense native/RAM fallback and deterministic explicit policy selection.
+- [x] Propagate and record the selected representation/placement through arena fitting, all probes, generated commands and sweeps.
 
 Exit: compact execution passes correctness and lifecycle gates, and actual allocation peaks demonstrate that the dense snapshot planes were removed.
 

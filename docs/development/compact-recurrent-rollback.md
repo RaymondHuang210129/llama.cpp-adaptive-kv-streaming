@@ -71,7 +71,7 @@ The regression first failed on the missing provider contract. Five tests then pa
 
 The missing history API first produced a compilation failure. CPU and the frozen sm120a CUDA backend then each passed 98,777 assertions, with zero failures, exceptions or skips. Cases cover one to four selected sequences, one to eight input rows, unequal per-sequence prefixes, abort/anchor/full acceptance, tail rebasing, repeated materialization and arbitrary FP32 bit patterns. The retained tensor has exactly `(history + retained rows) * channels * selected * sizeof(float)` bytes. Gather/transpose temporaries remain part of the graph quote and can be reused after their consumers complete.
 
-This qualifies the bounded history operations. P2 remains open for transaction, parking/reselection and production-provider integration; those tests must run against the integrated storage before this stage is declared complete. Production was restored after the isolated CUDA fixture.
+This qualifies the bounded history operations. The P4 evidence below additionally closes their transaction, parking/reselection and production-provider integration gates. Production was restored after the isolated CUDA fixture.
 
 ## P3 exact FP32 GDN capture and replay
 
@@ -103,3 +103,40 @@ Measured with `test-backend-ops perf`, using Qwen geometry (128-wide states, 48 
 | 8 | 4 | 160.31 | 37.13 | 71.02 |
 
 Replay cost is material even after reducing snapshot writes. P7 must measure its full inference cost, including integration copies, before retaining an optimization.
+
+## P4 compact transactions and measured integration
+
+`--recurrent-rollback-compact` selects the qualified GDN adapter with dense fallback for unsupported operators/backends. `--recurrent-rollback-ram` remains an independent explicit override; they are mutually exclusive. Defaults remain native. The finder and fixed-span sweeps preserve the requested policy in commands/results and record whether the compact provider was actually observed. Legacy host-spill environment switches cannot override an explicit compact request.
+
+Each selected logical sequence has independent committed/working matrix and convolution images, FP32 update records, and a bounded convolution timeline. Physical capacity follows the selection, including sparse logical IDs. No dense intermediate rollback planes are allocated for this plan. Partial acceptance reconstructs directly into the working images, waits for completion, then publishes their roles together. Abort preserves the committed images and refuses uncommitted export until explicit cleanup. A restore failure retains its checkpoint/log source and can retry without publishing partially written destinations. Active verification rejects parking, rebinding and state import.
+
+Long prefill retains its tail checkpoint as a graph-owned output while the original committed image survives verification. After graph computation and KV publication succeed, that output replaces the retired checkpoint image. Its overlapping lifetime is included in the normal graph quote. Prefix restoration has no additional device result allocation or prefix-descriptor buffer. Parking uses the existing owner/lease mechanism and preserves all internal resources; exported state still uses the native current-state format.
+
+The full-model regression initially failed because hybrid input wrappers bypassed the recurrent input setter, leaving the new working-row indices uninitialized. The wrappers now use the shared setter and reuse checks. The exact comparison was retained. The same test now passes across depths 1/3/7 and histories 249, 505, 2,041 and 16,381: 1,873 assertions over full-vocabulary logits, recurrent bytes, retained KV bytes, forced rejection/correction and context-boundary failure.
+
+The two-slot GPU test passes all 64 accepted-prefix pairs at depth seven, including correction, reconstruction and phase handoff: 6,844 total assertions including its ordinary control gates. Three-/four-slot MTP comparisons pass native features, acceptance and rollback (116/146 profile assertions). The injected owner-failure test passes its 65 profile assertions and closes admission before reconstruction. These are same-fork native comparisons, complementing the frozen GDN operator comparison rather than replacing an independent stock-server qualification.
+
+The integrated CPU tests pass 330,205 assertions, including all depths 1-7, sparse IDs through 255, unequal prefixes, working-role swaps, retained prefill tails, native-format export/import, parking/rebinding, different reselection/import order, copying, source removal, slot reuse, abort, stale completion, active-lease rejection and retry after a real destination write fails. The combined ASan/UBSan suites pass with leak detection enabled. Existing dense spill, requirement and budget tests remain unchanged and pass.
+
+### Actual representation payload
+
+The conservative integration additionally retains two small convolution images. Its persistent tensor payload is therefore 11.25 MiB per selected Qwen sequence above the earlier two-matrix-plus-timeline illustration. The allocator quotes all four tensor families and their alignment; prefill checkpoint workspace and other consumers remain separate. CUDA buffer/selected-bank logs agree with these derived payloads.
+
+| Per selected Qwen sequence | Native bank | Compact bank | Reduction |
+| --- | ---: | ---: | ---: |
+| MTP3 | 598.50 MiB | 318.41015625 MiB | 280.08984375 MiB |
+| DFlash7 | 1,197.00 MiB | 331.9453125 MiB | 865.0546875 MiB |
+
+Four selected MTP3 sequences have 1,273.640625 MiB of compact persistent payload, versus 2,394 MiB native. Target-only and Gemma do not acquire these resources. The convolution component alone has no standalone MTP3 memory saving under this conservative ownership policy. These are tensor/arena-region payloads, not a claim that driver allocation rounding or whole-process peak equals the table. Selected banks live inside the existing parent arena; the current serial path remains outside it and must be included in total-device budgeting.
+
+### Untuned end-to-end reference
+
+One no-startup-warmup pass, Qwen Q3 target, embedded MTP3, q8_0/q4_0 KV, 8,192 combined budget, 2,096 MiB arena and 512 output tokens per request. The finder uses bounded article histories and its single/joint profiles. Native, RAM and compact outputs match exactly: 2,048 output tokens compared per placement. This is not the SWE sweep. The one-request rows are selections within two configured slots, not a separate `--parallel 1` implementation. Joint columns are the individual request-reported rates; no exact common-window aggregate is inferred by summing them.
+
+| Placement | Single selection A t/s | Single selection B t/s | Joint slot 0 t/s | Joint slot 1 t/s |
+| --- | ---: | ---: | ---: | ---: |
+| Native VRAM | 102.02 | 102.00 | 69.17 | 73.41 |
+| Dense RAM | 96.24 | 95.45 | 61.36 | 66.19 |
+| Compact prototype | 100.38 | 100.12 | 68.86 | 73.10 |
+
+The memory reduction alone does not establish an end-to-end speedup. P7 must reduce capture/integration and replay costs, then remeasure matched workloads. An immutable pre-optimization runtime and hashes are retained in `P4-runtime/` and `P4-runtime-manifest.json` under the evidence directory. GPU pauses were bounded to the tests; the original production container/image was restored afterward. No candidate has been deployed or pushed.
