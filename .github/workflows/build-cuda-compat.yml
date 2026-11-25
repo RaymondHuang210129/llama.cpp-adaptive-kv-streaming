@@ -54,7 +54,7 @@ jobs:
     with:
       source_sha: ${{ needs.resolve.outputs.sha }}
   cuda-linux:
-    needs: [resolve, ui-build]
+    needs: [resolve, ui-build, cuda-dependencies]
     uses: ./.github/workflows/build-cuda-sharded.yml
     with:
       os: ubuntu-24.04
@@ -64,7 +64,7 @@ jobs:
       source_sha: ${{ needs.resolve.outputs.sha }}
       workers: 2
   cuda-windows:
-    needs: [resolve, ui-build]
+    needs: [resolve, ui-build, cuda-dependencies]
     uses: ./.github/workflows/build-cuda-sharded.yml
     with:
       os: windows-2022
@@ -73,9 +73,15 @@ jobs:
       profile: ${{ needs.resolve.outputs.profile }}
       source_sha: ${{ needs.resolve.outputs.sha }}
       workers: 2
+  cuda-dependencies:
+    needs: resolve
+    uses: ./.github/workflows/build-cuda-dependencies.yml
+    with:
+      profile: ${{ needs.resolve.outputs.profile }}
+      source_sha: ${{ needs.resolve.outputs.sha }}
   publish:
     needs: [resolve, cuda-linux, cuda-windows]
-    if: needs.cuda-linux.result == 'success' && needs.cuda-windows.result == 'success'
+    if: always() && !cancelled() && needs.cuda-linux.result == 'success' && needs.cuda-windows.result == 'success'
     permissions:
       contents: write
       actions: read

@@ -576,6 +576,23 @@ class Workflows(unittest.TestCase):
         for name in ("cuda-linux", "cuda-windows"):
             self.assertTrue({"changes", "ui-build", "cpu", "python", "source"} <= set(data["jobs"][name]["needs"]))
 
+    def test_cuda_jobs_share_one_verified_dependency_artifact_per_workflow(self):
+        for filename in ("ci.yml", "build-cuda-compat.yml"):
+            jobs = self.workflows[filename]["jobs"]
+            self.assertEqual(jobs["cuda-dependencies"]["uses"], "./.github/workflows/build-cuda-dependencies.yml")
+            for name in ("cuda-linux", "cuda-windows"):
+                self.assertIn("cuda-dependencies", jobs[name]["needs"])
+        stages = self.workflows["build-cuda-sharded.yml"]["jobs"]
+        for name in ("plan", "compile", "build"):
+            job = stages[name]
+            self.assertEqual(job["env"]["CMAKE_TOOLCHAIN_FILE"], "${{ github.workspace }}/build/_deps/cccl-src/cccl.cmake")
+            download = next(step for step in job["steps"] if step.get("name") == "Download shared CCCL source")
+            self.assertEqual(download["with"]["name"], "cccl-source-${{ inputs.profile }}-${{ inputs.source_sha || github.sha }}")
+            self.assertEqual(download["with"]["path"], "build/_deps/cccl-src")
+        producer = self.workflows["build-cuda-dependencies.yml"]["jobs"]["prepare"]
+        checkout = next(step for step in producer["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["ref"], "${{ github.workflow_sha }}")
+
     def test_required_result_is_unconditional_and_covers_four_builds(self):
         data = self.workflows["ci.yml"]
         self.assertEqual(data["on"]["push"]["branches"], ["feature/adaptive-kv-stream-v3"])
@@ -587,6 +604,8 @@ class Workflows(unittest.TestCase):
         self.assertEqual(data["jobs"]["publish"]["needs"], "required")
         self.assertIn("github.event_name == 'push'", data["jobs"]["publish"]["if"])
         self.assertIn("needs.required.result == 'success'", data["jobs"]["publish"]["if"])
+        self.assertIn("always()", data["jobs"]["publish"]["if"])
+        self.assertIn("!cancelled()", data["jobs"]["publish"]["if"])
 
     def test_optional_platforms_are_manual_and_cpu_cuda_components_have_no_duplicate_events(self):
         for name in ("build-cpu.yml", "build-cuda-ubuntu.yml", "build-cuda-windows.yml", "release.yml"):

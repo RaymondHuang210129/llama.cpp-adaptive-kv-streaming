@@ -36,7 +36,7 @@ def source_identity(root):
 
 def compiler_files(configuration):
     paths = {}
-    for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_CUDA_COMPILER", "CMAKE_LINKER"):
+    for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_CUDA_COMPILER", "CMAKE_LINKER", "CMAKE_TOOLCHAIN_FILE"):
         if not configuration.get(key):
             continue
         path = Path(configuration[key])

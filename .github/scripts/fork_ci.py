@@ -29,7 +29,7 @@ CUDA_PROFILES = {
     "p100": {"architectures": "60-real", "toolkit": "12.9.1", "cccl": "v2.8.2", "day": 5},
     "pascal": {"architectures": "61-real", "toolkit": "12.9.1", "cccl": "v2.8.2", "day": 6},
 }
-BASE_JOBS = {"changes", "cpu", "cuda-linux", "cuda-windows", "python", "source", "cmake-package", "ui-build"}
+BASE_JOBS = {"changes", "cpu", "cuda-dependencies", "cuda-linux", "cuda-windows", "python", "source", "cmake-package", "ui-build"}
 
 
 def classify_changes(paths, full=False):
@@ -109,7 +109,8 @@ def digest(path):
 def read_configuration(build):
     keys = {"BUILD_SHARED_LIBS", "CMAKE_BUILD_TYPE", "CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER",
             "CMAKE_CUDA_COMPILER", "CMAKE_LINKER", "CMAKE_CUDA_ARCHITECTURES", "GGML_CUDA", "GGML_BACKEND_DL",
-            "GGML_NATIVE", "GGML_CUDA_FA_QUANTS", "GGML_CUDA_CCCL_VERSION", "LLAMA_FATAL_WARNINGS", "GGML_FATAL_WARNINGS"}
+            "GGML_NATIVE", "GGML_CUDA_FA_QUANTS", "GGML_CUDA_CCCL_VERSION", "LLAMA_FATAL_WARNINGS", "GGML_FATAL_WARNINGS",
+            "CMAKE_TOOLCHAIN_FILE", "FETCHCONTENT_SOURCE_DIR_CCCL"}
     result = {}
     for line in (build / "CMakeCache.txt").read_text().splitlines():
         match = re.fullmatch(r"([^:=]+):[^=]*=(.*)", line)

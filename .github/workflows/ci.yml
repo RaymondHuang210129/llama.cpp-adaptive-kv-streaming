@@ -39,13 +39,17 @@ jobs:
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cpu.yml
   cuda-linux:
-    needs: [changes, ui-build, cpu, python, source]
+    needs: [changes, ui-build, cpu, python, source, cuda-dependencies]
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cuda-ubuntu.yml
   cuda-windows:
-    needs: [changes, ui-build, cpu, python, source]
+    needs: [changes, ui-build, cpu, python, source, cuda-dependencies]
     if: needs.changes.outputs.draft != 'true'
     uses: ./.github/workflows/build-cuda-windows.yml
+  cuda-dependencies:
+    needs: [changes, cpu, python, source]
+    if: needs.changes.outputs.draft != 'true'
+    uses: ./.github/workflows/build-cuda-dependencies.yml
   cmake-package:
     needs: changes
     if: needs.changes.outputs.draft != 'true'
@@ -75,7 +79,7 @@ jobs:
   required:
     name: required
     if: always()
-    needs: [changes, ui-build, cpu, cuda-linux, cuda-windows, cmake-package, python, source, server, sanitize, ui]
+    needs: [changes, ui-build, cpu, cuda-dependencies, cuda-linux, cuda-windows, cmake-package, python, source, server, sanitize, ui]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -87,7 +91,7 @@ jobs:
           CI_RESULTS: ${{ toJSON(needs) }}
   publish:
     needs: required
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feature/adaptive-kv-stream-v3' && needs.required.result == 'success'
+    if: always() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/feature/adaptive-kv-stream-v3' && needs.required.result == 'success'
     permissions:
       contents: write
       actions: read

@@ -27,6 +27,7 @@ jobs:
     env:
       OCEANUS_SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
       OCEANUS_CUDA_PROFILE: ${{ inputs.profile }}
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/build/_deps/cccl-src/cccl.cmake
     runs-on: ${{ inputs.os }}
     timeout-minutes: 60
     outputs:
@@ -40,6 +41,11 @@ jobs:
           ref: ${{ inputs.source_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Download shared CCCL source
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: cccl-source-${{ inputs.profile }}-${{ inputs.source_sha || github.sha }}
+          path: build/_deps/cccl-src
       - uses: ./.github/actions/setup-cuda-build
         with:
           profile: ${{ inputs.profile }}
@@ -65,6 +71,7 @@ jobs:
     env:
       OCEANUS_SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
       OCEANUS_CUDA_PROFILE: ${{ inputs.profile }}
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/build/_deps/cccl-src/cccl.cmake
     needs: plan
     runs-on: ${{ inputs.os }}
     timeout-minutes: 360
@@ -81,6 +88,11 @@ jobs:
           ref: ${{ inputs.source_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Download shared CCCL source
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: cccl-source-${{ inputs.profile }}-${{ inputs.source_sha || github.sha }}
+          path: build/_deps/cccl-src
       - uses: ./.github/actions/setup-cuda-build
         with:
           profile: ${{ inputs.profile }}
@@ -109,6 +121,7 @@ jobs:
     env:
       OCEANUS_SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
       OCEANUS_CUDA_PROFILE: ${{ inputs.profile }}
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/build/_deps/cccl-src/cccl.cmake
     needs: [plan, compile]
     runs-on: ${{ inputs.os }}
     timeout-minutes: 360
@@ -121,6 +134,11 @@ jobs:
           ref: ${{ inputs.source_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Download shared CCCL source
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: cccl-source-${{ inputs.profile }}-${{ inputs.source_sha || github.sha }}
+          path: build/_deps/cccl-src
       - uses: ./.github/actions/setup-cuda-build
         with:
           profile: ${{ inputs.profile }}

@@ -135,6 +135,17 @@ class NativeHandoff(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "compiler_files"):
             shards.validate_plan(plan, self.root, self.build)
 
+    def test_shared_dependency_initializer_is_part_of_the_build_identity(self):
+        initializer = self.root / "shared-dependencies.cmake"
+        initializer.write_text("# original initializer\n")
+        configuration = dict(shards.read_configuration(self.build), CMAKE_TOOLCHAIN_FILE=str(initializer))
+        with patch.object(shards, "read_configuration", return_value=configuration):
+            plan = copy.deepcopy(self.plan)
+            plan["profile"] = shards.profile(self.root, self.build, "fixture")
+            initializer.write_text("# changed initializer\n")
+            with self.assertRaisesRegex(ValueError, "compiler_files"):
+                shards.validate_plan(plan, self.root, self.build)
+
     def test_imported_objects_link_without_recompiling_shader_sources(self):
         shards.assemble(self.plan, self.root, self.build, self.archives, self.destination)
         commands = json.loads(subprocess.check_output(["ninja", "-t", "compdb", "-x"], cwd=self.build, text=True))

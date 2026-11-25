@@ -17,6 +17,10 @@ The aggregate rejects failed, cancelled, missing or unexpectedly skipped require
 
 Temporarily, Windows CPU/CUDA jobs use `--fatal-warnings OFF` to collect the warning inventory. Warnings remain visible; compiler errors and test failures still fail CI. Linux builds and the build helper's default remain strict. Restore Windows warning promotion after the inventory is fixed.
 
+CCCL is prepared once per workflow/profile, before either OS starts its CUDA plan. The producer verifies a commit- and SHA256-pinned source archive, validates cached source contents, and publishes one source artifact shared by both OSes, all compilation shards, and final linking. CMake receives that source through a portable initializer and does not clone CCCL in each worker. Upstream aliases are materialized for Windows without symlink privileges; dangling Markdown aliases in older releases are omitted. The CUDA SDK remains a separate checksum-verified cache per OS/toolkit.
+
+The initializer uses CMake's `CMAKE_TOOLCHAIN_FILE` environment input only to set and validate the CCCL source override; it changes no compiler or architecture options. This also works when scheduled/manual compatibility builds select an older published source whose build helper predates this workflow. The preparation helper is pinned to the calling workflow's commit, while UI, model code, and binary provenance remain pinned to the selected source SHA.
+
 ## CUDA coverage
 
 `fork_ci.py` owns the architecture profile table used by configuration, toolkit setup, packaging and schedule selection. Every profile builds Linux x64 and Windows x64 separately. The weekly workflow runs at **03:17 America/Chicago**, with daylight-saving handling delegated to GitHub's timezone-aware schedule.
@@ -64,7 +68,7 @@ The archives contain `llama-server`, `llama-cli`, `llama-bench`, backend/shared 
 
 The manifest identifies source SHA, architecture profile, run/attempt, compiler/configuration, SDK receipt, shard provenance and checksums. Validation requires both OS packages to match the profile's architecture, CCCL and toolkit. Weekly binaries can lag the latest RTX 50 release: choose the profile and SHA shown in the release name and manifest.
 
-Pull requests and manual main-CI runs cannot publish. The publisher stages assets in an owned draft and publishes only after validation. Reruns verify an existing complete release and preserve its original bytes. An interrupted draft may be resumed by the same Actions run ID; another run's draft is retained for review. Compatibility publication revalidates the source's successful RTX 50 release before writing its own release. Existing `sha-<sha>` V2 releases and assets are not modified.
+Pull requests and manual main-CI runs cannot publish. The publication gate explicitly checks cancellation and successful required builds so it can be reevaluated after recovery of a failed dependency. The publisher stages assets in an owned draft and publishes only after validation. Reruns verify an existing complete release and preserve its original bytes. An interrupted draft may be resumed by the same Actions run ID; another run's draft is retained for review. Compatibility publication revalidates the source's successful RTX 50 release before writing its own release. Existing `sha-<sha>` V2 releases and assets are not modified.
 
 ## Local checks and remaining rollout
 
