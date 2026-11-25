@@ -1,6 +1,6 @@
 # Compact recurrent rollback and budget-aware placement
 
-Status: P0-P5 complete, including the serial arena ownership correction. P6-P7 remain in progress. Implementation branch `feature/compact-recurrent-rollback`. Exact operator and integrated transaction gates passed on the qualified backend; bounded group and serial placement are qualified; broader product qualification and performance closeout remain open.
+Status: P0-P6 complete, including serial arena ownership and the full supported-configuration gate. P7 closeout is in progress. Implementation branch `feature/compact-recurrent-rollback`. Exact operator and integrated transaction gates passed on the qualified backend; bounded group and serial placement are qualified; broader product qualification and performance closeout remain open.
 
 Evidence: [P0 reference and allocation ledger](docs/development/compact-recurrent-rollback.md).
 
@@ -197,11 +197,11 @@ Exit: deterministic budget tests pass and measured plan choices improve total ex
 
 ### P6. Product qualification
 
-- [ ] Qualify every supported model/mode/KV-format/slot/modality combination affected by the integration; list unsupported combinations separately.
-- [ ] Preserve single-slot behavior and target-only/Gemma controls without extra recurrent allocations or material regressions.
-- [ ] Run applicable host sanitizers and CUDA memory/order checks with the established graphs, PDL and error-reporting settings.
-- [ ] Run matched performance/resource comparisons below and publish the raw configuration and evidence.
-- [ ] Document qualified arithmetic contracts, fallbacks, policy controls, measured peaks and hardware limits.
+- [x] Qualify every supported model/mode/KV-format/slot/modality combination affected by the integration; list unsupported combinations separately.
+- [x] Preserve single-slot behavior and target-only/Gemma controls without extra recurrent allocations or material regressions.
+- [x] Run applicable host sanitizers and CUDA memory/order checks with the established graphs, PDL and error-reporting settings.
+- [x] Run matched performance/resource comparisons below and publish the raw configuration and evidence.
+- [x] Document qualified arithmetic contracts, fallbacks, policy controls, measured peaks and hardware limits.
 
 Use the compositional numerical contracts in [MS17](MULTI_SLOT_PHASE_ARENA_ROADMAP.md) where available. Do not relabel existing same-fork comparisons as independent stock equivalence or make an unfinished tooling stage a substitute for bounded provider tests.
 

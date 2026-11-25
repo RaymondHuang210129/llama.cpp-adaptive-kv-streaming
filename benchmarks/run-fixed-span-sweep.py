@@ -179,6 +179,8 @@ class ArenaTooSmallError(RuntimeError):
 
 def arena_minimum_mib(log_text: str, *, include_mtp_fallback_hint: bool = True) -> int | None:
     diagnostics = (r"shared arena quota insufficient|persistent local cache does not fit the declared shared arena:\s*insufficient arena quota"
+                   r"|serial recurrent state does not fit the declared arena:\s*insufficient arena quota"
+                   r"|workspace admission:\s*insufficient arena quota"
                    r"|shared MTP arena quota requires")
     if include_mtp_fallback_hint:
         diagnostics += r"|MTP graph exceeds shared arena quota:"

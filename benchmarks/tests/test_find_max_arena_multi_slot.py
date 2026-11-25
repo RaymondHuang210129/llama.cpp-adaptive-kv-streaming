@@ -199,6 +199,20 @@ class MultiSlotFinder(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 finder.validate_completed_image_sources('', completed, groups=groups)
 
+    def test_copy_proof_charges_the_configured_cold_lookup_fallbacks(self):
+        zero = dict(generated_tokens=0, accepted_tokens=0, accept_calls=0, prediction_forwards=0)
+        timings = dict(draft_n=8, draft_n_accepted=8)
+        group = dict(label='image-copy', members=1, timings=timings, source_stats={
+            'draft-dflash': dict(zero, generated_tokens=1, accepted_tokens=1, accept_calls=1, prediction_forwards=1),
+            'ngram-map-k4v': dict(zero, generated_tokens=7, accepted_tokens=7, accept_calls=1)})
+        with patch.object(finder, 'validate_mixed_sources', return_value={'draft-dflash': {}, 'ngram-map-k4v': {}}):
+            finder.validate_completed_image_sources('', [dict(label='image-copy', timings=timings)],
+                groups=[group], ngram_min_hits=2)
+            group['source_stats']['draft-dflash']['prediction_forwards'] = 2
+            with self.assertRaises(RuntimeError):
+                finder.validate_completed_image_sources('', [dict(label='image-copy', timings=timings)],
+                    groups=[group], ngram_min_hits=2)
+
 
 if __name__ == '__main__':
     unittest.main()

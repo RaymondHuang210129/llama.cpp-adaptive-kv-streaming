@@ -491,7 +491,7 @@ def mixed_image_route_probe(args, url, images, candidate):
             "scope":"Separate image-conditioned target-biased copy and genuine-miss resource checks. Not performance or image quality evidence."}
 
 
-def validate_completed_image_sources(text, completed, groups=None):
+def validate_completed_image_sources(text, completed, groups=None, ngram_min_hits=1):
     totals = {key:sum(row["timings"].get(key,0) for row in completed) for key in ("draft_n","draft_n_accepted")}
     result = validate_mixed_sources(text,generated_tokens=totals["draft_n"],accepted_tokens=totals["draft_n_accepted"])
     if groups is not None:
@@ -507,8 +507,8 @@ def validate_completed_image_sources(text, completed, groups=None):
             if group["label"] == "image-copy" and not (
                     delta["ngram-map-k4v"]["generated_tokens"] > 0
                     and delta["ngram-map-k4v"]["accept_calls"] > 0
-                    and delta["draft-dflash"]["prediction_forwards"] == 0):
-                raise RuntimeError("image copy group did not use K4V without a neural forward")
+                    and delta["draft-dflash"]["prediction_forwards"] == (ngram_min_hits-1)*group["members"]):
+                raise RuntimeError("image copy group did not use K4V with only its configured cold-lookup fallbacks")
             if group["label"] == "image-miss" and not (
                     delta["draft-dflash"]["generated_tokens"] > 0
                     and delta["draft-dflash"]["prediction_forwards"] > 0
@@ -681,7 +681,8 @@ def _runtime_probe(args, candidate):
                 if mixed_proof is None:
                     raise RuntimeError("missing completed mixed route probe")
                 mixed_proof["source_stats"] = (
-                    validate_completed_image_sources(text, completed, groups=getattr(args, "_source_groups", None))
+                    validate_completed_image_sources(text, completed, groups=getattr(args, "_source_groups", None),
+                        ngram_min_hits=ngram_settings(args)["ngram_min_hits"])
                     if mixed_image else validate_mixed_sources(
                         text, generated_tokens=sum(row["timings"].get("draft_n", 0) for row in completed),
                         accepted_tokens=sum(row["timings"].get("draft_n_accepted", 0) for row in completed)))

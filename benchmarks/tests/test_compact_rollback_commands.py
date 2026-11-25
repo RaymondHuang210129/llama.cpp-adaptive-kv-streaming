@@ -20,6 +20,20 @@ SWEEP = module("compact_sweep", ROOT / "run-fixed-span-sweep.py")
 
 
 class CompactCommandTests(unittest.TestCase):
+    def test_serial_state_quota_is_a_lower_bound_and_allocation_failure_is_not(self):
+        prefix='serial recurrent state does not fit the declared arena: '
+        message=prefix+'insufficient arena quota; required=104857601, available=67108864, additional=37748737 bytes'
+        minimum=SWEEP.arena_minimum_mib(message)
+        self.assertEqual(101,minimum)
+        self.assertFalse(SWEEP.is_arena_capacity_failure(message))
+        self.assertIsNone(SWEEP.arena_minimum_mib(prefix+'backend or host allocation failed'))
+        self.assertEqual(2219,SWEEP.arena_minimum_mib(
+            'workspace admission: insufficient arena quota; required=2326112384, available=2197815296, additional=128297088 bytes'))
+        def probe(candidate):
+            if candidate<minimum:raise SWEEP.ArenaTooSmallError(minimum)
+            return candidate<=132
+        self.assertEqual(132,SWEEP.find_max_arena_mib(64,probe,upper_limit=200))
+
     def test_finder_and_sweep_preserve_explicit_compact_policy(self):
         for enabled in (False, True):
             extra = ["--recurrent-rollback-compact"] if enabled else []
