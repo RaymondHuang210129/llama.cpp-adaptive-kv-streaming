@@ -58,3 +58,9 @@ Zero accepted proposals normally still commits the anchor verification input. A 
 The new reference-comparison tests first failed because the harness did not exist, then passed four tests covering changed tokens, incomplete runs, changed prompts and missing requests. Existing CPU spill tests pass: 11,932 assertions, zero failures, exceptions or skips.
 
 No compact storage, CUDA replay, raw-state equivalence, image qualification or four-slot candidate admission is claimed by P0. These are explicit later gates. Reference artifact commands are replayable with `benchmarks/compact-rollback-reference.py`; GPU memory must first be available.
+
+## P1 capability and requirements contract
+
+`llama-memory-recurrent-provider.{h,cpp}` describes dense device, dense host and capability-gated scalar-decay FP32 GDN payloads. It does not select a runtime provider or alter defaults. Callers supply the existing owner's measured graph workspace quote, actual selected count and remaining hard budget. Configured capacity never multiplies physical storage. Capabilities must come from qualified operators/backends; merely constructing a compact description does not qualify it. Other recurrent and auxiliary state retains its existing independent requirements.
+
+The regression first failed on the missing provider contract. Five tests then pass 31 assertions for expected Qwen payloads, selected/configured separation, graph/stage overlap, one-byte budget shortfall, missing replay capabilities, incompatible grouped heads, invalid geometry/alignment, overflow, unchanged output on failure and no compact acquisition by target-only/empty controls. Existing sparse-ID and selected-storage tests remain in `test-memory-recurrent-spill`; that suite passes unchanged.

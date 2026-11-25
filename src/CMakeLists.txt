@@ -44,6 +44,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory-phase.cpp
     llama-memory-plan.cpp
     llama-memory-recurrent-spill.cpp
+    llama-memory-recurrent-provider.cpp
     llama-memory-requirements.cpp
     llama-memory-transition.cpp
     llama-memory-workspace.cpp

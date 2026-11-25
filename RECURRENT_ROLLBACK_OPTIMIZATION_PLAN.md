@@ -1,6 +1,6 @@
 # Compact recurrent rollback and budget-aware placement
 
-Status: P0 complete; P1 in progress. Implementation branch `feature/compact-recurrent-rollback`. Dense reference GPU checks passed; compact runtime qualification has not started.
+Status: P0-P1 complete; P2 in progress. Implementation branch `feature/compact-recurrent-rollback`. Dense reference GPU checks passed; compact runtime qualification has not started.
 
 Evidence: [P0 reference and allocation ledger](docs/development/compact-recurrent-rollback.md).
 
@@ -144,10 +144,10 @@ Exit: a reproducible allocation/transfer ledger and references for every current
 
 ### P1. Add capability and requirement descriptions
 
-- [ ] Describe existing representations through the provider contract without changing defaults.
-- [ ] Test unsupported capabilities, invalid dimensions, integer bounds, alignment, tight budgets and peak overlap.
-- [ ] Test selected-count sizing separately from configured capacity, including sparse/high logical IDs.
-- [ ] Preserve independent requirements for recurrent, append-only, bounded and auxiliary state.
+- [x] Describe existing representations through the provider contract without changing defaults.
+- [x] Test unsupported capabilities, invalid dimensions, integer bounds, alignment, tight budgets and peak overlap.
+- [x] Test selected-count sizing separately from configured capacity, including sparse/high logical IDs.
+- [x] Preserve independent requirements for recurrent, append-only, bounded and auxiliary state.
 
 Exit: existing paths pass unchanged, and common admission can compare complete candidate requirements without model-name branches.
 
