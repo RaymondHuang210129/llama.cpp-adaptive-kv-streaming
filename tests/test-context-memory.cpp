@@ -679,6 +679,33 @@ int main(int argc, char ** argv) {
             f.rebuild(); f.run(t,*parent,4);
         }
     });
+    t.test("recurrent_quote_can_trade_old_workspace_for_a_larger_state_bank", [&](testing & t) {
+        fixture f(dev);
+        llama_compute_workspace_plan plan;plan.groups=f.groups;
+        for (auto & group : plan.groups) group.size=8192;
+        plan.phase_sizes.assign(2,std::vector<size_t>(plan.groups.size(),8192));
+        auto owner=llama_context_memory::create(f.sched.get(),f.backends,plan,nullptr,nullptr,false,{},16384);
+        if (!t.assert_true(bool(owner))) return;
+        auto state=owner->reserve_recurrent_state(4096);
+        if (!t.assert_true(bool(state))) return;
+        for (auto & group : plan.groups) group.size=4096;
+        for (auto & phase : plan.phase_sizes) std::fill(phase.begin(),phase.end(),4096);
+        llama_context_memory_create_result admission;size_t pool=0;
+        const auto generation=owner->shared_arena_generation();
+        t.assert_true("a replacement quote releases the previous target's scratch envelope",
+            owner->quote_recurrent_state(12288,0,plan,text_phase::decode,admission,pool));
+        t.assert_equal(size_t(16384),admission.required_bytes);
+        t.assert_equal(generation,owner->shared_arena_generation());
+        fixture draft(dev);
+        auto draft_plan=plan;
+        for (auto & group : draft_plan.groups) group.size=8192;
+        for (auto & phase : draft_plan.phase_sizes) std::fill(phase.begin(),phase.end(),8192);
+        auto child=llama_context_memory::create(draft.sched.get(),draft.backends,draft_plan,nullptr,owner.get());
+        if (!t.assert_true(bool(child))) return;
+        t.assert_true("a smaller target cannot discard the live child's scratch requirement",
+            !owner->quote_recurrent_state(12288,0,plan,text_phase::decode,admission,pool) &&
+            admission.status==llama_context_memory_create_status::insufficient_budget);
+    });
     t.test("recurrent_state_prefix_coexists_with_fixed_suffixes_and_protects_its_bytes", [&](testing & t) {
         fixture f(dev);
         llama_compute_workspace_plan plan;plan.groups=f.groups;

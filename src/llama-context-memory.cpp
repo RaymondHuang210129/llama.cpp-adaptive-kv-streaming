@@ -154,6 +154,24 @@ struct llama_context_memory::implementation : llama_memory_executor_backend {
         return 0;
     }
 
+    size_t child_workspace_minimum(ggml_backend_buffer_type_t type,llama_memory_stage_id stage) const noexcept {
+        if (stage==suspend_stage) return 0;
+        size_t bytes=0;
+        for (auto * child : serial_children) {
+            const auto & state=*child->impl;
+            for (const auto & phase : state.phase_target.plan.stages) {
+                if (phase.id==state.suspend_stage ||
+                        (stage==prefill_stage && phase.id!=state.prefill_stage) ||
+                        (stage==decode_stage && phase.id!=state.decode_stage)) continue;
+                for (const auto & requirement : phase.requirements)
+                    if (requirement.resource && requirement.resource<=state.arenas.size() &&
+                            state.arenas[requirement.resource-1].buft==type)
+                        bytes=std::max(bytes,requirement.size_min);
+            }
+        }
+        return bytes;
+    }
+
     // Constructor failures and normal teardown use the same ordering while the scheduler remains alive.
     ~implementation() {
         *lifetime=nullptr;
@@ -1169,9 +1187,10 @@ bool llama_context_memory::quote_recurrent_state(size_t bytes,size_t publication
             if (plan.groups[g].buft!=impl->arenas[g].buft || plan.phase_sizes[0].size()!=plan.groups.size() ||
                     plan.phase_sizes[1].size()!=plan.groups.size()) return false;
             for (auto & stage : target.plan.stages) for (auto & requirement : stage.requirements) if (requirement.resource==g+1) {
-                const auto wanted=stage.id==impl->suspend_stage ? 0 : stage.id==impl->prefill_stage ? plan.phase_sizes[0][g] :
+                auto wanted=stage.id==impl->suspend_stage ? 0 : stage.id==impl->prefill_stage ? plan.phase_sizes[0][g] :
                     stage.id==impl->decode_stage ? plan.phase_sizes[1][g] : plan.groups[g].size;
-                requirement.size_min=requirement.size_preferred=std::max(requirement.size_min,wanted);
+                if (g==impl->kv_arena) wanted=std::max(wanted,impl->child_workspace_minimum(plan.groups[g].buft,stage.id));
+                requirement.size_min=requirement.size_preferred=wanted;
                 if (g!=impl->kv_arena && ggml_backend_buft_is_host(plan.groups[g].buft))
                     target.budgets[g].capacity=std::max(target.budgets[g].capacity,requirement.size_min);
             }
@@ -1241,15 +1260,7 @@ bool llama_context_memory::reconfigure_recurrent_workspace(const llama_compute_w
             for (auto & stage : target.plan.stages) {
                 size_t bytes=stage.id==impl->suspend_stage ? 0 : stage.id==impl->prefill_stage ? plan.phase_sizes[0][g] :
                     stage.id==impl->decode_stage ? plan.phase_sizes[1][g] : group.size;
-                if (g==impl->kv_arena && stage.id!=impl->suspend_stage) for (auto * child : impl->serial_children) {
-                    const auto child_stage=stage.id==impl->prefill_stage ? child->impl->prefill_stage : child->impl->decode_stage;
-                    for (auto * lease : child->impl->workspace->leases()) GGML_ASSERT(!lease);
-                    for (const auto & child_phase : child->impl->phase_target.plan.stages) if (child_phase.id==child_stage)
-                        for (const auto & requirement : child_phase.requirements)
-                            if (requirement.resource<=child->impl->arenas.size() &&
-                                    child->impl->arenas[requirement.resource-1].buft==group.buft)
-                                bytes=std::max(bytes,requirement.size_min);
-                }
+                if (g==impl->kv_arena) bytes=std::max(bytes,impl->child_workspace_minimum(group.buft,stage.id));
                 for (auto & requirement : stage.requirements) if (requirement.resource==id)
                     requirement.size_min=requirement.size_preferred=bytes;
                 next.stages.push_back({stage.id,bytes});

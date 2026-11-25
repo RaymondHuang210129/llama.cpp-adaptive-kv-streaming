@@ -202,3 +202,25 @@ The new arena tests began with missing reservation/replan operations and the ser
 The full-model migration test passes 69 assertions: native -> RAM -> compact -> native, a partial acceptance rollback, every vocabulary logit and every serialized current-state byte, automatic placement in 512/3072 MiB arenas, and rejection of a native bank that cannot fit the smaller budget. The ownership test passes 399 assertions proving all serial recurrent tensors are within the parent and their allocation matches diagnostics. Sixteen separate MTP3/DFlash7 text/image probes produce identical 64-token outputs across native, RAM, compact and automatic placement. Three-/four-slot MTP and the 6,844-assertion two-slot acceptance-prefix suite remain exact. Targeted ASan/UBSan suites pass with leak detection; final migration CUDA memory checking is recorded separately.
 
 Raw evidence and frozen runtimes are under `/home/raymond/LLM/compact-rollback-20261125/`: `P5-serial-final-lifecycle.log`, `P5-serial-final-probes.log`, `P5-arena-final-gates.log`, `P5-serial-asan-tests.log`, and `P5-serial-arena-final-runtime-manifest.json`. Earlier serial performance records above describe the pre-correction allocation policy and must not be relabeled as measurements of this implementation. P6 still needs the remaining product matrix and corrected serial profiles; P7 still needs its final matched performance/resource comparisons.
+
+### Serial cost-query reuse checkpoint
+
+A serial cost query now reuses at most three host-only graph templates. Each query still obtains a fresh complete arena quote and recomputes displaced KV traffic and acceptance-dependent cost. Queries for the active provider use its actual current workspace plan. A different winner always receives new graph measurement and admission before replacing storage. A graph reconfiguration invalidates templates; an unsuccessful cached choice permits one bounded refresh. Unsupported providers are cached as unavailable. No extra GPU storage or timing requests are introduced.
+
+The replacement quote now releases the previous target's scratch envelope instead of charging the maximum of old and new target workspace. It retains every live child's phase requirement, using the same calculation for quoting and actual workspace rebuilding. A regression first rejected a valid 12 KiB state + 4 KiB workspace replacement in a 16 KiB parent; the corrected quote admits it and rejects it again when a live child needs 8 KiB. The complete owner suite passes 8,879 assertions.
+
+The GPU cache regression first observed executable revision 4 becoming 5 after a repeated cost query. It now preserves the executable and also observes an increased quota when a new protected suffix is reserved, proving cached templates do not bypass current admission. Native/RAM/compact migration, all vocabulary logits and serialized current state remain exact. Actual MTP3/DFlash7 text/image automatic handoffs match the native 64-token references and report cached decode-phase quotes. The four host ASan/UBSan suites remain green with leak detection.
+
+A single serial MTP3 measurement used pinned SWE suffixes A/B, 8,192 history tokens each, 512 outputs per request, q8_0/q4_0 KV, a 262,144-position context limit and a common 2,304 MiB arena. All 1,024 output tokens match across these runs:
+
+| Placement | Mean A/B tokens/s |
+| --- | ---: |
+| Native device snapshots | 115.255 |
+| Dense RAM snapshots | 111.901 |
+| Explicit compact | 116.330 |
+| Automatic before query reuse | 115.740 |
+| Automatic with query reuse | 116.382 |
+
+The query-reuse observation is 0.55% faster than the previous automatic run and has the same sampled device peak, 15,770,189,824 bytes. These are single observations without timing repetitions, discarded startup requests or statistical confidence. Compact storage recovers capacity inside the fixed parent; it does not reduce the parent's allocation. A 2,096 MiB serial native MTP3 launch at this full context limit is not admitted: its complete quote requires 2,326,112,384 bytes, rounded up to 2,219 MiB. This is a lower-bound quota result, not a physical OOM or a timed sample. The fixed 2,096 MiB parallel control remains a separate supported measurement.
+
+Evidence is retained in `P7-serial-cache-{red,green}.log`, `P7-serial-complete-admission-green.log`, `P7-serial-cache-asan-tests.log`, `P7-cache-trial-queue.log`, `P7-capacity-limits.json` and the `P7-swe-qwen-mtp-n1-h8192-a2304-*` directories under the evidence root. Runtime and loaded-library identities distinguish these records from historical serial allocation results. This checkpoint does not close the remaining P6 matrix or the P7 long-context/resource comparisons.

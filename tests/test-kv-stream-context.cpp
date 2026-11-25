@@ -6793,6 +6793,20 @@ static void test_serial_recurrent_switch(testing & t,llama_model * model) {
                 t.assert_true("provider switches preserve native recurrent bytes",state.bytes==states[step]);
             }
             else states.push_back(std::move(state.bytes));
+            if (compare && !automatic && step==0) {
+                llama_recurrent_placement_plan first,second;
+                if (!t.assert_true(context.set_serial_recurrent_placement(llama_recurrent_representation::gdn_fp32,&first))) return;
+                auto * owner=llama_context_compute_memory(&context);
+                const auto revision=owner->graph_binding_revision();
+                if (!t.assert_true(context.set_serial_recurrent_placement(llama_recurrent_representation::gdn_fp32,&second))) return;
+                t.assert_equal("reusing an advisory quote keeps the active executable",revision,owner->graph_binding_revision());
+                t.assert_equal(first.peak_bytes,second.peak_bytes);
+                auto stage=owner->reserve_staging(1048576);
+                if (!t.assert_true(bool(stage))) return;
+                llama_recurrent_placement_plan changed;
+                t.assert_true(context.set_serial_recurrent_placement(llama_recurrent_representation::gdn_fp32,&changed) &&
+                    changed.peak_bytes>=second.peak_bytes+1048576);
+            }
             if (step==1 && !t.assert_true(llama_memory_seq_rm(context.get_memory(),0,34,-1))) return;
         }
     };

@@ -7620,6 +7620,53 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
 
+bool llama_context::serial_recurrent_cost(const serial_recurrent_quote & quote,const llama_memory_recurrent & current,
+        llama_memory_text_phase phase,llama_recurrent_placement_plan & output,
+        const llama_compute_workspace_plan * current_workspace) const {
+    if (!quote.supported || !compute_memory || !kv_resources.full) return false;
+    const auto * stream=kv_resources.full->get_kv_stream();
+    if (!stream || !stream->complete()) return false;
+    llama_context_memory_create_result admission;size_t pool_bytes=0;
+    const auto admitted=compute_memory->quote_recurrent_state(quote.state_bytes,quote.publication_bytes,
+        current_workspace ? *current_workspace : quote.workspace,phase,admission,pool_bytes);
+    llama_recurrent_placement_plan cost;cost.representation=quote.representation;cost.peak_bytes=admission.required_bytes;
+    if (!admitted && admission.status!=llama_context_memory_create_status::insufficient_budget)
+        return false;
+    double current_bytes=0,matrix=0;
+    for (auto * tensor : current.r_l) if (tensor) current_bytes+=ggml_row_size(tensor->type,tensor->ne[0]);
+    for (auto * tensor : current.s_l) if (tensor) matrix+=ggml_row_size(tensor->type,tensor->ne[0]);
+    current_bytes+=matrix;
+    llama_kv_stream_memory_requirements resources;
+    const auto host=stream->host();
+    if (!host || !stream->memory_requirements(resources))
+        return false;
+    const auto tokens=stream->tokens()+cparams.n_rs_seq+1;
+    const auto & layout=host->layout();
+    const long double required=static_cast<long double>((tokens+255)/256*256)*
+        (layout.k_token_bytes+layout.v_token_bytes)*host->config().layers;
+    if (required>SIZE_MAX) return false;
+    const auto available=pool_bytes>resources.pool_decode_min_bytes ? pool_bytes-resources.pool_decode_min_bytes : 0;
+    cost.kv_stream_bytes=required>available ? size_t(required)-available : 0;
+    constexpr double device_bytes_per_ms=512.0*1024*1024;
+    const double rows=cparams.n_rs_seq+1;
+    const auto events=current.rollback_events>=serial_placement_rollbacks ?
+        current.rollback_events-serial_placement_rollbacks : current.rollback_events;
+    const auto prefix_rows=current.rollback_prefix_rows>=serial_placement_prefix_rows ?
+        current.rollback_prefix_rows-serial_placement_prefix_rows : current.rollback_prefix_rows;
+    const double fraction=placement_steps ? std::min(1.0,double(events)/placement_steps) : .5;
+    const double prefix=events ? double(prefix_rows)/events : rows/2;
+    cost.compute_ms=model.size()/device_bytes_per_ms;
+    if (quote.representation==llama_recurrent_representation::dense_host) {
+        cost.d2h_bytes=size_t(current_bytes*cparams.n_rs_seq);cost.h2d_bytes=size_t(current_bytes*fraction);
+        cost.compute_ms+=current_bytes*rows/device_bytes_per_ms;
+    } else if (quote.representation==llama_recurrent_representation::gdn_fp32) {
+        const double factors=std::max(0.0,double(quote.state_bytes)-2*current_bytes);
+        cost.compute_ms+=(2*current_bytes+factors)/device_bytes_per_ms;
+        cost.restore_ms=fraction*(2*matrix+factors*prefix/rows)/device_bytes_per_ms;
+    } else cost.compute_ms+=current_bytes*(rows+1)/device_bytes_per_ms;
+    output=cost;return true;
+}
+
 bool llama_context::set_serial_recurrent_placement(llama_recurrent_representation representation,
         llama_recurrent_placement_plan * quote) {
     auto * hybrid=dynamic_cast<llama_memory_hybrid *>(memory.get());
@@ -7635,6 +7682,9 @@ bool llama_context::set_serial_recurrent_placement(llama_recurrent_representatio
     if (!quote && current==representation) return true;
     const auto phase=old_decode ?
         llama_memory_text_phase::decode : llama_memory_text_phase::prefill;
+    auto & cached=serial_recurrent_quotes[size_t(representation)];
+    if (quote && cached) return serial_recurrent_cost(*cached,*previous,phase,*quote,
+        current==representation ? &serial_recurrent_workspace_plan : nullptr);
     llama_compute_workspace_plan old_plan;
     std::vector<uint8_t> checkpoint;
     std::unique_ptr<llama_memory_recurrent> old;
@@ -7678,8 +7728,12 @@ bool llama_context::set_serial_recurrent_placement(llama_recurrent_representatio
             representation==llama_recurrent_representation::dense_host,true,true,
             representation==llama_recurrent_representation::gdn_fp32);
         if (!candidate->configure_selected_sequences({0}) ||
-                (representation==llama_recurrent_representation::gdn_fp32 && !candidate->compact_enabled()))
-            {LLAMA_LOG_ERROR("serial recurrent migration: provider unavailable\n");compute_memory->prepare_serial_target();return false;}
+                (representation==llama_recurrent_representation::gdn_fp32 && !candidate->compact_enabled())) {
+            if (quote) {
+                cached=std::make_unique<serial_recurrent_quote>();cached->representation=representation;
+            } else LLAMA_LOG_ERROR("serial recurrent migration: provider unavailable\n");
+            compute_memory->prepare_serial_target();return false;
+        }
         old=std::move(hybrid->mem_recr);hybrid->mem_recr=std::move(candidate);
         kv_resources=llama_memory_kv_resources_get(memory.get());
         cparams.recurrent_rollback_ram=representation==llama_recurrent_representation::dense_host;
@@ -7703,50 +7757,20 @@ bool llama_context::set_serial_recurrent_placement(llama_recurrent_representatio
         if (!state.current_storage_requirements(type,state_bytes) ||
                 (state.spill_enabled() && !state.spill_stage_requirements(stage_type,stage_bytes)))
             throw std::runtime_error("invalid serial recurrent storage quote");
-        llama_context_memory_create_result admission;
-        const auto admitted=compute_memory->quote_recurrent_state(state_bytes,stage_bytes,plan,phase,admission,pool_bytes);
         if (quote) {
-            llama_recurrent_placement_plan cost;cost.representation=representation;cost.peak_bytes=admission.required_bytes;
-            if (!admitted && admission.status!=llama_context_memory_create_status::insufficient_budget)
-                throw std::runtime_error("serial recurrent complete quote failed");
-            double current_bytes=0,matrix=0;
-            for (auto * tensor : state.r_l) if (tensor) current_bytes+=ggml_row_size(tensor->type,tensor->ne[0]);
-            for (auto * tensor : state.s_l) if (tensor) matrix+=ggml_row_size(tensor->type,tensor->ne[0]);
-            current_bytes+=matrix;
-            llama_kv_stream_memory_requirements resources;
-            const auto host=stream->host();
-            if (!host || !stream->memory_requirements(resources))
-                throw std::runtime_error("serial KV placement quote unavailable");
-            const auto tokens=stream->tokens()+cparams.n_rs_seq+1;
-            const auto & layout=host->layout();
-            const long double required=static_cast<long double>((tokens+255)/256*256)*
-                (layout.k_token_bytes+layout.v_token_bytes)*host->config().layers;
-            if (required>SIZE_MAX) throw std::runtime_error("serial KV placement quote overflow");
-            const auto available=pool_bytes>resources.pool_decode_min_bytes ? pool_bytes-resources.pool_decode_min_bytes : 0;
-            cost.kv_stream_bytes=required>available ? size_t(required)-available : 0;
-            constexpr double device_bytes_per_ms=512.0*1024*1024;
-            const double rows=cparams.n_rs_seq+1;
-            const auto events=previous->rollback_events>=serial_placement_rollbacks ?
-                previous->rollback_events-serial_placement_rollbacks : previous->rollback_events;
-            const auto prefix_rows=previous->rollback_prefix_rows>=serial_placement_prefix_rows ?
-                previous->rollback_prefix_rows-serial_placement_prefix_rows : previous->rollback_prefix_rows;
-            const double fraction=placement_steps ? std::min(1.0,double(events)/placement_steps) : .5;
-            const double prefix=events ? double(prefix_rows)/events : rows/2;
-            cost.compute_ms=model.size()/device_bytes_per_ms;
-            if (representation==llama_recurrent_representation::dense_host) {
-                cost.d2h_bytes=size_t(current_bytes*cparams.n_rs_seq);cost.h2d_bytes=size_t(current_bytes*fraction);
-                cost.compute_ms+=current_bytes*rows/device_bytes_per_ms;
-            } else if (representation==llama_recurrent_representation::gdn_fp32) {
-                const double factors=std::max(0.0,double(state_bytes)-2*current_bytes);
-                cost.compute_ms+=(2*current_bytes+factors)/device_bytes_per_ms;
-                cost.restore_ms=fraction*(2*matrix+factors*prefix/rows)/device_bytes_per_ms;
-            } else cost.compute_ms+=current_bytes*(rows+1)/device_bytes_per_ms;
+            auto prepared=std::make_unique<serial_recurrent_quote>();
+            prepared->representation=representation;prepared->workspace=std::move(plan);
+            prepared->state_bytes=state_bytes;prepared->publication_bytes=stage_bytes;prepared->supported=true;
+            llama_recurrent_placement_plan cost;
+            if (!serial_recurrent_cost(*prepared,*previous,phase,cost)) throw std::runtime_error("serial recurrent complete quote failed");
             hybrid->mem_recr=std::move(old);kv_resources=llama_memory_kv_resources_get(memory.get());
             cparams.recurrent_rollback_ram=old_ram;cparams.recurrent_rollback_compact=old_compact;cparams.kv_stream_decode=old_decode;
             sched_reserve_state.invalidate();
             if (!compute_memory->prepare_serial_target()) return false;
-            *quote=cost;return true;
+            cached=std::move(prepared);*quote=cost;return true;
         }
+        llama_context_memory_create_result admission;
+        const auto admitted=compute_memory->quote_recurrent_state(state_bytes,stage_bytes,plan,phase,admission,pool_bytes);
         if (!admitted) throw std::runtime_error("serial recurrent candidate exceeds arena budget");
         if (!compute_memory->begin_recurrent_replan()) throw std::runtime_error("recurrent replan gate rejected");
         begun=true;
@@ -7791,23 +7815,36 @@ bool llama_context::choose_serial_recurrent_placement(llama_memory_text_phase ph
     request.workload=(uint64_t(cparams.n_rs_seq)<<40) | (uint64_t(kv_resources.full->type_k())<<32) |
         (uint64_t(kv_resources.full->type_v())<<24) | (uint64_t(phase)<<20) | (stream->tokens()/16384);
     request.safe_boundary=true;
-    for (auto representation : {llama_recurrent_representation::dense_device,
-            llama_recurrent_representation::dense_host,llama_recurrent_representation::gdn_fp32}) {
-        llama_recurrent_placement_plan quote;
-        if (set_serial_recurrent_placement(representation,&quote)) request.plans.push_back(quote);
+    if (sched_reserve_state.begin()) for (auto & quote : serial_recurrent_quotes) quote.reset();
+    llama_recurrent_placement_state policy;llama_recurrent_placement_choice choice;
+    bool reused=false,chosen=false;
+    for (unsigned attempt=0;attempt<2 && !chosen;++attempt) {
+        reused=std::any_of(serial_recurrent_quotes.begin(),serial_recurrent_quotes.end(),[](const auto & quote){return bool(quote);});
+        request.plans.clear();
+        for (auto representation : {llama_recurrent_representation::dense_device,
+                llama_recurrent_representation::dense_host,llama_recurrent_representation::gdn_fp32}) {
+            llama_recurrent_placement_plan quote;
+            if (set_serial_recurrent_placement(representation,&quote)) request.plans.push_back(quote);
+        }
+        policy=serial_placement;
+        // Templates advise cost. A different winner is measured and admitted again before replacing storage.
+        chosen=llama_recurrent_placement_choose(request,policy,choice) && set_serial_recurrent_placement(choice.representation);
+        if (!chosen) {
+            if (!reused) return false;
+            for (auto & quote : serial_recurrent_quotes) quote.reset();
+        }
     }
-    auto policy=serial_placement;llama_recurrent_placement_choice choice;
-    if (!llama_recurrent_placement_choose(request,policy,choice) || !set_serial_recurrent_placement(choice.representation)) return false;
+    if (!chosen) return false;
     serial_placement=policy;serial_placement_choice=choice;serial_placement_generation=request.generation;
     serial_placement_workload=request.workload;serial_placement_phase=phase;
     placement_elapsed_ms=0;placement_steps=0;
     serial_placement_rollbacks=kv_resources.recurrent->rollback_events;
     serial_placement_prefix_rows=kv_resources.recurrent->rollback_prefix_rows;
     placement_expected_ms=phase==llama_memory_text_phase::decode ? choice.predicted_ms : 0;
-    LLAMA_LOG_INFO("rollback placement: provider=%s selected=1 history=%zu advisory_peak=%zu budget=%zu predicted_ms=%.3f safe_boundary=1 serial=1\n",
+    LLAMA_LOG_INFO("rollback placement: provider=%s selected=1 history=%zu advisory_peak=%zu budget=%zu predicted_ms=%.3f quote_reused=%d safe_boundary=1 serial=1\n",
         choice.representation==llama_recurrent_representation::gdn_fp32 ? "gdn-fp32" :
         choice.representation==llama_recurrent_representation::dense_host ? "dense-host" : "dense-device",
-        stream->tokens(),choice.peak_bytes,request.budget,choice.predicted_ms);
+        stream->tokens(),choice.peak_bytes,request.budget,choice.predicted_ms,reused);
     return true;
 }
 

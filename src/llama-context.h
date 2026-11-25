@@ -110,6 +110,7 @@ struct llama_context {
     // The frontend retains their RNG/grammar ownership through group retirement.
     LLAMA_API bool bind_group_samplers_from(const llama_context & prepared);
     // Internal phase-boundary operation; no model submission may be in progress.
+    // Cost templates are advisory; replacing storage always refreshes graph measurement and admission.
     LLAMA_API bool set_serial_recurrent_placement(llama_recurrent_representation representation,
         llama_recurrent_placement_plan * quote = nullptr);
     // Compose the measured group on one caller-retained parent, or allocate its first parent.
@@ -541,6 +542,16 @@ private:
     llama_memory_text_phase serial_placement_phase = llama_memory_text_phase::unspecified;
     uint64_t serial_placement_generation = 0, serial_placement_workload = 0;
     uint64_t serial_placement_rollbacks = 0, serial_placement_prefix_rows = 0;
+    struct serial_recurrent_quote {
+        llama_recurrent_representation representation = llama_recurrent_representation::dense_device;
+        llama_compute_workspace_plan workspace;
+        size_t state_bytes = 0, publication_bytes = 0;
+        bool supported = false;
+    };
+    std::array<std::unique_ptr<serial_recurrent_quote>,3> serial_recurrent_quotes;
+    bool serial_recurrent_cost(const serial_recurrent_quote & quote,const llama_memory_recurrent & current,
+        llama_memory_text_phase phase,llama_recurrent_placement_plan & cost,
+        const llama_compute_workspace_plan * current_workspace = nullptr) const;
     // Validated source context outlives this MTP context; no cross-context ownership cycle.
     llama_context * mtp_target_ctx = nullptr;
     llama_context * serial_target_ctx = nullptr;
