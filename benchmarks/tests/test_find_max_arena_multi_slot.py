@@ -6,6 +6,7 @@ import tempfile
 import json
 import urllib.request
 from unittest.mock import patch
+from typing import Any
 root = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('ms12_finder', root / 'benchmarks/find-max-arena.py')
 assert spec and spec.loader
@@ -116,11 +117,27 @@ class MultiSlotFinder(unittest.TestCase):
         self.assertEqual(finder.multi_slot_probe_profiles(args), [])
         self.assertEqual(finder.server_command(args, 1024)[finder.server_command(args, 1024).index('--parallel') + 1], '1')
 
+    def test_preflight_includes_a_wide_final_microbatch_for_draft_prefill(self):
+        args=self.args('--parallel','3','--context-size','262144','--probe-mode','preflight',
+                       '--spec-mode','dflash','--model-draft','draft.gguf','--decode-tokens','16')
+        profiles=finder.multi_slot_probe_profiles(args)
+        regular=next(row for row in profiles if row['label']=='joint')
+        wide=next(row for row in profiles if row['label']=='joint-wide-tail')
+        self.assertEqual(wide['slots'],[0,1,2])
+        self.assertEqual(wide['selected_max'],3)
+        self.assertLess(wide['prompt_tokens'][0],regular['prompt_tokens'][0])
+        chunk=min(args.batch_size,args.ubatch_size)//3
+        for held_back in range(args.draft_length+1):
+            self.assertGreater((wide['prompt_tokens'][0]-held_back)%chunk,16)
+        self.assertLessEqual(sum(wide['prompt_tokens'])+3*(args.decode_tokens+15),args.context_size)
+        full=self.args('--parallel','3','--context-size','262144','--probe-mode','full')
+        self.assertFalse(any(row['label']=='joint-wide-tail' for row in finder.multi_slot_probe_profiles(full)))
+
     def test_bounded_probes_cover_both_single_members_and_joint_group(self):
         args = self.args('--parallel', '2', '--probe-mode', 'preflight')
         profiles = finder.multi_slot_probe_profiles(args)
-        self.assertEqual([x['label'] for x in profiles], ['single-0', 'single-1', 'joint'])
-        self.assertEqual([x['slots'] for x in profiles], [[0], [1], [0, 1]])
+        self.assertEqual([x['label'] for x in profiles], ['single-0', 'single-1', 'joint', 'joint-wide-tail'])
+        self.assertEqual([x['slots'] for x in profiles], [[0], [1], [0, 1], [0, 1]])
         for x in profiles:
             self.assertLessEqual(sum(x['prompt_tokens']) + len(x['slots']) * (args.decode_tokens + 15), args.context_size)
 
@@ -167,8 +184,8 @@ class MultiSlotFinder(unittest.TestCase):
                 return rows if len(rows) == 2 else rows[0]
             with patch.object(finder, 'request_json', side_effect=request), patch.object(finder, 'request_completion_group', side_effect=request):
                 rows = finder.multi_slot_requests(args, 'http://unused', list(range(4096)), 1024, log)
-            self.assertEqual(len(calls), 3)
-            self.assertEqual(sum((len(row['responses']) for row in rows)), 4)
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(sum((len(row['responses']) for row in rows)), 6)
             self.assertEqual(rows[-1]['decode_selections'], [2])
 
     def test_paired_image_probe_requires_two_complete_independent_responses(self):
@@ -202,7 +219,7 @@ class MultiSlotFinder(unittest.TestCase):
     def test_copy_proof_charges_the_configured_cold_lookup_fallbacks(self):
         zero = dict(generated_tokens=0, accepted_tokens=0, accept_calls=0, prediction_forwards=0)
         timings = dict(draft_n=8, draft_n_accepted=8)
-        group = dict(label='image-copy', members=1, timings=timings, source_stats={
+        group: dict[str, Any] = dict(label='image-copy', members=1, timings=timings, source_stats={
             'draft-dflash': dict(zero, generated_tokens=1, accepted_tokens=1, accept_calls=1, prediction_forwards=1),
             'ngram-map-k4v': dict(zero, generated_tokens=7, accepted_tokens=7, accept_calls=1)})
         with patch.object(finder, 'validate_mixed_sources', return_value={'draft-dflash': {}, 'ngram-map-k4v': {}}):

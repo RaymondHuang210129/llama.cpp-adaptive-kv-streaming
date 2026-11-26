@@ -338,6 +338,7 @@ std::unique_ptr<llama_kv_stream_mtp_proxy> llama_kv_stream_mtp_proxy::create(
         [](void *) { return false; },
         [](void *) {},
         [](void * p) { delete static_cast<std::shared_ptr<implementation> *>(p); },
+        true,true,
     };
     auto holder = std::make_unique<std::shared_ptr<implementation>>(result->impl);
     result->proxy.reset(state.cache->host()->execution_buffer(device,

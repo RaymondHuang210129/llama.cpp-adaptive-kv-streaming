@@ -5,6 +5,9 @@
 #include <cstring>
 #include <climits>
 
+struct ggml_backend_cuda_context;
+bool ggml_cuda_operator_workspace_prepare_native(ggml_backend_cuda_context & ctx,const ggml_tensor * op);
+
 struct ggml_cuda_operator_tile_traits {
     int occupancy = 0, nbatch = 0, threads = 0;
 };

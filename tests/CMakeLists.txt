@@ -406,11 +406,22 @@ llama_test_cmd(${CMAKE_COMMAND} NAME test-cuda-kv-runtime-config
 if (GGML_CUDA AND GGML_CUDA_FA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    if (TARGET test-memory-workspace)
+        foreach(MODE IN ITEMS text scheduler native-text)
+            add_test(NAME test-cuda-arena-${MODE} COMMAND ${CMAKE_COMMAND} -E env
+                GGML_CUDA_TRACE_SCRATCH=1 $<TARGET_FILE:test-memory-workspace> --cuda-${MODE})
+        endforeach()
+    endif()
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET test-memory-workspace)
         add_library(test-cuda-workspace-faults SHARED test-cuda-workspace-faults.cpp)
         target_link_libraries(test-cuda-workspace-faults PRIVATE CUDA::cublas ${CMAKE_DL_LIBS})
         add_test(NAME test-cuda-workspace-failures COMMAND ${CMAKE_COMMAND} -E env
             LD_PRELOAD=$<TARGET_FILE:test-cuda-workspace-faults> $<TARGET_FILE:test-memory-workspace> --cuda-library-failures)
+        add_test(NAME test-cuda-arena-idle-sync COMMAND ${CMAKE_COMMAND} -E env
+            LD_PRELOAD=$<TARGET_FILE:test-cuda-workspace-faults> $<TARGET_FILE:test-memory-workspace> --cuda-idle-sync)
+        add_test(NAME test-cuda-arena-recovery COMMAND ${CMAKE_COMMAND} -E env
+            GGML_CUDA_TRACE_SCRATCH=1 LD_PRELOAD=$<TARGET_FILE:test-cuda-workspace-faults>
+            $<TARGET_FILE:test-memory-workspace> --cuda-scheduler-failures)
         add_test(NAME test-cuda-vision-workspace-failures COMMAND ${CMAKE_COMMAND} -E env
             LD_PRELOAD=$<TARGET_FILE:test-cuda-workspace-faults> $<TARGET_FILE:test-mtmd-workspace> --cuda-operator-failures)
     endif()

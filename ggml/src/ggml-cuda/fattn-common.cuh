@@ -1018,6 +1018,11 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Shape queries follow the native selector and stop before storage or kernel submission.
+bool ggml_cuda_fattn_workspace_query_launch(ggml_backend_cuda_context & ctx,const ggml_tensor * dst,
+        fattn_kernel_t kernel,int threads,size_t shared_bytes,int batch,int value_width,
+        int columns,int head_columns,bool stream_k,bool sparse,bool async_kv_preload);
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1025,6 +1030,8 @@ void launch_fattn(
     const int warp_size = WARP_SIZE, const bool async_kv_preload = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
+    if (ggml_cuda_fattn_workspace_query_launch(ctx,dst,fattn_kernel,nwarps*warp_size,nbytes_shared,
+            nbatch_fa,DV,ncols1,ncols2,stream_k,use_sparse,async_kv_preload)) return;
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];

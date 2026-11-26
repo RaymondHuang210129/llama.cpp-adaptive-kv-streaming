@@ -461,6 +461,70 @@ class FinderCapacity(unittest.TestCase):
             self.assertTrue(fit.call_args.kwargs["report_vision"])
             self.assertEqual(fit.call_args.args[0].image,[])
 
+    def test_fixed_image_budget_rejects_missing_or_conflicting_configuration(self):
+        module=self.finder()
+        for options in (["--model","model","--fixed-image-budget"],
+                        ["--model","model","--mmproj","projector","--fixed-image-budget"],
+                        ["--model","model","--mmproj","projector","--image","photo.png","--image-max-tokens","128","--fixed-image-budget"]):
+            with self.subTest(options=options),contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
+                module.arguments(options)
+
+    def test_fixed_image_budget_probes_requested_budget_for_every_ratio(self):
+        module,plan=self.plan()
+        args=module.arguments(["--model","model","--mmproj","projector","--image-max-tokens","128","--fixed-image-budget"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"vision_plan_probe",return_value=plan),patch.object(module,"_runtime_probe",return_value={"fits":True}) as probe:
+                module.probe_with_vision(args,1024)
+            config=probe.call_args.args[0]
+            self.assertEqual(config.image_min_tokens,64)
+            self.assertEqual(config.image_max_tokens,128)
+            self.assertEqual({row["ratio"] for row in config._vision_bootstrap},set(module.VISION_RATIOS))
+            self.assertTrue(all(row["shape"]["image_max_tokens"]==128 for row in config._vision_bootstrap))
+
+    def test_fixed_image_budget_never_downgrades_an_unadmitted_budget(self):
+        module,plan=self.plan();plan["ratios"][0]["budget_shape_ids"][128-plan["min_image_tokens"]]=-1
+        args=module.arguments(["--model","model","--mmproj","projector","--image-max-tokens","128","--fixed-image-budget"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"vision_plan_probe",return_value=plan),patch.object(module,"_runtime_probe") as probe:
+                with self.assertRaisesRegex(RuntimeError,"fixed image budget"):
+                    module.probe_with_vision(args,1024)
+            probe.assert_not_called()
+
+    def test_fixed_image_budget_quota_rejection_remains_a_lower_bound(self):
+        module,plan=self.plan()
+        plan["ratios"][0]["budget_shape_ids"][128-plan["min_image_tokens"]]=-1
+        plan["ratios"][0]["minimum_rejected_bytes"]=1025*1048576
+        plan["ratios"][1]["minimum_rejected_bytes"]=2048*1048576
+        args=module.arguments(["--model","model","--mmproj","projector","--image-max-tokens","128","--fixed-image-budget"])
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(module,"vision_plan_probe",return_value=plan),patch.object(module,"_runtime_probe") as probe:
+                with self.assertRaises(module.SWEEP.ArenaTooSmallError) as error:
+                    module.probe_with_vision(args,1024)
+                self.assertEqual(error.exception.minimum_mib,1025)
+                probe.assert_not_called()
+
+    def test_fixed_image_budget_requires_a_complete_common_sequence(self):
+        module,plan=self.plan()
+        args=module.arguments(["--model","model","--mmproj","projector","--image-max-tokens","128","--fixed-image-budget"])
+        for succeeds in (True,False):
+            with self.subTest(succeeds=succeeds),tempfile.TemporaryDirectory() as directory:
+                args.output=Path(directory)
+                receipt={"fits":succeeds,"record":"sequence.json"}
+                with patch.object(module,"vision_common_sequence",return_value=receipt) as sequence,patch.object(module,"probe") as probe:
+                    if succeeds:
+                        capacity=module.vision_capacity(args,1024,plan)
+                        self.assertEqual(capacity["common_image_max_tokens"],128)
+                        self.assertTrue(capacity["all_ratios_validated"])
+                        self.assertEqual(len(capacity["ratios"]),7)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError,"fixed image budget"):
+                            module.vision_capacity(args,1024,plan)
+                    self.assertEqual(sequence.call_args.args[3],128)
+                    probe.assert_not_called()
+
     def test_auto_probe_keeps_the_text_workload_and_adds_a_minimum_image(self):
         module,plan=self.plan()
         args=module.arguments(["--model","model","--mmproj","projector"])

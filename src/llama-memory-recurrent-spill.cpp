@@ -601,7 +601,7 @@ std::unique_ptr<llama_recurrent_spill_bank> llama_recurrent_spill_bank::create_m
                      (op->src[1]->view_src && std::find(publication->planes.begin(),publication->planes.end(),op->src[1]->view_src)!=publication->planes.end()));
             },
             [](void *,ggml_backend_t,ggml_tensor *) {return GGML_STATUS_FAILED;},
-            [](void *) {return false;},[](void *) {},[](void *) {}};
+            [](void *) {return false;},[](void *) {},[](void *) {},true};
         const ggml_backend_execution_io io{state.get(),
             [](void *,const ggml_tensor *,void *,size_t,size_t) {return false;},
             [](void *,const ggml_tensor *,const void *,size_t,size_t) {return false;},
@@ -657,6 +657,7 @@ bool llama_recurrent_spill_bank::enable_publication(
             [](void *) { return false; },
             [](void *) {},
             [](void *) {},
+            true,
         };
         next->execution=ggml_backend_execution_buffer_new(device,s.host,ops,&s);
         if (!next->execution) return false;

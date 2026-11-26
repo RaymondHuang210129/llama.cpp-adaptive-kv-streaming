@@ -3,6 +3,11 @@
 #define CUDA_ARGSORT_BLOCK_SIZE 1024
 
 void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+struct ggml_backend_operator_workspace;
+bool ggml_cuda_argsort_cub_workspace_plan(int columns,int rows,ggml_sort_order order,
+        ggml_backend_operator_workspace & output);
+bool ggml_cuda_argsort_workspace_plan(ggml_backend_cuda_context & ctx,const ggml_tensor * op,
+        ggml_backend_operator_workspace & output);
 
 int ggml_cuda_chunk_nrows(const size_t row_bytes, const int64_t nrows);
 

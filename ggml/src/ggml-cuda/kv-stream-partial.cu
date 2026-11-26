@@ -6,6 +6,7 @@
 #include "fattn-plan-cache.h"
 #include "convert.cuh"
 #include "fattn.cuh"
+#include "scratch-plan.h"
 #include "../ggml-backend-impl.h"
 #include "../ggml-backend-execution.h"
 #include "../ggml-kv-stream.h"
@@ -320,6 +321,7 @@ static bool direct(ggml_backend_t backend, const ggml_tensor * op) {
     output.end = address+required;
     for (int i = 0; i < 4; ++i) { span input; if (!tensor_span(backend,op->src[i],input) || overlap(input,output)) return false; }
     auto & ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (!ggml_cuda_operator_workspace_prepare_native(ctx,op)) return false;
     ggml_cuda_flash_attn_ext_selected(ctx,const_cast<ggml_tensor *>(op),description.family);
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); return true;
 }

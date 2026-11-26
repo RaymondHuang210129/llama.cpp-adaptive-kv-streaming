@@ -49,3 +49,21 @@ extern "C" __attribute__((visibility("default"))) cublasStatus_t cublasSetWorksp
     if (inject && result==CUBLAS_STATUS_SUCCESS) { ++hits;return CUBLAS_STATUS_INTERNAL_ERROR; }
     return result;
 }
+
+extern "C" __attribute__((visibility("default"))) void ggml_test_cuda_stream_create_faults(int);
+extern "C" __attribute__((visibility("default"))) int ggml_test_cuda_stream_create_calls();
+static std::atomic<int> stream_remaining{0},stream_calls{0};
+extern "C" __attribute__((visibility("default"))) void ggml_test_cuda_stream_create_faults(int count) {
+    stream_calls=0;stream_remaining=count;
+}
+extern "C" __attribute__((visibility("default"))) int ggml_test_cuda_stream_create_calls() { return stream_calls.load(); }
+extern "C" __attribute__((visibility("default"))) cudaError_t cudaStreamCreateWithFlags(cudaStream_t * stream,unsigned int flags) {
+    using function_t=decltype(&cudaStreamCreateWithFlags);
+    static auto actual=reinterpret_cast<function_t>(dlsym(RTLD_NEXT,"cudaStreamCreateWithFlags"));
+    if (!actual) std::abort();
+    ++stream_calls;
+    int count=stream_remaining.load();
+    while (count>0 && !stream_remaining.compare_exchange_weak(count,count-1)) {}
+    if (count>0) { *stream=nullptr;return cudaErrorMemoryAllocation; }
+    return actual(stream,flags);
+}

@@ -230,6 +230,13 @@ ggml_backend_buffer_t ggml_backend_execution_buffer_new_address_space(ggml_backe
 
 bool ggml_backend_buft_is_execution(ggml_backend_buffer_type_t type) { return type && type->iface.get_name == execution_name; }
 
+bool ggml_backend_execution_workspace_bounded(ggml_backend_buffer_t owner) {
+    return owner && ggml_backend_buft_is_execution(owner->buft) && storage(owner).ops.bounded_workspace;
+}
+bool ggml_backend_execution_uses_native_workspace(ggml_backend_buffer_t owner) {
+    return owner && ggml_backend_buft_is_execution(owner->buft) && storage(owner).ops.native_workspace;
+}
+
 // A graph node may use one managed storage owner, never combine unrelated execution domains implicitly.
 bool ggml_backend_execution_owner(const ggml_tensor * op,ggml_backend_buffer_t & owner) {
     owner = nullptr;

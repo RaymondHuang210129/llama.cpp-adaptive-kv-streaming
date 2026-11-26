@@ -137,38 +137,65 @@ bool ggml_cuda_mmq_workspace_plan(const ggml_tensor * a,const ggml_tensor * b,co
         int cc,size_t shared_bytes,int nsm,ggml_backend_operator_workspace & output,int * selected_columns,int * selected_threads) {
     size_t na,nb,nd;
     if (!ggml_cuda_operator_elements(a,na) || !ggml_cuda_operator_elements(b,nb) ||
-            !ggml_cuda_operator_elements(dst,nd) || a->type!=GGML_TYPE_Q8_0 || b->type!=GGML_TYPE_F32 ||
+            !ggml_cuda_operator_elements(dst,nd) || !ggml_is_quantized(a->type) || b->type!=GGML_TYPE_F32 ||
             dst->type!=GGML_TYPE_F32 || a->nb[0]!=ggml_type_size(a->type) || b->nb[0]!=sizeof(float) ||
             a->ne[0]!=b->ne[0] || dst->ne[0]!=a->ne[1] || dst->ne[1]!=b->ne[1] ||
             dst->ne[2]!=b->ne[2] || dst->ne[3]!=b->ne[3]) return false;
     const auto precision=(ggml_prec)ggml_get_op_params_i32(dst,0);
-    if (precision!=GGML_PREC_UNDEFINED && precision!=GGML_PREC_Q8 && precision!=GGML_PREC_Q4) return false;
+    if (precision!=GGML_PREC_UNDEFINED && precision!=GGML_PREC_F32 && precision!=GGML_PREC_Q8 && precision!=GGML_PREC_Q4) return false;
     const bool fallback=ggml_cuda_mmq_needs_fallback(a->ne[1]);
     const auto prec=ggml_cuda_mmq_get_prec_src1(a,dst,cc);
-    int best_columns=0,best_threads=0,best_tiles=INT_MAX;
-    for (int columns=8;columns<=128 && best_tiles>1;columns+=8) {
-        const auto config=ggml_cuda_mmq_get_config(a->type,columns,fallback,cc,prec);
-        if (config.type==GGML_TYPE_COUNT || mmq_get_nbytes_shared(config,cc)>shared_bytes) continue;
-        const int64_t tiles=(b->ne[1]+config.J-1)/config.J;
-        if (tiles<best_tiles) { best_columns=columns;best_threads=config.nthreads;best_tiles=int(tiles); }
+    struct selection {
+        ggml_type type=GGML_TYPE_COUNT;
+        ggml_prec precision=GGML_PREC_UNDEFINED;
+        int cc=0,columns=0,threads=0,I=0,J=0;
+        int64_t rows=0;
+        size_t shared=0;
+        bool fallback=false,stream_k=false;
+    };
+    static thread_local std::array<selection,64> selections;
+    const size_t index=(size_t(b->ne[1]^(b->ne[1]>>6))*17+size_t(a->type)*13+size_t(prec)*7+size_t(fallback))%selections.size();
+    auto & selected=selections[index];
+    if (selected.type!=a->type || selected.precision!=prec || selected.cc!=cc ||
+            selected.rows!=b->ne[1] || selected.shared!=shared_bytes || selected.fallback!=fallback) {
+        selection next;next.type=a->type;next.precision=prec;next.cc=cc;next.rows=b->ne[1];
+        next.shared=shared_bytes;next.fallback=fallback;
+        int64_t best_tiles=INT64_MAX;
+        for (int columns=8;columns<=128 && best_tiles>1;columns+=8) {
+            const auto config=ggml_cuda_mmq_get_config(a->type,columns,fallback,cc,prec);
+            if (config.type==GGML_TYPE_COUNT || mmq_get_nbytes_shared(config,cc)>shared_bytes) continue;
+            const int64_t tiles=b->ne[1]/config.J+(b->ne[1]%config.J!=0);
+            if (tiles<best_tiles) {
+                next.columns=columns;next.threads=config.nthreads;next.I=config.I;next.J=config.J;
+                next.stream_k=config.stream_k;best_tiles=tiles;
+            }
+        }
+        if (!next.columns || !next.threads) return false;
+        selected=next;
     }
-    if (best_columns<=0 || best_threads<=0) return false;
+    // Only tile selection is cached. Current tensor dimensions still determine every scratch byte.
+    const int best_columns=selected.columns,best_threads=selected.threads;
     size_t padded;
     if (!ggml_backend_operator_workspace_align(size_t(b->ne[0]),MATRIX_ROW_PADDING,padded)) return false;
     size_t bytes=padded;
     for (int i=1;i<GGML_MAX_DIMS;++i) if (!ggml_cuda_operator_product(bytes,size_t(b->ne[i]))) return false;
-    if (!ggml_cuda_operator_product(bytes,sizeof(block_q8_1_mmq))) return false;
-    bytes/=QK8_1_MMQ;
+    const bool native_fp4=prec==GGML_PREC_Q4;
+    if (!ggml_cuda_operator_product(bytes,native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq))) return false;
+    bytes/=native_fp4 ? QK_FP4_MMQ : QK8_1_MMQ;
     const size_t load=size_t(best_threads)*sizeof(int),raw=size_t(best_columns)*sizeof(block_q8_1_mmq);
     if (raw>SIZE_MAX-(load-1)) return false;
     const size_t padding=(raw+load-1)/load*load;
     if (bytes>SIZE_MAX-padding) return false;
     ggml_backend_operator_workspace next;
     if (!ggml_backend_operator_workspace_add(next,bytes+padding)) return false;
-    const auto config=ggml_cuda_mmq_get_config(a->type,best_columns,fallback,cc,prec);
+    if (a->type==GGML_TYPE_NVFP4 && native_fp4) {
+        size_t scales=sizeof(float);
+        for (int i=1;i<GGML_MAX_DIMS;++i) if (!ggml_cuda_operator_product(scales,size_t(b->ne[i]))) return false;
+        if (!ggml_backend_operator_workspace_add(next,scales)) return false;
+    }
     size_t fixup;
-    if (!ggml_cuda_mmq_fixup_workspace(a->ne[1],b->ne[1],b->ne[2],b->ne[3],config.I,config.J,nsm,
-            config.stream_k,GGML_CUDA_CC_IS_NVIDIA(cc),fixup) || !ggml_backend_operator_workspace_add(next,fixup)) return false;
+    if (!ggml_cuda_mmq_fixup_workspace(a->ne[1],b->ne[1],b->ne[2],b->ne[3],selected.I,selected.J,nsm,
+            selected.stream_k,GGML_CUDA_CC_IS_NVIDIA(cc),fixup) || !ggml_backend_operator_workspace_add(next,fixup)) return false;
     output=next;
     if (selected_columns) *selected_columns=best_columns;
     if (selected_threads) *selected_threads=best_threads;

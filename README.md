@@ -210,7 +210,18 @@ if ($OceanusMMProj) {
 }
 ```
 
-The finder will check image shapes and supply fitted image limits in step 7. Multiple images or different workloads can require another fit.
+The finder will check image shapes and supply fitted image limits in step 7. Multiple images or different workloads can require another fit. Full validation is required for long histories: if a preflight candidate runs out of physical memory during validation, the finder searches the full workload for a valid size without an automatic reserve.
+
+To keep a required image budget, add `--fixed-image-budget` to the finder. For example, these settings fit the arena while retaining 4,096 image tokens for every reported aspect ratio:
+
+```bash
+FIT+=(--image-max-tokens 4096 --fixed-image-budget)
+```
+
+```powershell
+$FIT += @('--image-max-tokens', '4096', '--fixed-image-budget')
+```
+
 
 ### 4. Choose the drafting mode
 

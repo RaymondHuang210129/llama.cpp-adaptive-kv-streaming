@@ -37,6 +37,8 @@ using ggml_backend_operator_workspace_graph_query_t = ggml_backend_operator_work
 using ggml_backend_operator_workspace_bind_t = ggml_backend_operator_workspace_status (*)(
     ggml_backend_t,const ggml_backend_operator_workspace_binding *);
 using ggml_backend_operator_workspace_release_t = ggml_backend_operator_workspace_status (*)(ggml_backend_t);
+// Controllers reject unbound work that needs scratch; nested measurement schedulers retain independent claims.
+using ggml_backend_operator_workspace_control_t = ggml_backend_operator_workspace_status (*)(ggml_backend_t,bool);
 
 static inline bool ggml_backend_operator_workspace_align(size_t bytes,size_t alignment,size_t & output) {
     if (!alignment || (alignment&(alignment-1)) || bytes>SIZE_MAX-(alignment-1)) return false;

@@ -8,6 +8,9 @@ struct ggml_backend_execution_ops {
     bool (*can_write)(void * context);
     void (*modified)(void * context);
     void (*destroy)(void * context);
+    // Replacement storage is admitted before compute; no native scratch pool may grow.
+    bool bounded_workspace = false;
+    bool native_workspace = false;
 };
 
 // Checked byte access for a logical address space with partially backed host ranges.
@@ -30,6 +33,8 @@ GGML_API ggml_backend_buffer_t ggml_backend_execution_buffer_new_address_space(g
         const ggml_backend_execution_io & io, void * context);
 GGML_API bool ggml_backend_buft_is_execution(ggml_backend_buffer_type_t type);
 GGML_API bool ggml_backend_execution_buffers_present();
+GGML_API bool ggml_backend_execution_workspace_bounded(ggml_backend_buffer_t owner);
+GGML_API bool ggml_backend_execution_uses_native_workspace(ggml_backend_buffer_t owner);
 // Multiple unrelated owners are rejected. A null owner means ordinary storage.
 GGML_API bool ggml_backend_execution_owner(const ggml_tensor * op, ggml_backend_buffer_t & owner);
 GGML_API bool ggml_backend_execution_supports(ggml_backend_buffer_t owner, ggml_backend_dev_t device, const ggml_tensor * op);

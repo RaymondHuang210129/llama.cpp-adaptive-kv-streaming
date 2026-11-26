@@ -169,7 +169,8 @@ std::unique_ptr<llama_kv_stream_read_proxy> llama_kv_stream_read_proxy::create(l
             [](void * p,ggml_backend_t backend,ggml_tensor * op) { return (*static_cast<std::shared_ptr<implementation> *>(p))->compute(backend,op); },
             [](void *) { return false; },
             [](void *) {},
-            [](void * p) { delete static_cast<std::shared_ptr<implementation> *>(p); }
+            [](void * p) { delete static_cast<std::shared_ptr<implementation> *>(p); },
+            true,true,
         };
         auto context=std::make_unique<std::shared_ptr<implementation>>(state);
         std::unique_ptr<llama_kv_stream_read_proxy> result(new llama_kv_stream_read_proxy);
@@ -783,7 +784,8 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
             },
             [](void * p) { auto & s = **static_cast<std::shared_ptr<implementation> *>(p); return !s.session || !s.session->active(); },
             [](void * p) { (*static_cast<std::shared_ptr<implementation> *>(p))->modified(); },
-            [](void * p) { delete static_cast<std::shared_ptr<implementation> *>(p); }
+            [](void * p) { delete static_cast<std::shared_ptr<implementation> *>(p); },
+            s->config.shared_device_memory_bytes!=0,true,
         };
         auto owner = std::make_unique<std::shared_ptr<implementation>>(s);
         std::unique_ptr<llama_kv_stream_model> result(new llama_kv_stream_model);
@@ -1595,6 +1597,7 @@ std::unique_ptr<llama_kv_stream_group_model> llama_kv_stream_group_model::create
             [](void * p) {const auto & s=**static_cast<state *>(p);return !s.active && !s.projection;},
             [](void *) {},
             [](void * p) {delete static_cast<state *>(p);},
+            true,
         };
         const ggml_backend_execution_io io{
             s.get(),

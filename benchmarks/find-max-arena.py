@@ -88,6 +88,8 @@ def arguments(argv=None):
     parser.add_argument("--ubatch-size", type=int, default=256)
     parser.add_argument("--image-min-tokens", type=int, help="minimum image budget (auto: projector metadata; explicit images: 64)")
     parser.add_argument("--image-max-tokens", type=int, help="image-budget search ceiling (auto: projector metadata; explicit images: 4096)")
+    parser.add_argument("--fixed-image-budget", action="store_true",
+                        help="fit the arena with --image-max-tokens fixed for every reported ratio; requires --mmproj and no --image")
     parser.add_argument("--initial-arena-mib", type=int, default=2240, help="optional initial search guess, not the final arena size or a safety reserve")
     parser.add_argument("--port", type=int, default=1249)
     parser.add_argument("--request-timeout", type=float, default=3600)
@@ -99,6 +101,8 @@ def arguments(argv=None):
         parser.error("decode-window measurement needs at least two output tokens")
     if sum((args.recurrent_rollback_ram,args.recurrent_rollback_compact,args.recurrent_rollback_auto))>1:
         parser.error("RAM, compact and automatic rollback policies are mutually exclusive")
+    if args.fixed_image_budget and (not args.mmproj or args.image or args.image_max_tokens is None):
+        parser.error("--fixed-image-budget requires --mmproj, an explicit --image-max-tokens and no --image")
     if args.image:
         if args.image_min_tokens is None:args.image_min_tokens=64
         if args.image_max_tokens is None:args.image_max_tokens=4096
@@ -295,6 +299,13 @@ def multi_slot_probe_profiles(args):
     profiles = [{"label":f"single-{slot}", "slots":[slot], "prompt_tokens":[count], "selected_max":1}
                 for slot in range(slots)]
     profiles.append({"label":"joint", "slots":list(range(active)), "prompt_tokens":[joint] * active, "selected_max":active})
+    if args.probe_mode == "preflight":
+        chunk=max(1,min(args.batch_size,args.ubatch_size or args.batch_size)//active)
+        wide=joint-(joint+1)%chunk
+        if 0<wide<joint:
+            # A nearly full tail exercises dispatch routes omitted by an aligned short prompt.
+            profiles.append({"label":"joint-wide-tail", "slots":list(range(active)),
+                             "prompt_tokens":[wide]*active, "selected_max":active})
     if slots > 2 and active > 1:
         profiles.append({"label":"asymmetric", "slots":list(range(active)),
                          "prompt_tokens":[max(1, joint // 2)] + [joint] * (active - 1), "selected_max":active})
@@ -872,10 +883,21 @@ def probe_with_vision(args, candidate):
         if minimum <= candidate *1048576:
             raise RuntimeError("no supported image shape is admitted by the selected configuration")
         raise SWEEP.ArenaTooSmallError((minimum +1048575) //1048576)
-    offset=next((i for i in range(plan["effective_image_max_tokens"] -plan["min_image_tokens"] +1)
-                 if all(row["budget_shape_ids"][i]>0 for row in plan["ratios"])),None)
-    if offset is None:raise RuntimeError("no common image budget is admitted for all listed ratios")
-    budget=plan["min_image_tokens"] +offset
+    if getattr(args,"fixed_image_budget",False):
+        budget=args.image_max_tokens
+        index=budget-plan["min_image_tokens"]
+        if index<0 or budget>plan["effective_image_max_tokens"]:
+            raise RuntimeError("fixed image budget is outside the projector's supported budget range")
+        rejected=[row for row in plan["ratios"] if row["budget_shape_ids"][index]<=0]
+        if rejected:
+            minimum=max(((row.get("minimum_rejected_bytes") or 0) for row in rejected),default=0)
+            if minimum>candidate*1048576:raise SWEEP.ArenaTooSmallError((minimum+1048575)//1048576)
+            raise RuntimeError("fixed image budget is not admitted for every reported aspect ratio")
+    else:
+        offset=next((i for i in range(plan["effective_image_max_tokens"] -plan["min_image_tokens"] +1)
+                     if all(row["budget_shape_ids"][i]>0 for row in plan["ratios"])),None)
+        if offset is None:raise RuntimeError("no common image budget is admitted for all listed ratios")
+        budget=plan["min_image_tokens"] +offset
     bootstrap=[]
     for row in plan["ratios"]:
         shape=vision_shape_at_budget(plan,row,budget)
@@ -945,6 +967,18 @@ def vision_capacity(args, candidate, plan):
               "scope":"Per-source-aspect single-image capacity. The native planner measures every budget; runtime uses a boundary search ordered by processed token count. These are validated fits, not proof that every larger shape fails. Native alignment can change the processed ratio. Independent maxima have row-specific settings; the common command is validated for all listed ratios. Arbitrary ratios and image batches are not validated."}
     directory = args.output /"vision-capacity"
     directory.mkdir()
+    if getattr(args,"fixed_image_budget",False):
+        budget=args.image_max_tokens
+        sequence=vision_common_sequence(args,candidate,plan,budget,directory /("common-sequence-"+str(budget)))
+        if not sequence["fits"]:
+            raise RuntimeError("fixed image budget failed its common runtime sequence; no launch command published")
+        rows=[{"ratio":row["ratio"],"maximum":dict(vision_shape_at_budget(plan,row,budget),validated=True,
+               record=sequence["record"],limiting_factor="fixed_image_budget")} for row in plan["ratios"]]
+        result.update(ratios=rows,common={"image_max_tokens":budget,"ratios":rows,"validated":True,"sequence":sequence},
+                      common_image_max_tokens=budget,all_ratios_validated=True,
+                      scope="Fixed image budget validated for every reported aspect ratio in one server lifetime; no image-budget downgrade.")
+        (directory /"results.json").write_text(json.dumps(result,indent=2)+"\n")
+        return result
     cache = {}
 
     def check(ratio,shape,attempt):
@@ -1062,7 +1096,8 @@ def fit(args, report_vision=False):
         sys.stdout.write(str(json.dumps(logged)) + "\n")
         sys.stdout.flush()
         return record["fits"]
-    maximum = SWEEP.find_max_arena_mib(args.initial_arena_mib, checked)
+    maximum = (SWEEP.find_max_arena_mib(args.initial_arena_mib, checked, upper_limit=args._arena_upper_limit)
+               if hasattr(args,"_arena_upper_limit") else SWEEP.find_max_arena_mib(args.initial_arena_mib, checked))
     next_rejected = any(row["arena_mib"] == maximum +1 and not row["fits"] for row in records)
     selected = next((row for row in records if row["arena_mib"] == maximum and row.get("fits")), None)
     runtime_validated = selected is not None and selected.get("timings") is not None
@@ -1095,6 +1130,21 @@ def fit(args, report_vision=False):
             raise RuntimeError(f"selected arena full workload validation failed: {error}; see {full.output}") from error
         (full.output /"record.json").write_text(json.dumps(selected_validation,indent=2) +"\n")
         if not selected_validation["fits"]:
+            if args.probe_mode=="preflight" and selected_validation.get("limiting_factor")=="runtime_capacity" and maximum>1:
+                retry=argparse.Namespace(**vars(command_args))
+                retry.probe_mode,retry.validate_selected="full",False
+                retry.output=args.output /"full-search";retry.output.mkdir()
+                retry.initial_arena_mib=maximum-1;retry._arena_upper_limit=maximum-1
+                if capacity:retry.fixed_image_budget=True
+                print("Preflight did not fit the full workload; fitting the full workload without a reserve.",flush=True)
+                report=fit(retry,report_vision=report_vision)
+                report["preflight_arena_mib"]=maximum
+                report["preflight_full_validation_record"]=str(full.output /"record.json")
+                if report["arena_mib"]==maximum-1:report["next_mib_rejected"]=maximum
+                (args.output /"result.json").write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
+                (args.output /"command.txt").write_text(report["shell_command"]+"\n",encoding="utf-8")
+                (args.output /"command.ps1").write_text(report["powershell_command"]+"\n",encoding="utf-8-sig")
+                return report
             raise RuntimeError(f"selected arena failed full workload validation; no fit published; see {full.output}")
         if capacity and selected_validation.get("command") != server_command(command_args,maximum):
             raise RuntimeError("full workload validation used a different vision launch configuration")
@@ -1121,6 +1171,7 @@ def fit(args, report_vision=False):
               "model_draft":str(args.model_draft) if args.model_draft else None,
               "prompt_file":str(args.prompt_file) if args.prompt_file else None,
               "projector_configured":bool(args.mmproj), "vision_capacity":capacity,
+              "fixed_image_budget":getattr(args,"fixed_image_budget",False),
               "vision_execution_validated":runtime_validated and (bool(args.image) or bool((selected or {}).get("vision_bootstrap"))),
               "probe_mode":args.probe_mode, "runtime_probe_validated":runtime_validated,
               "startup_warmup":not args.no_warmup,

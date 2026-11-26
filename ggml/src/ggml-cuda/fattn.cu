@@ -10,6 +10,113 @@
 #include "fattn-plan-cache.h"
 #include "../ggml-kv-stream-device.h"
 #include "../ggml-backend-execution.h"
+#include "scratch-plan.h"
+
+namespace {
+struct fattn_workspace_query {
+    ggml_backend_operator_workspace plan;
+    bool complete=false,valid=false;
+};
+thread_local fattn_workspace_query * fattn_query=nullptr;
+}
+
+bool ggml_cuda_fattn_workspace_query_launch(ggml_backend_cuda_context & ctx,const ggml_tensor * dst,
+        fattn_kernel_t kernel,int threads,size_t shared_bytes,int batch,int value_width,
+        int columns,int head_columns,bool stream_k,bool sparse,bool async_kv_preload) {
+    if (!fattn_query) return false;
+    auto & query=*fattn_query;query.complete=true;
+    const auto describe=[&](ggml_backend_operator_workspace & output) {
+        const auto * q=dst->src[0];const auto * k=dst->src[1];const auto * v=dst->src[2];
+        const auto * mask=dst->src[3];
+        size_t elements;
+        for (auto * tensor : {q,k,v,dst}) if (!ggml_cuda_operator_elements(tensor,elements)) return false;
+        if (!kernel || threads<=0 || batch<=0 || columns<=0 || head_columns<=0 || value_width<=0 ||
+                q->ne[2]%k->ne[2] || k->ne[1]!=v->ne[1]) return false;
+        const auto & device=ggml_cuda_info().devices[ctx.device];
+        int occupancy=0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy,kernel,threads,shared_bytes)!=cudaSuccess ||
+                occupancy<=0 || occupancy>32 || device.nsm<=0 || device.nsm>1024) return false;
+        const int64_t tiles_x=(q->ne[1]+columns-1)/columns;
+        const int64_t ratio=q->ne[2]/k->ne[2];
+        const int64_t tiles_z=(ratio+head_columns-1)/head_columns;
+        size_t tiles=size_t(tiles_x);
+        for (int64_t factor : {tiles_z,k->ne[2],q->ne[3]}) if (!ggml_cuda_operator_product(tiles,size_t(factor))) return false;
+        if (!tiles || tiles>INT32_MAX) return false;
+        ggml_backend_operator_workspace next;
+        int64_t visible=k->ne[1];
+        if (sparse) {
+            const int64_t per_query=ggml_get_op_params_i32(dst,4);
+            if (!mask || per_query<=0 || per_query>INT32_MAX/columns) return false;
+            visible=std::min(visible,int64_t(columns)*per_query);
+            size_t lists=size_t(tiles_x),indices=size_t(visible)+1;
+            if (!ggml_cuda_operator_product(lists,size_t(mask->ne[3])) ||
+                    !ggml_cuda_operator_product(indices,lists) || !ggml_cuda_operator_product(indices,sizeof(int)) ||
+                    !ggml_backend_operator_workspace_add(next,indices)) return false;
+        }
+        const bool scan=!sparse && mask && k->ne[1]%FATTN_KQ_STRIDE==0 && (q->ne[1]>=1024 || q->ne[3]>1);
+        if (scan) {
+            size_t bytes=size_t(tiles_x);
+            if (!ggml_cuda_operator_product(bytes,size_t(q->ne[3])) || !ggml_cuda_operator_product(bytes,sizeof(int)) ||
+                    !ggml_backend_operator_workspace_add(next,bytes)) return false;
+        }
+        const int64_t tiles_kv=(visible+batch-1)/batch;
+        if (!tiles_kv || tiles_kv>INT32_MAX || tiles>size_t(INT32_MAX)/size_t(tiles_kv)) return false;
+        if (stream_k) {
+            const bool whole=GGML_CUDA_CC_IS_NVIDIA(device.cc) && device.cc==GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan;
+            const bool force=(GGML_CUDA_CC_IS_NVIDIA(device.cc) && device.cc>=GGML_CUDA_CC_ADA_LOVELACE) ||
+                (amd_wmma_available(device.cc) && q->ne[0]==64);
+            ggml_cuda_fattn_stream_k_plan plan;
+            if (!ggml_cuda_fattn_stream_k_plan_make(tiles,tiles_kv,int64_t(occupancy)*device.nsm,force,whole,plan)) return false;
+            if (plan.needs_fixup) {
+                size_t bytes=size_t(plan.blocks);
+                for (size_t factor : {size_t(columns),size_t(head_columns),size_t(2+value_width/2),sizeof(float2)})
+                    if (!ggml_cuda_operator_product(bytes,factor)) return false;
+                if (!ggml_backend_operator_workspace_add(next,bytes)) return false;
+            }
+        } else {
+            int64_t parallel=std::min<int64_t>(occupancy,tiles_kv),best_waves=0,best_efficiency=0;
+            const int64_t wave=int64_t(device.nsm)*occupancy;
+            for (int64_t candidate=parallel;candidate<=tiles_kv;++candidate) {
+                const int64_t blocks=int64_t(tiles)*candidate,waves=(blocks+wave-1)/wave;
+                const int64_t efficiency=100*blocks/(waves*wave);
+                if (best_efficiency>=95 && waves>best_waves) break;
+                if (efficiency>best_efficiency) {best_waves=waves;best_efficiency=efficiency;parallel=candidate;}
+            }
+            if (parallel>1) {
+                size_t payload=size_t(parallel),metadata=size_t(parallel);
+                for (int i=0;i<GGML_MAX_DIMS;++i) if (!ggml_cuda_operator_product(payload,size_t(dst->ne[i]))) return false;
+                for (int i=1;i<GGML_MAX_DIMS;++i) if (!ggml_cuda_operator_product(metadata,size_t(dst->ne[i]))) return false;
+                if (!ggml_cuda_operator_product(payload,sizeof(float)) || !ggml_cuda_operator_product(metadata,sizeof(float2)) ||
+                        !ggml_backend_operator_workspace_add(next,payload) || !ggml_backend_operator_workspace_add(next,metadata)) return false;
+            }
+        }
+        output=next;return true;
+    };
+    query.valid=describe(query.plan);
+    return true;
+}
+
+bool ggml_cuda_flash_attn_ext_workspace_plan(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * dst,ggml_backend_operator_workspace & output) {
+    if (fattn_query || !dst || dst->op!=GGML_OP_FLASH_ATTN_EXT || dst->type!=GGML_TYPE_F32 ||
+            !dst->src[0] || !dst->src[1] || !dst->src[2]) return false;
+    const auto * q=dst->src[0];const auto * k=dst->src[1];const auto * v=dst->src[2];
+    size_t elements;
+    for (const auto * tensor : {q,k,v,dst}) if (!ggml_cuda_operator_elements(tensor,elements) ||
+            tensor->nb[0]!=ggml_type_size(tensor->type)) return false;
+    if (q->type!=GGML_TYPE_F32 || q->ne[0]!=k->ne[0] || k->ne[1]!=v->ne[1] ||
+            k->ne[2]!=v->ne[2] || q->ne[2]%k->ne[2] || q->ne[3]!=k->ne[3] || k->ne[3]!=v->ne[3] ||
+            dst->ne[0]!=v->ne[0] || dst->ne[1]!=q->ne[2] || dst->ne[2]!=q->ne[1] || dst->ne[3]!=q->ne[3] ||
+            !ggml_cuda_flash_attn_ext_supported(ctx.device,dst)) return false;
+    fattn_workspace_query query;
+    struct query_guard {
+        explicit query_guard(fattn_workspace_query & query) { fattn_query=&query; }
+        ~query_guard() { fattn_query=nullptr; }
+    } guard(query);
+    ggml_cuda_flash_attn_ext(ctx,const_cast<ggml_tensor *>(dst));
+    if (!query.complete || !query.valid) return false;
+    output=query.plan;return true;
+}
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it

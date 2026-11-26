@@ -1,4 +1,5 @@
 #include "argsort.cuh"
+#include "scratch-plan.h"
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -262,6 +263,68 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     } else {
         GGML_ABORT("fatal error");
     }
+}
+
+bool ggml_cuda_argsort_cub_workspace_plan(int columns,int rows,ggml_sort_order order,
+        ggml_backend_operator_workspace & output) {
+#ifdef GGML_CUDA_USE_CUB
+    if (columns<=0 || rows<=0 || columns>INT32_MAX/rows ||
+            (order!=GGML_SORT_ORDER_ASC && order!=GGML_SORT_ORDER_DESC)) return false;
+    ggml_backend_operator_workspace next;
+    const size_t items=size_t(columns)*rows;
+    for (int i=0;i<3;++i) if (!ggml_backend_operator_workspace_add(next,items*sizeof(int))) return false;
+#ifdef STRIDED_ITERATOR_AVAILABLE
+    auto offsets=cuda::make_strided_iterator(cuda::make_counting_iterator(0),columns);
+#else
+    int offsets[2]={0,columns*rows};
+    if (!ggml_backend_operator_workspace_add(next,(size_t(rows)+1)*sizeof(int))) return false;
+#endif
+    float * keys=nullptr;int * indices=nullptr;
+    size_t bytes=0,maximum=0;
+    if (rows==1) {
+        const auto status=order==GGML_SORT_ORDER_ASC
+            ? DeviceRadixSort::SortPairs(nullptr,bytes,keys,keys,indices,indices,columns,0,32)
+            : DeviceRadixSort::SortPairsDescending(nullptr,bytes,keys,keys,indices,indices,columns,0,32);
+        if (status!=cudaSuccess) return false;
+        maximum=bytes;
+    } else {
+        auto status=order==GGML_SORT_ORDER_ASC
+            ? DeviceSegmentedSort::SortPairs(nullptr,bytes,keys,keys,indices,indices,columns*rows,rows,offsets,offsets+1)
+            : DeviceSegmentedSort::SortPairsDescending(nullptr,bytes,keys,keys,indices,indices,columns*rows,rows,offsets,offsets+1);
+        if (status!=cudaSuccess) return false;
+        maximum=bytes;bytes=0;
+        status=order==GGML_SORT_ORDER_ASC
+            ? DeviceSegmentedRadixSort::SortPairs(nullptr,bytes,keys,keys,indices,indices,columns*rows,rows,offsets,offsets+1,0,32)
+            : DeviceSegmentedRadixSort::SortPairsDescending(nullptr,bytes,keys,keys,indices,indices,columns*rows,rows,offsets,offsets+1,0,32);
+        if (status!=cudaSuccess) return false;
+        maximum=std::max(maximum,bytes);
+    }
+    if (!ggml_backend_operator_workspace_add(next,maximum)) return false;
+    output=next;return true;
+#else
+    GGML_UNUSED(columns);GGML_UNUSED(rows);GGML_UNUSED(order);GGML_UNUSED(output);
+    return false;
+#endif
+}
+
+bool ggml_cuda_argsort_workspace_plan(ggml_backend_cuda_context & ctx,const ggml_tensor * op,
+        ggml_backend_operator_workspace & output) {
+    if (!op || op->op!=GGML_OP_ARGSORT || op->type!=GGML_TYPE_I32 || !op->src[0] ||
+            op->src[0]->type!=GGML_TYPE_F32 || !ggml_is_contiguous(op->src[0]) || !ggml_are_same_shape(op->src[0],op)) return false;
+    size_t elements;
+    if (!ggml_cuda_operator_elements(op->src[0],elements) || elements>INT32_MAX) return false;
+    ggml_backend_operator_workspace next;
+#ifdef GGML_CUDA_USE_CUB
+    const int columns=int(op->src[0]->ne[0]),rows=int(ggml_nrows(op->src[0]));
+    size_t padded=1;while (padded<size_t(columns)) padded*=2;
+    if (!(columns<=1024 && padded*sizeof(int)<=ggml_cuda_info().devices[ctx.device].smpb)) {
+        const int chunk=ggml_cuda_chunk_nrows(op->src[0]->nb[1],rows);
+        if (!ggml_cuda_argsort_cub_workspace_plan(columns,chunk,ggml_sort_order(op->op_params[0]),next)) return false;
+    }
+#else
+    GGML_UNUSED(ctx);
+#endif
+    output=next;return true;
 }
 
 void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

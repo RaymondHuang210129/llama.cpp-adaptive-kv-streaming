@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend-memory.h"
+#include "ggml-backend-operator-workspace.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <new>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1003,6 +1005,25 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_operator_workspace {
+    struct bank {
+        ggml_backend_operator_workspace_prepare_t prepare = nullptr;
+        ggml_backend_operator_workspace_graph_query_t query = nullptr;
+        ggml_backend_operator_workspace_bind_t bind = nullptr;
+        ggml_backend_operator_workspace_release_t release = nullptr;
+        ggml_backend_operator_workspace_control_t control = nullptr;
+        ggml_backend_operator_phase_workspace plan;
+        ggml_backend_operator_phase_workspace bound_plan;
+        ggml_backend_memory_lease_t bound_root = nullptr;
+        ggml_backend_memory_lease_t scratch = nullptr;
+        ggml_backend_memory_arena_t arena = nullptr;
+        size_t capacity = 0;
+        bool bound = false;
+    };
+    bank banks[GGML_SCHED_MAX_BACKENDS];
+    bool valid = true;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1012,6 +1033,7 @@ struct ggml_backend_sched {
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_memory_lease_t memory_leases[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_sched_operator_workspace * operator_workspace;
     ggml_gallocr_t galloc;
 
     // hash map of the nodes in the graph
@@ -1071,6 +1093,203 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static bool ggml_backend_sched_operator_release(ggml_backend_sched_t sched) {
+    auto * state = sched->operator_workspace;
+    if (!state) return true;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto & bank = state->banks[i];
+        if (bank.bound) {
+            bank.bound_root = nullptr;
+            bank.bound_plan = {};
+            ggml_backend_synchronize(sched->backends[i]);
+            if (bank.release(sched->backends[i]) != ggml_backend_operator_workspace_status::success) return false;
+            bank.bound = false;
+        }
+        ggml_backend_memory_lease_free(bank.scratch);
+        ggml_backend_memory_arena_free(bank.arena);
+        bank.scratch = nullptr;
+        bank.arena = nullptr;
+    }
+    return true;
+}
+
+bool ggml_backend_sched_set_operator_workspace(ggml_backend_sched_t sched) {
+    if (!sched || sched->is_alloc) return false;
+    if (sched->operator_workspace) return true;
+    for (int i = 0; i < sched->n_backends; ++i) if (sched->memory_leases[i]) return false;
+    auto * state = new (std::nothrow) ggml_backend_sched_operator_workspace;
+    if (!state) return false;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto * dev = ggml_backend_get_device(sched->backends[i]);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg) { delete state; return false; }
+        auto prepare = reinterpret_cast<ggml_backend_operator_workspace_prepare_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_operator_workspace_prepare"));
+        auto & bank = state->banks[i];
+        bank.prepare = prepare;
+        bank.query = reinterpret_cast<ggml_backend_operator_workspace_graph_query_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_operator_workspace_graph_query"));
+        bank.bind = reinterpret_cast<ggml_backend_operator_workspace_bind_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_operator_workspace_bind"));
+        bank.release = reinterpret_cast<ggml_backend_operator_workspace_release_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_operator_workspace_release"));
+        bank.control = reinterpret_cast<ggml_backend_operator_workspace_control_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_operator_workspace_control"));
+        if (!prepare && !bank.query && !bank.bind && !bank.release && !bank.control) {
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) { delete state; return false; }
+            continue;
+        }
+        if (!prepare || !bank.query || !bank.bind || !bank.release || !bank.control) {
+            delete state; return false;
+        }
+    }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto & bank = state->banks[i];
+        if (!bank.control) continue;
+        const bool claimed = bank.control(sched->backends[i], true) == ggml_backend_operator_workspace_status::success;
+        if (!claimed || bank.prepare(sched->backends[i]) != ggml_backend_operator_workspace_status::success) {
+            for (int j = 0; j < i + int(claimed); ++j) if (state->banks[j].control) state->banks[j].control(sched->backends[j], false);
+            delete state; return false;
+        }
+    }
+    sched->operator_workspace = state;
+    return true;
+}
+
+static bool ggml_backend_sched_operator_query(ggml_backend_sched_t sched) {
+    auto * state = sched->operator_workspace;
+    if (!state) return true;
+    state->valid = false;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto & bank = state->banks[i];
+        bank.plan = {};
+        if (!bank.query) continue;
+        std::vector<ggml_tensor *> nodes;
+        for (int n = 0; n < sched->graph.n_nodes; ++n) {
+            if (sched->node_backend_ids[n] == i) nodes.push_back(sched->graph.nodes[n]);
+        }
+        if (nodes.empty()) continue;
+        auto graph = sched->graph;
+        graph.nodes = nodes.data();
+        graph.n_nodes = int(nodes.size());
+        const auto result = bank.query(sched->backends[i], &graph, &bank.plan);
+        if (result != ggml_backend_operator_workspace_status::success || !ggml_backend_operator_workspace_phase_valid(bank.plan)) {
+            GGML_LOG_ERROR("%s: %s operator workspace query failed: status=%d\n", __func__, ggml_backend_name(sched->backends[i]), int(result));
+            return false;
+        }
+    }
+    state->valid = true;
+    return true;
+}
+
+static bool ggml_backend_sched_operator_suffix(ggml_backend_sched_t sched, int group, size_t & bytes) {
+    bytes = 0;
+    auto * state = sched->operator_workspace;
+    if (!state) return true;
+    const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[group]);
+    if (!state->valid || !alignment || (alignment & (alignment - 1))) return false;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        const auto & plan = state->banks[i].plan;
+        if (sched->bufts[i] != sched->bufts[group] || !plan.count) continue;
+        const size_t padding = plan.bytes && alignment < plan.alignment ? plan.alignment - alignment : 0;
+        if (plan.bytes > SIZE_MAX - padding || plan.bytes + padding > SIZE_MAX - bytes) return false;
+        bytes += plan.bytes + padding;
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_operator_measure(ggml_backend_sched_t sched, size_t * sizes) {
+    if (!sched->operator_workspace) return true;
+    if (!ggml_backend_sched_operator_query(sched)) return false;
+    size_t combined[GGML_SCHED_MAX_BACKENDS] = {};
+    for (int i = 0; i < sched->n_backends; ++i) {
+        size_t graph = 0, suffix = 0;
+        for (int j = 0; j < sched->n_backends; ++j) {
+            if (sched->bufts[j] == sched->bufts[i]) graph = std::max(graph, sizes[j]);
+        }
+        if (!ggml_backend_sched_operator_suffix(sched, i, suffix) ||
+                !ggml_backend_operator_workspace_align(graph, ggml_backend_buft_get_alignment(sched->bufts[i]), graph) ||
+                suffix > SIZE_MAX - graph) return false;
+        combined[i] = graph + suffix;
+    }
+    std::copy(combined, combined + sched->n_backends, sizes);
+    return true;
+}
+
+static bool ggml_backend_sched_operator_bind(ggml_backend_sched_t sched, bool force = false, bool * oversized = nullptr) {
+    if (oversized) *oversized = false;
+    auto * state = sched->operator_workspace;
+    if (!state) return true;
+    if (!ggml_backend_sched_operator_query(sched)) return false;
+    bool covered = !force, larger = false;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        const auto & bank = state->banks[i];
+        if (!bank.plan.count) continue;
+        if (!bank.bound || bank.bound_root != sched->memory_leases[i] || bank.plan.count > bank.bound_plan.count) {
+            covered = false;
+            continue;
+        }
+        for (size_t stream = 0; stream < bank.plan.count; ++stream) {
+            covered &= bank.plan.streams[stream].scratch_bytes <= bank.bound_plan.streams[stream].scratch_bytes &&
+                bank.plan.streams[stream].library_bytes <= bank.bound_plan.streams[stream].library_bytes;
+        }
+        larger |= bank.bound_plan.bytes > bank.plan.bytes;
+    }
+    if (covered) {
+        if (oversized) *oversized = larger;
+        return true;
+    }
+    if (!ggml_backend_sched_operator_release(sched)) return false;
+    for (int g = 0; g < sched->n_backends; ++g) {
+        bool duplicate = false, managed = false;
+        for (int j = 0; j < g; ++j) duplicate |= sched->bufts[j] == sched->bufts[g];
+        if (duplicate) continue;
+        for (int i = g; i < sched->n_backends; ++i) managed |= sched->bufts[i] == sched->bufts[g] && state->banks[i].plan.count;
+        if (!managed) continue;
+        auto * root = sched->memory_leases[g];
+        auto * buffer = ggml_backend_memory_lease_buffer(root);
+        ggml_backend_memory_region region = {};
+        size_t suffix = 0;
+        if (!buffer || !ggml_backend_memory_lease_get_region(root, &region) || region.flags ||
+                !ggml_backend_sched_operator_suffix(sched, g, suffix)) return false;
+        const size_t capacity = state->banks[g].capacity;
+        const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[g]);
+        if (!capacity || capacity > region.size || suffix >= capacity) return false;
+        const size_t graph = (capacity - suffix) & ~(alignment - 1);
+        if (!graph || !ggml_gallocr_set_buffer_range_limit(sched->galloc, g, graph)) return false;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer));
+        if (!base || region.size > UINTPTR_MAX - base) return false;
+        size_t cursor = graph;
+        for (int i = g; i < sched->n_backends; ++i) {
+            auto & bank = state->banks[i];
+            if (sched->bufts[i] != sched->bufts[g] || !bank.plan.count) continue;
+            if (bank.plan.bytes) {
+                size_t address = 0;
+                if (!ggml_backend_operator_workspace_align(base + cursor, bank.plan.alignment, address) ||
+                        address < base || address - base > capacity || bank.plan.bytes > capacity - (address - base)) return false;
+                cursor = address - base;
+                bank.arena = ggml_backend_memory_arena_new_from_buffer(buffer);
+                if (!bank.arena || !ggml_backend_memory_arena_begin(bank.arena, 0) ||
+                        !ggml_backend_memory_arena_reserve_at(bank.arena, 1, cursor, bank.plan.bytes, alignment, 0, nullptr) ||
+                        !ggml_backend_memory_arena_commit(bank.arena)) return false;
+                bank.scratch = ggml_backend_memory_arena_acquire(bank.arena, 1);
+                if (!bank.scratch) return false;
+                cursor += bank.plan.bytes;
+            }
+            ggml_backend_operator_workspace_binding binding;
+            binding.parent = ggml_backend_memory_lease_parent(root);
+            binding.root = root; binding.root_id = region.id;
+            binding.root_generation = ggml_backend_memory_lease_generation(root);
+            binding.scratch = bank.scratch; binding.layout = bank.plan;
+            if (bank.scratch) {
+                binding.scratch_id = 1;
+                binding.scratch_generation = ggml_backend_memory_lease_generation(bank.scratch);
+            }
+            const auto result = bank.bind(sched->backends[i], &binding);
+            bank.bound = result == ggml_backend_operator_workspace_status::success || result == ggml_backend_operator_workspace_status::failed;
+            if (result != ggml_backend_operator_workspace_status::success) return false;
+            bank.bound_plan = bank.plan;
+            bank.bound_root = root;
+        }
+    }
+    return true;
+}
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -2106,6 +2325,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (has_memory_leases) {
         ggml_backend_sched_synchronize(sched);
     }
+    GGML_ASSERT(ggml_backend_sched_operator_release(sched));
+    if (sched->operator_workspace) for (int b = 0; b < sched->n_backends; ++b) {
+        auto control = sched->operator_workspace->banks[b].control;
+        if (control) GGML_ASSERT(control(sched->backends[b], false) == ggml_backend_operator_workspace_status::success);
+    }
+    delete sched->operator_workspace;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2155,9 +2380,16 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_synchronize(sched);
 
+    if (!ggml_backend_sched_operator_release(sched)) {
+        std::fill(sizes, sizes + sched->n_backends, SIZE_MAX);
+        return;
+    }
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    if (!ggml_backend_sched_operator_measure(sched, sizes)) {
+        std::fill(sizes, sizes + sched->n_backends, SIZE_MAX);
+    }
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2168,8 +2400,11 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    bool oversized = false;
+    if (!ggml_backend_sched_operator_bind(sched, false, &oversized)) return false;
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-        return false;
+        if (!oversized || !ggml_backend_sched_operator_bind(sched, true) ||
+                !ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) return false;
     }
 
     ggml_backend_sched_reset(sched);
@@ -2187,8 +2422,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_backend_sched_split_graph(sched, graph);
 
+    bool oversized = false;
+    if (!ggml_backend_sched_operator_bind(sched, false, &oversized)) return false;
     if (!ggml_backend_sched_alloc_splits(sched)) {
-        return false;
+        if (!oversized || !ggml_backend_sched_operator_bind(sched, true) || !ggml_backend_sched_alloc_splits(sched)) return false;
     }
 
     sched->is_alloc = true;
@@ -2282,6 +2519,9 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
+    if (sched->operator_workspace && sched->memory_leases[backend_index]) {
+        return sched->operator_workspace->banks[backend_index].capacity;
+    }
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
@@ -2292,7 +2532,12 @@ bool ggml_backend_sched_set_buffer_range(
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
-    return ggml_gallocr_set_buffer_range(sched->galloc, backend_index, buffer, offset, size);
+    if (!ggml_backend_sched_operator_release(sched) ||
+            !ggml_gallocr_set_buffer_range(sched->galloc, backend_index, buffer, offset, size)) return false;
+    if (sched->operator_workspace) for (int i = 0; i < sched->n_backends; ++i) {
+        if (sched->bufts[i] == sched->bufts[backend_index]) sched->operator_workspace->banks[i].capacity = size;
+    }
+    return true;
 }
 
 static void ggml_backend_sched_release_memory_lease(ggml_backend_sched_t sched, int backend_index) {
@@ -2319,6 +2564,7 @@ bool ggml_backend_sched_clear_buffer_range(
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     ggml_backend_sched_synchronize(sched);
+    if (!ggml_backend_sched_operator_release(sched)) return false;
     if (!ggml_gallocr_clear_buffer_range(sched->galloc, backend_index)) {
         return false;
     }
@@ -2363,8 +2609,12 @@ bool ggml_backend_sched_set_memory_lease_limit(ggml_backend_sched_t sched, ggml_
     auto * lease = sched->memory_leases[index];
     ggml_backend_memory_region region{};
     if (!size || !ggml_backend_memory_lease_get_region(lease, &region) || region.flags || size > region.size) return false;
+    if (!ggml_backend_sched_operator_release(sched)) return false;
     ggml_backend_sched_synchronize(sched);
     if (!ggml_gallocr_set_buffer_range_limit(sched->galloc, index, size)) return false;
+    if (sched->operator_workspace) for (int i = 0; i < sched->n_backends; ++i) {
+        if (sched->bufts[i] == sched->bufts[index]) sched->operator_workspace->banks[i].capacity = size;
+    }
     ggml_backend_sched_reset(sched);
     return true;
 }

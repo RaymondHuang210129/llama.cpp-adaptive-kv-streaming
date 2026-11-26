@@ -49,6 +49,33 @@ class ArenaFinderTests(unittest.TestCase):
                 self.assertEqual(persisted["recurrent_rollback_ram"], ram)
                 self.assertEqual("--recurrent-rollback-ram" in (args.output / "command.ps1").read_text(encoding="utf-8-sig"), ram)
 
+    def test_failed_full_validation_refits_the_full_workload_without_a_reserve(self):
+        args=self.args('--probe-mode','preflight','--validate-selected')
+        calls=[]
+        def probe(config,candidate):
+            calls.append((config.probe_mode,config.output.name,candidate))
+            if config.output.name=='selected-validation':
+                return {'arena_mib':candidate,'fits':False,'limiting_factor':'runtime_capacity','error':'CUDA out of memory'}
+            return {'arena_mib':candidate,'fits':candidate<=(1024 if config.probe_mode=='preflight' else 1000),
+                    'probe_mode':config.probe_mode,'timings':{'predicted_n':256}}
+        def search(start,checked,**kwargs):
+            if kwargs:
+                self.assertEqual(kwargs['upper_limit'],1023)
+                self.assertTrue(checked(1000));self.assertFalse(checked(1001));return 1000
+            self.assertTrue(checked(1024));self.assertFalse(checked(1025));return 1024
+        with tempfile.TemporaryDirectory() as directory:
+            args.output=Path(directory)
+            with patch.object(FINDER,'probe',side_effect=probe),patch.object(FINDER.SWEEP,'find_max_arena_mib',side_effect=search):
+                report=FINDER.fit(args)
+            self.assertEqual(report['arena_mib'],1000)
+            self.assertEqual(report['next_mib_rejected'],1001)
+            self.assertEqual(report['reserve_mib'],0)
+            self.assertTrue(report['full_workload_validated'])
+            self.assertEqual(report['preflight_arena_mib'],1024)
+            self.assertEqual(json.loads((args.output/'result.json').read_text())['arena_mib'],1000)
+            self.assertIn('1000',(args.output/'command.txt').read_text())
+            self.assertFalse(any(mode=='preflight' and folder=='full-search' for mode,folder,_ in calls))
+
     def test_preflight_caps_history_but_keeps_native_capacity_and_requested_decode(self):
         args = self.args("--context-size", "262144", "--probe-mode", "preflight",
                          "--spec-mode", "mtp", "--model-draft", "assistant.gguf", "--mmproj", "vision.gguf")

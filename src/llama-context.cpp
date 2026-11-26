@@ -1810,6 +1810,12 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     if (!keep_parent) sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    const bool bounded_operators=cparams.shared_device_memory_bytes || group_initializing || measurement_only ||
+        (serial_target_ctx && serial_target_ctx->cparams.shared_device_memory_bytes) ||
+        (mtp_target_ctx && mtp_target_ctx->cparams.shared_device_memory_bytes);
+    if (bounded_operators &&
+            !ggml_backend_sched_set_operator_workspace(sched.get()))
+        throw std::runtime_error("shared arena requires bounded native operator workspaces");
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
     llama_memory_context_ptr mctx;
@@ -1972,6 +1978,9 @@ void llama_context::sched_reserve() {
                 sched.reset();
                 compute_arenas.clear();
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                if (bounded_operators &&
+                        !ggml_backend_sched_set_operator_workspace(sched.get()))
+                    throw std::runtime_error("shared arena requires bounded native operator workspaces");
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 if (no_alloc() || prepare_arenas()) {
                     gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
@@ -5318,7 +5327,7 @@ bool llama_context::measure_workspace_impl(const llama_ubatch * native_batch, ui
                     ggml_kv_stream_status::success;
             },
             [](void *,ggml_backend_t,ggml_tensor *) {return GGML_STATUS_FAILED;},
-            [](void *) {return true;},[](void *) {},[](void *) {}};
+            [](void *) {return true;},[](void *) {},[](void *) {},true};
         const ggml_backend_execution_io io{&owner,
             [](void *,const ggml_tensor *,void *,size_t,size_t) {return false;},
             [](void *,const ggml_tensor *,const void *,size_t,size_t) {return false;},
@@ -5387,6 +5396,10 @@ ggml_cgraph * llama_context::graph_reserve(
         ggml_backend_sched_ptr temporary(ggml_backend_sched_new(backend_ptrs.data(),backend_buft.data(),
             backend_ptrs.size(),size_t(gf_res_reserve->get_max_nodes()),cparams.pipeline_parallel,cparams.op_offload));
         if (!temporary) return nullptr;
+        if ((cparams.shared_device_memory_bytes || group_initializing || measurement_only ||
+                (serial_target_ctx && serial_target_ctx->cparams.shared_device_memory_bytes) ||
+                (mtp_target_ctx && mtp_target_ctx->cparams.shared_device_memory_bytes)) &&
+                !ggml_backend_sched_set_operator_workspace(temporary.get())) return nullptr;
         ggml_backend_sched_set_copy_callback(temporary.get(),sched_copy_experts,this);
         measuring.saved=std::move(sched);
         sched=std::move(temporary);
@@ -5399,6 +5412,7 @@ ggml_cgraph * llama_context::graph_reserve(
     if (split_only) {
         if (sizes) {
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            for (size_t i=0;i<backend_ptrs.size();++i) if (sizes[i]==SIZE_MAX) return nullptr;
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }

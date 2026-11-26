@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import sys
+from typing import Any
 
 ROOT=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT))
@@ -43,6 +44,7 @@ def choose(rows, previous=None, hysteresis=.05):
 
 def load(name):
     spec=importlib.util.spec_from_file_location(name.replace('-','_'),ROOT/(name+'.py'))
+    assert spec is not None and spec.loader is not None
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     return module
 
@@ -57,7 +59,8 @@ def identity(args, qualification):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--placement-reserve-mib",type=int,default=16)
+    parser.add_argument("--placement-reserve-mib",type=int,default=0,
+                        help="optional subtraction from the fitted arena; default uses the validated maximum")
     parser.add_argument("--previous-selection",type=Path)
     options,remaining=parser.parse_known_args(argv)
     finder=load("find-max-arena");qualification=load("qualify-recurrent-compact")
@@ -85,6 +88,8 @@ def main(argv=None):
     if os.name=="nt":
         print("Windows: configure this server executable to Prefer No Sysmem Fallback in NVIDIA settings before fitting.",flush=True)
     rows=[];reference=None
+    row: dict[str, Any]
+    record: dict[str, Any]
     for provider in ("native","ram","compact"):
         directory=args.output/provider;directory.mkdir(exist_ok=True)
         result_path=directory/"measured.json"
@@ -98,7 +103,9 @@ def main(argv=None):
             if list(directory.iterdir()):raise RuntimeError(f"{directory}: inspect incomplete attempt before resuming")
             fitting=copy.deepcopy(variant)
             fitting.output=directory/"fit";fitting.output.mkdir()
-            fitting.measure_decode=False;fitting.probe_mode="preflight";fitting.decode_tokens=16
+            fitting.measure_decode=False;fitting.probe_mode="preflight"
+            fitting.validate_selected=options.placement_reserve_mib==0
+            fitting.decode_tokens=variant.decode_tokens if fitting.validate_selected else 16
             print("FIT",provider,flush=True)
             try:
                 with (directory/"fit.log").open("w") as output,contextlib.redirect_stdout(output):

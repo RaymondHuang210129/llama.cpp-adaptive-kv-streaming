@@ -1,5 +1,6 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "scratch-plan.h"
 
 // Adjusted implementation thresholds from #28547, can be overridden at build time
 #ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC
@@ -276,6 +277,62 @@ static void top_k_argsort_cuda(
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;
     }
+}
+
+bool ggml_cuda_top_k_workspace_plan(ggml_backend_cuda_context & ctx,const ggml_tensor * op,
+        ggml_backend_operator_workspace & output) {
+    if (!op || op->op!=GGML_OP_TOP_K || op->type!=GGML_TYPE_I32 || !op->src[0] ||
+            op->src[0]->type!=GGML_TYPE_F32 || !ggml_is_contiguous(op->src[0])) return false;
+    const auto * input=op->src[0];size_t elements;
+    if (!ggml_cuda_operator_elements(input,elements) || elements>INT32_MAX ||
+            op->ne[0]<=0 || op->ne[0]>input->ne[0]) return false;
+    for (int i=1;i<GGML_MAX_DIMS;++i) if (op->ne[i]!=input->ne[i]) return false;
+    const int columns=int(input->ne[0]),rows=int(ggml_nrows(input)),k=int(op->ne[0]);
+    GGML_UNUSED(k);
+    const auto & device=ggml_cuda_info().devices[ctx.device];
+#ifdef CUB_TOP_K_AVAILABLE
+    const bool short_rows=rows>1 && columns<=GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
+#else
+    const bool short_rows=columns<=GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
+#endif
+    const bool few=rows>GGML_CUDA_TOP_K_NROWS_THRESHOLD && columns<=GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS && rows<=device.nsm;
+    size_t padded=1;while (padded<size_t(columns)) padded*=2;
+    ggml_backend_operator_workspace next;
+    const auto argsort=[&](bool cub) {
+        const int chunk=ggml_cuda_chunk_nrows(size_t(columns)*sizeof(int),rows);
+        if (!ggml_backend_operator_workspace_add(next,size_t(columns)*chunk*sizeof(int))) return false;
+        if (cub) {
+            ggml_backend_operator_workspace nested;
+            if (!ggml_cuda_argsort_cub_workspace_plan(columns,chunk,GGML_SORT_ORDER_DESC,nested)) return false;
+            for (size_t i=0;i<nested.count;++i) if (!ggml_backend_operator_workspace_add(next,nested.requests[i])) return false;
+        }
+        return true;
+    };
+    if ((short_rows || few) && padded*sizeof(int)<=device.smpb) {
+        if (!argsort(false)) return false;
+        output=next;return true;
+    }
+#ifdef CUB_TOP_K_AVAILABLE
+    if (rows<=GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
+        auto requirements=cuda::execution::require(cuda::execution::determinism::not_guaranteed,cuda::execution::output_ordering::unsorted);
+        auto stream=cuda::stream_ref{cudaStream_t(nullptr)};
+        auto environment=cuda::std::execution::env{stream,requirements};
+        size_t bytes=0;const float * source=nullptr;int * destination=nullptr;
+        if (DeviceTopK::MaxPairs(nullptr,bytes,source,cuda::discard_iterator(),cuda::make_counting_iterator(0),destination,columns,k,environment)!=cudaSuccess ||
+                !ggml_backend_operator_workspace_add(next,bytes)) return false;
+        output=next;return true;
+    }
+#elif defined(GGML_CUDA_USE_CUB)
+    if (rows<=GGML_CUDA_TOP_K_NROWS_THRESHOLD && columns<=GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT) {
+        if (!argsort(true)) return false;
+        output=next;return true;
+    }
+#endif
+    const int blocks=int(std::min<int64_t>((int64_t(columns)+1023)/1024,64));
+    const int chunk=ggml_cuda_chunk_nrows(size_t(blocks)*256*sizeof(int),rows);
+    if (!ggml_backend_operator_workspace_add(next,size_t(chunk)*sizeof(top_k_radix_state)) ||
+            !ggml_backend_operator_workspace_add(next,size_t(chunk)*blocks*256*sizeof(int))) return false;
+    output=next;return true;
 }
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
