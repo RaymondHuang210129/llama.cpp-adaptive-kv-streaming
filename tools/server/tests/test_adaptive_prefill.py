@@ -91,12 +91,19 @@ def qualify(args):
         if args.mode == "dflash7k4v":
             command += ["--spec-ngram-map-k4v-size-n", "12", "--spec-ngram-map-k4v-size-m", "7",
                         "--spec-ngram-map-k4v-min-hits", "2"]
+    if args.recurrent_rollback_compact:
+        command += ["--recurrent-rollback-compact"]
     if args.sanitizer:
         command = [str(args.sanitizer), "--tool", "memcheck", "--report-api-errors", "all", "--error-exitcode", "99"] + command
     env = dict(os.environ, LD_LIBRARY_PATH=str(args.server.resolve().parent) + ":/usr/local/cuda/lib64",
                CUDA_MODULE_LOADING="LAZY", LLAMA_MEDIA_MARKER="<__media__>")
     env.pop("GGML_CUDA_ENABLE_UNIFIED_MEMORY", None)
     env.pop("LD_PRELOAD", None)
+    guard = args.output / "cublas-create-disabled"
+    if args.cuda_library_guard:
+        guard.unlink(missing_ok=True)
+        env["LD_PRELOAD"] = str(args.cuda_library_guard.resolve())
+        env["GGML_TEST_CUBLAS_CREATE_GUARD_FILE"] = str(guard.resolve())
     (args.output / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     report = {"passed": False, "mode": args.mode, "parallel": args.parallel, "arrival_phase": args.arrival_phase,
               "harness_sha256": hashlib.sha256(TEST_SOURCE).hexdigest(), "closed_group_reference": args.closed_group_reference}
@@ -115,6 +122,8 @@ def qualify(args):
                 time.sleep(0.1)
             else:
                 raise RuntimeError("server startup timed out")
+            if args.cuda_library_guard:
+                guard.touch()
             if args.mmproj and not args.late_vision:
                 from test_adaptive_vision import png
                 image = request(port, "/v1/chat/completions", {
@@ -293,6 +302,9 @@ def qualify(args):
                 assert retried["tokens_predicted"] == 16
                 report["cancelled_request_retry"] = True
             assert request(port, "/health")["status"] == "ok"
+            if args.cuda_library_guard:
+                assert "test_cublas: rejected late handle creation" not in text
+                report["no_library_creation_after_startup"] = True
             report["passed"] = True
         except BaseException as error:
             report["error"] = repr(error)
@@ -320,6 +332,7 @@ def qualify(args):
                 if not report["sanitizer_zero_errors"]:
                     report.update(passed=False, error="missing zero-error CUDA memcheck summary")
             (args.output / "status.json").write_text(json.dumps(report, indent=2) + "\n")
+            guard.unlink(missing_ok=True)
     assert report["passed"], report
 
 
@@ -364,5 +377,7 @@ if __name__ == "__main__":
     parser.add_argument("--context-checkpoints", type=int)
     parser.add_argument("--timeout-seconds", type=int, default=240)
     parser.add_argument("--sanitizer", type=Path)
+    parser.add_argument("--cuda-library-guard", type=Path, help="test fault shim rejecting handle creation after startup")
+    parser.add_argument("--recurrent-rollback-compact", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     qualify(parser.parse_args())

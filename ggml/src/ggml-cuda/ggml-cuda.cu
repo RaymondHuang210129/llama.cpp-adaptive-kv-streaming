@@ -846,6 +846,7 @@ struct ggml_backend_cuda_workspace_context : ggml_backend_cuda_context {
     ggml_cuda_operator_workspace_caps operator_caps;
     ggml_backend_operator_workspace_binding operator_binding;
     bool operator_pending=false, operator_executing=false, operator_library_ready=false;
+    std::array<bool,GGML_CUDA_MAX_STREAMS> operator_library_required{};
     size_t operator_controllers=0;
     explicit ggml_backend_cuda_workspace_context(int device) : ggml_backend_cuda_context(device) {}
     bool operator_bound() const { return operator_binding.root!=nullptr; }
@@ -6878,8 +6879,25 @@ static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspa
     auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
     ggml_backend_operator_phase_workspace next;
     const auto result=ggml_cuda_operator_graph_plan(ctx,graph,next,false);
-    if (result==status::success) *output=next;
+    if (result==status::success) {
+        for (size_t i=0;i<next.count;++i) ctx.operator_library_required[i]=ctx.operator_library_required[i] || next.streams[i].library_bytes;
+        *output=next;
+    }
     return result;
+}
+
+static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_prepare_libraries(ggml_backend_t backend) {
+    using status=ggml_backend_operator_workspace_status;
+    if (!backend || !ggml_backend_is_cuda(backend)) return status::invalid;
+    auto & ctx=*static_cast<ggml_backend_cuda_workspace_context *>(static_cast<ggml_backend_cuda_context *>(backend->context));
+    if (!ctx.operator_caps.ready) return status::unprepared;
+    for (size_t i=0;i<ctx.operator_library_required.size();++i) {
+        if (!ctx.operator_library_required[i] || ctx.cublas_handles[ctx.device][i]) continue;
+        if (ctx.operator_bound() || ctx.operator_pending || ctx.operator_executing) return status::busy;
+        ggml_cuda_set_device(ctx.device);
+        if (!ctx.operator_library_handle(int(i))) return status::failed;
+    }
+    return status::success;
 }
 
 static ggml_backend_operator_workspace_status ggml_backend_cuda_operator_workspace_bind(ggml_backend_t backend,
@@ -6989,6 +7007,7 @@ static bool ggml_backend_cuda_gdn_replay_exact(ggml_backend_dev_t device) {
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (!strcmp(name,"ggml_backend_gdn_fp32_replay_exact")) return (void *)ggml_backend_cuda_gdn_replay_exact;
     if (!strcmp(name,"ggml_backend_operator_workspace_prepare")) return (void *)ggml_backend_cuda_operator_workspace_prepare;
+    if (!strcmp(name,"ggml_backend_operator_workspace_prepare_libraries")) return (void *)ggml_backend_cuda_operator_workspace_prepare_libraries;
     if (!strcmp(name,"ggml_backend_operator_workspace_query")) return (void *)ggml_backend_cuda_operator_workspace_query;
     if (!strcmp(name,"ggml_backend_operator_workspace_graph_query")) return (void *)ggml_backend_cuda_operator_workspace_graph_query;
     if (!strcmp(name,"ggml_backend_operator_workspace_bind")) return (void *)ggml_backend_cuda_operator_workspace_bind;

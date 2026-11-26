@@ -415,6 +415,8 @@ if (GGML_CUDA AND GGML_CUDA_FA)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET test-memory-workspace)
         add_library(test-cuda-workspace-faults SHARED test-cuda-workspace-faults.cpp)
         target_link_libraries(test-cuda-workspace-faults PRIVATE CUDA::cublas ${CMAKE_DL_LIBS})
+        add_test(NAME test-cuda-library-startup COMMAND ${CMAKE_COMMAND} -E env
+            LD_PRELOAD=$<TARGET_FILE:test-cuda-workspace-faults> $<TARGET_FILE:test-memory-workspace> --cuda-library-startup)
         add_test(NAME test-cuda-workspace-failures COMMAND ${CMAKE_COMMAND} -E env
             LD_PRELOAD=$<TARGET_FILE:test-cuda-workspace-faults> $<TARGET_FILE:test-memory-workspace> --cuda-library-failures)
         add_test(NAME test-cuda-arena-idle-sync COMMAND ${CMAKE_COMMAND} -E env

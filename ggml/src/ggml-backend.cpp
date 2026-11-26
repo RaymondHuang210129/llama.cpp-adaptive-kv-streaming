@@ -1178,6 +1178,18 @@ static bool ggml_backend_sched_operator_query(ggml_backend_sched_t sched) {
     return true;
 }
 
+bool ggml_backend_sched_prepare_operator_libraries(ggml_backend_sched_t sched) {
+    if (!sched || !sched->operator_workspace) return false;
+    for (int i=0;i<sched->n_backends;++i) {
+        if (!sched->operator_workspace->banks[i].prepare) continue;
+        auto * dev=ggml_backend_get_device(sched->backends[i]);
+        auto prepare=reinterpret_cast<ggml_backend_operator_workspace_prepare_libraries_t>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),"ggml_backend_operator_workspace_prepare_libraries"));
+        if (!prepare || prepare(sched->backends[i])!=ggml_backend_operator_workspace_status::success) return false;
+    }
+    return true;
+}
+
 static bool ggml_backend_sched_operator_suffix(ggml_backend_sched_t sched, int group, size_t & bytes) {
     bytes = 0;
     auto * state = sched->operator_workspace;

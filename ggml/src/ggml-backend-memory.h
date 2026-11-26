@@ -18,6 +18,7 @@ typedef struct ggml_backend_host_reservation * ggml_backend_host_reservation_t;
 // Include native operator/library scratch in scheduler measurements and bind it inside workspace loans.
 // Enable before graph measurement or attaching loans. Unsupported operators fail admission without a native pool fallback.
 GGML_API bool ggml_backend_sched_set_operator_workspace(ggml_backend_sched_t sched);
+GGML_API bool ggml_backend_sched_prepare_operator_libraries(ggml_backend_sched_t sched);
 
 // Stable host address space, independent of device arenas. These calls do not pin/map CUDA memory.
 GGML_API size_t ggml_backend_host_reservation_granularity(void);

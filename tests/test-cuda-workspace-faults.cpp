@@ -2,13 +2,16 @@
 #include <dlfcn.h>
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 
 extern "C" __attribute__((visibility("default"))) void ggml_test_cublas_workspace_faults(int,bool,bool);
 extern "C" __attribute__((visibility("default"))) int ggml_test_cublas_workspace_hits();
 extern "C" __attribute__((visibility("default"))) void ggml_test_cublas_create_faults(int);
+extern "C" __attribute__((visibility("default"))) int ggml_test_cublas_create_calls();
 extern "C" __attribute__((visibility("default"))) void ggml_test_cublas_workspace_skip(int);
 
 static std::atomic<int> remaining{0}, create_remaining{0}, skip_remaining{0}, hits{0};
+static std::atomic<int> create_calls{0};
 static std::atomic<bool> match_borrowed{false}, fail_after{false};
 
 extern "C" __attribute__((visibility("default"))) void ggml_test_cublas_workspace_faults(int count,bool borrowed,bool after) {
@@ -17,7 +20,8 @@ extern "C" __attribute__((visibility("default"))) void ggml_test_cublas_workspac
 
 extern "C" __attribute__((visibility("default"))) int ggml_test_cublas_workspace_hits() { return hits.load(); }
 
-extern "C" __attribute__((visibility("default"))) void ggml_test_cublas_create_faults(int count) { hits=0;create_remaining=count; }
+extern "C" __attribute__((visibility("default"))) void ggml_test_cublas_create_faults(int count) { hits=0;create_calls=0;create_remaining=count; }
+extern "C" __attribute__((visibility("default"))) int ggml_test_cublas_create_calls() { return create_calls.load(); }
 
 extern "C" __attribute__((visibility("default"))) void ggml_test_cublas_workspace_skip(int count) { skip_remaining=count; }
 
@@ -25,6 +29,13 @@ extern "C" __attribute__((visibility("default"))) cublasStatus_t cublasCreate_v2
     using function_t=decltype(&cublasCreate_v2);
     static auto actual=reinterpret_cast<function_t>(dlsym(RTLD_NEXT,"cublasCreate_v2"));
     if (!actual) std::abort();
+    ++create_calls;
+    if (const auto * path=std::getenv("GGML_TEST_CUBLAS_CREATE_GUARD_FILE")) {
+        if (auto * guard=std::fopen(path,"r")) {
+            std::fclose(guard);std::fputs("test_cublas: rejected late handle creation\n",stderr);
+            ++hits;*handle=nullptr;return CUBLAS_STATUS_ALLOC_FAILED;
+        }
+    }
     int count=create_remaining.load();
     while (count>0 && !create_remaining.compare_exchange_weak(count,count-1)) {}
     if (count>0) { ++hits;*handle=nullptr;return CUBLAS_STATUS_ALLOC_FAILED; }

@@ -943,6 +943,74 @@ int main(int argc, char ** argv) {
         }
     });
 #if defined(__linux__)
+    if (argc>1 && !std::strcmp(argv[1],"--cuda-library-startup")) t.test("cuda_library_initializes_before_arena_and_survives_scheduler_replacement",[](testing & t) {
+        using faults_t=void (*)(int);using calls_t=int (*)();
+        auto faults=reinterpret_cast<faults_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_create_faults"));
+        auto calls=reinterpret_cast<calls_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_create_calls"));
+        if (!t.assert_true(faults && calls)) return;
+        ggml_backend_load_all();auto * dev=ggml_backend_dev_by_name("CUDA0");
+        if (!t.assert_true(dev!=nullptr)) return;
+        ggml_backend_ptr backend(ggml_backend_dev_init(dev,nullptr)),cpu(ggml_backend_cpu_init());
+        auto * reg=ggml_backend_dev_backend_reg(dev);
+        using type_t=ggml_backend_buffer_type_t (*)(int);
+        auto device_type=reinterpret_cast<type_t>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_device_buffer_type"));
+        if (!t.assert_true(device_type!=nullptr)) return;
+        ggml_backend_t backends[]={backend.get(),cpu.get()};
+        ggml_backend_buffer_type_t types[]={device_type(0),ggml_backend_cpu_buffer_type()};
+        ggml_context_ptr ctx(ggml_init({1024*1024,nullptr,true}));
+        auto * a=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,64,64);
+        auto * b=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,64,128);
+        auto * output=ggml_mul_mat(ctx.get(),a,b);ggml_set_output(output);
+        auto * graph=ggml_new_graph_custom(ctx.get(),32,false);ggml_build_forward_expand(graph,output);
+        ggml_backend_buffer_ptr tensors(ggml_backend_alloc_ctx_tensors(ctx.get(),backend.get()));
+        if (!t.assert_true(bool(tensors))) return;
+        ggml_backend_sched_ptr prepared(ggml_backend_sched_new(backends,types,2,32,false,true));
+        faults(0);
+        if (!t.assert_true(ggml_backend_sched_set_operator_workspace(prepared.get()))) return;
+        t.assert_equal("metadata preparation alone creates no unused library handle",0,calls());
+        size_t required[2]={};ggml_backend_sched_reserve_size(prepared.get(),graph,required);
+        t.assert_equal("graph queries allocate no native library storage",0,calls());
+        faults(1);
+        t.assert_true("library exhaustion is reported before arena allocation",!ggml_backend_sched_prepare_operator_libraries(prepared.get()));
+        t.assert_equal(1,calls());faults(0);
+        if (!t.assert_true(ggml_backend_sched_prepare_operator_libraries(prepared.get()))) return;
+        t.assert_equal("native library initialization precedes arena allocation",1,calls());
+        auto query=reinterpret_cast<ggml_backend_operator_workspace_graph_query_t>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_operator_workspace_graph_query"));
+        auto bind=reinterpret_cast<ggml_backend_operator_workspace_bind_t>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_operator_workspace_bind"));
+        auto release=reinterpret_cast<ggml_backend_operator_workspace_release_t>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_operator_workspace_release"));
+        if (!t.assert_true(query && bind && release)) return;
+        using result=ggml_backend_operator_workspace_status;
+        faults(100);
+        for (int round=0;round<3;++round) {
+            ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends,types,2,32,false,true));
+            if (!t.assert_true(ggml_backend_sched_set_operator_workspace(sched.get()))) break;
+            size_t sizes[2]={};ggml_backend_sched_reserve_size(sched.get(),graph,sizes);
+            if (!t.assert_true(ggml_backend_sched_prepare_operator_libraries(sched.get()))) break;
+            ggml_backend_operator_phase_workspace phase;
+            if (!t.assert_true(query(backend.get(),graph,&phase)==result::success && phase.streams[0].library_bytes>0)) break;
+            arena_ptr arena(ggml_backend_memory_arena_new(types[0],phase.bytes),ggml_backend_memory_arena_free);
+            if (!t.assert_true(bool(arena))) break;
+            t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0));
+            t.assert_true(ggml_backend_memory_arena_reserve(arena.get(),1,phase.bytes,256,0,nullptr));
+            t.assert_true(ggml_backend_memory_arena_commit(arena.get()));
+            auto * lease=ggml_backend_memory_arena_acquire(arena.get(),1);
+            ggml_backend_operator_workspace_binding binding;
+            binding.parent=ggml_backend_memory_arena_parent(arena.get());binding.root=binding.scratch=lease;
+            binding.root_id=binding.scratch_id=1;binding.root_generation=binding.scratch_generation=ggml_backend_memory_lease_generation(lease);binding.layout=phase;
+            const auto attached=bind(backend.get(),&binding);
+            ggml_backend_memory_lease_free(lease);
+            if (!t.assert_equal("bind prepared library bank",int(result::success),int(attached))) break;
+            std::vector<ggml_fp16_t> weights(64*64,ggml_fp32_to_fp16(1));std::vector<float> input(64*128,0.5f);
+            ggml_backend_tensor_set(a,weights.data(),0,ggml_nbytes(a));ggml_backend_tensor_set(b,input.data(),0,ggml_nbytes(b));
+            if (!t.assert_true("prepared native GEMM executes without library initialization",
+                    ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS)) break;
+            std::vector<float> actual(64*128);ggml_backend_tensor_get(output,actual.data(),0,ggml_nbytes(output));
+            t.assert_true(std::all_of(actual.begin(),actual.end(),[](float value) {return value==32;}));
+            t.assert_true(release(backend.get())==result::success);
+            t.assert_equal(size_t(0),ggml_backend_memory_arena_lease_count(arena.get()));
+        }
+        t.assert_equal("slot changes cannot create another native library handle",0,calls());faults(0);
+    });
     if (argc>1 && !std::strcmp(argv[1],"--cuda-library-failures")) t.test("cuda_library_bind_and_release_failures_retain_storage_until_recovery",[](testing & t) {
         using faults_t=void (*)(int,bool,bool);using hits_t=int (*)();
         auto faults=reinterpret_cast<faults_t>(dlsym(RTLD_DEFAULT,"ggml_test_cublas_workspace_faults"));

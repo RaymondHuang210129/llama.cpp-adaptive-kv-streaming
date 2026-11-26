@@ -3804,7 +3804,7 @@ private:
             params.recurrent_rollback_ram=*placement==llama_recurrent_representation::dense_host;
             params.recurrent_rollback_compact=*placement==llama_recurrent_representation::gdn_fp32;
         }
-        pending_stream_contexts result;result.target=std::make_unique<llama_context>(*model_tgt,params,selected);
+        pending_stream_contexts result;result.target=std::make_unique<llama_context>(*model_tgt,params,selected,stream_contexts->metadata_context());
         auto & pending=*result.target;
         if (!pending.bind_group_samplers_from(*stream_contexts->metadata_context()))
             throw std::runtime_error("selected sampling graph could not be measured");
@@ -3826,8 +3826,8 @@ private:
             child_params.n_outputs_max_per_seq=metadata->get_cparams().n_outputs_max_per_seq;
             if (!block && !params.kv_stream_auxiliary_layers) child_params.n_batch=child_params.n_ubatch=
                 std::min({llama_n_seq_max(&pending),llama_n_batch(&pending),llama_n_ubatch(&pending)});
-            result.auxiliary=block ? std::make_unique<llama_context>(metadata->get_model(),child_params,selected,metadata->get_cparams().serial_block_rows) :
-                std::make_unique<llama_context>(metadata->get_model(),child_params,selected);
+            result.auxiliary=block ? std::make_unique<llama_context>(metadata->get_model(),child_params,selected,metadata->get_cparams().serial_block_rows,metadata) :
+                std::make_unique<llama_context>(metadata->get_model(),child_params,selected,metadata);
             result.auxiliary->set_embeddings_nextn(true,!block);
             if (!result.auxiliary->bind_group_samplers_from(*metadata)) throw std::runtime_error("selected speculative sampling graph could not be measured");
         }

@@ -2196,8 +2196,9 @@ static void test_group_initialization(testing & t,llama_model * model) {
     cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q4_0;
     cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.shared_device_memory_bytes=size_t(1024)*1024*1024;
+    llama_context prepared(*model,cp,std::vector<llama_seq_id>{0,1});
     for (const std::vector<llama_seq_id> & selected : {std::vector<llama_seq_id>{0,1},std::vector<llama_seq_id>{1}}) {
-        llama_context context(*model,cp,selected);
+        llama_context context(*model,cp,selected,&prepared);
         t.assert_true(!context.is_measurement_only() && context.group_storage_pending());
         const auto resources=context.get_kv_resources();
         if (!t.assert_true(resources.full && resources.full->full_storage_pending() && !resources.full->get_kv_stream())) return;
@@ -2205,6 +2206,11 @@ static void test_group_initialization(testing & t,llama_model * model) {
         if (resources.bounded) t.assert_true(resources.bounded->bounded_storage_pending());
         for (const auto & entry : context.get_memory()->memory_breakdown()) t.assert_equal(size_t(0),entry.second);
         auto * scheduler=context.get_sched();
+        auto * original=prepared.get_sched();
+        if (!t.assert_equal(ggml_backend_sched_get_n_backends(original),ggml_backend_sched_get_n_backends(scheduler))) return;
+        for (int i=0;i<ggml_backend_sched_get_n_backends(scheduler);++i)
+            t.assert_true("selected work reuses the metadata owner's native resources",
+                ggml_backend_sched_get_backend(original,i)==ggml_backend_sched_get_backend(scheduler,i));
         for (int i=0;i<ggml_backend_sched_get_n_backends(scheduler);++i)
             t.assert_equal(size_t(0),ggml_backend_sched_get_buffer_size(scheduler,ggml_backend_sched_get_backend(scheduler,i)));
         llama_batch empty{};

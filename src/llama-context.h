@@ -92,9 +92,10 @@ struct llama_context {
     llama_context(const llama_model & model, llama_context_params params, llama_context_mode mode);
     bool is_measurement_only() const { return measurement_only; }
     // Selected-state metadata stays non-executable until all group grants are bound.
-    LLAMA_API llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected);
+    LLAMA_API llama_context(const llama_model & model, llama_context_params params, const std::vector<llama_seq_id> & selected,
+        const llama_context * prepared = nullptr);
     LLAMA_API llama_context(const llama_model & model,llama_context_params params,
-        const std::vector<llama_seq_id> & selected,uint32_t prediction_rows);
+        const std::vector<llama_seq_id> & selected,uint32_t prediction_rows,const llama_context * prepared = nullptr);
     bool group_storage_pending() const noexcept { return group_initializing; }
     const llama_context * group_target_context() const noexcept { return group_target; }
     // The supplied owner and measured workspace cover all selected native state and graph users.
@@ -351,7 +352,7 @@ private:
         const llama_context * target,const llama_context * draft,llama_sampler * const * samplers,size_t count);
     llama_context(const llama_model & model, llama_context_params params,
         uint32_t serial_prediction_rows, bool serial_image_inputs, llama_context_mode mode,
-        const std::vector<llama_seq_id> & selected = {});
+        const std::vector<llama_seq_id> & selected = {},const llama_context * prepared = nullptr);
     bool no_alloc() const;
 
     //
@@ -520,7 +521,8 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_t backend_cpu = nullptr;
-    std::vector<ggml_backend_ptr> backends;
+    // Selected contexts share the non-executing metadata context's initialized queues and library handles.
+    std::vector<std::shared_ptr<ggml_backend>> backends;
     std::unique_ptr<llama_context_memory_loan> serial_cache;
     std::unique_ptr<llama_context_memory_loan> publication_stage;
     std::unique_ptr<llama_context_memory_loan> recurrent_storage;

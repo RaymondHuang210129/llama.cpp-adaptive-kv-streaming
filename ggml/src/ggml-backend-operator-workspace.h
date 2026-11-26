@@ -22,6 +22,8 @@ struct ggml_backend_operator_phase_workspace {
     size_t count = 0, bytes = 0, alignment = 256;
 };
 using ggml_backend_operator_workspace_prepare_t = ggml_backend_operator_workspace_status (*)(ggml_backend_t);
+// Initialize only library banks discovered by prior graph queries, before committing device storage.
+using ggml_backend_operator_workspace_prepare_libraries_t = ggml_backend_operator_workspace_status (*)(ggml_backend_t);
 using ggml_backend_operator_workspace_query_t = ggml_backend_operator_workspace_status (*)(
     ggml_backend_t,const ggml_tensor *,ggml_backend_operator_workspace *);
 

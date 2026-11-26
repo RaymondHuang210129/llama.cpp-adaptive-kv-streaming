@@ -493,12 +493,12 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     llama_context(model, params, serial_prediction_rows, serial_image_inputs, llama_context_mode::execution) {}
 
 llama_context::llama_context(const llama_model & model,llama_context_params params,
-        const std::vector<llama_seq_id> & selected) :
-    llama_context(model,params,0,false,llama_context_mode::group_initialization,selected) {}
+        const std::vector<llama_seq_id> & selected,const llama_context * prepared) :
+    llama_context(model,params,0,false,llama_context_mode::group_initialization,selected,prepared) {}
 
 llama_context::llama_context(const llama_model & model,llama_context_params params,
-        const std::vector<llama_seq_id> & selected,uint32_t prediction_rows) :
-    llama_context(model,params,prediction_rows,false,llama_context_mode::group_initialization,selected) {}
+        const std::vector<llama_seq_id> & selected,uint32_t prediction_rows,const llama_context * prepared) :
+    llama_context(model,params,prediction_rows,false,llama_context_mode::group_initialization,selected,prepared) {}
 
 bool llama_context::group_submission_allowed() const noexcept {
     return group_execution && !group_initializing && !group_execution->failed && group_execution->admission!=0;
@@ -719,7 +719,7 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params,
               uint32_t serial_prediction_rows, bool serial_image_inputs, llama_context_mode mode,
-        const std::vector<llama_seq_id> & selected) :
+        const std::vector<llama_seq_id> & selected,const llama_context * prepared) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -1218,33 +1218,40 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
-        // GPU backends
-        for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
-            if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
-            }
-            backends.emplace_back(backend);
-        }
-
-        // add ACCEL backends (such as BLAS)
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        if (prepared) {
+            if (!group_initializing || &prepared->model!=&model || !prepared->group_initializing ||
+                    prepared->group_execution || prepared->backends.empty())
+                throw std::runtime_error("selected backends require a compatible metadata owner");
+            backends=prepared->backends;backend_cpu=prepared->backend_cpu;
+        } else {
+            // GPU backends
+            for (const auto & dev : model.devices) {
+                ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
                 if (backend == nullptr) {
-                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
                 }
-                backends.emplace_back(backend);
+                backends.emplace_back(backend,ggml_backend_free);
             }
-        }
 
-        // add CPU backend
-        backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-        if (backend_cpu == nullptr) {
-            throw std::runtime_error("failed to initialize CPU backend");
+            // add ACCEL backends (such as BLAS)
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                    if (backend == nullptr) {
+                        throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                    }
+                    backends.emplace_back(backend,ggml_backend_free);
+                }
+            }
+
+            // add CPU backend
+            backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            if (backend_cpu == nullptr) {
+                throw std::runtime_error("failed to initialize CPU backend");
+            }
+            backends.emplace_back(backend_cpu,ggml_backend_free);
         }
-        backends.emplace_back(backend_cpu);
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
@@ -1448,6 +1455,18 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+
+        if (group_initializing && !prepared) {
+            if (cparams.serial_block_rows) {
+                std::vector<size_t> prefill(backend_ptrs.size());
+                const uint32_t width=std::min(cparams.n_ctx,cparams.n_ubatch);
+                auto full=memory->init_full();
+                if (!full || !graph_reserve(width,1,std::min(width,cparams.n_outputs_max),full.get(),true,prefill.data()))
+                    throw std::runtime_error("failed to measure draft prefill library requirements");
+            }
+            if (!ggml_backend_sched_prepare_operator_libraries(sched.get()))
+                throw std::runtime_error("failed to initialize selected native libraries before arena allocation");
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -1869,6 +1888,16 @@ void llama_context::sched_reserve() {
             n_seqs, n_seqs, n_seqs, mctx.get(), true,
             measurements.data() + backend_ptrs.size());
         if (!gf_pp || !gf_tg) return false;
+        if (cparams.serial_block_rows) {
+            const uint32_t width=std::min(cparams.n_ctx,cparams.n_ubatch);
+            if (width>n_tokens) {
+                std::vector<size_t> prefill(backend_ptrs.size());
+                cparams.kv_stream_decode=false;cparams.mtp_span_attention=false;
+                if (!graph_reserve(width,1,std::min(width,cparams.n_outputs_max),mctx.get(),true,prefill.data())) return false;
+                for (size_t i=0;i<prefill.size();++i) measurements[i]=std::max(measurements[i],prefill[i]);
+                cparams.kv_stream_decode=cparams.kv_streaming();cparams.mtp_span_attention=cparams.mtp_publish_host;
+            }
+        }
         if (n_seqs_pp != n_seqs) {
             std::vector<size_t> single(backend_ptrs.size());
             cparams.kv_stream_decode = false;
@@ -1958,7 +1987,8 @@ void llama_context::sched_reserve() {
                         std::max(verify_one[i], verify_all[i]));
             }
         }
-        return prepare_compute_arenas(measurements, 2);
+        return (!bounded_operators || ggml_backend_sched_prepare_operator_libraries(sched.get())) &&
+            prepare_compute_arenas(measurements, 2);
     };
 
     if (!no_alloc() && !prepare_arenas()) {
@@ -8746,7 +8776,7 @@ bool llama_context_group::selected_state_limit(uint32_t maximum,uint32_t & outpu
                 size_t smallest=SIZE_MAX;
                 for (int alternative=0;alternative<(automatic ? 3 : 1);++alternative) {
                     if (automatic) {params.recurrent_rollback_ram=alternative==1;params.recurrent_rollback_compact=alternative==2;}
-                    llama_context pending(*impl->model,params,selected);
+                    llama_context pending(*impl->model,params,selected,impl->metadata.get());
                     ggml_backend_buffer_type_t current_type=nullptr;size_t bytes=0;
                     const auto * current=pending.get_kv_resources().recurrent;
                     if (!current || !current->current_storage_requirements(current_type,bytes) || current_type!=type) return false;
@@ -9049,7 +9079,7 @@ bool llama_context_group::activate(const llama_kv_stream_selection & selection,
         std::vector<llama_context_group_sequence_state> child_states;
         const auto prepare=[&](llama_context_params params) {
             child.reset();candidate.reset();child_projection.reset();child_states.clear();
-            candidate=std::make_unique<llama_context>(*impl->model,params,selected);
+            candidate=std::make_unique<llama_context>(*impl->model,params,selected,impl->metadata.get());
             if (impl->metadata) {
                 const auto & prepared=impl->metadata->get_cparams();
                 candidate->set_causal_attn(prepared.causal_attn);
@@ -9089,8 +9119,8 @@ bool llama_context_group::activate(const llama_kv_stream_selection & selection,
                             child_states.push_back(std::move(saved));
                         }
                     }
-                    child=std::make_unique<llama_context>(*impl->block_model,child_params,selected,impl->prediction_rows);
-                } else child=std::make_unique<llama_context>(impl->shared_model ? *impl->shared_model : *impl->model,child_params,selected);
+                    child=std::make_unique<llama_context>(*impl->block_model,child_params,selected,impl->prediction_rows,impl->auxiliary_metadata.get());
+                } else child=std::make_unique<llama_context>(impl->shared_model ? *impl->shared_model : *impl->model,child_params,selected,impl->auxiliary_metadata.get());
                 child->set_embeddings_nextn(true,!impl->block_model);
                 if (impl->auxiliary_metadata && !child->bind_group_samplers_from(*impl->auxiliary_metadata)) return false;
             }
@@ -9249,7 +9279,7 @@ bool llama_context_group::set_recurrent_placement(llama_recurrent_representation
             if (representation!=llama_recurrent_representation::dense_device) return false;
         } else {
             auto probe=params;probe.samplers=nullptr;probe.n_samplers=0;
-            llama_context pending(*impl->model,probe,std::vector<llama_seq_id>{0});
+            llama_context pending(*impl->model,probe,std::vector<llama_seq_id>{0},impl->metadata.get());
             const auto * recurrent=pending.get_kv_resources().recurrent;
             if (!recurrent || (params.recurrent_rollback_ram && !recurrent->spill_enabled()) ||
                     (params.recurrent_rollback_compact && !recurrent->compact_enabled())) return false;
