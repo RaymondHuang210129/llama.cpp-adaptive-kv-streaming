@@ -47,6 +47,8 @@ int main() {
              linked_export(&destroy_group) &&
              linked_export(&llama_context_group_checkpoint::payload_size) &&
              linked_export(&llama_context::group_parent) &&
+             linked_export(&llama_context::group_prefill_workload_fits) &&
+             linked_export(&llama_context::prepare_group_prefill_reuse) &&
              linked_export(&llama_context::get_cparams) &&
              linked_export(&llama_context_group::prepare_shared_mtp) &&
              linked_export(&llama_context_group::prepare_dflash) &&

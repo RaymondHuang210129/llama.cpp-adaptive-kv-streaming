@@ -238,6 +238,8 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
     uint32_t get_head(llama_seq_id seq_id) const;
+    // Match per-sequence checkpoint pruning without moving live rows or changing the cursor.
+    void prune_checkpoint_rows();
     bool supports_mask_bounds() const;
 
     // The stream holding seq_id's cells.

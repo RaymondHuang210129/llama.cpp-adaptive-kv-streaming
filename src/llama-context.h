@@ -105,6 +105,9 @@ struct llama_context {
         std::shared_ptr<llama_kv_stream_slot_projection> projection,std::unique_ptr<llama_memory_phase_owner> & owner,
         llama_memory_work_phase phase,uint32_t profile,uint64_t selection_revision);
     bool group_submission_allowed() const noexcept;
+    // Check an exact prefill quote against the live frame, without retiring its grants.
+    LLAMA_API bool group_prefill_workload_fits(const llama_context_group_plan & quote) const;
+    LLAMA_API bool prepare_group_prefill_reuse(const llama_context_group_plan & quote);
     bool group_mtp_ready(uint32_t future_tokens) const noexcept;
     // Selected recurrent destinations are retained outside every draft workspace view.
     LLAMA_API bool group_recurrent_restore_isolated() const noexcept;

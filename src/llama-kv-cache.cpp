@@ -1972,6 +1972,17 @@ uint32_t llama_kv_cache::get_head(llama_seq_id seq_id) const {
     return v_heads[get_stream(seq_id)];
 }
 
+void llama_kv_cache::prune_checkpoint_rows() {
+    if (other || !n_swa) return;
+    for (auto & cells:v_cells) {
+        const auto end=cells.used_max_p1();
+        for (uint32_t row=0;row<end;++row) if (!cells.is_empty(row))
+            for (llama_seq_id seq=0;seq<llama_seq_id(n_seq_max);++seq)
+                if (cells.seq_has(row,seq) && llama_hparams::is_masked_swa(n_swa,swa_type,cells.pos_get(row),cells.seq_pos_max(seq)))
+                    cells.seq_rm(row,seq);
+    }
+}
+
 uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 

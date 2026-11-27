@@ -60,6 +60,14 @@ def request_configuration(args):
     return ids, counts, files
 
 
+def prefill_bindings(text, maximum):
+    first_decode=text.find('phase=decode revision=')
+    assert first_decode>=0, 'missing decode transition'
+    binds=re.findall(r'stream group bind: selected=(\d+) rows=(\d+) phase=prefill revision=(\d+)',text[:first_decode])
+    assert binds and len(binds)<=maximum, 'prefill rebuilt its frame unnecessarily'
+    return [{'selected':int(n),'rows':int(rows),'revision':int(revision)} for n,rows,revision in binds]
+
+
 def checkpoint_coverage(text, expected):
     expected=set(expected);tasks={};frontiers={};checkpoints={}
     for line in text.splitlines():
@@ -98,7 +106,8 @@ def qualify(args):
                "--flash-attn", "on", "--cache-type-k", args.cache_type_k, "--cache-type-v", args.cache_type_v,
                "--shared-device-memory-mib", str(args.arena_mib), "--fit", "off", "--no-mmproj", "--offline",
                "--no-context-shift", "--no-warmup", "--cache-ram", "0", "--no-webui", "--threads", "4",
-               "--threads-batch", "4", "--host", "127.0.0.1", "--port", str(port), "-lv", "3"]
+               "--threads-batch", "4", "--host", "127.0.0.1", "--port", str(port), "-lv",
+               "4" if args.check_checkpoint_coverage else "3"]
     if args.context_checkpoints is not None:
         command += ["--ctx-checkpoints", str(args.context_checkpoints)]
     if args.parallel > 1:
@@ -266,6 +275,8 @@ def qualify(args):
                     assert final["timings"]["cache_n"] == 256
                     report["cached_prefix_tokens"] = 256
             text = (args.output / "server.log").read_text()
+            if args.max_prefill_bindings is not None:
+                report['initial_prefill_bindings']=prefill_bindings(text,args.max_prefill_bindings)
             if args.check_checkpoint_coverage:
                 report['checkpoint_coverage']=checkpoint_coverage(text,zip(slot_ids,prompt_counts))
             prefill = re.findall(r"stream group bind: selected=(\d+) rows=(\d+) phase=prefill", text)
@@ -403,6 +414,7 @@ if __name__ == "__main__":
     parser.add_argument("--context-size", type=int, default=32768)
     parser.add_argument("--context-checkpoints", type=int)
     parser.add_argument("--check-checkpoint-coverage", action="store_true")
+    parser.add_argument("--max-prefill-bindings", type=int)
     parser.add_argument("--timeout-seconds", type=int, default=240)
     parser.add_argument("--sanitizer", type=Path)
     parser.add_argument("--cuda-library-guard", type=Path, help="test fault shim rejecting handle creation after startup")

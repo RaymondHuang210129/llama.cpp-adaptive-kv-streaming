@@ -39,13 +39,14 @@ struct state_reader : llama_io_read_i {
 struct fixture {
     std::unique_ptr<llama_model> model{llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params())};
     std::unique_ptr<llama_kv_cache> cache;
-    explicit fixture(float bias = 0, uint32_t capacity = 32, bool transposed = false) {
+    explicit fixture(float bias = 0, uint32_t capacity = 32, bool transposed = false, uint32_t window = 0) {
         auto & hp = model->hparams;
         hp.n_layer_all = 1; hp.n_embd = 8; hp.n_head_arr[0] = hp.n_head_kv_arr[0] = 1;
         hp.n_embd_head_k_full = hp.n_embd_head_v_full = 8;
         hp.n_rot_full = 8;
         cache = std::make_unique<llama_kv_cache>(*model, hp, GGML_TYPE_F32, GGML_TYPE_F32,
-            transposed, false, true, capacity, 4, 1, 0, LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
+            transposed, false, true, capacity, 4, 1, window, window ? LLAMA_SWA_TYPE_STANDARD : LLAMA_SWA_TYPE_NONE,
+            nullptr, nullptr, nullptr, nullptr);
         std::vector<float> values(size_t(capacity)*8);
         for (size_t i = 0; i < values.size(); ++i) values[i] = float(i + 1) + bias;
         for (auto * tensor : {cache->get_k_storage(0), cache->get_v_storage(0)})
@@ -73,6 +74,22 @@ int main() {
     testing t;
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     const std::vector<uint32_t> first{0, 4, 8, 12}, second{1, 5, 9, 13};
+    t.test("sliding_window_frame_reuse_matches_checkpoint_pruning_and_head", [&](testing & t) {
+        fixture source(0,32,false,4);source.place(0,{0,4,8,12,16,20,24,28});
+        source.place(1,second);
+        const auto saved=source.save(0),peer=source.save(1);
+        fixture destination(-1000,32,false,4);destination.restore(saved,0);destination.restore(peer,1);
+        source.cache->prune_checkpoint_rows();
+        t.assert_equal(source.cache->get_head(0),destination.cache->get_head(0));
+        t.assert_equal(source.cache->get_cells(0).get_used(),destination.cache->get_cells(0).get_used());
+        for (uint32_t row=0;row<32;++row) {
+            const auto & expected=destination.cache->get_cells(0);const auto & actual=source.cache->get_cells(0);
+            t.assert_equal(expected.is_empty(row),actual.is_empty(row));
+            if (!expected.is_empty(row)) t.assert_true(actual.seq_get(row)==expected.seq_get(row) && actual.pos_get(row)==expected.pos_get(row));
+            float value=0;ggml_backend_tensor_get(source.cache->get_k_storage(0),&value,row*32,sizeof(value));
+            t.assert_equal(float(row*8+1),value);
+        }
+    });
     t.test("sequence_and_whole_restore_preserve_global_holes_head_and_payload", [&](testing & t) {
         fixture source; source.place(0, first); source.place(1, second);
         const auto a = source.save(0), b = source.save(1), whole = source.save(-1);

@@ -50,5 +50,13 @@ id 0 | task 10 | created context checkpoint 1 of 32, n_tokens = 768
         with self.assertRaisesRegex(AssertionError,'unsubmitted'):
             harness.checkpoint_coverage(text.replace('n_tokens = 768\n','n_tokens = 900\n',1),[(0,1024),(1,1024)])
 
+    def test_prefill_frame_counter_rejects_shape_rebuilds(self):
+        first='stream group bind: selected=3 rows=255 phase=prefill revision=1\n'
+        tail='stream group bind: selected=3 rows=93 phase=prefill revision=2\n'
+        decode='stream group bind: selected=3 rows=3 phase=decode revision=3\n'
+        with self.assertRaisesRegex(AssertionError,'rebuilt'):
+            harness.prefill_bindings(first+tail+decode,1)
+        self.assertEqual(len(harness.prefill_bindings(first+decode+tail,1)),1)
+
 if __name__ == '__main__':
     unittest.main()

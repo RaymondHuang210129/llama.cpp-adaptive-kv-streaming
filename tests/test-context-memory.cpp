@@ -155,6 +155,51 @@ static void benchmark(ggml_backend_dev_t dev) {
 
 int main(int argc, char ** argv) {
     testing t;
+    t.test("prefill_reuse_checks_each_live_region_and_member", [](testing & t) {
+        llama_context_group_plan capacity;
+        auto & q=capacity.target;
+        q.buffer_type=ggml_backend_cpu_buffer_type();
+        q.writer_bytes=8192;q.attention_bytes=4096;q.encoded_stage_bytes=2048;q.publication_bytes=1024;
+        q.pool_minimum_bytes=4096;q.host_compute_bytes=2048;q.host_descriptor_bytes=1024;
+        q.measurement.graph_bytes={16384};q.measurement.alignment=128;
+        q.measurement.workload.selected_count=2;q.measurement.workload.microbatch_rows=256;
+        for (uint32_t i=0;i<2;++i) {
+            llama_memory_workload_requirement member;
+            member.phase=llama_memory_work_phase::target_prefill;member.cache={i+1,1};
+            member.input_rows=member.query_rows=128;member.output_rows=1;
+            member.microbatch_rows=256;member.writes_cache=true;
+            q.measurement.workload.members.push_back(member);
+        }
+        capacity.current_state_bytes=1024;capacity.bounded.allocation.bytes=2048;
+        capacity.budget.host_feature_peak_bytes=4096;
+        auto required=capacity;
+        for (auto & member:required.target.measurement.workload.members) {
+            member.input_rows=member.query_rows=13;member.cache.generation=5;
+        }
+        required.target.measurement.graph_bytes={8192};
+        t.assert_true("smaller exactly measured shape fits",llama_context_group_prefill_fits(required,capacity));
+        const auto rejected=[&](const std::function<void(llama_context_group_plan &)> & change) {
+            auto wrong=required;change(wrong);t.assert_true(!llama_context_group_prefill_fits(wrong,capacity));
+        };
+        for (auto field : {&llama_context_group_workload_quote::writer_bytes,&llama_context_group_workload_quote::attention_bytes,
+                &llama_context_group_workload_quote::encoded_stage_bytes,&llama_context_group_workload_quote::publication_bytes,
+                &llama_context_group_workload_quote::pool_minimum_bytes,&llama_context_group_workload_quote::host_compute_bytes,
+                &llama_context_group_workload_quote::host_descriptor_bytes})
+            rejected([&](auto & plan) {plan.target.*field=capacity.target.*field+1;});
+        rejected([&](auto & plan) {plan.target.measurement.graph_bytes={16385};});
+        rejected([&](auto & plan) {plan.current_state_bytes=1025;});
+        rejected([&](auto & plan) {plan.bounded.allocation.bytes=2049;});
+        rejected([&](auto & plan) {plan.budget.host_feature_peak_bytes=4097;});
+        rejected([&](auto & plan) {plan.target.measurement.alignment=256;});
+        rejected([&](auto & plan) {plan.target.buffer_type=nullptr;});
+        rejected([&](auto & plan) {plan.target.measurement.workload.members[0].cache.id=99;});
+        rejected([&](auto & plan) {plan.target.measurement.workload.members[0].input_rows=129;});
+        rejected([&](auto & plan) {plan.target.measurement.workload.members[0].phase=llama_memory_work_phase::target_verify;});
+        rejected([&](auto & plan) {plan.target.measurement.workload.members[0].causal=false;});
+        rejected([&](auto & plan) {plan.target.measurement.workload.members.pop_back();});
+        rejected([&](auto & plan) {plan.target.measurement.workload.selected_count=3;});
+        rejected([&](auto & plan) {plan.target.measurement.workload.microbatch_rows=512;});
+    });
     t.test("group_graph_catalog_covers_native_shapes_with_bounded_count", [](testing & t) {
         using shape=std::tuple<uint32_t,uint32_t,uint32_t>;
         for (uint32_t selected : {3u,4u,8u,64u,256u}) for (bool recurrent : {false,true}) {

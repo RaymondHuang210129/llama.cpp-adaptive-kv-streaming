@@ -4148,6 +4148,33 @@ private:
         return stream_requests->selected(uint32_t(slot.id),handle.generation);
     }
 
+    bool stream_prefill_workload_fits(const llama_batch & input,bool causal) {
+        auto * active=stream_contexts->context();
+        const auto & params=active->get_cparams();
+        const auto placement=params.recurrent_rollback_compact ? llama_recurrent_representation::gdn_fp32 :
+            params.recurrent_rollback_ram ? llama_recurrent_representation::dense_host : llama_recurrent_representation::dense_device;
+        std::vector<llama_seq_id> selected;
+        std::vector<llama_memory_phase_cache_identity> sources,auxiliary;
+        for (const auto & member:stream_selection.slots) {
+            selected.push_back(llama_seq_id(member.id));
+            const auto handle=stream_contexts->source_handles()[member.id];
+            for (uint32_t role=0;role<=params.kv_stream_auxiliary_layers;++role) {
+                std::shared_ptr<llama_kv_stream_logical_cache> cache;
+                if (!stream_contexts->source_table()->get(handle,role,cache) || !cache->ready()) return false;
+                (role ? auxiliary : sources).push_back({cache->identity().id,cache->content()->generation()});
+            }
+        }
+        try {
+            auto pending=make_pending_stream_contexts(selected,&placement);
+            pending.target->set_causal_attn(causal);
+            llama_memory_phase_cache_identity bounded;llama_context_group_plan quote;
+            if (!llama_context_group_bounded_identity(sources,auxiliary,bounded) ||
+                    pending.target->quote_target_group(input,sources,bounded,llama_memory_work_phase::target_prefill,1,SIZE_MAX,
+                        quote,pending.auxiliary.get(),auxiliary).status!=llama_context_memory_create_status::success) return false;
+            return active->prepare_group_prefill_reuse(quote);
+        } catch (const std::bad_alloc &) {return false;}
+    }
+
     bool ensure_stream_execution(llama_batch * supplied=nullptr, bool causal=true,
             llama_context_memory_create_result * rejected=nullptr) {
         if (!stream_contexts) return true;
@@ -4178,8 +4205,14 @@ private:
         auto * active=stream_contexts->context();
         const bool embedded=representative.embd!=nullptr;
         if (active && embedded==stream_embedded && active->get_cparams().causal_attn==causal &&
-                (shape==stream_shape || (spec && phase==llama_memory_work_phase::target_verify)) &&
-                active->get_cparams().kv_stream_decode==(phase==llama_memory_work_phase::target_verify)) return true;
+                active->get_cparams().kv_stream_decode==(phase==llama_memory_work_phase::target_verify)) {
+            if (shape==stream_shape || (spec && phase==llama_memory_work_phase::target_verify)) return true;
+            if (phase==llama_memory_work_phase::target_prefill && stream_prefill_workload_fits(representative,causal)) {
+                SRV_DBG("stream prefill frame reuse: rows=%d revision=%" PRIu64 "\n",representative.n_tokens,stream_binding_revision);
+                stream_shape=std::move(shape);
+                return true;
+            }
+        }
         park_stream_context();
         llama_set_causal_attn(stream_contexts->metadata_context(),causal);
         auto selection=stream_selection;selection.history_tokens=0;

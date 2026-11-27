@@ -70,6 +70,32 @@ inline bool llama_context_group_bounded_identity(const std::vector<llama_memory_
     return false;
 }
 
+// Both quotes must describe the same prepared models and selected sources. No region may borrow another region's spare bytes.
+inline bool llama_context_group_prefill_fits(const llama_context_group_plan & required,const llama_context_group_plan & capacity) {
+    const auto & a=required.target;const auto & b=capacity.target;
+    const auto & work=a.measurement.workload;const auto & admitted=b.measurement.workload;
+    if (!a.buffer_type || a.buffer_type!=b.buffer_type || !a.measurement.alignment || a.measurement.alignment!=b.measurement.alignment ||
+            work.selected_count!=admitted.selected_count || work.microbatch_rows!=admitted.microbatch_rows ||
+            work.members.empty() || work.members.size()!=admitted.members.size() ||
+            a.measurement.graph_bytes.empty() || b.measurement.graph_bytes.empty()) return false;
+    for (size_t i=0;i<work.members.size();++i) {
+        const auto & member=work.members[i];const auto & limit=admitted.members[i];
+        if (member.phase!=llama_memory_work_phase::target_prefill || limit.phase!=member.phase ||
+                member.cache.id!=limit.cache.id || !member.input_rows || member.input_rows>limit.input_rows ||
+                member.query_rows>limit.query_rows || member.causal!=limit.causal ||
+                member.writes_cache!=limit.writes_cache || member.rollback_depth!=limit.rollback_depth ||
+                member.microbatch_rows!=limit.microbatch_rows) return false;
+    }
+    for (auto field : {&llama_context_group_workload_quote::writer_bytes,&llama_context_group_workload_quote::attention_bytes,
+            &llama_context_group_workload_quote::encoded_stage_bytes,&llama_context_group_workload_quote::publication_bytes,
+            &llama_context_group_workload_quote::pool_minimum_bytes,&llama_context_group_workload_quote::host_compute_bytes,
+            &llama_context_group_workload_quote::host_descriptor_bytes}) if (a.*field>b.*field) return false;
+    return *std::max_element(a.measurement.graph_bytes.begin(),a.measurement.graph_bytes.end())<=
+            *std::max_element(b.measurement.graph_bytes.begin(),b.measurement.graph_bytes.end()) &&
+        required.current_state_bytes<=capacity.current_state_bytes && required.bounded.allocation.bytes<=capacity.bounded.allocation.bytes &&
+        required.budget.host_feature_peak_bytes<=capacity.budget.host_feature_peak_bytes;
+}
+
 // Native state banks grow monotonically with selected count. This bound does not admit graph workspaces or attention.
 inline bool llama_context_group_state_limit(uint32_t maximum,size_t capacity,
         const std::function<bool(uint32_t,size_t &)> & measure,uint32_t & output) {

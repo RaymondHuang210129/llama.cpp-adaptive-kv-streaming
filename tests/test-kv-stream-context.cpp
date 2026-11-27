@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-context.h"
+#include "../src/llama-context-memory.h"
 #include "../src/llama-memory-workspace.h"
 #include "../src/llama-batch.h"
 #include "../src/llama-model.h"
@@ -2709,6 +2710,73 @@ static void test_group_park_continuation(testing & t,llama_model * model,bool fl
             <<" native_same_layout_max_abs="<<maximum<<" native_continuous_max_abs="<<continuous_difference<<'\n';
         if(grouped)t.assert_true("group matches native server under the same restore/layout history",maximum==0);
         if(restore)t.assert_true("save/restore preserves uninterrupted logits bit for bit",continuous_difference==0);
+    }
+}
+
+static void test_group_prefill_reuse(testing & t,llama_model * model,uint32_t configured,const std::vector<llama_seq_id> & selected) {
+    auto cp=llama_context_default_params();cp.n_ctx=512;cp.n_batch=cp.n_ubatch=32;cp.n_seq_max=configured;
+    cp.kv_unified=true;cp.swa_full=false;cp.type_k=test_cache_k;cp.type_v=test_cache_v;
+    cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;cp.n_threads=cp.n_threads_batch=4;
+    auto batch=llama_batch_init(int32_t(8*selected.size()),0,1);
+    struct release_batch {llama_batch & batch;~release_batch(){llama_batch_free(batch);}} release{batch};
+    std::vector<std::vector<float>> reference;
+    for (bool grouped : {false,true}) {
+        std::unique_ptr<llama_context> native;
+        std::unique_ptr<llama_context_group> group;
+        auto params=cp;
+        if (grouped) {
+            params.shared_device_memory_bytes=size_t(2096)*1024*1024;
+            for (uint32_t layer=0;layer<model->hparams.n_layer();++layer) if (model->hparams.is_recr(layer)) {
+                params.n_rs_seq=3;params.recurrent_rollback_compact=true;break;
+            }
+            group=llama_context_group::create(*model,params);if (!t.assert_true(bool(group))) return;
+        } else native=std::make_unique<llama_context>(*model,params);
+        uint32_t first=0;size_t record=0;llama_context * frame=nullptr;ggml_backend_buffer_t parent=nullptr;ggml_backend_sched_t scheduler=nullptr;
+        for (uint32_t rows : {8u,3u,7u,1u,8u}) {
+            batch.n_tokens=0;
+            for (auto id : selected) for (uint32_t row=0;row<rows;++row) {
+                const auto i=batch.n_tokens++;batch.token[i]=10+id*7+(first+row)%5;batch.pos[i]=first+row;
+                batch.n_seq_id[i]=1;batch.seq_id[i][0]=id;batch.logits[i]=row+1==rows;
+            }
+            if (grouped && !frame) {
+                llama_kv_stream_selection selection;std::vector<llama_kv_stream_selection_slot> histories;
+                std::vector<llama_kv_stream_slot_handle> handles;
+                for (auto id:selected) {histories.push_back({uint32_t(id),0});handles.push_back(group->source_handles()[id]);}
+                if (!t.assert_true(llama_kv_stream_select({512,configured},histories,selection)==llama_kv_stream_selection_status::success &&
+                        group->activate(selection,handles,batch,llama_memory_work_phase::target_prefill,1,1))) return;
+                frame=group->context();parent=frame->group_parent();scheduler=frame->get_sched();
+            }
+            auto * context=grouped ? frame : native.get();
+            if (grouped) {
+                llama_context pending(*model,params,selected,group->metadata_context());
+                std::vector<llama_memory_phase_cache_identity> sources;
+                for (auto id:selected) {
+                    std::shared_ptr<llama_kv_stream_logical_cache> cache;
+                    if (!t.assert_true(group->source_table()->get(group->source_handles()[id],0,cache))) return;
+                    sources.push_back({cache->identity().id,cache->content()->generation()});
+                }
+                llama_memory_phase_cache_identity bounded;llama_context_group_plan quote;
+                if (!t.assert_true(llama_context_group_bounded_identity(sources,{},bounded) &&
+                        pending.quote_target_group(batch,sources,bounded,llama_memory_work_phase::target_prefill,1,SIZE_MAX,quote).status==
+                            llama_context_memory_create_status::success)) return;
+                if (!t.assert_true("exact smaller prefill quote fits the original frame",frame->group_prefill_workload_fits(quote))) return;
+                if (!t.assert_true("reuse prepares the measured frame",frame->prepare_group_prefill_reuse(quote))) return;
+                auto oversized=quote;oversized.target.writer_bytes=SIZE_MAX;
+                t.assert_true("an oversized region rejects reuse",!frame->group_prefill_workload_fits(oversized));
+            }
+            if (!t.assert_equal(0,context->decode(batch))) return;
+            for (size_t slot=0;slot<selected.size();++slot) {
+                const auto * values=llama_get_logits_ith(context,int32_t((slot+1)*rows-1));
+                if (!t.assert_true(values!=nullptr)) return;
+                if (!grouped) reference.emplace_back(values,values+model->vocab.n_tokens());
+                else if (!t.assert_true("variable prefill frame preserves native logits bit for bit",
+                        !std::memcmp(values,reference[record].data(),model->vocab.n_tokens()*sizeof(float)))) return;
+                ++record;
+            }
+            if (grouped) t.assert_true("shape changes retain execution and its grants",group->context()==frame &&
+                frame->group_parent()==parent && frame->get_sched()==scheduler && group->parked_payload_bytes()==0);
+            first+=rows;
+        }
     }
 }
 
@@ -10405,6 +10473,16 @@ int main(int argc,char ** argv) {
     }
     for (int i=3;i+1<argc;++i) if (!std::strcmp(argv[i],"--group-active-dflash-checkpoint")) {
         t.test("Active_checkpoint_preserves_target_and_draft_and_rejects_partial_export",[&](testing & t) {test_active_dflash_checkpoint(t,model.get(),argv[i+1]);});
+        return t.summary();
+    }
+    if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-prefill-reuse-only");})) {
+        for (uint32_t count=1;count<=4;++count) {
+            std::vector<llama_seq_id> selected;for (uint32_t i=0;i<count;++i) selected.push_back(llama_seq_id(i));
+            t.test("Variable_prefill_reuses_"+std::to_string(count)+"_selected_sources",[&](testing & t) {
+                test_group_prefill_reuse(t,model.get(),std::max(2u,count),selected);
+            });
+        }
+        t.test("Variable_prefill_preserves_sparse_source_ordinals",[&](testing & t) {test_group_prefill_reuse(t,model.get(),4,{1,3});});
         return t.summary();
     }
     if (std::any_of(argv+3,argv+argc,[](const char * arg) {return !std::strcmp(arg,"--group-active-checkpoint-only") || !std::strcmp(arg,"--group-active-checkpoint-f16");})) {

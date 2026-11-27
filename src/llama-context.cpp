@@ -8040,6 +8040,7 @@ namespace {
 using group_lease_ptr=std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)>;
 struct group_execution_resources {
     llama_context & context;
+    llama_context_group_plan capacity;
     std::shared_ptr<llama_kv_stream_slot_table> table;
     std::shared_ptr<llama_kv_stream_slot_projection> projection;
     ggml_backend_t backend=nullptr;
@@ -8644,6 +8645,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
             child->leases.emplace_back(child_staging,ggml_backend_memory_lease_free);
             bind_readers(*auxiliary,child,child_staging);
         }
+        resources->capacity=std::move(quote);
         group_execution->resources=std::move(resources);
         if (result) result->status=llama_context_memory_create_status::success;
         return true;
@@ -8653,6 +8655,25 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
     } catch (const std::exception & error) {
         LLAMA_LOG_ERROR("%s: group initialization failed: %s\n",__func__,error.what());return false;
     }
+}
+
+bool llama_context::group_prefill_workload_fits(const llama_context_group_plan & quote) const {
+    if (!group_execution || group_execution->failed || group_execution->admission || cparams.kv_stream_decode ||
+            !group_execution->resources || !group_execution->table->projection_current(*group_execution->projection)) return false;
+    const auto * peer=group_execution->peer;
+    if (peer && (peer->failed || peer->admission)) return false;
+    const auto resources=std::static_pointer_cast<group_execution_resources>(group_execution->resources);
+    return llama_context_group_prefill_fits(quote,resources->capacity);
+}
+
+bool llama_context::prepare_group_prefill_reuse(const llama_context_group_plan & quote) {
+    if (!group_prefill_workload_fits(quote)) return false;
+    return group_execution->mutate([&] {
+        if (kv_resources.bounded) kv_resources.bounded->prune_checkpoint_rows();
+        if (const auto * peer=group_execution->peer)
+            if (peer->context.kv_resources.bounded) peer->context.kv_resources.bounded->prune_checkpoint_rows();
+        return true;
+    });
 }
 
 ggml_backend_buffer_t llama_context::group_parent() const noexcept {
