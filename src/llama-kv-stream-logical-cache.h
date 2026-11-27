@@ -106,7 +106,7 @@ struct llama_kv_stream_slot_handle {
     uint64_t generation = 0;
 };
 
-// Native columns pack committed rows; logical growth allowances are not attention columns.
+// Native columns preserve attention row placement; logical growth allowances are not attention columns.
 // Canonical host addresses never move.
 struct llama_kv_stream_slot_projection {
     llama_kv_stream_selection selected;
@@ -114,7 +114,7 @@ struct llama_kv_stream_slot_projection {
     std::vector<llama_kv_stream_logical_checkpoint> sources;
     std::shared_ptr<llama_kv_cells> cells;
     std::vector<ggml_kv_stream_gather_row> columns;
-    uint32_t role = 0;
+    uint32_t role = 0, head = 0;
 };
 
 // Owner-thread metadata for stable canonical histories. Read aliases resolve through their source.

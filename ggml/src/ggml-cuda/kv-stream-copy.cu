@@ -795,7 +795,7 @@ static __global__ void gather_rectangles(const gather_batch batch) {
     if (!((uintptr_t(rectangle.source)|uintptr_t(rectangle.destination)|rectangle.source_stride|
             rectangle.destination_stride|rectangle.row_bytes)&15)) {
         const size_t width=rectangle.row_bytes/sizeof(uint4),words=width*rectangle.rows;
-        for (size_t index=threadIdx.x;index<words;index+=blockDim.x) {
+        for (size_t index=threadIdx.x+size_t(blockIdx.y)*blockDim.x;index<words;index+=size_t(blockDim.x)*gridDim.y) {
             const size_t row=index/width,column=index%width;
             reinterpret_cast<uint4 *>(rectangle.destination+row*rectangle.destination_stride)[column]=
                 reinterpret_cast<const uint4 *>(rectangle.source+row*rectangle.source_stride)[column];
@@ -803,7 +803,7 @@ static __global__ void gather_rectangles(const gather_batch batch) {
         return;
     }
     const size_t bytes=rectangle.row_bytes*rectangle.rows;
-    for (size_t index=threadIdx.x;index<bytes;index+=blockDim.x) {
+    for (size_t index=threadIdx.x+size_t(blockIdx.y)*blockDim.x;index<bytes;index+=size_t(blockDim.x)*gridDim.y) {
         const size_t row=index/rectangle.row_bytes,column=index%rectangle.row_bytes;
         rectangle.destination[row*rectangle.destination_stride+column]=
             rectangle.source[row*rectangle.source_stride+column];
@@ -825,18 +825,20 @@ static bool gather(ggml_backend_t backend,ggml_backend_buffer_t destination,
     auto * target=static_cast<char *>(ggml_backend_buffer_get_base(destination));
     if (initialize) CUDA_CHECK(cudaMemsetAsync(target,0,ggml_backend_buffer_get_size(destination),ctx.stream()));
     gather_batch batch{};
-    size_t pending=0;
+    size_t pending=0,largest=0;
     const auto flush=[&] {
         if (pending) {
-            gather_rectangles<<<pending,256,0,ctx.stream()>>>(batch);
-            CUDA_CHECK(cudaGetLastError());pending=0;
+            gather_rectangles<<<dim3(pending,largest>65536 ? 8 : 1),256,0,ctx.stream()>>>(batch);
+            CUDA_CHECK(cudaGetLastError());pending=0;largest=0;
         }
     };
     for (size_t i=0;i<count;++i) {
         const auto & r=rectangles[i];
         const auto * source=static_cast<const char *>(ggml_backend_buffer_get_base(r.source))+r.source_offset;
         const size_t bytes=r.row_bytes*r.rows;
-        if (r.rows<=16 && bytes<=65536) {
+        if (r.rows<=256 && bytes<=4*1024*1024 && r.row_bytes<=UINT32_MAX &&
+                r.source_stride<=UINT32_MAX && r.destination_stride<=UINT32_MAX) {
+            largest=std::max(largest,bytes);
             batch.rectangles[pending++]={source,target+r.destination_offset,uint32_t(r.rows==1 ? r.row_bytes : r.source_stride),
                 uint32_t(r.rows==1 ? r.row_bytes : r.destination_stride),uint32_t(r.row_bytes),uint32_t(r.rows)};
             if (pending==gather_batch_size) flush();

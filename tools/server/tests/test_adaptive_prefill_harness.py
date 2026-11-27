@@ -36,5 +36,19 @@ class CohortConfiguration(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 harness.request_configuration(self.args(**changes))
 
+    def test_checkpoint_coverage_rejects_missing_siblings(self):
+        text='''id 0 | task 10 | new prompt, task.n_tokens = 1024
+id 1 | task 11 | new prompt, task.n_tokens = 1024
+id 0 | task 10 | cached n_tokens = 768
+id 1 | task 11 | cached n_tokens = 768
+id 0 | task 10 | created context checkpoint 1 of 32, n_tokens = 768
+'''
+        with self.assertRaisesRegex(AssertionError,'sibling'):
+            harness.checkpoint_coverage(text,[(0,1024),(1,1024)])
+        text+='id 1 | task 11 | created context checkpoint 1 of 32, n_tokens = 768\n'
+        self.assertEqual([r['prefixes'] for r in harness.checkpoint_coverage(text,[(0,1024),(1,1024)])],[[768],[768]])
+        with self.assertRaisesRegex(AssertionError,'unsubmitted'):
+            harness.checkpoint_coverage(text.replace('n_tokens = 768\n','n_tokens = 900\n',1),[(0,1024),(1,1024)])
+
 if __name__ == '__main__':
     unittest.main()

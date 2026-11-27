@@ -35,6 +35,8 @@ struct llama_context_group_sequence_state {
     llama_pos draft_position = -1;
     std::vector<uint8_t> recurrent, bounded;
     std::vector<uint32_t> full_columns;
+    std::vector<uint32_t> full_rows;
+    uint32_t full_head = UINT32_MAX;
 };
 // Parked request checkpoint. No physical GPU ownership or process-local source identity is restored.
 struct llama_context_group_checkpoint {
@@ -696,6 +698,9 @@ public:
     LLAMA_API const std::vector<llama_kv_stream_slot_handle> & source_handles() const noexcept;
     // Export only parked sources. Loading starts a new namespace at the destination's reserved addresses.
     LLAMA_API bool save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes=true) const;
+    // Snapshot selected requests at a completed batch boundary without retiring their device grants.
+    LLAMA_API bool snapshot_requests(const std::vector<uint32_t> & slots,
+        std::vector<llama_context_group_checkpoint> & output,bool copy_bytes=false) const;
     // Versioned native-endian checkpoint. Caller supplies the actual remaining input bytes.
     LLAMA_API bool write_request(uint32_t slot,llama_io_write_i & output) const;
     LLAMA_API bool read_request(uint32_t slot,llama_io_read_i & input,size_t available);
@@ -708,6 +713,8 @@ public:
     LLAMA_API size_t parked_payload_bytes() const noexcept;
 private:
     llama_context_group();
+    bool make_request_checkpoint(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes,
+        llama_context_group_sequence_state target,llama_context_group_sequence_state auxiliary) const;
     struct implementation;
     std::unique_ptr<implementation> impl;
 };

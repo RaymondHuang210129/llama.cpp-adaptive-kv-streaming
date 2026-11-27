@@ -274,6 +274,7 @@ bool llama_kv_cache::bind_group_model(std::unique_ptr<llama_kv_stream_group_mode
             0,LLAMA_SWA_TYPE_NONE,nullptr,filter,nullptr,nullptr,"",&params);
         if (next.get_layer_ids()!=ids || next.ctxs_bufs.size()!=1 || next.full_pending) return false;
         next.v_cells[0]=*projection.cells;
+        next.v_heads[0]=projection.head;
         retired_storage_metadata.swap(ctxs_bufs);
         ctxs_bufs.swap(next.ctxs_bufs);layers.swap(next.layers);map_layer_ids.swap(next.map_layer_ids);
         v_cells.swap(next.v_cells);v_heads.swap(next.v_heads);storage_selected_sequences.swap(next.storage_selected_sequences);
@@ -1967,6 +1968,10 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+uint32_t llama_kv_cache::get_head(llama_seq_id seq_id) const {
+    return v_heads[get_stream(seq_id)];
+}
+
 uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -2768,6 +2773,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+static constexpr uint32_t kv_state_layout_v1 = 0x4b564c31;
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (seq_id>=0 && !selected_sequence_valid(seq_id)) throw std::runtime_error("state export names an unchosen bounded-cache sequence");
     if (bounded_storage_pending()) throw std::runtime_error("bounded storage is unbound");
@@ -2778,6 +2785,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
     GGML_UNUSED(flags);
 
+    io.write(&kv_state_layout_v1, sizeof(kv_state_layout_v1));
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2835,6 +2843,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             continue;
         }
 
+        const uint32_t capacity = cells.size();
+        io.write(&capacity, sizeof(capacity));
+        io.write(&v_heads[s], sizeof(v_heads[s]));
+        for (const auto & range : cr.data) for (uint32_t row = range.first; row < range.second; ++row) {
+            io.write(&row, sizeof(row));
+        }
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
     }
@@ -2872,6 +2886,8 @@ const slot_info_vec_t *   sinfos_in) {
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
+    const bool has_layout = n_stream_cur == kv_state_layout_v1;
+    if (has_layout) io.read(&n_stream_cur, sizeof(n_stream_cur));
     if (n_stream_cur != n_stream) {
         throw std::runtime_error("n_stream mismatch");
     }
@@ -2900,9 +2916,31 @@ const slot_info_vec_t *   sinfos_in) {
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
         slot_info sinfo;
+        slot_info saved_layout;
+        uint32_t saved_head = 0;
+        if (has_layout) {
+            uint32_t capacity;
+            io.read(&capacity, sizeof(capacity));
+            io.read(&saved_head, sizeof(saved_head));
+            if (!capacity || saved_head > capacity || cell_count > v_cells[strm].size()) {
+                throw std::runtime_error("invalid saved KV layout extent");
+            }
+            saved_layout.s0 = saved_layout.s1 = strm;
+            saved_layout.resize(1);
+            saved_layout.strm[0] = strm;
+            auto & rows = saved_layout.idxs[0];
+            rows.resize(cell_count);
+            io.read(rows.data(), rows.size()*sizeof(uint32_t));
+            for (size_t i = 0; i < rows.size(); ++i) {
+                if (rows[i] >= capacity || (i && rows[i] <= rows[i-1])) {
+                    throw std::runtime_error("invalid saved KV row order");
+                }
+            }
+        }
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr,
+            has_layout ? &saved_layout : nullptr, saved_head);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2984,6 +3022,7 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (sinfos_out) {
+            sinfo.next_head = v_heads[strm];
             (*sinfos_out)[s] = sinfo;
         }
     }
@@ -3123,10 +3162,16 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, const slot_info * saved_layout, uint32_t saved_head) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
     if (kv_stream && cell_count > cells.size()) return false;
+    if (sinfo_in && sinfo_in->next_head != UINT32_MAX && sinfo_in->next_head > cells.size()) return false;
+    const auto layout_available = [&] {
+        return saved_layout && saved_head <= cells.size() &&
+            std::all_of(saved_layout->idxs[0].begin(), saved_layout->idxs[0].end(),
+                [&](uint32_t row) { return row < cells.size() && cells.is_empty(row); });
+    };
 
     if (dest_seq_id != -1) {
         // single sequence
@@ -3212,6 +3257,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                     return false;
                 }
             }
+        } else if (layout_available()) {
+            sinfo = *saved_layout;
         } else {
             sinfo = find_slot(ubatch, false);
             if (sinfo.empty()) {
@@ -3224,6 +3271,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+        if (saved_layout && saved_head <= cells.size() && sinfo.idxs == saved_layout->idxs) head = saved_head;
 
         // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
         // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
@@ -3251,14 +3299,18 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        // the cells go in from 0, so a mirrored cache lands on the same ones as long as it restores the same count. the layout itself carries no more information here
         if (sinfo_in && (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count)) {
             LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
                     sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);
             return false;
         }
 
+        const auto * placement = sinfo_in ? sinfo_in : layout_available() ? saved_layout : nullptr;
+        if (placement) for (auto row : placement->idxs[0]) {
+            if (row >= cells.size() || !cells.is_empty(row)) return false;
+        }
         for (uint32_t i = 0; i < cell_count; ++i) {
+            const uint32_t row = placement ? placement->idxs[0][i] : i;
             llama_pos pos;
             uint32_t  n_seq_id;
 
@@ -3266,12 +3318,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&n_seq_id, sizeof(n_seq_id));
 
             if (kv_stream && (pos < 0 || n_seq_id != 1)) return false;
-            cells.pos_set(i, pos);
+            cells.pos_set(row, pos);
 
             if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
-                cells.ext_set(i, ext);
+                cells.ext_set(row, ext);
             }
 
             for (uint32_t j = 0; j < n_seq_id; ++j) {
@@ -3283,23 +3335,24 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                     return false;
                 }
 
-                cells.seq_add(i, seq_id);
+                cells.seq_add(row, seq_id);
             }
         }
 
-        // Create contiguous slot_info for whole cache restore
+        // Return the actual destination rows to caches mirroring this one.
         sinfo.s0 = strm;
         sinfo.s1 = strm;
         sinfo.resize(1);
         sinfo.strm[0] = strm;
         sinfo.idxs[0].resize(cell_count);
         for (uint32_t i = 0; i < cell_count; ++i) {
-            sinfo.idxs[0][i] = i;
+            sinfo.idxs[0][i] = placement ? placement->idxs[0][i] : i;
         }
 
-        head = 0;
+        head = saved_layout && sinfo.idxs[0] == saved_layout->idxs[0] && saved_head <= cells.size() ? saved_head : 0;
     }
 
+    if (sinfo_in && sinfo_in->next_head != UINT32_MAX) head = sinfo_in->next_head;
     return true;
 }
 

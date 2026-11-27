@@ -5098,7 +5098,9 @@ bool llama_context::measure_target_workload(const llama_batch & input,
         if (!llama_kv_stream_writer::requirements(next.buffer_type,shape,cparams.n_ubatch,next.writer_bytes)) return false;
         ggml_kv_stream_layout encoded;
         if (ggml_kv_stream_layout_make(shape,256,encoded).status!=ggml_kv_stream_status::success) return false;
-        next.encoded_stage_bytes=encoded.bytes;
+        const size_t stage_tiles=cparams.n_seq_max>1 ? std::max(size_t(1),std::min(size_t(64),size_t(16)*1024*1024/encoded.bytes)) : 1;
+        if (encoded.bytes>SIZE_MAX/stage_tiles) return false;
+        next.encoded_stage_bytes=encoded.bytes*stage_tiles;
         llama_kv_stream_policy_config policy;
         policy.shape=shape; policy.capabilities=ops->capabilities(backend,shape.type_k,shape.type_v);
         policy.layers=uint32_t(layers.size());
@@ -5719,11 +5721,14 @@ private:
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len,bool flush_on_destroy=true) : ptr(p), buf_size(len),flush_on_destroy(flush_on_destroy) {}
 
-    ~llama_io_write_host() {
+    ~llama_io_write_host() { if (flush_on_destroy) flush(); }
+
+    void flush() {
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
+        auto pending=std::move(winfos);winfos.clear();
+        for (const auto & winfo : pending) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
     }
@@ -5759,6 +5764,7 @@ private:
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
+    bool flush_on_destroy;
 
     struct write_info {
         ggml_tensor * tensor;
@@ -7903,7 +7909,8 @@ bool llama_context::save_group_sequences(std::vector<llama_context_group_sequenc
             if (!memory) return;
             llama_io_write_dummy size(false);memory->state_write(size,sequence,0);
             bytes.resize(size.n_bytes());
-            llama_io_write_host data(bytes.data(),bytes.size());memory->state_write(data,sequence,0);
+            llama_io_write_host data(bytes.data(),bytes.size(),false);memory->state_write(data,sequence,0);
+            data.flush();
             if (data.n_bytes()!=bytes.size()) throw std::runtime_error("native selected-state size changed during export");
         };
         std::vector<llama_context_group_sequence_state> next;
@@ -7931,9 +7938,10 @@ bool llama_context::save_group_sequences(std::vector<llama_context_group_sequenc
             for (uint32_t row=0;row<native.used_max_p1();++row) if (!native.is_empty(row) && native.seq_has(row,state.sequence)) {
                 const auto column=group_execution->projection->columns[row];
                 if (native.seq_count(row)!=1 || column.source!=next.size() || column.token>=state.tokens || seen[column.token]) return false;
-                seen[column.token]=true;state.full_columns.push_back(uint32_t(column.token));
+                seen[column.token]=true;state.full_columns.push_back(uint32_t(column.token));state.full_rows.push_back(row);
             }
             if (state.full_columns.size()!=state.tokens) return false;
+            state.full_head=(block ? group_target->kv_resources.full : kv_resources.full)->get_head(0);
             save(kv_resources.recurrent,state.sequence,state.recurrent);
             save(block ? memory.get() : kv_resources.bounded,state.sequence,state.bounded);
             next.push_back(std::move(state));
@@ -8271,7 +8279,7 @@ bool llama_context::initialize_group_execution(std::shared_ptr<llama_kv_stream_s
         };
         if ((quote.current_state_bytes && !reserve(101,quote.current_state_bytes)) ||
                 (quote.bounded.allocation.bytes && !reserve(102,quote.bounded.allocation.bytes)) || !reserve(201,graph_bytes) ||
-                !reserve(202,quote.target.writer_bytes) || !reserve(203,quote.target.attention_bytes) || !reserve(204,page.bytes) ||
+                !reserve(202,quote.target.writer_bytes) || !reserve(203,quote.target.attention_bytes) || !reserve(204,quote.target.encoded_stage_bytes) ||
                 (quote.target.publication_bytes && !reserve(205,quote.target.publication_bytes))) return false;
         if (cursor>SIZE_MAX-(alignment-1)) return false;
         const size_t pools_first=(cursor+alignment-1)/alignment*alignment,count=projection->handles.size();
@@ -9002,14 +9010,30 @@ bool restore_parked_group_projection(const llama_model & model,const std::shared
         if (!table->get_cells(handle,projection->role,cells)) return false;
         canonical.push_back(std::move(cells));states.push_back(std::move(saved));
     }
-    // Native sequence checkpoints retain physical column order, including reused rollback holes.
+    // Preserve global row placement as well as each source's token order.
+    const auto capacity=projection->cells->size();
+    const uint32_t head=states.front().full_head;
+    bool preserve=head<=capacity;
+    std::vector<bool> occupied(capacity,false);
+    for (const auto & state : states) {
+        if (state.full_rows.size()!=state.tokens || state.full_head!=head) {preserve=false;break;}
+        for (auto row : state.full_rows) {
+            if (row>=capacity || occupied[row]) {preserve=false;break;}
+            occupied[row]=true;
+        }
+        if (!preserve) break;
+    }
     projection->cells->reset();uint32_t first=0;
+    std::fill(projection->columns.begin(),projection->columns.end(),ggml_kv_stream_gather_row{UINT32_MAX,0});
     for (size_t i=0;i<states.size();++i) {
         const auto & order=states[i].full_columns;
-        projection->cells->set(first,canonical[i]->cp(order));
-        for (size_t row=0;row<order.size();++row) projection->columns[first+row]={uint32_t(i),order[row]};
+        if (preserve) projection->cells->set(states[i].full_rows,canonical[i]->cp(order));
+        else projection->cells->set(first,canonical[i]->cp(order));
+        for (size_t row=0;row<order.size();++row)
+            projection->columns[preserve ? states[i].full_rows[row] : first+row]={uint32_t(i),order[row]};
         first+=uint32_t(order.size());
     }
+    projection->head=preserve ? head : 0;
     output=std::move(states);return true;
 }
 
@@ -9310,6 +9334,14 @@ const std::vector<llama_kv_stream_slot_handle> & llama_context_group::source_han
 bool llama_context_group::save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes) const {
     if (!impl || impl->active || impl->vision_lent || slot>=impl->handles.size()) return false;
     try {
+        return make_request_checkpoint(slot,output,copy_bytes,impl->parked[slot],impl->parked_auxiliary[slot]);
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+bool llama_context_group::make_request_checkpoint(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes,
+        llama_context_group_sequence_state target,llama_context_group_sequence_state auxiliary) const {
+    if (!impl || impl->vision_lent || slot>=impl->handles.size()) return false;
+    try {
         llama_context_group_checkpoint saved;
         saved.model=impl->model;saved.auxiliary_model=impl->block_model ? impl->block_model : impl->shared_model;saved.slot=slot;
         const auto handle=impl->handles[slot];
@@ -9320,13 +9352,54 @@ bool llama_context_group::save_request(uint32_t slot,llama_context_group_checkpo
                     !impl->table->get_cells(handle,role,cells) || cells->get_used()!=history.tokens) return false;
             saved.histories.push_back(std::move(history));saved.cells.push_back(std::make_shared<llama_kv_cells>(*cells));
         }
-        saved.target=impl->parked[slot];saved.auxiliary=impl->parked_auxiliary[slot];
+        saved.target=std::move(target);saved.auxiliary=std::move(auxiliary);
         const auto & source=saved.histories.front();
         std::shared_ptr<llama_kv_stream_logical_cache> cache;
         if (!impl->table->get(handle,0,cache)) return false;
         if (source.tokens && (saved.target.model!=impl->model || saved.target.sequence!=llama_seq_id(slot) ||
                 saved.target.request_epoch!=handle.generation || saved.target.tokens!=source.tokens ||
                 saved.target.cache_id!=cache->identity().id || saved.target.cache_generation!=cache->identity().generation)) return false;
+        output=std::move(saved);return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+bool llama_context_group::snapshot_requests(const std::vector<uint32_t> & slots,
+        std::vector<llama_context_group_checkpoint> & output,bool copy_bytes) const {
+    if (!impl || !impl->active || impl->vision_lent || slots.empty() || slots.size()>impl->selected.size()) return false;
+    const auto idle=[](const llama_context & context) {
+        const auto * execution=context.group_execution.get();
+        return execution && !execution->failed && !execution->admission;
+    };
+    if (!idle(*impl->active) || (impl->active_auxiliary && !idle(*impl->active_auxiliary))) return false;
+    try {
+        std::vector<bool> seen(impl->handles.size(),false);
+        for (auto slot : slots) {
+            if (slot>=seen.size() || seen[slot] ||
+                    std::find(impl->selected.begin(),impl->selected.end(),llama_seq_id(slot))==impl->selected.end()) return false;
+            seen[slot]=true;
+        }
+        std::vector<llama_context_group_sequence_state> target,auxiliary;
+        if (!impl->active->save_group_sequences(target)) return false;
+        const bool native_auxiliary=impl->params.kv_stream_auxiliary_layers || impl->block_model;
+        if (native_auxiliary && (!impl->active_auxiliary || !impl->active_auxiliary->save_group_sequences(auxiliary))) return false;
+        std::vector<llama_context_group_checkpoint> saved;saved.reserve(slots.size());
+        for (auto slot : slots) {
+            auto current=std::find_if(target.begin(),target.end(),[&](const auto & state) {return state.sequence==llama_seq_id(slot);});
+            if (current==target.end()) return false;
+            llama_context_group_sequence_state child;
+            if (native_auxiliary) {
+                auto found=std::find_if(auxiliary.begin(),auxiliary.end(),[&](const auto & state) {return state.sequence==llama_seq_id(slot);});
+                if (found==auxiliary.end()) return false;
+                std::shared_ptr<llama_kv_stream_logical_cache> cache;
+                if (!impl->table->get(impl->handles[slot],impl->params.kv_stream_auxiliary_layers ? 1 : 0,cache) ||
+                        found->request_epoch!=impl->handles[slot].generation || found->cache_id!=cache->identity().id ||
+                        found->cache_generation!=cache->identity().generation || found->tokens!=cache->tokens()) return false;
+                child=std::move(*found);
+            }
+            llama_context_group_checkpoint checkpoint;
+            if (!make_request_checkpoint(slot,checkpoint,copy_bytes,std::move(*current),std::move(child))) return false;
+            saved.push_back(std::move(checkpoint));
+        }
         output=std::move(saved);return true;
     } catch (const std::bad_alloc &) {return false;}
 }
@@ -9369,6 +9442,11 @@ bool llama_context_group::load_request(uint32_t slot,const llama_context_group_c
                 if (row>=seen.size() || seen[row]) return false;
                 seen[row]=true;
             }
+            if (!state.full_rows.empty()) {
+                if (state.full_rows.size()!=history.tokens || state.full_head>impl->table->limits().slot_storage) return false;
+                for (size_t i=0;i<state.full_rows.size();++i)
+                    if (state.full_rows[i]>=impl->table->limits().slot_storage || (i && state.full_rows[i]<=state.full_rows[i-1])) return false;
+            }
             return true;
         };
         if (saved.histories.front().tokens && !validate(target,impl->model,saved.histories.front(),impl->metadata.get(),false)) return false;
@@ -9402,7 +9480,7 @@ bool llama_context_group::load_request(uint32_t slot,const llama_context_group_c
 
 namespace {
 constexpr uint32_t group_checkpoint_magic=0x47534350;
-constexpr uint32_t group_checkpoint_version=2;
+constexpr uint32_t group_checkpoint_version=3;
 
 std::array<uint64_t,8> group_checkpoint_model(const llama_model * model) {
     if (!model) return {};
@@ -9459,6 +9537,9 @@ bool llama_context_group::write_checkpoint(const llama_context_group_checkpoint 
             }
             const uint64_t columns=state->full_columns.size();io.write(&columns,sizeof(columns));
             io.write(state->full_columns.data(),state->full_columns.size()*sizeof(uint32_t));
+            io.write(&state->full_head,sizeof(state->full_head));
+            const uint64_t rows=state->full_rows.size();io.write(&rows,sizeof(rows));
+            io.write(state->full_rows.data(),state->full_rows.size()*sizeof(uint32_t));
         }
         return true;
     } catch (const std::exception &) {return false;}
@@ -9480,7 +9561,7 @@ bool llama_context_group::read_checkpoint(uint32_t slot,llama_io_read_i & io,siz
             if (bytes) io.read(destination,bytes);
         };
         std::array<uint32_t,3> header{};read(header.data(),sizeof(header));
-        if (header[0]!=group_checkpoint_magic || header[1]!=group_checkpoint_version || header[2]>=LLAMA_MAX_SEQ) return false;
+        if (header[0]!=group_checkpoint_magic || (header[1]!=group_checkpoint_version && header[1]!=2) || header[2]>=LLAMA_MAX_SEQ) return false;
         llama_context_group_checkpoint saved;saved.slot=header[2];saved.model=impl->model;
         saved.auxiliary_model=impl->block_model ? impl->block_model : impl->shared_model;
         for (const auto * model : {saved.model,saved.auxiliary_model}) {
@@ -9541,6 +9622,15 @@ bool llama_context_group::read_checkpoint(uint32_t slot,llama_io_read_i & io,siz
             uint64_t columns;read(&columns,sizeof(columns));const auto consumed=io.n_bytes()-start;
             if (columns!=tokens || columns>SIZE_MAX/sizeof(uint32_t) || consumed>available || columns*sizeof(uint32_t)>available-consumed) return false;
             state->full_columns.resize(size_t(columns));read(state->full_columns.data(),state->full_columns.size()*sizeof(uint32_t));
+            if (header[1]>=3) {
+                read(&state->full_head,sizeof(state->full_head));
+                uint64_t rows;read(&rows,sizeof(rows));const auto used=io.n_bytes()-start;
+                if ((rows && rows!=tokens) || rows>SIZE_MAX/sizeof(uint32_t) || used>available || rows*sizeof(uint32_t)>available-used) return false;
+                state->full_rows.resize(size_t(rows));read(state->full_rows.data(),state->full_rows.size()*sizeof(uint32_t));
+                if (rows && state->full_head>impl->table->limits().slot_storage) return false;
+                for (size_t i=0;i<state->full_rows.size();++i)
+                    if (state->full_rows[i]>=impl->table->limits().slot_storage || (i && state->full_rows[i]<=state->full_rows[i-1])) return false;
+            }
         }
         if (saved.slot!=slot) {
             for (size_t role=0;role<saved.cells.size();++role) for (uint32_t row=0;row<saved.histories[role].tokens;++row) {
@@ -9565,6 +9655,8 @@ size_t llama_context_group_checkpoint::payload_size() const noexcept {
         add(state->recurrent.size());add(state->bounded.size());
         if (state->full_columns.size()>SIZE_MAX/sizeof(uint32_t)) return SIZE_MAX;
         add(state->full_columns.size()*sizeof(uint32_t));
+        if (state->full_rows.size()>SIZE_MAX/sizeof(uint32_t)) return SIZE_MAX;
+        add(state->full_rows.size()*sizeof(uint32_t));
     }
     return bytes;
 }
@@ -9573,7 +9665,7 @@ size_t llama_context_group::parked_payload_bytes() const noexcept {
     if (!impl) return 0;
     size_t bytes=0;
     for (const auto * states : {&impl->parked,&impl->parked_auxiliary}) for (const auto & state : *states)
-        bytes+=state.recurrent.size()+state.bounded.size()+state.full_columns.size()*sizeof(uint32_t);
+        bytes+=state.recurrent.size()+state.bounded.size()+(state.full_columns.size()+state.full_rows.size())*sizeof(uint32_t);
     return bytes;
 }
 

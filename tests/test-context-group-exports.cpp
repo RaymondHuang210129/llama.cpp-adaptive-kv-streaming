@@ -65,6 +65,7 @@ int main() {
              linked_export(&llama_context_group::source_table) &&
              linked_export(&llama_context_group::source_handles) &&
              linked_export(&llama_context_group::save_request) &&
+             linked_export(&llama_context_group::snapshot_requests) &&
              linked_export(&llama_context_group::write_request) &&
              linked_export(&llama_context_group::read_request) &&
              linked_export(&llama_context_group::write_checkpoint) &&

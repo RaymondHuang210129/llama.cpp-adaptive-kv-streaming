@@ -1856,7 +1856,7 @@ struct llama_kv_stream_group_reader::implementation {
         bool prefix_ready=false,ring_started=false;
         std::unique_ptr<void,void (*)(void *)> queue{nullptr,[](void *) {}};
         llama_kv_stream_prefetch_plan plan;
-        std::vector<size_t> last_use;
+        std::vector<size_t> last_use,demand_last;
         std::vector<uint8_t> held,consumed;
         std::vector<bool> layer_sampled;
         size_t next=0,virtual_first=0;
@@ -1869,10 +1869,10 @@ struct llama_kv_stream_group_reader::implementation {
     ggml_kv_stream_layout tile;
     std::function<bool(uint32_t)> current;
     std::vector<ggml_kv_stream_gather_row> columns;
-    uint32_t layer=0;
+    uint32_t layer=0,staging_tiles=1;
     size_t next=0,resident_bytes=0;
     bool active=false,wide_prefill=false,pending=false;
-    bool pipeline=false,sequence=false;
+    bool pipeline=false,sequence=false,retain_pages=false;
     bool request_pipeline=false;
     uint32_t next_layer=0;
     llama_kv_stream_prefetch_stats stats;
@@ -2245,7 +2245,14 @@ struct llama_kv_stream_group_reader::implementation {
 
     bool acquire(source & owner,size_t first,size_t count) {
         auto & source=transport(owner);
-        if (!pipeline) return copies->acquire_span(source.queue.get(),first,count);
+        if (!pipeline) {
+            if (!retain_pages) return copies->acquire_span(source.queue.get(),first,count);
+            for (size_t i=0;i<count;++i) if (!source.held[first+i]) {
+                if (!copies->acquire_span(source.queue.get(),first+i,1)) return false;
+                source.held[first+i]=true;
+            }
+            return true;
+        }
         if (!probe(source)) return false;
         for (size_t i=0;i<count;) {
             if (source.held[first+i]) {++i;continue;}
@@ -2269,7 +2276,9 @@ struct llama_kv_stream_group_reader::implementation {
         auto & source=transport(owner);
         if (!pipeline) {
             for (auto slot : physical) {
+                if (retain_pages && source.demand_last[slot]>=end_column) continue;
                 if (!copies->release_span(source.queue.get(),slot,1)) return false;
+                if (retain_pages) source.held[slot]=false;
                 source.queued[slot]=false;source.pending_pages.invalidate(slot,1);
             }
             return true;
@@ -2387,7 +2396,13 @@ struct llama_kv_stream_group_reader::implementation {
         if (!registered->enqueue(stream.queue.get(),slot,fragments[0].data(),fragments[0].size(),
                 fragments[1].data(),fragments[1].size(),live,256,false) ||
                 !stream.pending_pages.record(slot,layer,virtual_token,live)) return false;
-        stream.queued[slot]=true;stream.next=(slot+1)%stream.slots;physical=slot;return true;
+        stream.queued[slot]=true;stream.next=(slot+1)%stream.slots;
+        if (retain_pages) {
+            const size_t index=virtual_token/256;
+            if (index>=stream.last_use.size() || slot>=stream.demand_last.size()) return false;
+            stream.demand_last[slot]=stream.last_use[index];
+        }
+        physical=slot;return true;
     }
 
     bool prime(size_t first) {
@@ -2460,8 +2475,10 @@ std::unique_ptr<llama_kv_stream_group_reader> llama_kv_stream_group_reader::crea
         };
         if (!accept(staging) || !sources.front().host) return {};
         const auto & shape=sources.front().host->config().shape;
-        if (shape.page_tokens!=256 || ggml_kv_stream_layout_make(shape,256,s.tile).status!=ggml_kv_stream_status::success ||
-                ggml_backend_buffer_get_size(ggml_backend_memory_lease_buffer(staging))!=s.tile.bytes) return {};
+        if (shape.page_tokens!=256 || ggml_kv_stream_layout_make(shape,256,s.tile).status!=ggml_kv_stream_status::success) return {};
+        const size_t stage_bytes=ggml_backend_buffer_get_size(ggml_backend_memory_lease_buffer(staging));
+        if (!stage_bytes || stage_bytes%s.tile.bytes || stage_bytes/s.tile.bytes>64) return {};
+        s.staging_tiles=uint32_t(stage_bytes/s.tile.bytes);
         s.staging.reset(ggml_backend_memory_lease_retain(staging));
         std::vector<uint64_t> owning_ids;
         const auto same_shape=[&](const ggml_kv_stream_shape & other) {
@@ -2695,11 +2712,30 @@ bool llama_kv_stream_group_reader::begin(uint32_t layer,const std::vector<ggml_k
             }
             return true;
         }
-        s.pipeline=false;
+        s.pipeline=false;s.retain_pages=s.request_pipeline;
+        if (s.aggregate) s.retain_pages=s.retain_pages && s.shared.slots>=2*s.sources.size();
+        else for (const auto & source:s.sources) s.retain_pages=s.retain_pages && source.slots>=2;
+        std::vector<size_t> previous(s.sources.size(),SIZE_MAX);
+        if (s.retain_pages) for (const auto & row:columns) if (row.source!=UINT32_MAX) {
+            const size_t page=row.token/256;
+            if (previous[row.source]!=SIZE_MAX && page<previous[row.source]) {s.retain_pages=false;break;}
+            previous[row.source]=page;
+        }
+        if (s.retain_pages) {
+            if (s.aggregate) s.shared.last_use.assign(s.aggregate->impl->aggregate_layout.requirements.role_tokens[s.aggregate_role]/256,SIZE_MAX);
+            else for (auto & source:s.sources) source.last_use.assign((source.config.tokens+255)/256,SIZE_MAX);
+            for (size_t column=0;column<columns.size();++column) if (columns[column].source!=UINT32_MAX) {
+                auto & source=s.sources[columns[column].source];auto & stream=s.transport(source);
+                const size_t page=(source.virtual_first+columns[column].token)/256;
+                if (page>=stream.last_use.size()) return false;
+                stream.last_use[page]=column;
+            }
+        }
         if (!layer) s.stats={};
         if (s.aggregate) {
             for (auto & source:s.sources) source.prefix_ready=false;
             s.shared.pending_pages.clear();std::fill(s.shared.queued.begin(),s.shared.queued.end(),false);
+            std::fill(s.shared.held.begin(),s.shared.held.end(),false);s.shared.demand_last.assign(s.shared.slots,SIZE_MAX);
             s.shared.ring_started=std::any_of(needs_ring.begin(),needs_ring.end(),[](bool value) {return value;});
             if (s.shared.ring_started && !s.copies->begin_with_feedback(s.shared.queue.get(),false)) {finish();return false;}
             s.columns=std::move(next);return true;
@@ -2707,6 +2743,7 @@ bool llama_kv_stream_group_reader::begin(uint32_t layer,const std::vector<ggml_k
         for (size_t index=0;index<s.sources.size();++index) {
             auto & source=s.sources[index];
             source.prefix_ready=false;source.pending_pages.clear();std::fill(source.queued.begin(),source.queued.end(),false);
+            source.held.assign(source.slots,false);source.demand_last.assign(source.slots,SIZE_MAX);
             source.ring_started=needs_ring[index];
             if (source.ring_started && !(source.config.buffering ? s.copies->begin_with_feedback(source.queue.get(),false) :
                     s.copies->begin(source.queue.get()))) {finish();return false;}
@@ -2716,16 +2753,60 @@ bool llama_kv_stream_group_reader::begin(uint32_t layer,const std::vector<ggml_k
 }
 
 bool llama_kv_stream_group_reader::gather(size_t first) {
+    return gather_into(first,0,1);
+}
+
+bool llama_kv_stream_group_reader::gather_into(size_t first,size_t tile_index,size_t tiles) {
     auto & s=*impl;
     if (!s.active || first!=s.next || first>=s.columns.size()) return false;
     try {
         if (!s.current(s.layer)) return false;
-        bool initialize=true;
+        if (!tiles || tiles>s.staging_tiles || tile_index>=tiles) return false;
+        ggml_kv_stream_layout destination_layout;
+        if (ggml_kv_stream_layout_make(s.sources.front().config.host->config().shape,tiles*256,destination_layout).status!=ggml_kv_stream_status::success) return false;
+        auto * destination=ggml_backend_memory_lease_buffer(s.staging.get());
+        ggml_backend_buffer_ptr destination_view,packet_view;
+        if (tiles<s.staging_tiles) {
+            destination_view.reset(ggml_backend_buffer_view(destination,0,destination_layout.bytes));
+            if (!destination_view) return false;
+            destination=destination_view.get();
+        }
+        auto * builder=destination;
+        if (tiles>1) {
+            packet_view.reset(ggml_backend_buffer_view(destination,0,s.tile.bytes));
+            if (!packet_view) return false;
+            builder=packet_view.get();
+        }
+        bool initialize=tile_index==0;
         std::vector<ggml_kv_stream_span_plan_view> views(s.sources.size());
         for (size_t i=0;i<s.sources.size();++i) views[i]={s.sources[i].config.host->config().shape,nullptr,0,
             (s.sources[i].config.tokens+255)/256*256,1};
         std::vector<ggml_kv_stream_gather_row> packet(256);
-        std::vector<ggml_kv_stream_copy_rectangle> rectangles;
+        std::vector<ggml_kv_stream_copy_rectangle> rectangles,combined;
+        std::vector<std::pair<size_t,std::vector<size_t>>> held;
+        std::vector<std::pair<size_t,size_t>> required;
+        for (size_t column=first;column<first+256;++column) {
+            const auto row=s.columns[column];
+            if (row.source==UINT32_MAX) continue;
+            const auto & source=s.sources[row.source];
+            const size_t prefix=source.config.content ? std::min((source.config.tokens+255)/256*256,source.placement.layers[s.layer].planes.tokens) : 0;
+            if (row.token>=prefix) required.push_back({row.source,row.token/256});
+        }
+        std::sort(required.begin(),required.end());required.erase(std::unique(required.begin(),required.end()),required.end());
+        bool coalesce=true;
+        if (s.aggregate) coalesce=required.size()+(!s.pipeline && s.retain_pages ? size_t(std::count(s.shared.held.begin(),s.shared.held.end(),uint8_t(1))) : 0)<=s.shared.slots;
+        else for (size_t i=0;i<s.sources.size();++i)
+            coalesce=coalesce && size_t(std::count_if(required.begin(),required.end(),[&](const auto & page) {return page.first==i;}))+(!s.pipeline && s.retain_pages ? size_t(std::count(s.sources[i].held.begin(),s.sources[i].held.end(),uint8_t(1))) : 0)<=s.sources[i].slots;
+
+        const auto submit=[&] {
+            for (auto & rectangle : rectangles) {
+                const bool value=rectangle.destination_offset>=s.tile.v_offset;
+                rectangle.destination_offset+=tile_index*(value ? s.tile.v_bytes : s.tile.k_bytes);
+                if (value) rectangle.destination_offset+=destination_layout.v_offset-s.tile.v_offset;
+            }
+            if (coalesce) {combined.insert(combined.end(),rectangles.begin(),rectangles.end());return true;}
+            return s.copies->gather(s.backend,destination,rectangles.data(),rectangles.size(),initialize);
+        };
         for (size_t i=0;i<s.sources.size();++i) {
             auto & source=s.sources[i];
             const auto * resident=source.config.content ? &source.placement.layers[s.layer] : nullptr;
@@ -2741,8 +2822,7 @@ bool llama_kv_stream_group_reader::gather(size_t first) {
                 const ggml_kv_stream_span span{buffer,buffer,0,prefix,resident->offset,resident->offset+resident->planes.v_offset};
                 views[i].spans=&span;views[i].count=1;
                 if (!ggml_kv_stream_gather_make(views.data(),views.size(),packet,0,
-                        ggml_backend_memory_lease_buffer(s.staging.get()),rectangles) ||
-                        !s.copies->gather(s.backend,ggml_backend_memory_lease_buffer(s.staging.get()),rectangles.data(),rectangles.size(),initialize)) {
+                        builder,rectangles) || !submit()) {
                     finish();return false;
                 }
                 views[i].spans=nullptr;views[i].count=0;initialize=false;
@@ -2768,16 +2848,19 @@ bool llama_kv_stream_group_reader::gather(size_t first) {
                 for (size_t col=first;col<first+256;++col) if (s.columns[col].source==i &&
                         std::binary_search(pages.begin()+batch,pages.begin()+batch+count,s.columns[col].token/256)) packet[col-first]=s.columns[col];
                 if (!ggml_kv_stream_gather_make(views.data(),views.size(),packet,0,
-                        ggml_backend_memory_lease_buffer(s.staging.get()),rectangles) ||
-                        !s.copies->gather(s.backend,ggml_backend_memory_lease_buffer(s.staging.get()),rectangles.data(),rectangles.size(),initialize)) {
+                        builder,rectangles) || !submit()) {
                     finish();return false;
                 }
-                if (!s.release(source,std::vector<size_t>(physical,physical+count),first+256)) {finish();return false;}
+                if (coalesce) held.push_back({i,std::vector<size_t>(physical,physical+count)});
+                else if (!s.release(source,std::vector<size_t>(physical,physical+count),first+256)) {finish();return false;}
                 views[i].spans=nullptr;views[i].count=0;
                 initialize=false;batch+=count;
             }
         }
-        if (initialize && !s.copies->gather(s.backend,ggml_backend_memory_lease_buffer(s.staging.get()),nullptr,0,true)) {finish();return false;}
+        if (coalesce) {
+            if (!s.copies->gather(s.backend,destination,combined.data(),combined.size(),tile_index==0)) {finish();return false;}
+            for (const auto & item : held) if (!s.release(s.sources[item.first],item.second,first+256)) {finish();return false;}
+        } else if (initialize && !s.copies->gather(s.backend,destination,nullptr,0,true)) {finish();return false;}
         s.next+=256;return true;
     } catch (...) {finish();return false;}
 }
@@ -3051,9 +3134,13 @@ bool llama_kv_stream_group_reader::attention_impl(uint32_t layer,const std::vect
                 }
                 s.next=first+held_count*256;
             } else {
-                if (!gather(first)) {finish();return false;}
+                const size_t tiles=queued && decode ? std::min(size_t(s.staging_tiles),(tokens-first)/256) : 1;
+                for (size_t tile=0;tile<tiles;++tile)
+                    if (!gather_into(first+tile*256,tile,queued && decode ? s.staging_tiles : 1)) {finish();return false;}
+                ggml_kv_stream_layout staged;
+                if (ggml_kv_stream_layout_make(shape,(queued && decode ? s.staging_tiles : 1)*256,staged).status!=ggml_kv_stream_status::success) {finish();return false;}
                 auto * buffer=ggml_backend_memory_lease_buffer(s.staging.get());
-                spans.push_back({buffer,buffer,first,256,0,s.tile.v_offset});
+                spans.push_back({buffer,buffer,first,tiles*256,0,staged.v_offset});
             }
             const size_t end=s.next;
             if (!streamed && end<tokens && !s.prime(end)) {finish();return false;}

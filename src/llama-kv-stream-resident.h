@@ -208,6 +208,7 @@ public:
     llama_kv_stream_prefetch_stats sequence_stats() const noexcept;
 private:
     llama_kv_stream_group_reader() = default;
+    bool gather_into(size_t first,size_t tile_index,size_t tiles);
     bool attention_impl(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,
         ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode,bool queued);
     struct implementation;

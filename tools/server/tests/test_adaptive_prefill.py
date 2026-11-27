@@ -60,6 +60,31 @@ def request_configuration(args):
     return ids, counts, files
 
 
+def checkpoint_coverage(text, expected):
+    expected=set(expected);tasks={};frontiers={};checkpoints={}
+    for line in text.splitlines():
+        event=re.search(r'id\s+(\d+) \| task (\d+) \| (.*)',line)
+        if not event:
+            continue
+        slot,task,msg=int(event[1]),int(event[2]),event[3]
+        prompt=re.search(r'new prompt,.*task.n_tokens = (\d+)',msg)
+        if prompt and (slot,int(prompt[1])) in expected:
+            tasks[task]=(slot,int(prompt[1]));checkpoints[task]=[]
+        if task not in tasks:
+            continue
+        cached=re.search(r'cached n_tokens = (\d+)',msg)
+        if cached:
+            frontiers[task]=int(cached[1])
+        checkpoint=re.search(r'created context checkpoint .*n_tokens = (\d+)',msg)
+        if checkpoint:
+            n=int(checkpoint[1])
+            assert n==frontiers.get(task) and 0<n<tasks[task][1], 'checkpoint includes unsubmitted tokens'
+            checkpoints[task].append(n)
+    assert set(tasks.values())==expected, 'missing checkpoint workload requests'
+    assert all(checkpoints.values()), 'eligible sibling request has no prefill checkpoint'
+    return [{'task':task,'slot':tasks[task][0],'prefixes':values} for task,values in checkpoints.items()]
+
+
 def qualify(args):
     slot_ids, prompt_counts, token_files = request_configuration(args)
     request_count = len(slot_ids)
@@ -241,6 +266,8 @@ def qualify(args):
                     assert final["timings"]["cache_n"] == 256
                     report["cached_prefix_tokens"] = 256
             text = (args.output / "server.log").read_text()
+            if args.check_checkpoint_coverage:
+                report['checkpoint_coverage']=checkpoint_coverage(text,zip(slot_ids,prompt_counts))
             prefill = re.findall(r"stream group bind: selected=(\d+) rows=(\d+) phase=prefill", text)
             decode = re.findall(r"stream group bind: selected=(\d+) rows=(\d+) phase=decode", text)
             prompt_token_counts = [len(value) for value in prompts]
@@ -375,6 +402,7 @@ if __name__ == "__main__":
     parser.add_argument("--cached-prefix", action="store_true")
     parser.add_argument("--context-size", type=int, default=32768)
     parser.add_argument("--context-checkpoints", type=int)
+    parser.add_argument("--check-checkpoint-coverage", action="store_true")
     parser.add_argument("--timeout-seconds", type=int, default=240)
     parser.add_argument("--sanitizer", type=Path)
     parser.add_argument("--cuda-library-guard", type=Path, help="test fault shim rejecting handle creation after startup")

@@ -53,6 +53,7 @@ public:
 
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns]
+        uint32_t next_head = UINT32_MAX; // restore cursor supplied by the primary cache
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -64,6 +65,7 @@ public:
         void resize(size_t n) {
             strm.resize(n);
             idxs.resize(n);
+            next_head = UINT32_MAX;
         }
 
         size_t size() const {
@@ -83,6 +85,7 @@ public:
 
         void clear() {
             idxs.clear();
+            next_head = UINT32_MAX;
         }
 
         // check if indices are contiguous starting from head()
@@ -234,6 +237,7 @@ public:
     ggml_tensor * get_v_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+    uint32_t get_head(llama_seq_id seq_id) const;
     bool supports_mask_bounds() const;
 
     // The stream holding seq_id's cells.
@@ -381,7 +385,7 @@ private:
     std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> bounded_lease{nullptr,ggml_backend_memory_lease_free};
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
-    // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+    // Saved with row placement so restoration preserves subsequent allocation order.
     std::vector<uint32_t> v_heads;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
@@ -432,7 +436,7 @@ private:
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, const slot_info * saved_layout = nullptr, uint32_t saved_head = 0);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);

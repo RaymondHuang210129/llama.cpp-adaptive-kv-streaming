@@ -2757,7 +2757,8 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
+            std::shared_ptr<llama_context_group_checkpoint> snapshot = {}) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2812,8 +2813,8 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         if (stream_contexts) {
-            park_stream_context();cur.streamed=std::make_shared<llama_context_group_checkpoint>();
-            if (!stream_contexts->save_request(uint32_t(slot.id),*cur.streamed,false)) throw std::runtime_error("stream checkpoint export failed");
+            if (!snapshot) throw std::runtime_error("missing selected checkpoint snapshot");
+            cur.streamed=std::move(snapshot);
         } else {
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -4251,6 +4252,13 @@ private:
     }
 
     void pre_decode() {
+        struct pending_checkpoint {
+            uint32_t slot;
+            int task;
+            int64_t pending_tokens;
+            llama_pos pos_min,pos_max;
+        };
+        std::vector<pending_checkpoint> checkpoints;
         prepare_stream_slots();
         if (stream_contexts && spec && stream_requests->phase()==llama_kv_stream_group_phase::decode) {
             auto input=llama_batch_init(int32_t(stream_selection.slots.size()),0,1);
@@ -5104,7 +5112,8 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        if (stream_contexts) checkpoints.push_back({uint32_t(slot.id),slot.task->id,int64_t(n_tokens_cur),pos_min,pos_max});
+                        else create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
                 }
 
@@ -5112,6 +5121,28 @@ private:
                     slot_batched = &slot;
                 }
             });
+        }
+        if (!checkpoints.empty()) {
+            std::vector<uint32_t> selected;
+            for (const auto & checkpoint : checkpoints) {
+                const auto & slot=slots[checkpoint.slot];
+                if (!slot.task || slot.task->id!=checkpoint.task) throw std::runtime_error("checkpoint request changed during batch preparation");
+                selected.push_back(checkpoint.slot);
+            }
+            std::vector<llama_context_group_checkpoint> saved;
+            if (!stream_contexts->snapshot_requests(selected,saved,false) || saved.size()!=checkpoints.size())
+                throw std::runtime_error("selected checkpoint export failed");
+            std::vector<std::shared_ptr<llama_context_group_checkpoint>> retained;retained.reserve(saved.size());
+            for (size_t i=0;i<saved.size();++i) {
+                const auto & checkpoint=checkpoints[i];const auto & slot=slots[checkpoint.slot];
+                if (saved[i].slot!=checkpoint.slot || saved[i].target.tokens!=size_t(slot.prompt.n_tokens()-checkpoint.pending_tokens))
+                    throw std::runtime_error("checkpoint frontier includes unsubmitted input");
+                retained.push_back(std::make_shared<llama_context_group_checkpoint>(std::move(saved[i])));
+            }
+            for (size_t i=0;i<checkpoints.size();++i) {
+                const auto & checkpoint=checkpoints[i];
+                create_checkpoint(slots[checkpoint.slot],checkpoint.pending_tokens,checkpoint.pos_min,checkpoint.pos_max,std::move(retained[i]));
+            }
         }
     }
 
