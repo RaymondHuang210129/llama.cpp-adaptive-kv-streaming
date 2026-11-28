@@ -1,0 +1,42 @@
+{
+  "capture_start": "2026-11-26T16:54:02.093449207-06:00",
+  "capture_end": "2026-11-27T05:09:03.598210+00:00",
+  "timezone": "America/Chicago",
+  "source_revision": "b7188898c78a7d8ecd9b24b32fee45497b73812b",
+  "hardware": "RTX 5070 Ti 16 GB",
+  "model": "Qwen3.8-27B IQ4_XS",
+  "KV": "Q8_0 K / Q4_0 V",
+  "draft": "DFlash2 with 7 proposals",
+  "K4V": false,
+  "rollback": "compact VRAM",
+  "vision_projector_loaded": true,
+  "arena_mib": 2314,
+  "context_limit": 262144,
+  "configured_slots": 3,
+  "segments": 217,
+  "counts_by_parallelism": {
+    "1": 151,
+    "2": 41,
+    "3": 25
+  },
+  "cancellation_estimates": 4,
+  "total_decode_outputs": 231911.0,
+  "source_log_sha256": "54d9ea7e250e875bc961ff8bf523a0d17ccbcbfc75bf62720a5f3153649fb6f8",
+  "checks": {
+    "one_point_per_logged_decode_binding": true,
+    "output_token_conservation": true,
+    "selected_slot_membership_verified": true,
+    "batched_finishes_folded_into_their_actual_binding": true
+  },
+  "definition": "One point per completed logged decode binding revision and selected slot/task set. Context is combined history at entry. Throughput divides combined emitted tokens by the interval after the binding is active until its completion boundary. Activation/rebinding and prefill time are excluded. Scheduling, sampling and pipeline gaps inside the active interval remain included. Internal resident/ring repartitions are not separately logged.",
+  "smoothing": {
+    "method": "Gaussian weighted arithmetic mean",
+    "bandwidth_tokens": 12288,
+    "base_weight": "equal per segment",
+    "range": "each parallelism observed context-entry range; no extrapolation"
+  },
+  "uncertainty": "Cancellation-adjacent estimates are hollow diamonds. Completion boundaries have up to one verification block of attribution uncertainty.",
+  "scope": "All completed decode bindings in the production launch, including smoke probes and other traffic; not restricted to one Hermes task. Captured before temporary GPU-test pauses; later code is not represented by this source revision.",
+  "throughput_metric": "bind_only_tokens_per_second",
+  "duration_metric": "stable_bind_seconds"
+}

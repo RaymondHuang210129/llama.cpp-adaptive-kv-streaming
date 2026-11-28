@@ -29,14 +29,13 @@ class MtpSweepTests(unittest.TestCase):
     def test_rollback_location_reaches_target_and_speculative_commands(self):
         for ram in (False, True):
             argv = [str(SCRIPT), "--model", "target.gguf"]
-            if ram:
-                argv.append("--recurrent-rollback-ram")
+            argv += ["--recurrent-rollback", "ram" if ram else "vram"]
             with self.subTest(ram=ram), patch("sys.argv", argv):
                 args = SWEEP.arguments()
             self.assertEqual(args.recurrent_rollback_ram, ram)
             for depth in (0, 3):
                 command = SWEEP.server_command(args, 32768, depth, 2096)
-                self.assertEqual("--recurrent-rollback-ram" in command, ram)
+                self.assertEqual(command[command.index("--recurrent-rollback") + 1] == "ram", ram)
 
     def test_external_assistant_cli_and_commands_do_not_load_it_for_target_only(self):
         with patch("sys.argv",[str(SCRIPT),"--model","target.gguf","--model-draft","assistant.gguf","--mtp-lengths","0,1,2,3"]):

@@ -128,9 +128,11 @@ def run_case(finder, config, case, server, root, identity, image, port):
             else:
                 command += ["--prompt-tokens", "64", "--distinct-probe-histories"]
             if placement == "compact":
-                command += ["--recurrent-rollback-compact"]
+                command += ["--recurrent-rollback", "compact"]
             elif model.get("rollback_control") == "ram" and case["mode"] != "none":
-                command += ["--recurrent-rollback-ram"]
+                command += ["--recurrent-rollback", "ram"]
+            if "--recurrent-rollback" not in command:
+                command += ["--recurrent-rollback", "vram"]
             args = finder.arguments(command)
             args.output = directory
             from recurrent_measurement import MemorySampler

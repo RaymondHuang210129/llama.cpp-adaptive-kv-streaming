@@ -51,11 +51,11 @@ def main(argv):
     spec = importlib.util.spec_from_file_location("rollback_finder", Path(__file__).with_name("find-max-arena.py"))
     finder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(finder)
-    if "--recurrent-rollback-ram" in argv[2:]:
+    if "--recurrent-rollback" in argv[2:]:
         raise ValueError("this harness selects both placements itself")
     runs = []
     for ram in (False, True):
-        args = finder.arguments(argv[2:] + (["--recurrent-rollback-ram"] if ram else []))
+        args = finder.arguments(argv[2:] + ["--recurrent-rollback", "ram" if ram else "vram"])
         args.output = directory / ("ram" if ram else "native")
         args.output.mkdir()
         record = finder.probe(args, arena)

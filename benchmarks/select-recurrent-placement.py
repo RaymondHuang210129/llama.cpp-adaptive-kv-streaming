@@ -67,7 +67,7 @@ def main(argv=None):
     args=finder.arguments(remaining)
     if options.placement_reserve_mib<0 or args.decode_tokens<64:
         parser.error("reserve must be nonnegative and measured decoding needs at least 64 outputs")
-    if args.recurrent_rollback_ram or args.recurrent_rollback_compact or args.recurrent_rollback_auto:
+    if args.recurrent_rollback is not None:
         parser.error("omit explicit placement flags; this tool compares all three placements")
     if args.mmproj and not args.image:
         parser.error("supply a concrete image workload; automatic image-capacity search is a separate operation")
@@ -96,7 +96,7 @@ def main(argv=None):
         variant=copy.deepcopy(args)
         variant.recurrent_rollback_ram=provider=="ram"
         variant.recurrent_rollback_compact=provider=="compact"
-        variant.recurrent_rollback_auto=False
+        variant.recurrent_rollback="vram" if provider=="native" else provider
         if result_path.exists():
             row=json.loads(result_path.read_text())
         else:

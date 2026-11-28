@@ -23,7 +23,7 @@ SPEC.loader.exec_module(FINDER)
                      "set rollback test server and embedded-MTP model paths for CUDA integration")
 class RecurrentRollbackPlacementTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("LLAMA_ROLLBACK_TEST_DRAFT"), "set the matching DFlash2 draft path")
-    def test_automatic_admission_considers_four_slot_compact_plan(self):
+    def test_explicit_compact_mode_admits_four_slots(self):
         with socket.socket() as listener:
             listener.bind(("127.0.0.1",0));port=listener.getsockname()[1]
         destination=os.environ.get("LLAMA_ROLLBACK_TEST_OUTPUT")
@@ -35,7 +35,7 @@ class RecurrentRollbackPlacementTests(unittest.TestCase):
                 "--model-draft",str(Path(os.environ["LLAMA_ROLLBACK_TEST_DRAFT"]).resolve()),
                 "--context-size","262144","--parallel","4","--cache-type-k","q8_0","--cache-type-v","q4_0",
                 "--spec-mode","dflash","--draft-length","7","--prompt-tokens","64","--decode-tokens","16",
-                "--probe-mode","preflight","--recurrent-rollback-auto","--no-warmup","--no-webui","--verbosity","4","--port",str(port)])
+                "--probe-mode","preflight","--recurrent-rollback","compact","--no-warmup","--no-webui","--verbosity","4","--port",str(port)])
             args.output=Path(temporary);args.output.mkdir(exist_ok=True)
             record=FINDER.probe(args,3072)
             (args.output/"record.json").write_text(json.dumps(record,indent=2)+"\n")
@@ -63,7 +63,7 @@ class RecurrentRollbackPlacementTests(unittest.TestCase):
                     "--context-size", "8192", "--parallel", "2", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
                     "--spec-mode", mode, "--draft-length", str(depth), "--decode-tokens", "64", "--batch-size", "256",
                     "--ubatch-size", "256", "--probe-mode", "preflight", "--no-webui", "--verbosity", "4",
-                    "--port", str(port), *(["--recurrent-rollback-ram"] if ram else []),
+                    "--port", str(port), *(["--recurrent-rollback", "ram" if ram else "vram"]),
                     *(["--model-draft", str(Path(os.environ["LLAMA_ROLLBACK_TEST_DRAFT"]).resolve())] if mode == "dflash" else []),
                 ])
                 args.output = Path(temporary) / ("ram" if ram else "vram")
@@ -72,7 +72,7 @@ class RecurrentRollbackPlacementTests(unittest.TestCase):
                 with patch.object(FINDER, "server_command", side_effect=lambda config, arena: original(config, arena) + ["--tensor-split", "1"]):
                     record = FINDER.probe(args, arena)
                 self.assertTrue(record["fits"], record.get("error"))
-                self.assertEqual("--recurrent-rollback-ram" in record["command"], ram)
+                self.assertEqual(record["command"][record["command"].index("--recurrent-rollback") + 1] == "ram", ram)
                 profiles = []
                 for artifact in sorted(args.output.glob(f"arena-{arena}-*-response.json")):
                     value = json.loads(artifact.read_text())

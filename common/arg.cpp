@@ -2468,20 +2468,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) { params.no_kv_stream_rs_rollback = true; }
     ).set_env("LLAMA_ARG_NO_KV_STREAM_RS_ROLLBACK"));
     add_opt(common_arg(
-        {"--recurrent-rollback-ram"},
-        "store recurrent rollback snapshots in RAM instead of VRAM; current state and KV placement are unchanged",
-        [](common_params & params) { params.recurrent_rollback_ram = true; }
-    ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_RAM"));
-    add_opt(common_arg(
-        {"--recurrent-rollback-compact"},
-        "use qualified FP32 GDN rollback logs with KV streaming; unsupported operators retain native storage",
-        [](common_params & params) { params.recurrent_rollback_compact = true; }
-    ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT"));
-    add_opt(common_arg(
-        {"--recurrent-rollback-auto"},
-        "compare complete native/RAM/compact quotes at drained request/phase boundaries within the shared arena",
-        [](common_params & params) { params.recurrent_rollback_auto = true; }
-    ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK_AUTO"));
+        {"--recurrent-rollback"}, "MODE",
+        "required for recurrent speculative decoding: ram, vram (full state), or compact (qualified compact VRAM state); no default",
+        [](common_params & params, const std::string & value) {
+            if (value == "ram") params.recurrent_rollback = COMMON_RECURRENT_ROLLBACK_RAM;
+            else if (value == "vram") params.recurrent_rollback = COMMON_RECURRENT_ROLLBACK_VRAM;
+            else if (value == "compact") params.recurrent_rollback = COMMON_RECURRENT_ROLLBACK_COMPACT;
+            else throw std::invalid_argument("recurrent rollback mode must be ram, vram, or compact");
+        }
+    ).set_env("LLAMA_ARG_RECURRENT_ROLLBACK"));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},

@@ -35,20 +35,20 @@ Throughput is measured over a common middle output window, after every request r
 
 </details>
 
-### Real workload: Hermes with subagents
+### Real workload: production traffic
 
-This production run included a Hermes agent delegating flight and Hyatt hotel research to two subagents for a trip. The server used DFlash2 with seven proposals plus K4V and supported up to three active slots.
+The refreshed `llm-llmster` capture uses DFlash2 with seven proposals, compact recurrent rollback in VRAM, vision support, and up to three active slots. K4V is disabled in this run.
 
-![Production decode distribution: aggregate tokens per second versus combined context, with separate colors and smoothed mean curves for one, two, and three active slots.](media/oceanus-v3-hermes-decode-distribution.png)
+![Production active-binding decode throughput: aggregate tokens per second versus combined context, with separate colors and smoothed mean curves for one, two, and three active slots.](media/oceanus-v3-production-bound-intervals.png)
 
-Each point represents one decode period, colored by its active slot count. Its throughput is the total emitted decode tokens divided by that period's elapsed time. The matching curves show smoothed average throughput across the observed context range for each color.
+Each point represents a completed decode binding with an unchanged selected slot/task set, colored by parallelism. Its context is the selected slots' combined history at entry; throughput is their total emitted decode tokens divided by the interval after that binding becomes active. Activation and rebinding time are excluded. A new binding starts a new point. Curves show a smoothed average within each color's observed context range.
 
 <details>
 <summary>Production measurement notes</summary>
 
-The chart covers the whole server-log capture from November 19-20, 2026 (CST), including startup probes and any other traffic; it is not filtered exclusively to the travel task. It contains 580 completed decode periods: 497 single-slot, 71 two-slot, and 12 three-slot. Two cancellation-adjacent estimates are marked with hollow diamonds.
+The chart covers the November 26, 2026 production launch from 16:54 to 23:09 CST, on revision `b7188898c`, including startup probes and other traffic. It contains 217 completed decode bindings: 151 single-slot, 41 two-slot, and 25 three-slot. Four cancellation-adjacent estimates are marked with hollow diamonds. The capture ends before the temporary GPU-test pauses; it is an observation of this production revision rather than a benchmark of the subsequent checkpoint and frame-reuse changes.
 
-Context is the combined logical history at period entry, excluding unused arena headroom. Unlike the SWE middle-window measurement, these rates include decode activation and regrouping overhead. Prefill and external tool waits are excluded. Curves use a Gaussian weighted mean with a 12K-token bandwidth, restricted to each color's observed context range. Different requests, output lengths, and draft acceptance rates make this a workload distribution rather than a controlled comparison of slot counts.
+Context is the combined logical history at period entry, excluding unused arena headroom. These rates exclude decode activation/rebinding and prefill. They include scheduling, sampling, and pipeline gaps while the binding is active; they are not GPU-kernel-only timings. The SWE chart uses a different middle-output window. Curves use a Gaussian weighted mean with a 12K-token bandwidth, restricted to each color's observed context range. Different requests, output lengths, and draft acceptance rates make this a workload distribution rather than a controlled comparison of slot counts. Internal adaptive resident/ring repartitions are not separately logged. [Measurements](media/oceanus-v3-production-bound-intervals.csv) / [capture and methodology](media/oceanus-v3-production-bound-intervals.json).
 
 </details>
 
@@ -59,6 +59,7 @@ Context is the combined logical history at period entry, excluding unused arena 
 | [V1](https://www.reddit.com/r/LocalLLM/comments/1w0impd/breaking_vram_barrier_qwen_38_27b_at_262k_context/) | 2026-08-28 | Introduced adaptive KV streaming: keep full KV histories in system RAM and dynamically divide a bounded VRAM pool between resident KV and a shared prefetch ring. |
 | [V2](https://www.reddit.com/r/LocalLLM/comments/1wt03zh/adaptive_kvcache_streaming_v2_full_context_mtp/) | 2026-09-29 | Integrated speculative drafting into the existing streaming infrastructure, sharing KV storage and reusing the same VRAM arena across prefill, drafting, and verification. |
 | V3 ("Oceanus") | 2026-11-21 | Enabled parallel slots by packing their independent per-layer KV histories into a consecutive aggregate working set, mapped onto the shared resident KV pool and ring buffer. |
+| V3.1 | 2026-11-27 | Reduced recurrent-state VRAM with shared histories and compact FP32 checkpoint/log storage; select RAM, full VRAM, or compact VRAM using `--recurrent-rollback`. Bound CUDA workspaces to the arena, preserved KV layout across checkpoints, and reused admitted prefill frames to reduce transition overhead. |
 
 ## Supported Features
 
@@ -70,7 +71,7 @@ Oceanus runs on one CUDA GPU. Model weights and KV-cache quantization are separa
 | KV cache | Q8V8 (`q8_0` / `q8_0`), Q8V4 (`q8_0` / `q4_0`), and Q4V4 (`q4_0` / `q4_0`), subject to compiled kernels and memory fit. |
 | Image input | Optional matching `mmproj` for still images and interleaved image/text prompts. Text-only execution explicitly disables the projector. |
 | Drafting | Target-only; MTP with 1-3 proposals on both models; DFlash2 with 1-7 proposals on Qwen; Qwen DFlash2 + CPU K4V with independently selected neural/copy lengths of 1-7. |
-| Qwen recurrent rollback | Native snapshots by default; optional RAM snapshots, qualified FP32 checkpoint/log storage, or automatic placement for selected groups. Refit the arena after changing placement. |
+| Qwen recurrent rollback | Explicitly select `--recurrent-rollback ram`, `vram` (full state), or `compact` (qualified FP32 checkpoint/log storage in VRAM). No default; refit the arena after selecting a mode. |
 | Parallel requests | Configurable logical slots, one shared GPU arena, independent histories, and jointly executed selections that fit the context and memory budgets. |
 
 Q8V8 and Q8V4 have full-model reference profiles. Q4V4 is available through the common KV reader, with narrower full-model qualification; availability is not evidence that every model/drafter/image combination has been qualified. GPU execution evidence covers selected one- to four-slot profiles. Larger configured counts and other GPUs need their own qualification; see the [qualification ledger](MULTI_SLOT_PHASE_ARENA_ROADMAP.md).
@@ -355,41 +356,33 @@ $CMD += @('--model-draft', $OceanusDraftModel, '--spec-draft-ngl', '999')
 $FIT += @('--model-draft', $OceanusDraftModel)
 ```
 
-**Optional: keep Qwen rollback snapshots in RAM.** Speculative verification retains recurrent-state snapshots so it can restore a rejected prefix. These stay on the native backend by default (VRAM with CUDA offload). Their footprint grows with draft depth and the number of selected slots, which can reduce the number of requests that decode together in a small arena. To reduce that footprint, append the following to both commands; transfers may reduce decode speed. This changes rollback snapshots only, not live recurrent state or attention KV. Refit the arena whenever you change this choice. Gemma has no recurrent rollback state.
+**Choose recurrent rollback storage: `--recurrent-rollback <option>`.** Recurrent speculative rollback requires an explicit choice; there is no default. Select a mode before fitting the arena, and pass the same selection to the server and finder:
 
-Bash:
+| Option | Storage | When to choose it |
+| --- | --- | --- |
+| `--recurrent-rollback ram` | Full rollback snapshots in system RAM. | VRAM is scarce and you need more space for KV. Host/device transfers add decode cost. |
+| `--recurrent-rollback vram` | Full rollback state in VRAM. | VRAM is sufficient and you prioritize rollback speed without host transfers or prefix replay. |
+| `--recurrent-rollback compact` | Compact FP32 checkpoints/logs in VRAM. | VRAM is limited, but you want to keep rollback on the GPU. Replay typically has a milder performance cost than RAM transfers. |
 
-```bash
-CMD+=(--recurrent-rollback-ram)
-FIT+=(--recurrent-rollback-ram)
-```
-
-PowerShell:
-
-```powershell
-$CMD += '--recurrent-rollback-ram'
-$FIT += '--recurrent-rollback-ram'
-```
-
-**Optional: compact Qwen rollback in VRAM.** Choose this instead of the RAM option above. `--recurrent-rollback-compact` retains a checkpoint, a working state and the evaluated FP32 updates needed to reconstruct an accepted prefix. For the reference Qwen geometry, persistent rollback storage falls from 598.50 to 318.41 MiB per selected request with MTP3, and from 1,197.00 to 331.95 MiB with DFlash7. Prefix restoration adds computation; the fastest choice depends on context and available KV capacity.
-
-Bash:
+Linux/macOS shell (choose `ram`, `vram`, or `compact`):
 
 ```bash
-CMD+=(--recurrent-rollback-compact)
-FIT+=(--recurrent-rollback-compact)
+read -r -p "Rollback mode (ram/vram/compact): " ROLLBACK_MODE
+CMD+=(--recurrent-rollback "$ROLLBACK_MODE")
+FIT+=(--recurrent-rollback "$ROLLBACK_MODE")
 ```
 
-PowerShell:
+Windows PowerShell:
 
 ```powershell
-$CMD += '--recurrent-rollback-compact'
-$FIT += '--recurrent-rollback-compact'
+$ROLLBACK_MODE = Read-Host 'Rollback mode (ram/vram/compact)'
+$CMD += @('--recurrent-rollback', $ROLLBACK_MODE)
+$FIT += @('--recurrent-rollback', $ROLLBACK_MODE)
 ```
 
-Compact CUDA execution is currently gated to the qualified Linux Release build using NVCC 13.0.88 and `sm120a`; other builds retain native storage. Target-only and Gemma retain their normal storage. Check the observed representation in the finder log, then refit the arena. The [rollback qualification ledger](docs/development/compact-recurrent-rollback.md) records the arithmetic contract and hardware limits.
+This selects rollback storage; live recurrent state and attention KV keep their normal placement. The recurrent-state footprint grows with draft depth and selected slot count, so refit the arena after choosing a mode. Recorded full-versus-compact recurrent-storage footprints per selected Qwen request are 598.50 versus 318.41 MiB with MTP3, and 1,197.00 versus 331.95 MiB with DFlash7. The fastest choice depends on context, transfers, replay cost, and available KV capacity.
 
-**Optional: automatic group placement.** Use `--recurrent-rollback-auto` in both commands to compare native, RAM and compact plans when a selected group is activated. It accounts for state storage, graph workspace, KV residency and estimated transfer/replay cost, with bounded feedback and hysteresis. Plans can change after a group drains and parks its state. The RAM, compact and automatic flags are mutually exclusive. Serial storage stays fixed at launch; the [measured placement selector](benchmarks/select-recurrent-placement.py) can fit and compare explicit launch settings before starting a server.
+Compact CUDA execution is currently gated to the qualified Linux Release build using NVCC 13.0.88 and `sm120a`; other builds retain native storage. Target-only and Gemma do not use recurrent speculative rollback, so they do not require this selection. Check the observed representation in the finder log. The [rollback qualification ledger](docs/development/compact-recurrent-rollback.md) records the arithmetic contract and hardware limits.
 
 ### 5. Choose slots and the context budget
 
@@ -700,7 +693,7 @@ Shared ring  [ target suffixes, refilled as layers advance   ]
 Workspace    [ target verification of anchor and candidates ]
 ```
 
-The accepted prefix is committed. A rejection also restores the matching recurrent state and truncates or replays the provisional suffix; changing KV length alone would be insufficient. Rollback snapshots stay on the native backend by default. With `--recurrent-rollback-ram`, host-backed candidates and bounded device staging reduce their VRAM footprint at the cost of transfers. Workspace, draft weights, active state, and transfers still cost memory and time. See [MTP design and qualification](MTP_ADAPTIVE_KV_ROADMAP.md).
+The accepted prefix is committed. A rejection also restores the matching recurrent state and truncates or replays the provisional suffix; changing KV length alone would be insufficient. Choose rollback storage explicitly with `--recurrent-rollback ram`, `vram`, or `compact`. With `--recurrent-rollback ram`, host-backed candidates and bounded device staging reduce their VRAM footprint at the cost of transfers. Workspace, draft weights, active state, and transfers still cost memory and time. See [MTP design and qualification](MTP_ADAPTIVE_KV_ROADMAP.md).
 
 #### Gemma MTP: borrow the target's KV
 

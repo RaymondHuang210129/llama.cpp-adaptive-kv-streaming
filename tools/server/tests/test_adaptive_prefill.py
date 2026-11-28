@@ -125,8 +125,8 @@ def qualify(args):
         if args.mode == "dflash7k4v":
             command += ["--spec-ngram-map-k4v-size-n", "12", "--spec-ngram-map-k4v-size-m", "7",
                         "--spec-ngram-map-k4v-min-hits", "2"]
-    if args.recurrent_rollback_compact:
-        command += ["--recurrent-rollback-compact"]
+    if args.recurrent_rollback is not None:
+        command += ["--recurrent-rollback", args.recurrent_rollback]
     if args.sanitizer:
         command = [str(args.sanitizer), "--tool", "memcheck", "--report-api-errors", "all", "--error-exitcode", "99"] + command
     env = dict(os.environ, LD_LIBRARY_PATH=str(args.server.resolve().parent) + ":/usr/local/cuda/lib64",
@@ -418,6 +418,6 @@ if __name__ == "__main__":
     parser.add_argument("--timeout-seconds", type=int, default=240)
     parser.add_argument("--sanitizer", type=Path)
     parser.add_argument("--cuda-library-guard", type=Path, help="test fault shim rejecting handle creation after startup")
-    parser.add_argument("--recurrent-rollback-compact", action="store_true")
+    parser.add_argument("--recurrent-rollback", choices=("ram", "vram", "compact"))
     parser.add_argument("--output", type=Path, required=True)
     qualify(parser.parse_args())

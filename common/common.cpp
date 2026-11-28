@@ -1408,6 +1408,10 @@ static void common_resolve_streaming_context_params(const common_params & params
     cparams.kv_stream_auxiliary_layers=common_kv_stream_auxiliary_layers(params,llama_model_n_layer_nextn(model),shared_target_kv);
     cparams.kv_stream_verify_max=common_kv_stream_verify_max(params,shared_target_kv);
     if (shared_target_kv && common_params_uses_streamed_mtp(params)) cparams.n_rs_seq=0;
+    if (cparams.n_rs_seq && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) &&
+            params.recurrent_rollback==COMMON_RECURRENT_ROLLBACK_UNSPECIFIED) {
+        throw std::invalid_argument("recurrent speculative decoding requires an explicit --recurrent-rollback ram, vram, or compact");
+    }
 }
 
 struct llama_context_params common_context_params_to_llama(const common_params & params,const llama_model * model) {
@@ -1882,9 +1886,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
-    cparams.recurrent_rollback_ram = params.recurrent_rollback_ram;
-    cparams.recurrent_rollback_compact = params.recurrent_rollback_compact;
-    cparams.recurrent_rollback_auto = params.recurrent_rollback_auto;
+    cparams.recurrent_rollback_ram = params.recurrent_rollback == COMMON_RECURRENT_ROLLBACK_RAM;
+    cparams.recurrent_rollback_compact = params.recurrent_rollback == COMMON_RECURRENT_ROLLBACK_COMPACT;
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;

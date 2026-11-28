@@ -34,24 +34,28 @@ class CompactCommandTests(unittest.TestCase):
             return candidate<=132
         self.assertEqual(132,SWEEP.find_max_arena_mib(64,probe,upper_limit=200))
 
-    def test_finder_and_sweep_preserve_explicit_compact_policy(self):
-        for enabled in (False, True):
-            extra = ["--recurrent-rollback-compact"] if enabled else []
-            args = FINDER.arguments(["--model", "target.gguf", "--spec-mode", "mtp", *extra])
-            self.assertEqual(enabled, "--recurrent-rollback-compact" in FINDER.server_command(args, 2096))
-            with patch.object(sys, "argv", [str(ROOT / "run-fixed-span-sweep.py"), "--model", "target.gguf", *extra]):
+    def test_finder_and_sweep_preserve_each_explicit_mode(self):
+        for mode in ("ram", "vram", "compact"):
+            args = FINDER.arguments(["--model", "target.gguf", "--spec-mode", "mtp", "--recurrent-rollback", mode])
+            command = FINDER.server_command(args, 2096)
+            self.assertEqual(mode, command[command.index("--recurrent-rollback") + 1])
+            with patch.object(sys, "argv", [str(ROOT / "run-fixed-span-sweep.py"), "--model", "target.gguf", "--recurrent-rollback", mode]):
                 config = SWEEP.arguments()
             for depth in (0, 3):
-                self.assertEqual(enabled, "--recurrent-rollback-compact" in SWEEP.server_command(config, 8192, depth, 2096))
+                command = SWEEP.server_command(config, 8192, depth, 2096)
+                self.assertEqual(mode, command[command.index("--recurrent-rollback") + 1])
 
-    def test_conflicting_policies_are_rejected_before_launch(self):
-        with self.assertRaises(SystemExit):
-            FINDER.arguments(["--model", "target.gguf", "--recurrent-rollback-compact", "--recurrent-rollback-ram"])
+    def test_invalid_modes_are_rejected_before_launch(self):
+        for mode in ("auto", "native", "RAM", ""):
+            with self.subTest(mode=mode), self.assertRaises(SystemExit):
+                FINDER.arguments(["--model", "target.gguf", "--recurrent-rollback", mode])
+            with patch.object(sys, "argv", [str(ROOT / "run-fixed-span-sweep.py"), "--model", "target.gguf", "--recurrent-rollback", mode]), self.assertRaises(SystemExit):
+                SWEEP.arguments()
 
     def test_environment_cannot_silently_enable_compact_in_control_runs(self):
-        with patch.dict(os.environ, {"LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT": "1"}):
-            self.assertNotIn("LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT", SWEEP.server_environment(False))
-            self.assertNotIn("LLAMA_ARG_RECURRENT_ROLLBACK_COMPACT", FINDER.environment())
+        with patch.dict(os.environ, {"LLAMA_ARG_RECURRENT_ROLLBACK": "compact"}):
+            self.assertNotIn("LLAMA_ARG_RECURRENT_ROLLBACK", SWEEP.server_environment(False))
+            self.assertNotIn("LLAMA_ARG_RECURRENT_ROLLBACK", FINDER.environment())
 
     def test_independent_serial_and_joint_histories_match_for_each_slot(self):
         args=FINDER.arguments(["--model","target.gguf","--parallel","2","--context-size","8192",
@@ -66,12 +70,14 @@ class CompactCommandTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             FINDER.multi_slot_probe_prompts(args,tokens[:20],next(p for p in profiles if p["label"]=="joint"))
 
-    def test_auto_policy_roundtrips_and_conflicts_with_explicit_placements(self):
-        args=FINDER.arguments(["--model","target.gguf","--parallel","4","--recurrent-rollback-auto"])
-        self.assertIn("--recurrent-rollback-auto",FINDER.server_command(args,2096))
-        for explicit in ("--recurrent-rollback-ram","--recurrent-rollback-compact"):
-            with self.assertRaises(SystemExit):
-                FINDER.arguments(["--model","target.gguf","--recurrent-rollback-auto",explicit])
+    def test_missing_mode_stays_unselected_and_old_flags_are_rejected(self):
+        args=FINDER.arguments(["--model","target.gguf"])
+        command=FINDER.server_command(args,2096)
+        self.assertIsNone(args.recurrent_rollback)
+        self.assertNotIn("--recurrent-rollback",command)
+        for flag in ("--recurrent-rollback-ram","--recurrent-rollback-compact","--recurrent-rollback-auto"):
+            with self.subTest(flag=flag),self.assertRaises(SystemExit):
+                FINDER.arguments(["--model","target.gguf",flag])
 
     def test_mixed_mode_joint_capacity_uses_the_larger_verification_width(self):
         args=FINDER.arguments(["--model","target.gguf","--model-draft","draft.gguf","--parallel","64",

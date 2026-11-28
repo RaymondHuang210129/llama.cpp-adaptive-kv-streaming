@@ -422,6 +422,13 @@ struct common_params_diffusion {
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
 };
 
+enum common_recurrent_rollback_mode {
+    COMMON_RECURRENT_ROLLBACK_UNSPECIFIED,
+    COMMON_RECURRENT_ROLLBACK_RAM,
+    COMMON_RECURRENT_ROLLBACK_VRAM,
+    COMMON_RECURRENT_ROLLBACK_COMPACT,
+};
+
 // reasoning API response format (not to be confused as chat template's reasoning format)
 // only used by server
 enum common_reasoning_format {
@@ -588,9 +595,7 @@ struct common_params {
     size_t shared_device_memory_bytes = 0; // exact shared device-local phase budget; mutually exclusive with kv_stream_pool_bytes
     uint32_t kv_stream_auxiliary_layers = 0; // optional legacy assertion; context count comes from model metadata
     bool no_kv_stream_rs_rollback = false; // retain full checkpoints for attached MTP
-    bool recurrent_rollback_ram = false; // store recurrent rollback snapshots in host RAM
-    bool recurrent_rollback_compact = false;
-    bool recurrent_rollback_auto = false;
+    common_recurrent_rollback_mode recurrent_rollback = COMMON_RECURRENT_ROLLBACK_UNSPECIFIED;
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

@@ -25,13 +25,13 @@ class ArenaFinderTests(unittest.TestCase):
         for ram in (False, True):
             with self.subTest(ram=ram), tempfile.TemporaryDirectory() as temporary:
                 args = self.args("--probe-mode", "preflight", "--validate-selected",
-                                 *(["--recurrent-rollback-ram"] if ram else []))
+                                 *(["--recurrent-rollback", "ram" if ram else "vram"]))
                 args.output = Path(temporary)
                 observed = []
 
                 def probe(config, candidate):
                     command = FINDER.server_command(config, candidate)
-                    observed.append((config.probe_mode, "--recurrent-rollback-ram" in command))
+                    observed.append((config.probe_mode, command[command.index("--recurrent-rollback") + 1] == "ram"))
                     return {"arena_mib": candidate, "fits": True,
                             "timings": {"prompt_n": FINDER.probe_text_tokens(config), "predicted_n": 256}}
 
@@ -44,10 +44,10 @@ class ArenaFinderTests(unittest.TestCase):
                     report = FINDER.fit(args)
                 self.assertEqual(observed, [("preflight", ram), ("full", ram)])
                 self.assertEqual(report["recurrent_rollback_ram"], ram)
-                self.assertEqual("--recurrent-rollback-ram" in report["command"], ram)
+                self.assertEqual(report["command"][report["command"].index("--recurrent-rollback") + 1] == "ram", ram)
                 persisted = json.loads((args.output / "result.json").read_text())
                 self.assertEqual(persisted["recurrent_rollback_ram"], ram)
-                self.assertEqual("--recurrent-rollback-ram" in (args.output / "command.ps1").read_text(encoding="utf-8-sig"), ram)
+                self.assertIn("'ram'" if ram else "'vram'", (args.output / "command.ps1").read_text(encoding="utf-8-sig"))
 
     def test_failed_full_validation_refits_the_full_workload_without_a_reserve(self):
         args=self.args('--probe-mode','preflight','--validate-selected')

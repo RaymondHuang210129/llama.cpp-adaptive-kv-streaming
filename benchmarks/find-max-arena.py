@@ -69,12 +69,8 @@ def arguments(argv=None):
     parser.add_argument("--copy-probe", action="store_true",
                         help="also validate a separate 32-output copying path; always enabled for mixed K4V, optional for matched non-mixed sizing")
     parser.add_argument("--no-webui", action="store_true", help="disable the test server's web UI")
-    parser.add_argument("--recurrent-rollback-ram", action="store_true",
-                        help="store recurrent rollback snapshots in RAM; default keeps them in VRAM")
-    parser.add_argument("--recurrent-rollback-compact", action="store_true",
-                        help="use qualified FP32 GDN logs; unsupported operators retain native storage")
-    parser.add_argument("--recurrent-rollback-auto", action="store_true",
-                        help="compare complete native/RAM/compact plans at drained selected-group boundaries")
+    parser.add_argument("--recurrent-rollback", choices=("ram", "vram", "compact"),
+                        help="explicit rollback storage: ram, vram, or compact; required for recurrent speculative rollback")
     parser.add_argument("--measure-decode", action="store_true",
                         help="record token arrival timelines and a common decode window for each probe cohort")
     parser.add_argument("--distinct-probe-histories", action="store_true",
@@ -99,8 +95,8 @@ def arguments(argv=None):
         parser.error("probe token offset must be nonnegative and applies to text histories only")
     if args.measure_decode and args.decode_tokens<2:
         parser.error("decode-window measurement needs at least two output tokens")
-    if sum((args.recurrent_rollback_ram,args.recurrent_rollback_compact,args.recurrent_rollback_auto))>1:
-        parser.error("RAM, compact and automatic rollback policies are mutually exclusive")
+    args.recurrent_rollback_ram = args.recurrent_rollback == "ram"
+    args.recurrent_rollback_compact = args.recurrent_rollback == "compact"
     if args.fixed_image_budget and (not args.mmproj or args.image or args.image_max_tokens is None):
         parser.error("--fixed-image-budget requires --mmproj, an explicit --image-max-tokens and no --image")
     if args.image:
@@ -156,12 +152,8 @@ def server_command(args, arena_mib):
         command.append("--kv-unified")
     if args.no_webui:
         command.append("--no-webui")
-    if args.recurrent_rollback_ram:
-        command.append("--recurrent-rollback-ram")
-    if getattr(args, "recurrent_rollback_compact", False):
-        command.append("--recurrent-rollback-compact")
-    if getattr(args, "recurrent_rollback_auto", False):
-        command.append("--recurrent-rollback-auto")
+    if args.recurrent_rollback is not None:
+        command += ["--recurrent-rollback", args.recurrent_rollback]
     if getattr(args, "no_warmup", False):
         command.append("--no-warmup")
     if args.draft_length:
@@ -1154,7 +1146,7 @@ def fit(args, report_vision=False):
               "command":server_command(command_args,maximum), "uvm":False, "reserve_mib":0,
               "recurrent_rollback_ram":args.recurrent_rollback_ram,
               "recurrent_rollback_compact":args.recurrent_rollback_compact,
-              "recurrent_rollback_auto":args.recurrent_rollback_auto,
+              "recurrent_rollback":args.recurrent_rollback,
               "measured_decode_windows":args.measure_decode,
               "distinct_probe_histories":args.distinct_probe_histories,
               "probe_token_offset":args.probe_token_offset,

@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "../src/llama-model.h"
 #include "download.h"
 #include "llama.h"
 #include "speculative.h"
@@ -487,13 +488,54 @@ static void test(void) {
         assert(!llama_context_default_params().recurrent_rollback_ram);
         assert(!common_context_params_to_llama(rollback).recurrent_rollback_ram);
         {
+            assert(rollback.recurrent_rollback==COMMON_RECURRENT_ROLLBACK_UNSPECIFIED);
+            std::unique_ptr<llama_model> qwen(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+            qwen->hparams.n_layer_nextn=1;
+            bool rejected=false;
+            try { common_context_params_to_llama(rollback,qwen.get()); }
+            catch (const std::invalid_argument & error) { rejected=std::string(error.what()).find("--recurrent-rollback")!=std::string::npos; }
+            assert(rejected && "recurrent decoding must require an explicit storage mode");
+            for (auto mode : {COMMON_RECURRENT_ROLLBACK_RAM,COMMON_RECURRENT_ROLLBACK_VRAM,COMMON_RECURRENT_ROLLBACK_COMPACT}) {
+                auto chosen=rollback;chosen.recurrent_rollback=mode;
+                assert(common_context_params_to_llama(chosen,qwen.get()).n_rs_seq==3);
+            }
+            common_params target;
+            assert(common_context_params_to_llama(target,qwen.get()).n_rs_seq==0);
+            std::unique_ptr<llama_model> gemma(llama_model_create(LLM_ARCH_GEMMA4,llama_model_default_params()));
+            gemma->gguf_kv["general.architecture"]="gemma4";
+            auto assistant=rollback;assistant.n_parallel=1;assistant.kv_stream_auxiliary_layers=0;assistant.speculative.draft.mparams.path="assistant.gguf";
+            assert(common_context_params_to_llama(assistant,gemma.get()).n_rs_seq==0);
+        }
+        {
             auto ram_argv=argv;
-            ram_argv.push_back("--recurrent-rollback-ram");
+            ram_argv.insert(ram_argv.end(),{"--recurrent-rollback","ram"});
             common_params ram;
             assert(common_params_parse(ram_argv.size(),list_str_to_char(ram_argv).data(),ram,LLAMA_EXAMPLE_SERVER));
             assert(common_context_params_to_llama(ram).n_rs_seq == 3);
             assert(common_context_params_to_llama(ram).recurrent_rollback_ram);
-            assert(!common_base_params_to_speculative(ram).recurrent_rollback_ram);
+            assert(common_base_params_to_speculative(ram).recurrent_rollback==COMMON_RECURRENT_ROLLBACK_VRAM);
+        }
+        for (const auto & mode : {"ram","vram","compact"}) {
+            auto mode_argv=argv;mode_argv.insert(mode_argv.end(),{"--recurrent-rollback",mode});
+            common_params selected;
+            assert(common_params_parse(mode_argv.size(),list_str_to_char(mode_argv).data(),selected,LLAMA_EXAMPLE_SERVER));
+            const auto target=common_context_params_to_llama(selected);
+            assert(target.recurrent_rollback_ram==(std::string(mode)=="ram"));
+            assert(target.recurrent_rollback_compact==(std::string(mode)=="compact"));
+            assert(!target.recurrent_rollback_auto);
+            const auto draft=common_context_params_to_llama(common_base_params_to_speculative(selected));
+            assert(!draft.recurrent_rollback_ram && !draft.recurrent_rollback_compact && !draft.recurrent_rollback_auto);
+        }
+        for (const auto & mode : {"auto","native","","RAM"}) {
+            auto invalid=argv;invalid.insert(invalid.end(),{"--recurrent-rollback",mode});common_params selected;
+            assert(!common_params_parse(invalid.size(),list_str_to_char(invalid).data(),selected,LLAMA_EXAMPLE_SERVER));
+        }
+        {
+            auto reset=argv;reset.insert(reset.end(),{"--recurrent-rollback","compact","--recurrent-rollback","vram"});
+            common_params selected;
+            assert(common_params_parse(reset.size(),list_str_to_char(reset).data(),selected,LLAMA_EXAMPLE_SERVER));
+            const auto target=common_context_params_to_llama(selected);
+            assert(!target.recurrent_rollback_ram && !target.recurrent_rollback_compact && !target.recurrent_rollback_auto);
         }
         argv.push_back("--no-kv-stream-rs-rollback");
         common_params full_checkpoint;
