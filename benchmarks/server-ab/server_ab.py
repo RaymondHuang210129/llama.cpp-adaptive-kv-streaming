@@ -119,6 +119,27 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def http_error_details(error: urllib.error.HTTPError) -> str:
+    try:
+        with error:
+            body = error.read(4097)
+    except Exception:
+        # Preserve the HTTP failure if reading its diagnostic body also fails.
+        return str(error)
+    detail = body[:4096].decode("utf-8", errors="replace").strip()
+    try:
+        data = json.loads(detail)
+        if isinstance(data, dict):
+            data = data.get("error", data)
+            if isinstance(data, dict) and isinstance(data.get("message"), str):
+                detail = data["message"]
+    except json.JSONDecodeError:
+        pass
+    if not detail:
+        return str(error)
+    return f"{error}; server response: {detail}" + (" [truncated]" if len(body) > 4096 else "")
+
+
 def request_json(
         url: str,
         payload: dict[str, Any] | None = None,
@@ -137,6 +158,8 @@ def request_json(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"request failed for {url}: {http_error_details(exc)}") from exc
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"request failed for {url}: {exc}") from exc
     if not isinstance(result, dict):

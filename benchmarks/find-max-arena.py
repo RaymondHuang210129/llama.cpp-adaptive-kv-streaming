@@ -26,7 +26,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmarks/server-ab"))
 sys.path.insert(0, str(ROOT / "benchmarks"))
-from server_ab import request_json  # noqa: E402
+from server_ab import http_error_details, request_json  # noqa: E402
 from run_dflash_controls import ngram_command, ngram_settings, speculative_source_stats, validate_mixed_sources  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location("arena_sweep", ROOT / "benchmarks/run-fixed-span-sweep.py")
@@ -336,6 +336,8 @@ def request_completion_group(url, body, timeout):
         if len(data) > 64 *1048576:
             raise RuntimeError("completion group response exceeds 64 MiB")
         rows = json.loads(data)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"completion group request failed for {url}: {http_error_details(error)}") from error
     except (urllib.error.URLError, json.JSONDecodeError) as error:
         raise RuntimeError(f"completion group request failed for {url}: {error}") from error
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
@@ -346,13 +348,20 @@ def request_completion_group(url, body, timeout):
 def observed_completion(args, url, body, label, grouped=False):
     log_path = getattr(args, "_source_log_path", None)
     before = speculative_source_stats(log_path.read_text(errors="replace")) if log_path else {}
-    if getattr(args, "measure_decode", False):
-        from recurrent_measurement import stream_completions
-        body["stream"] = True
-        rows = stream_completions(url +"/completion", body, len(body["prompt"]) if grouped else 1, args.request_timeout)
-        result = rows if grouped else rows[0]
-    else:
-        result = request_completion_group(url +"/completion", body, timeout=args.request_timeout) if grouped else request_json(url +"/completion", body, timeout=args.request_timeout)
+    try:
+        if getattr(args, "measure_decode", False):
+            from recurrent_measurement import stream_completions
+            body["stream"] = True
+            rows = stream_completions(url +"/completion", body, len(body["prompt"]) if grouped else 1, args.request_timeout)
+            result = rows if grouped else rows[0]
+        else:
+            result = request_completion_group(url +"/completion", body, timeout=args.request_timeout) if grouped else request_json(url +"/completion", body, timeout=args.request_timeout)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"probe {label} request failed: {http_error_details(error)}") from error
+    except SWEEP.ArenaTooSmallError:
+        raise
+    except RuntimeError as error:
+        raise RuntimeError(f"probe {label} request failed: {error}") from error
     if log_path:
         after = speculative_source_stats(log_path.read_text(errors="replace"))
         fields = ("generated_tokens", "accepted_tokens", "accept_calls", "prediction_forwards")
@@ -703,7 +712,7 @@ def _runtime_probe(args, candidate):
     context_limit=bool(failure and getattr(args,"_vision_capacity_probe",False)
                        and re.search(r"request .*exceeds the available context size|request .*exceeds.*context size",text,re.I))
     if failure and not context_limit and not SWEEP.is_arena_capacity_failure(text):
-        raise RuntimeError(f"probe failed; not a physical OOM: {failure}; see {log_path}") from failure
+        raise RuntimeError(f"probe failed with an unclassified runtime error; arena search stopped: {failure}; see {log_path}") from failure
     return {"arena_mib":candidate, "fits":failure is None, "log":str(log_path), "command":command,
             "observed_compact_recurrent":bool(re.search(r"representation=gdn-fp32",text)),
             "log_sha256":hashlib.sha256(log_path.read_bytes()).hexdigest(),

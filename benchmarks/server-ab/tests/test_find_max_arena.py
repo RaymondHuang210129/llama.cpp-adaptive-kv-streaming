@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import shlex
 import subprocess
 import sys
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[2] / "find-max-arena.py"
@@ -18,6 +20,32 @@ SPEC.loader.exec_module(FINDER)
 
 
 class ArenaFinderTests(unittest.TestCase):
+    def test_http_failure_preserves_server_error_and_probe_identity(self):
+        message="pre_decode() failed: selected workload admission failed: unsupported workload"
+        for measured,grouped,label in [(False,False,"single-1"),(False,True,"joint"),(True,False,"measured-single-0")]:
+            with self.subTest(grouped=grouped,measured=measured):
+                body=json.dumps({"error":{"code":500,"message":message,"type":"server_error"}}).encode()
+                error=urllib.error.HTTPError("http://127.0.0.1:1249/completion",500,"Internal Server Error",{},io.BytesIO(body))
+                args=self.args()
+                args.measure_decode=measured
+                with patch.object(FINDER.urllib.request,"urlopen",side_effect=error),self.assertRaises(RuntimeError) as caught:
+                    FINDER.observed_completion(args,"http://127.0.0.1:1249",{"prompt":[[1],[2]] if grouped else [1]},label,grouped=grouped)
+                text=str(caught.exception)
+                self.assertIn(message,text)
+                self.assertIn(label,text)
+                self.assertIn("500",text)
+
+    def test_http_error_body_is_bounded_and_non_json_is_readable(self):
+        for body in [b"CUDA operator initialization failed",b"x"*16384,b""]:
+            with self.subTest(size=len(body)):
+                error=urllib.error.HTTPError("http://127.0.0.1:1249/completion",500,"Internal Server Error",{},io.BytesIO(body))
+                with patch.object(FINDER.urllib.request,"urlopen",side_effect=error),self.assertRaises(RuntimeError) as caught:
+                    FINDER.request_json(error.url,{"prompt":[1]})
+                text=str(caught.exception)
+                self.assertIn("500",text)
+                self.assertLess(len(text),4600)
+                if body and len(body)<4096:self.assertIn(body.decode(),text)
+
     def args(self, *extra):
         return FINDER.arguments(["--model", "model.gguf", "--context-size", "8192", *extra])
 
